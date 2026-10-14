@@ -1,6 +1,6 @@
 {
   "name": "codex-gate",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Pre-PR gate: rounds of adversarial Codex review (gstack /codex) and agent fixes, run locally before a PR to dev or main is opened, with a live progress pane.",
   "author": {
     "name": "adam schoen"

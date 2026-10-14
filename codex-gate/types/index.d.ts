@@ -63,6 +63,8 @@ export type Run = {
   lane: Lane
   /** The effort Codex runs at now; a timeout steps it down and reruns the round. */
   effort: Effort
+  /** The effort this branch's tier and lane call for, before any carried or timeout step-down. */
+  startEffort?: Effort
   round: number
   maxRounds: number
   status: RunStatus
@@ -95,6 +97,8 @@ export type PassRecord = {
   effort?: Effort
   /** The run ended because Codex timed out at its lowest effort, or on the step timeout. */
   hasTimedOut?: boolean
+  /** The effort a review last completed at, kept while it is below the branch's default; the next run starts no higher. */
+  passedEffort?: Effort
 }
 
 declare module 'claude-code' {

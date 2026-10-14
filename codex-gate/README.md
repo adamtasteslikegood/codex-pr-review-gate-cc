@@ -81,7 +81,10 @@ large diff) and at `reviewEffort` (`medium`) otherwise. It never runs at
 `"error":"timeout"`, or the review step passes `stepTimeoutMinutes`), the
 same round reruns one level lower and spends no round: high, then medium,
 then low. A timeout at `low` fails closed. The next run on that branch
-starts one level below where the timed-out run ended. A reviewer that was
+starts one level below where the timed-out run ended. A run that stepped down
+and then completed its reviews keeps that effort for the branch: later runs
+start no higher than it. A branch that never stepped down keeps no such
+limit, so it still starts at `high` once it grows into high blast radius. A reviewer that was
 replaced is not stopped, since there is no way to; its late answer is
 ignored.
 

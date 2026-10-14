@@ -298,6 +298,40 @@ test('the next run on a branch that timed out at low effort stays at low', async
   expect(w.spawned.at(-1)?.prompt).toContain('args "challenge --effort low"')
 })
 
+test('a branch keeps the effort a review last completed at after a timeout', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '30\t4\tserver/security.ts'
+  const rerun = () =>
+    $.command.run({ command: 'pr-gate', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(`${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"timeout"}`, 'agent-1'))
+  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-3'))
+  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-4'))
+  expect((await runOf(w)).status).toBe('passed')
+
+  // Passed at medium after a timeout at high: the next run starts at medium.
+  await rerun()
+  expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
+  await $.turn.complete(turn(review('r1-review', 'PASS'), `agent-${w.spawned.length - 1}`))
+  await $.turn.complete(turn(review('r1-challenge', 'PASS'), `agent-${w.spawned.length}`))
+  expect((await runOf(w)).status).toBe('passed')
+  // And keeps it on the run after that.
+  await rerun()
+  expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
+})
+
+test('a branch that passed at its default effort starts at high once it grows into high blast radius', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  expect((await runOf(w)).status).toBe('passed')
+  w.git.numstat = '30\t4\tserver/security.ts'
+  await $.command.run({ command: 'pr-gate', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+  expect(w.spawned.at(-1)?.prompt).toContain('--effort high')
+})
+
 test('a review that did not complete fails closed', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)

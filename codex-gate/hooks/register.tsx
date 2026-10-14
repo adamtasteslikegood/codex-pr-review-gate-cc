@@ -193,6 +193,12 @@ let ticker: { cancel: () => void } | undefined
     isLive = false
     if (run === null) return
     const head = await git($, run.root, ['rev-parse', 'HEAD'])
+    // A review that completed below the branch's default sets where the next run starts; a run that never completed one keeps the last.
+    const hasReviewed = status === 'passed' || status === 'exhausted' || status === 'blocked'
+    const prior = (await $.store.get(storeKey(run.root, run.branch))) as PassRecord | undefined | null
+    const passedEffort = hasReviewed ? run.effort : prior?.passedEffort
+    const start = run.startEffort ?? 'high'
+    const isBelow = passedEffort !== undefined && passedEffort !== start && lowerOf(passedEffort, start) === passedEffort
     const record: PassRecord = {
       sha: head.isOk ? head.out : run.headSha,
       base: run.base,
@@ -202,6 +208,7 @@ let ticker: { cancel: () => void } | undefined
       note: message,
       effort: run.effort,
       ...(hasTimedOut ? { hasTimedOut: true } : {}),
+      ...(isBelow ? { passedEffort } : {}),
     }
     await $.store.set(storeKey(run.root, run.branch), record)
     $.ui.status(undefined)
@@ -604,8 +611,9 @@ let ticker: { cancel: () => void } | undefined
     const startEffort: Effort = scope.tier === 'high' ? 'high' : lane === 'light' ? config.lightEffort : config.effort
     const last = (await $.store.get(storeKey(root, branch))) as PassRecord | undefined | null
     // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
-    const effort =
-      last?.hasTimedOut === true && last.effort !== undefined ? lowerOf(startEffort, stepDown(last.effort) ?? 'low') : startEffort
+    // Otherwise it starts no higher than the effort a review last completed at on this branch.
+    const afterTimeout = last?.hasTimedOut === true && last.effort !== undefined ? (stepDown(last.effort) ?? 'low') : startEffort
+    const effort = lowerOf(lowerOf(startEffort, afterTimeout), last?.passedEffort ?? startEffort)
     const now = await $.clock.now()
     const run: Run = {
       id: `${now}`,
@@ -618,6 +626,7 @@ let ticker: { cancel: () => void } | undefined
       tierWhy: scope.why,
       lane,
       effort,
+      startEffort,
       round: 1,
       maxRounds: lane === 'light' ? 1 : config.maxRounds,
       status: 'running',
