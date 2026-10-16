@@ -94,6 +94,27 @@ test('the fixer reports a fix; only a check verifies it', async () => {
   expect(markHeld(reported, 2, 'codex', 6, 'still reachable').status).toBe('open')
 })
 
+test('a fixer cannot lower a finding: a P3 answer to a P1 keeps P1', async () => {
+  const rebutted = applyAnswer(finding(), { id: 'R1-1', action: 'rebutted', severity: 'P3' }, 1, 'main', 5)
+  expect(rebutted.severity).toBe('P1')
+})
+
+test('a fixer may raise a finding: a P1 answer to a P3 becomes P1', async () => {
+  const fixed = applyAnswer(finding({ severity: 'P3' }), { id: 'R1-1', action: 'fixed', severity: 'P1' }, 1, 'main', 5)
+  expect(fixed.severity).toBe('P1')
+  expect('isSecurity' in fixed).toBe(false)
+})
+
+test('a fixer cannot clear isSecurity: a false answer keeps a security finding security', async () => {
+  const kept = applyAnswer(finding({ isSecurity: true }), { id: 'R1-1', action: 'rebutted', isSecurity: false }, 1, 'main', 5)
+  expect(kept.isSecurity).toBe(true)
+})
+
+test('a fixer may mark a finding security: a true answer sets isSecurity', async () => {
+  const marked = applyAnswer(finding(), { id: 'R1-1', action: 'fixed', isSecurity: true }, 1, 'main', 5)
+  expect(marked.isSecurity).toBe(true)
+})
+
 test('merging a later review never changes a finding it left out', async () => {
   const old = [finding({ status: 'reported-fixed' }), finding({ id: 'R1-2', status: 'open', severity: 'P2' })]
   const merged = mergeFindings(old, [finding({ id: 'R2-1', round: 2, title: 'Something else' })])
