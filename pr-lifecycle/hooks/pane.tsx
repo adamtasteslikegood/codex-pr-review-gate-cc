@@ -5,7 +5,7 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { Finding, LifecycleRecord, Run, Step } from '../types'
 import { isBlocking } from './core'
-import { isAcceptedRebuttal, isDisputed, isReverifyOwed, mergeHolds, usedRounds, verificationOwed, waivedIds } from './lifecycle'
+import { isAcceptedRebuttal, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
 import { elapsed, finish, SPINNER } from './round'
 
 type Engine = EngineInterface
@@ -42,21 +42,31 @@ const rowsOf = (run: Run | null, rec: LifecycleRecord | undefined): Finding[] =>
   return [...fromRun, ...(rec?.findings ?? []).filter(one => !carried.has(one.id))]
 }
 
-type Mark = { glyph: string; said: string; isSettled: boolean; isOwed: boolean; isStruck: boolean }
+/** The status line's color: the run's outcome, or a warning when only a record is left. */
+const colorOf = (run: Run | null): 'success' | 'claude' | 'warning' | 'error' => {
+  if (run === null || run.status === 'waived') return 'warning'
+  return run.status === 'passed' ? 'success' : run.status === 'running' ? 'claude' : 'error'
+}
+
+type Mark = { glyph: string; said: string; isSettled: boolean; isOwed: boolean; isStruck: boolean; isVerify?: true }
 
 /** One finding in words: the mark, what stands, and whether it is settled, owed a check, or struck through (only a verified fix is). */
 const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
   const last = one.history.at(-1)
   const wasAccepted = one.status === 'rebutted' && last?.by === 'codex' && last.status === 'rebutted'
-  const waived = rec === undefined ? undefined : waivedIds(rec).has(one.id) ? rec.waivers.find(w => w.scope === 'finding' && w.findingId === one.id && w.lapsedAt === undefined) : undefined
+  const isWaived = rec !== undefined && waivedIds(rec).has(one.id)
+  const waived = isWaived ? rec.waivers.find(w => w.scope === 'finding' && w.findingId === one.id && w.lapsedAt === undefined) : undefined
   const hasLapsed = rec?.waivers.some(w => w.scope === 'finding' && w.findingId === one.id && w.lapsedAt !== undefined) === true
   const lapse = hasLapsed && waived === undefined ? ' (waiver lapsed)' : ''
   if (waived !== undefined) return { glyph: '⊘', said: ` — waived: ${waived.reason}`, isSettled: true, isOwed: false, isStruck: false }
   if (isReverifyOwed(one) || (wasAccepted && one.needsRecheck === true)) {
-    return { glyph: one.status === 'rebutted' ? '↩' : '✔', said: ' — re-verify owed (file changed)', isSettled: false, isOwed: true, isStruck: false }
+    const glyph = one.status === 'rebutted' ? '↩' : '✔'
+    return { glyph, said: ' — re-verify owed (file changed)', isSettled: false, isOwed: true, isStruck: false, isVerify: true }
   }
   if (one.status === 'verified-fixed') return { glyph: '✔', said: ' — verified fixed', isSettled: true, isOwed: false, isStruck: true }
-  if (one.status === 'reported-fixed') return { glyph: '✓', said: ` — reported fixed, unverified${lapse}`, isSettled: false, isOwed: true, isStruck: false }
+  if (one.status === 'reported-fixed') {
+    return { glyph: '✓', said: ` — reported fixed, unverified${lapse}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
+  }
   if (one.status === 'rebutted') {
     if (isAcceptedRebuttal(one)) return { glyph: '↩', said: ' — rebuttal accepted', isSettled: true, isOwed: false, isStruck: false }
     if (isDisputed(one)) return { glyph: '↩', said: ` — disputed: awaiting the person${lapse}`, isSettled: false, isOwed: true, isStruck: false }
@@ -106,20 +116,22 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
   const room = Math.max(4, (e.viewport?.rows ?? 30) - (run?.steps.length ?? 0) - 12)
   const shown = [...current, ...earlier].slice(0, room)
   const hidden = all.length - shown.length
-  const statusColor = run === null ? 'warning' : run.status === 'passed' ? 'success' : run.status === 'running' ? 'claude' : run.status === 'waived' ? 'warning' : 'error'
+  const statusColor = colorOf(run)
   // The merge-hold count is mergeHolds itself, so the pane never disagrees with the merge guard.
   const holds = rec === undefined ? 0 : mergeHolds(rec).length
   const blockingOpen =
     rec === undefined
       ? current.filter(one => isBlocking(one) && one.status === 'open').length
       : all.filter(one => isBlocking(one) && one.status === 'open' && !waivedIds(rec).has(one.id)).length
-  const owed = rec === undefined ? 0 : verificationOwed(rec).length
+  // Every row owed a check, by the predicate the rows use (a reported fix, a re-verify), at any severity.
+  const owed = all.filter(one => markOf(one, rec).isVerify === true).length
   const heading =
     rec === undefined
       ? `Findings (${all.length}${current.some(isBlocking) ? `, ${blockingOpen} blocking open` : ''})`
       : `Findings (${all.length}, ${holds} holding the merge, ${blockingOpen} blocking open, ${owed} owed verification)`
-  const awaited = rec !== undefined && !isRunning && rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision' ? awaitedOf(rec) : undefined
-  const message = rec?.message === undefined ? undefined : truncate(rec.message, MESSAGE_CHARS)
+  const awaited = rec !== undefined && !isRunning && rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision' ? awaitedOf(rec) || undefined : undefined
+  // A stop reason is stale mid-round: it shows only while no run is running.
+  const message = rec?.message === undefined || isRunning ? undefined : truncate(rec.message, MESSAGE_CHARS)
 
   return (
     <Box flexDirection="column">
@@ -151,7 +163,7 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
           </Text>
         ) : (
           <Text color={statusColor} bold wrap="truncate-end">
-            {(run?.status ?? rec?.postStatus ?? rec?.phase ?? '').toUpperCase()}
+            {(run?.status ?? (rec?.phase === 'pre' ? rec.preStatus : rec?.postStatus) ?? rec?.phase ?? '').toUpperCase()}
           </Text>
         )}
         {run !== null && isRunning && run.activity !== '' && (
@@ -190,6 +202,7 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
         {all.length === 0 && <Text dimColor>None yet.</Text>}
         {shown.map(one => {
           const said = markOf(one, rec)
+          const where = one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`
           return (
             <Text
               key={`finding-${one.id}`}
@@ -198,7 +211,7 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
               color={said.isOwed ? 'warning' : one.round === round && isBlocking(one) && one.status === 'open' ? 'error' : undefined}
               strikethrough={said.isStruck}
             >
-              {`${said.glyph} ${one.id} [${one.severity}] ${one.title}${one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`}${said.said}`}
+              {`${said.glyph} ${one.id} [${one.severity}] ${one.title}${where}${said.said}`}
             </Text>
           )
         })}

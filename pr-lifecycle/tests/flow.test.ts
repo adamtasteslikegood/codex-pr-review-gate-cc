@@ -2170,7 +2170,14 @@ const mountPane = ($: Parameters<TestBody>[0]) =>
     surface: 'terminal',
     component: 'Pane',
     requestId: 'pr-lifecycle',
-    props: { title: 'PR lifecycle', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { top: 0, bodyRows: 40, rows: 40 } as never, view: {} as never },
+    props: {
+      title: 'PR lifecycle',
+      isFocused: false,
+      bodyColumns: 60,
+      placement: 'dock',
+      scroll: { top: 0, bodyRows: 40, rows: 40 } as never,
+      view: {} as never,
+    },
   })
 
 const paneFinding = (id: string, change: Partial<Finding>): Finding => ({
@@ -2263,6 +2270,10 @@ test('the pane shows the record\'s message, truncated', async ($, on) => {
   await toPost($, w)
   const key = 'lifecycle:/repo:feat/x'
   w.store.set(key, { ...(await recordOf(w)), message: `Stopped for a reason. ${'long '.repeat(80)}` })
+  const midRound = await mountPane($)
+  expect(await midRound.find({ type: 'Text', text: /Stopped for a reason/ })).toBeUndefined()
+  await midRound.unmount()
+  await $.command.run(cmd('stop'))
   const ui = await mountPane($)
   const shown = (await ui.find({ type: 'Text', text: /Stopped for a reason\./ }))?.text ?? ''
   expect(shown).toContain('…')
@@ -2281,4 +2292,63 @@ test('rendering the pane starts no run and writes no state', async ($, on) => {
   await w.clock.advance(5_000)
   await ui.unmount()
   expect(snapshot()).toBe(before)
+})
+
+test('the pane does not say it awaits a decision when every hold is waived', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await $.command.run(cmd('stop'))
+  const rec = await recordOf(w)
+  const waiver = { scope: 'finding', findingId: 'A8', head: rec.head, reason: 'tracked', by: 'composer', at: 1 } as const
+  w.store.set('lifecycle:/repo:feat/x', { ...rec, postStatus: 'awaiting-decision', findings: [paneFinding('A8', { status: 'deferred' })], waivers: [waiver] })
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: /awaiting your decision/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'A8 [P2] Title of A8 — waived: tracked' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('only a verified fix not owed a re-verify is struck through', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const rec = await recordOf(w)
+  const findings = [
+    paneFinding('S1', { status: 'verified-fixed' }),
+    paneFinding('S2', { status: 'verified-fixed', needsRecheck: true }),
+    paneFinding('S3', { status: 'reported-fixed' }),
+  ]
+  w.store.set('lifecycle:/repo:feat/x', { ...rec, findings })
+  const ui = await mountPane($)
+  const struck = async (id: string): Promise<unknown> => (await ui.find({ type: 'Text', text: new RegExp(`${id} \\[`) }))?.props?.strikethrough
+  expect(await struck('S1')).toBe(true)
+  expect(await struck('S2')).toBeFalsy()
+  expect(await struck('S3')).toBeFalsy()
+  await ui.unmount()
+})
+
+test('the heading counts every row owed a verification, whatever its severity', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const rec = await recordOf(w)
+  const findings = [
+    paneFinding('V1', { status: 'verified-fixed', needsRecheck: true, severity: 'P3' }),
+    paneFinding('V2', { status: 'reported-fixed', severity: 'P3' }),
+    paneFinding('V3', { status: 'verified-fixed' }),
+  ]
+  w.store.set('lifecycle:/repo:feat/x', { ...rec, findings })
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: /2 owed verification/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('with no run, a pre-PR record shows its verdict, not PRE', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('pre')
+  w.store.set('lifecycle:/repo:feat/x', { ...rec, preStatus: 'exhausted' })
+  w.clearState()
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: 'EXHAUSTED' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'PRE' })).toBeUndefined()
+  await ui.unmount()
 })
