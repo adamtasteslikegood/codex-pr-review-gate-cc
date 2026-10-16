@@ -656,7 +656,13 @@ Expected: FAIL, `applyAnswer` (and the rest) not exported.
 
 - [ ] **Step 3: Implement**
 
-Append to `hooks/lifecycle.ts` (add `isBlocking` import from `./core` and `Finding, FindingStatus, Severity` to the type import):
+Append to `hooks/lifecycle.ts` (add `Finding, FindingStatus, Severity` to the type import). Move `isBlocking` here from `core.ts` so imports run one way only (`core.ts` → `lifecycle.ts`, never back): define it in `lifecycle.ts` exactly as in 0.3.1,
+
+```ts
+export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
+```
+
+and in `core.ts` replace its definition with `export { isBlocking } from './lifecycle'` plus `import { isBlocking } from './lifecycle'` for its own uses. `lifecycle.ts` must not import from `core.ts`.
 
 ```ts
 // ----------------------------------------------------------------- ledger
@@ -752,7 +758,7 @@ export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waiver
 }
 ```
 
-`isBlocking` in `core.ts` takes `Pick<Finding, 'severity'>`, so it accepts the new `Finding` unchanged.
+`core.ts` re-exports `isBlocking`, so `register.tsx` and the tests keep importing it from `./core`.
 
 - [ ] **Step 4: Run the tests**
 
@@ -856,6 +862,13 @@ test('post-PR: the final-head check never certifies a head it did not review cle
   expect(decideNext(rec).kind).toBe('exhausted')
 })
 
+test('post-PR: a push after ready or exhaustion continues the lifecycle on the new head', async () => {
+  const done = [post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })]
+  expect(decideNext(at(done, { phase: 'ready', head: 'b' }))).toEqual({ kind: 'ready' })
+  expect(decideNext(at(done, { phase: 'ready', head: 'c' }))).toMatchObject({ kind: 'round', phase: 'post', roundKind: 'discretionary' })
+  expect(decideNext(at(done, { phase: 'post', postStatus: 'exhausted', head: 'c', allowance: 0 }))).toMatchObject({ kind: 'round', roundKind: 'final-head-check' })
+})
+
 test('post-PR: a reported fix owed verification keeps the lifecycle from ready', async () => {
   const rec = at([post()], { phase: 'post', findings: [finding({ status: 'reported-fixed' })] })
   expect(decideNext(rec)).toMatchObject({ kind: 'round' })
@@ -942,6 +955,12 @@ function decidePost(rec: LifecycleRecord): Next {
   const isChanged = last.endHead !== last.startHead
   const unresolved = unresolvedBlockers(rec)
   const owed = verificationOwed(rec)
+  // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
+  if (rec.head !== last.endHead) {
+    return mayStartRound(rec, false)
+      ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+      : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
+  }
   if (last.kind === 'final-head-check') {
     if (!isChanged && unresolved.length === 0 && owed.length === 0) return { kind: 'ready' }
     return {
@@ -968,7 +987,8 @@ function decidePost(rec: LifecycleRecord): Next {
 
 /** What the controller does after a round, from the record alone. Exhaustion is never a pass. */
 export function decideNext(rec: LifecycleRecord): Next {
-  if (rec.phase === 'ready') return { kind: 'ready' }
+  // Ready holds only for the head it was reached at: a later push continues the lifecycle.
+  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec)) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
 }
 ```
@@ -1543,7 +1563,7 @@ Expected: FAIL (`readTriage`, `priorRounds` not exported; `verified` missing).
    const idList = (value: unknown): string[] => (Array.isArray(value) ? value.map(text).filter((one): one is string => one !== undefined) : [])
    ```
    and `return { gate: hasBlocking ? 'FAIL' : gate, findings, note, verified: idList(trailer.verified), held: idList(trailer.held) }`.
-3. Replace `Disposition`/`readDispositions` with one reader shared by fix and triage (import `Answer` type from `./lifecycle`; `lifecycle.ts` imports only `isBlocking` from `core.ts`, and type-only imports do not create a runtime cycle):
+3. Replace `Disposition`/`readDispositions` with one reader shared by fix and triage (import the `Answer` type and, for `prPrompt`/`reportPrompt`, `usedRounds` and `unresolvedBlockers` from `./lifecycle`; `lifecycle.ts` imports nothing from `core.ts`):
    ```ts
    export type TriageAnswer = Answer & { replyId?: string; duplicateOf?: string }
 
@@ -1755,8 +1775,8 @@ test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', a
   ])
 })
 
-test('a security P1 only reported fixed does not let an exhausted gate open the PR', async ($, on) => {
-  const w = world(on, { allowanceStandard: 1 })
+test('a security P1 only reported fixed does not let an exhausted gate open the PR', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
   await $.tool.call(createPr)
   await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
@@ -1802,7 +1822,7 @@ test('timeout retries record effort without recording a completed round', async 
 ```
 
 `world(on, options?)` must now pass plugin options and expose the store. Change `tests/world.ts`:
-- `world(on: On, options: Record<string, unknown> = {})`; keep `mock.store(on)` but also keep a copy: replace it with a store hook of the test's that records into `w.store: Map<string, unknown>`:
+- `world(on: On)` stays one-argument. Replace `mock.store(on)` with store hooks of the test's that record into `w.store: Map<string, unknown>` (the events carry `e.key`, and `e.value` on set):
   ```ts
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_$, e) => {
@@ -1810,8 +1830,8 @@ test('timeout retries record effort without recording a completed round', async 
     return { value: undefined }
   })
   ```
-  and `stored: (key: string) => w.store.get(key)` on the world. (Check the exact `store.get`/`store.set` event field names in `.claude-plugin/types/claude-code/index.d.ts` under `'store.get'`; if the hook form differs, keep `mock.store(on, entries)` and read through `$.store.get` in the test instead.)
-- Options: the test runner passes plugin options at register time. Find how in `claude-code/testing` (search the types for `options` on `test(`); if a test cannot set them, give `world` a `w.options` object and make `configOf` read from `$.config`-style options at `register`. Whichever mechanism the testing API offers is the one to use; `allowanceStandard: 1` must reach `configOf`.
+  and `stored: (key: string) => w.store.get(key)` on the world. Also answer `store.delete` and `store.keys` from the map, as `mock.store` did.
+- Options: a test passes the plugin's `userConfig` values as `test(name, { options: { allowanceStandard: 1 } }, async ($, on) => …)`; `register(on, options)` receives them with the manifest defaults filled in. Because the manifest's `allowanceStandard` default (4) is always filled in, the `maxRounds` fallback in `configOf` only matters for a manifest without that default; keep it for hand-written option files, and say so in the README migration table.
 
 Adjust `tests/gate.test.ts` (each change keeps the test's intent, and its name says so):
 - `'five rounds without agreement end the gate as exhausted'` → rename to `'the shared allowance (4) without agreement ends the pre-PR gate as exhausted'`, loop 4 reviews instead of 5, and expect `rec.preStatus === 'exhausted'`.
@@ -1929,7 +1949,7 @@ In `register.tsx`, `startGate` keeps scoping exactly as 0.3.1 (pass-throughs, `c
     const allowance = allowanceFor(scope.tier, lane, config.allowances)
     let rec =
       prior !== undefined && prior.phase !== 'archived'
-        ? rescope({ ...prior, head, base }, scope.tier, scope.why, config.allowances)
+        ? rescope({ ...prior, head, base, ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}), postStatus: undefined }, scope.tier, scope.why, config.allowances)
         : { ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }), effort, ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}) }
     if (prior !== undefined && prior.head !== head) {
       const lastHead = lastReviewedHead(prior)
@@ -2977,8 +2997,8 @@ test('only the person waives, allows or resets', async ($, on) => {
   expect((await cmd($, 'waive hotfix')).text).toContain('waive pre|post|<findingId> <reason>')
 })
 
-test('exhaustion is distinct from passing, and the person can allow one more round', async ($, on) => {
-  const w = world(on, { allowanceStandard: 1 })
+test('exhaustion is distinct from passing, and the person can allow one more round', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
   await $.tool.call(createPr)
   await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
@@ -3212,8 +3232,8 @@ Claude-Session: https://claude.ai/code/session_011uo5tautwojx3MV7KCquhb"
 - [ ] **Step 1: Add the last two behavior tests**
 
 ```ts
-test('an exhausted pre-PR allowance still permits the protected post-PR baseline', async ($, on) => {
-  const w = world(on, { allowanceStandard: 1 })
+test('an exhausted pre-PR allowance still permits the protected post-PR baseline', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
   await $.tool.call(createPr)
   await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'Off by one in pagination' }])))
   w.git.head = 'd'.repeat(40)
