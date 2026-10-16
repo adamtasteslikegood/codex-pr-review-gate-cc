@@ -365,3 +365,42 @@ test('post-PR: a ready record is ready no longer once its ledger holds a blocker
   expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: owed })).kind).not.toBe('ready')
   expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [finding({ status: 'rebutted' })] }))).toEqual({ kind: 'ready' })
 })
+
+// ------------------------------------------------------------- task 12 fix round 1
+
+test('R33: a comment posted after the rebuttal is not a duplicate of it', async () => {
+  const answered = [finding({ status: 'rebutted', history: [{ round: 2, status: 'rebutted', by: 'main', at: 100 }] })]
+  const same = { file: 'src/app.ts', line: 14, title: 'Unvalidated redirect in the login handler' }
+  expect(triage({ ...same, at: 50 }, answered, new Set())).toEqual({ cls: 'duplicate', matchId: 'R1-1' })
+  expect(triage({ ...same, at: 150 }, answered, new Set()).cls).toBe('new-on-reviewed')
+})
+
+test('R32: post-PR, a round that left a blocker open on the same head without a rebuttal blocks instead of spending a round', async () => {
+  const round = post({ n: 2, startHead: 'b', endHead: 'b', raised: { blocking: 1, advisory: 0 } })
+  const rec = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2 })] })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'fix or rebut G2-1, then pr-gate resume' })
+  // A rebuttal in the round: another round may settle it.
+  expect(decideNext({ ...rec, rounds: [rec.rounds[0]!, { ...round, rebutted: 1 }] })).toMatchObject({ kind: 'round', roundKind: 'discretionary' })
+})
+
+test('R34: post-PR, reviewer feedback left unanswered never reaches ready', async () => {
+  const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2, source: 'github', severity: 'P2' })] })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'answer G2-1 in its thread (fix, rebut or defer), then pr-gate resume' })
+})
+
+test('the post-PR report names the agent\'s next step and the person\'s options apart, with what is owed', async () => {
+  const rec = { ...fresh(), pr: 7, phase: 'post' as const, findings: [finding(), finding({ id: 'R1-2', status: 'reported-fixed' })] }
+  const text = reportPrompt(rec, { why: 'R1-1 unresolved and the review allowance is spent', nextStep: 'fix R1-1 and push, then pr-gate resume' })
+  expect(text).toContain('Your next step: fix R1-1 and push, then pr-gate resume.')
+  expect(text).toContain('Their options:')
+  expect(text).toContain('R1-2 [P1]')
+  expect(text).toContain('waive post')
+})
+
+test('the triage prompt calls new commits unreviewed, not someone else\'s, and leaves out an empty feedback list', async () => {
+  const rec = { ...fresh(), pr: 7, slug: 'me/repo' }
+  const text = triagePrompt(runOf({ lifecycle: 'post' }), rec, [], ['abc1234 bob fix typo'])
+  expect(text).toContain('Commits on the PR since a, not yet reviewed: abc1234 bob fix typo')
+  expect(text).not.toContain('someone else')
+  expect(text).not.toContain('New review feedback:')
+})

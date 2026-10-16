@@ -396,7 +396,21 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
   return lines.join('\n')
 }
 
-export function verifyPrompt(run: Run, fromSha: string): string {
+export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Finding[]): string {
+  if (rebuttals !== undefined) {
+    return [
+      `You check rebuttals for pr-gate's post-PR review. Round ${run.round}.`,
+      where(run),
+      '',
+      'The main agent rebutted these security findings instead of fixing them. A rebuttal alone never settles a security blocker:',
+      listFindings(rebuttals),
+      '',
+      'For each one: read the code at HEAD and decide whether the rebuttal holds. ok is true only when every rebuttal holds.',
+      'You are read-only: do not edit, commit or push.',
+      '',
+      trailerRule(stepOf(run, 'verify'), '{"ok":true,"notes":"when ok is false: why the rebuttal fails, by finding id"}'),
+    ].join('\n')
+  }
   const current = run.findings.filter(one => raisedIn(one, run.round) && isBlocking(one))
   return [
     `You review a fix for pr-gate, a pre-PR gate. Round ${run.round}.`,
@@ -416,6 +430,7 @@ export function triagePrompt(
   rec: LifecycleRecord,
   items: readonly { feedback: Feedback; cls: TriageClass; matchId?: string; findingId: string }[],
   others: readonly string[],
+  more: { carried?: readonly Finding[]; codex?: readonly Finding[]; codexRange?: string } = {},
 ): string {
   const cls = { duplicate: 'duplicate of an answered finding', 'new-on-reviewed': 'new claim about code already reviewed', 'new-on-changed': 'about code changed since the last review' } as const
   const lines = [
@@ -424,13 +439,25 @@ export function triagePrompt(
     '',
   ]
   if (others.length > 0) {
-    lines.push(`Commits were pushed by someone else since ${rec.head.slice(0, 7)}: ${others.join(', ')}. Pull them (git pull --ff-only), read each, and verify it like a review finding before anything else.`, '')
+    lines.push(
+      `Commits on the PR since ${rec.head.slice(0, 7)}, not yet reviewed: ${others.join(', ')}.`,
+      'Pull them (git pull --ff-only), read each, and verify it like a review finding before anything else.',
+      '',
+    )
   }
-  lines.push('New review feedback:')
+  if (items.length > 0) lines.push('New review feedback:')
   for (const one of items) {
     const at = one.feedback.file === undefined ? '' : ` (${one.feedback.file}${one.feedback.line === undefined ? '' : `:${one.feedback.line}`})`
     const earlier = one.matchId === undefined ? '' : `\n    earlier answer: ${listFindings(rec.findings.filter(each => each.id === one.matchId)).replace(/\n/g, '\n    ')}`
-    lines.push(`- ${one.findingId} from ${one.feedback.reviewer}${at}, ${cls[one.cls]}; reply to ${one.feedback.kind === 'inline' ? `thread ${one.feedback.threadId}` : 'the PR conversation'}:\n    ${one.feedback.body.slice(0, 1500).replace(/\n/g, '\n    ')}${earlier}`)
+    const replied = rec.replies[one.feedback.id]
+    const where = one.feedback.kind === 'inline' ? `thread ${one.feedback.threadId}` : 'the PR conversation'
+    const reply = replied === undefined ? `reply to ${where}` : `already replied (${replied}): do not reply again`
+    const body = one.feedback.body.slice(0, 1500).replace(/\n/g, '\n    ')
+    lines.push(`- ${one.findingId} from ${one.feedback.reviewer}${at}, ${cls[one.cls]}; ${reply}:\n    ${body}${earlier}`)
+  }
+  if ((more.codex ?? []).length > 0) lines.push('', `Codex reviewed ${more.codexRange ?? 'the round'} and raised:`, listFindings(more.codex ?? []))
+  if ((more.carried ?? []).length > 0) {
+    lines.push('', 'Carried from earlier rounds, still open (fix or rebut each; it blocks the merge):', listFindings(more.carried ?? []))
   }
   const owed = rec.findings.filter(one => isBlocking(one) && one.status === 'reported-fixed')
   if (owed.length > 0) lines.push('', 'Reported fixed, verification still owed:', listFindings(owed))
@@ -443,6 +470,7 @@ export function triagePrompt(
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies -f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). Put the reply id in replyId.${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
+    '   Before posting, check the thread for a reply of yours already there: never post a second one.',
     '5. Run the checks that cover what you touched, commit, and push to the PR branch.',
     '',
     trailerRule(
@@ -508,15 +536,42 @@ export function readyPrompt(rec: LifecycleRecord): string {
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }
 
+const PERSON_POST =
+  'Their options: /pr-gate waive post <reason> lets this head merge without the review, and /pr-gate allow 1 <reason> grants one more review round.'
+
+/** Post-PR review stopped short of ready: why, what holds the merge, the agent's next step, and apart from it the person's options. */
 export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep: string }): string {
-  const open = unresolvedBlockers(rec)
-  const head = `pr-gate stopped short of ready on PR #${rec.pr}: ${next.why}. Tell the person, with each open finding and its evidence, and the smallest next step: ${next.nextStep}. Do not merge.`
-  return open.length === 0 ? head : `${head}\n\n${listFindings(open)}`
+  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+  const unanswered = rec.findings.filter(one => one.source === 'github' && one.status === 'open' && !holding.includes(one))
+  const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
+  if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
+  if (unanswered.length > 0) lines.push('', 'Reviewer feedback with no answer yet:', listFindings(unanswered))
+  lines.push(
+    '',
+    `Your next step: ${next.nextStep}.`,
+    'Verify each finding against the code first: fix a real one with the smallest change, commit and push it,',
+    'or rebut a false one with file:line evidence in its thread.',
+    'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
+    `Tell the person why it stopped. ${PERSON_POST}`,
+  )
+  return lines.join('\n')
 }
 
 /** The pre-PR gate ended holding the pull request: why, what holds it, the agent's next step and the person's options. */
 export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string): string {
   const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+  if (rec.phase !== 'pre') {
+    // After the PR opened: the merge is what is held.
+    const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
+    if (holding.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holding))
+    post.push(
+      '',
+      `Your next step: ${nextStep}.`,
+      'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
+      `Tell the person why it is held. ${PERSON_POST}`,
+    )
+    return post.join('\n')
+  }
   const lines = [`pr-gate: the pull request for ${rec.branch} → ${rec.base} is held at ${rec.head.slice(0, 7)}: ${why}.`]
   if (holding.length > 0) lines.push('', 'What holds it, with the evidence so far:', listFindings(holding))
   lines.push(

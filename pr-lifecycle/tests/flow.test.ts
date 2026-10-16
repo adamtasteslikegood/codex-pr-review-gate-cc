@@ -738,7 +738,9 @@ const inline = (id: number, body: string, head: string, line = 4) => ({
   id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: `u${id}`,
 })
 const roster = '{"reviewers":["claude[bot]"],"checks":[]}'
-const covers = (head: string) => [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
+const covers = (head: string) => [
+  { id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' },
+]
 
 /** Round 1 ends with the reviewer's feedback handed to the main agent. */
 const toTriage = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = '**P1** SQL injection') => {
@@ -826,7 +828,7 @@ test('commits the PR does not have end triage as an attempt, keeping the replies
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   const run = await runOf(w)
   expect(run.status).toBe('error')
-  expect(run.message).toContain('commits on feat/x are not pushed: push, then pr-gate resume')
+  expect(run.message).toContain('commits on feat/x are not on the PR: pull or push, then pr-gate resume')
   const rec = await recordOf(w)
   expect(rec.attempts).toBe(1)
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
@@ -873,11 +875,142 @@ test('GitHub findings in a final-head check enter the ledger and can make it exh
   expect(w.prompts.at(-1)).toContain('G4-1')
   await w.clock.advance(1000)
   await $.turn.complete(triaged('r4-triage', []))
+  // Asked once more (R34), and left unanswered again.
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r4-triage', []))
   const rec = await recordOf(w)
   const raised = rec.findings.find(one => one.externalId === 'inline:13')
   expect(raised?.severity).toBe('P1')
   expect(raised?.status).toBe('open')
-  expect(rec.processed).toContain('inline:13')
+  expect(rec.processed).not.toContain('inline:13')
   expect(rec.phase).not.toBe('ready')
   expect(rec.postStatus).toBe('exhausted')
+})
+
+// ------------------------------------------------------------- task 12 fix round 1
+
+test('R32: an open blocker left unanswered on an unchanged head blocks with the agent\'s next step, spending nothing', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await $.turn.complete(triaged('r2-triage', []))
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', []))
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
+  expect(rec.rounds.filter(one => one.kind === 'discretionary' && one.isCompleted)).toHaveLength(1) // the pre-PR round only
+  expect(rec.postStatus).toBe('blocked')
+  expect((await runOf(w)).status).toBe('blocked')
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('G2-1')
+  expect(said).toContain('Your next step: fix or rebut G2-1, then pr-gate resume')
+})
+
+test('R32: an open blocker from an earlier round is carried into triage', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const rec = await recordOf(w)
+  const open = {
+    id: 'R1-1', round: 1, source: 'codex-review', reviewer: 'codex', severity: 'P1', title: 'Unvalidated redirect', file: 'src/app.ts', line: 12,
+    headSeen: 'a'.repeat(40), status: 'open', history: [],
+  }
+  w.store.set(KEY, { ...rec, findings: [open] })
+  w.gh.comments = [inline(11, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('Carried from earlier rounds, still open')
+  expect(said).toContain('R1-1 [P1] Unvalidated redirect')
+})
+
+test('R33: in the protected round, a comment on the lines just fixed is not called a duplicate', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, '**P1** SQL injection still here', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await $.turn.complete(turn(review('r3-review', 'PASS'), `agent-${w.spawned.length}`))
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('G3-1')
+  expect(said).not.toContain('duplicate of an answered finding')
+})
+
+test('R34: an item left without an answer is asked about once more, and does not reach ready silently', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await $.turn.complete(triaged('r2-triage', []))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', []))
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.processed).not.toContain('inline:11')
+  expect(w.prompts.at(-1)).toContain('G2-1')
+})
+
+test('R35: feedback this machine already replied to is not asked to be replied to again', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const mine = { ...inline(12, 'Fixed in 1234567.', w.gh.prHead), user: { login: 'me' }, in_reply_to_id: 11, created_at: '1970-01-01T00:02:00Z' }
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead), mine]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('G2-1')
+  expect(said).not.toContain('reply to thread 11')
+  expect(said).toContain('check the thread for a reply of yours')
+  expect((await recordOf(w)).replies['inline:11']).toBe('12')
+})
+
+test('R36: a rebutted security blocker is not ready until Codex checks the rebuttal', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const spawned = w.spawned.length
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the query is parameterised at src/db.ts:4', replyId: '991' }]))
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect(w.spawned.at(-1)?.prompt).toContain('rebutted')
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', ok: true })}`, `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+  expect(rec.phase).toBe('ready')
+})
+
+test('R36: a rebuttal Codex does not accept reopens the security blocker and goes back to the agent', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  const verdict = JSON.stringify({ step: 'r2-verify', ok: false, notes: 'G2-1: reachable from /search' })
+  await $.turn.complete(turn(`no\n${TRAILER}\n${verdict}`, `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
+  expect(rec.phase).not.toBe('ready')
+  expect(w.prompts.at(-1)).toContain('G2-1')
+})
+
+test('R36: a rebuttal check that cannot finish holds the PR', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await w.clock.advance(2 * 60_000)
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('is held')
+})
+
+test('a ready record that is no longer ready goes back to post', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  const open = { ...rec.findings[0], id: 'X-1', severity: 'P1', status: 'open' }
+  w.store.set(KEY, { ...rec, findings: [...rec.findings, open] })
+  await $.command.run(cmd('resume'))
+  expect((await recordOf(w)).phase).toBe('post')
 })

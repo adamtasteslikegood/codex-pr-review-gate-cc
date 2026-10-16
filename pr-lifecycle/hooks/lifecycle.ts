@@ -170,14 +170,24 @@ function isSame(a: { file?: string; line?: number; title: string }, b: { file?: 
 
 const ANSWERED: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
 
-/** Where incoming feedback stands against the ledger. Prior review can make it a duplicate, never dismiss a new claim. */
+/** When a finding was last rebutted, or undefined. */
+const rebuttedAt = (f: Finding): number | undefined => f.history.filter(one => one.status === 'rebutted').at(-1)?.at
+
+/**
+ * Where incoming feedback stands against the ledger. Prior review can make it a duplicate, never dismiss a new claim.
+ * Feedback posted after a rebuttal answers that rebuttal: it is never its duplicate (R33).
+ */
 export function triage(
-  item: { file?: string; line?: number; title: string },
+  item: { file?: string; line?: number; title: string; at?: number },
   findings: readonly Finding[],
   changedFiles: ReadonlySet<string>,
 ): { cls: TriageClass; matchId?: string } {
   if (item.file !== undefined && changedFiles.has(item.file)) return { cls: 'new-on-changed' }
-  const match = findings.find(one => ANSWERED.includes(one.status) && one.needsRecheck !== true && isSame(one, item))
+  const isAnswerTo = (one: Finding): boolean => {
+    const when = one.status === 'rebutted' ? rebuttedAt(one) : undefined
+    return item.at !== undefined && when !== undefined && item.at > when
+  }
+  const match = findings.find(one => ANSWERED.includes(one.status) && one.needsRecheck !== true && !isAnswerTo(one) && isSame(one, item))
   return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
 }
 
@@ -285,6 +295,8 @@ function decidePost(rec: LifecycleRecord): Next {
   const isChanged = last.endHead !== last.startHead
   const unresolved = unresolvedBlockers(rec)
   const owed = verificationOwed(rec)
+  // Reviewer feedback nobody answered never rides into ready (R34): the agent answers it in its thread.
+  const unanswered = rec.findings.filter(one => one.source === 'github' && one.status === 'open' && !isBlocking(one))
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -294,20 +306,36 @@ function decidePost(rec: LifecycleRecord): Next {
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
   }
   if (last.kind === 'final-head-check') {
-    if (!isChanged && unresolved.length === 0 && owed.length === 0) return { kind: 'ready' }
+    if (!isChanged && unresolved.length === 0 && owed.length === 0 && unanswered.length === 0) return { kind: 'ready' }
     return {
       kind: 'exhausted',
       why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
       nextStep:
         unresolved.length > 0
-          ? `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>`
-          : '/pr-gate allow 1 <reason>',
+          ? `fix ${ids(unresolved)} and push, then pr-gate resume`
+          : 'tell the person the final head is not reviewed clean; a new round needs their allowance',
+    }
+  }
+  // The pre-PR backstop (R32): blockers left open on an unchanged head with nothing rebutted; another round would say the same.
+  const open = unresolved.filter(one => one.status === 'open')
+  if (!isChanged && last.rebutted === 0 && open.length > 0) {
+    return {
+      kind: 'blocked',
+      why: `${ids(open)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`,
+      nextStep: `fix or rebut ${ids(open)}, then pr-gate resume`,
     }
   }
   if (isChanged || owed.length > 0) {
     return mayStartRound(rec, false)
       ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
+  }
+  if (unresolved.length === 0 && unanswered.length > 0) {
+    return {
+      kind: 'blocked',
+      why: `${ids(unanswered)} from reviewers ${unanswered.length === 1 ? 'has' : 'have'} no answer`,
+      nextStep: `answer ${ids(unanswered)} in ${unanswered.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer), then pr-gate resume`,
+    }
   }
   if (unresolved.length === 0) return { kind: 'ready' }
   if (unresolved.some(one => one.status === 'deferred')) {
@@ -322,7 +350,7 @@ function decidePost(rec: LifecycleRecord): Next {
     : {
         kind: 'exhausted',
         why: `${ids(unresolved)} unresolved and the review allowance is spent`,
-        nextStep: `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>`,
+        nextStep: `fix ${ids(unresolved)} and push, then pr-gate resume`,
       }
 }
 
