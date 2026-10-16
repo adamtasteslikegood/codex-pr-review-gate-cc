@@ -142,6 +142,7 @@ export function readTriage(answer: string): TriageAnswer[] {
     const action = String(row.action ?? '').toLowerCase()
     if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
     const severity = String(row.severity ?? '').toUpperCase() as Severity
+    const replyId = typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
     out.push({
       id,
       action,
@@ -149,7 +150,7 @@ export function readTriage(answer: string): TriageAnswer[] {
       ...(text(row.evidence) === undefined ? {} : { evidence: text(row.evidence)?.slice(0, 2000) }),
       ...(SEVERITIES.includes(severity) ? { severity } : {}),
       ...(typeof row.isSecurity === 'boolean' ? { isSecurity: row.isSecurity } : {}),
-      ...(row.replyId === undefined || row.replyId === null ? {} : { replyId: String(row.replyId) }),
+      ...(replyId === undefined ? {} : { replyId }),
       ...(text(row.duplicateOf) === undefined ? {} : { duplicateOf: text(row.duplicateOf) }),
     })
   }
@@ -282,7 +283,8 @@ const listFindings = (findings: readonly Finding[]): string =>
       const detail = one.detail === undefined ? '' : `\n    ${one.detail.replace(/\n/g, '\n    ')}`
       const said = one.status === 'reported-fixed' ? 'reported-fixed, verification owed' : one.status
       const note = one.status === 'open' && one.note === undefined ? '' : `\n    ${said}${one.note === undefined || one.note === '' ? '' : `: ${one.note}`}`
-      return `- ${one.id} [${one.severity}] ${one.title}${at}${detail}${note}`
+      const recheck = one.needsRecheck === true ? ' (file changed since: re-verify)' : ''
+      return `- ${one.id} [${one.severity}] ${one.title}${at}${recheck}${detail}${note}`
     })
     .join('\n')
 
@@ -451,6 +453,7 @@ export function triagePrompt(
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
     '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, or defer it with the reason. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies -f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). Put the reply id in replyId.${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
     '5. Run the checks that cover what you touched, commit, and push to the PR branch.',
@@ -476,7 +479,7 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
     status === 'waived'
       ? `pr-gate was waived for ${run.branch} at ${run.headSha.slice(0, 7)}.`
       : run.tier === 'trivial'
-        ? `/pr-gate skipped Codex for ${run.branch}: ${run.tierWhy}.`
+        ? `pr-gate skipped Codex for ${run.branch}: ${run.tierWhy}.`
         : hasConverged
           ? `pr-gate passed for ${run.branch} at ${run.headSha.slice(0, 7)}: no high/critical finding left after ${run.round} round${run.round === 1 ? '' : 's'} (${budget}; ${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
           : `pr-gate did not converge for ${run.branch}: ${blocking} high/critical finding${blocking === 1 ? '' : 's'} still open after ${run.round} rounds (${budget}).`

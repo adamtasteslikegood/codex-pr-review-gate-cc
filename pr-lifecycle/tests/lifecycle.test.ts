@@ -21,7 +21,7 @@ import {
   verificationOwed,
   withRound,
 } from '../hooks/lifecycle'
-import { priorRounds, readReview, readTriage, TRAILER } from '../hooks/core'
+import { fixPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
 const fresh = () =>
@@ -266,4 +266,66 @@ test('prior rounds list the answered findings that still apply, with their evide
   expect(text).toContain('R1-2 [P1] Unvalidated redirect in login (src/app.ts:12)\n    reported-fixed, verification owed: allow-list')
   expect(text).not.toContain('R1-3')
   expect(priorRounds([])).toBe('')
+})
+
+const runOf = (over: Record<string, unknown> = {}): any => ({
+  id: 'x', cwd: '/repo', root: '/repo', branch: 'feat/x', base: 'dev', headSha: 'abcdef123', tier: 'standard', tierWhy: '10 lines', lane: 'full', effort: 'high',
+  round: 1, lifecycle: 'pre', roundKind: 'discretionary', roundStartHead: 'abcdef123', diffBase: 'origin/dev', fixKind: 'blocking', findings: [finding()], ...over,
+})
+
+test('no prompt opens with a slash, which would be read as a command', async () => {
+  const rec = { ...fresh(), pr: 7, slug: 'me/repo', findings: [finding()] }
+  const fb: any = { id: 'inline:1', kind: 'inline', reviewer: 'bot', body: 'x', threadId: '5', at: 1, isFinding: true }
+  const items = [{ feedback: fb, cls: 'new-on-reviewed' as const, findingId: 'G1-1' }]
+  const prompts = [
+    prPrompt(runOf(), rec, 'passed'),
+    prPrompt(runOf(), rec, 'exhausted'),
+    prPrompt(runOf(), rec, 'waived'),
+    prPrompt(runOf({ tier: 'trivial', tierWhy: 'docs only' }), rec, 'passed'),
+    fixPrompt(runOf(), undefined, true),
+    fixPrompt(runOf({ fixKind: 'advisory', findings: [finding({ severity: 'P2' })] }), undefined, true),
+    triagePrompt(runOf({ lifecycle: 'post', roundKind: 'baseline' }), rec, items, []),
+    readyPrompt(rec),
+    reportPrompt(rec, { why: 'budget spent', nextStep: 'ask for more rounds' }),
+  ]
+  for (const one of prompts) expect(one.startsWith('/')).toBe(false)
+})
+
+test('a triage prompt tells the agent to answer a new claim on its merits', async () => {
+  const rec = { ...fresh(), pr: 7, slug: 'me/repo' }
+  const fb: any = { id: 'comment:1', kind: 'comment', reviewer: 'bot', body: 'x', at: 1, isFinding: true }
+  const text = triagePrompt(runOf({ lifecycle: 'post' }), rec, [{ feedback: fb, cls: 'new-on-reviewed', findingId: 'G1-1' }], [])
+  expect(text).toContain('An earlier review is not a reason to rebut a new claim: answer it on its merits.')
+})
+
+test('history marks the entries whose file changed since', async () => {
+  const text = priorRounds([finding({ status: 'rebutted', note: 'ok', needsRecheck: true }), finding({ id: 'R1-2', status: 'rebutted', note: 'ok' })])
+  expect(text).toContain('R1-1 [P1] Unvalidated redirect in login (src/app.ts:12) (file changed since: re-verify)\n    rebutted: ok')
+  expect(text.match(/re-verify/g)).toHaveLength(1)
+  expect(reviewPrompt(runOf(), 'review', [finding({ status: 'rebutted', note: 'ok', needsRecheck: true })])).toContain('(file changed since: re-verify)')
+})
+
+const trailerOf = (body: unknown): string => `${TRAILER}\n${JSON.stringify(body)}`
+
+test('readers drop only the malformed parts of a dispositions list', async () => {
+  for (const read of [readTriage, readDispositions]) {
+    expect(read(trailerOf({ dispositions: 'nope' }))).toEqual([])
+    expect(read(trailerOf({ dispositions: { id: 'R1-1' } }))).toEqual([])
+    expect(read(trailerOf({ dispositions: [null, 3, 'x', { id: 'R1-1', action: 'fixed' }] }))).toEqual([{ id: 'R1-1', action: 'fixed' }])
+    expect(read(trailerOf({ dispositions: [{ id: 'R1-1', action: 'maybe' }, { id: 'R1-2', action: 'FIXED' }] }))).toEqual([{ id: 'R1-2', action: 'fixed' }])
+    expect(read(trailerOf({ dispositions: [{ id: 'R1-1', action: 'fixed', severity: 'P9' }] }))).toEqual([{ id: 'R1-1', action: 'fixed' }])
+  }
+})
+
+test('a reply id is a non-empty string or a finite number; anything else is dropped', async () => {
+  const ids = (replyId: unknown) => readTriage(trailerOf({ dispositions: [{ id: 'G1-1', action: 'fixed', replyId }] }))[0]
+  expect(ids('991')).toEqual({ id: 'G1-1', action: 'fixed', replyId: '991' })
+  expect(ids(991)).toEqual({ id: 'G1-1', action: 'fixed', replyId: '991' })
+  for (const bad of ['', '  ', null, true, {}, [1], Number.NaN, { toString: 1 }]) expect(ids(bad)).toEqual({ id: 'G1-1', action: 'fixed' })
+})
+
+test('verified and held that are not lists of strings read as empty or lose the bad entries', async () => {
+  const read = (extra: object) => readReview(trailerOf({ step: 'r1-review', gate: 'PASS', findings: [], ...extra }))
+  expect(read({ verified: 'R1-1', held: { a: 1 } })).toMatchObject({ gate: 'PASS', verified: [], held: [] })
+  expect(read({ verified: ['R1-1', 3, null, {}, ''], held: [['x'], 'R1-2'] })).toMatchObject({ verified: ['R1-1'], held: ['R1-2'] })
 })

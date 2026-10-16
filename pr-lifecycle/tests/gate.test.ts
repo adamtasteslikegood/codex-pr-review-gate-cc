@@ -69,7 +69,7 @@ test('five rounds without agreement end the gate as exhausted', async ($, on) =>
   expect(run.round).toBe(5)
   expect(w.spawned).toHaveLength(5)
   expect(w.prompts.at(-1)).toContain('did not converge')
-  expect(w.prompts.at(-1)).toContain('did not converge for feat/x')
+  expect(w.prompts.at(-1)).toContain('stays with this pull request')
   // The findings reach the main agent for the conversation; the pull request gets counts only.
   expect(w.prompts.at(-1)).toContain('do not paste a finding into it')
 })

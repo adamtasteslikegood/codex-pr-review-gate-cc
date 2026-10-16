@@ -214,7 +214,21 @@ let ticker: { cancel: () => void } | undefined
     await $.store.set(storeKey(run.root, run.branch), record)
     $.ui.status(undefined)
     $.ui.toast(`codex-gate ${status}: ${message}`.slice(0, 300))
-    if (willOpen) void $.prompt.submit({ text: prPrompt(run, { ...newRecord({ root: run.root, branch: run.branch, base: run.base, head: run.headSha, tier: run.tier, tierWhy: run.tierWhy, lane: run.lane, allowance: run.round, at: now }), findings: run.findings }, status === 'exhausted' ? 'exhausted' : 'passed') }).catch(() => undefined)
+    if (willOpen) {
+      const base = newRecord({
+        root: run.root,
+        branch: run.branch,
+        base: run.base,
+        head: run.headSha,
+        tier: run.tier,
+        tierWhy: run.tierWhy,
+        lane: run.lane,
+        allowance: run.round,
+        at: now,
+      })
+      const text = prPrompt(run, { ...base, findings: run.findings }, status === 'exhausted' ? 'exhausted' : 'passed')
+      void $.prompt.submit({ text }).catch(() => undefined)
+    }
   }
 
   // ----------------------------------------------------------- the steps
@@ -260,7 +274,8 @@ let ticker: { cancel: () => void } | undefined
     const roles = opened.tier === 'high' ? (['review', 'challenge'] as const) : (['review'] as const)
     $.ui.status(`codex-gate r${opened.round}: codex reviewing (${opened.effort})`)
     // Parallel sub-agents: on a high blast-radius change the review and the challenge run side by side.
-    const started = await Promise.all(roles.map(role => spawn($, opened, role, reviewPrompt(opened, role, opened.findings.filter(one => one.round === opened.round - 1 && one.status === 'rebutted')))))
+    const rebuttedBefore = opened.findings.filter(one => one.round === opened.round - 1 && one.status === 'rebutted')
+    const started = await Promise.all(roles.map(role => spawn($, opened, role, reviewPrompt(opened, role, rebuttedBefore))))
     if (started.some(one => !one.isStarted)) {
       await finish($, id, 'error', 'A Codex reviewer sub-agent could not be started.')
       return
