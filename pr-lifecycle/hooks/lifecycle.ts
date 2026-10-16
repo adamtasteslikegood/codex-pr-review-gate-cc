@@ -96,6 +96,10 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
 
 export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
 
+/** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
+export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
+  finding.round === round || finding.history.some(one => one.round === round && one.status === 'open')
+
 // ----------------------------------------------------------------- ledger
 
 export type Answer = {

@@ -8,23 +8,17 @@
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
-    "maxRounds": {
+    "allowanceStandard": {
       "type": "number",
-      "title": "Max review rounds",
-      "description": "How many Codex review rounds to run before the gate stops trying to converge.",
-      "default": 5
+      "title": "Review rounds, standard changes",
+      "description": "Discretionary review rounds one lifecycle may complete on a standard change, before and after the PR opens together, advisory rounds included. The protected post-PR rounds do not count. Replaces maxRounds, which is read when this is unset.",
+      "default": 4
     },
-    "advisoryMinRounds": {
+    "allowanceHigh": {
       "type": "number",
-      "title": "Min advisory rounds",
-      "description": "Once no high/critical finding is left, Codex's other findings (P2/P3) go back to the fixer. Up to this round, a rebuttal that changes no code still goes back to Codex for its answer.",
-      "default": 1
-    },
-    "advisoryMaxRounds": {
-      "type": "number",
-      "title": "Max advisory rounds",
-      "description": "How many rounds of advisory findings the fixer is sent before the PR opens with whatever is left. 0 skips advisories. These rounds are on top of the max review rounds.",
-      "default": 3
+      "title": "Review rounds, high blast-radius changes",
+      "description": "The same allowance for a high blast-radius change.",
+      "default": 6
     },
     "bases": {
       "type": "string",
@@ -36,6 +30,12 @@
       "type": "boolean",
       "title": "Block ungated PRs",
       "description": "Deny `gh pr create` (and the GitHub MCP create-PR tool) to a gated base until the gate has finished for the current HEAD, and start the gate when one is denied.",
+      "default": true
+    },
+    "enforceMerge": {
+      "type": "boolean",
+      "title": "Hold merges until the lifecycle is done",
+      "description": "Deny merging a PR to a gated base (gh, gh api, GitHub MCP tools) until its lifecycle review is complete for the PR's current head, or the person waived it.",
       "default": true
     },
     "fixer": {
@@ -62,7 +62,7 @@
     "onExhausted": {
       "type": "string",
       "title": "After the last round without agreement",
-      "description": "open-pr opens the PR anyway and says the gate did not converge (counts only, no finding details); stop leaves the PR blocked for a human decision.",
+      "description": "open-pr opens the PR anyway when the pre-PR allowance is spent (never with an open security P1); stop leaves it held for a person's decision. Either way the post-PR lifecycle still runs, and merging stays held.",
       "default": "open-pr",
       "options": [
         "open-pr",
@@ -114,6 +114,24 @@
       "title": "Step timeout (minutes)",
       "description": "How long one agent step may run before the gate stops with an error.",
       "default": 30
+    },
+    "routineRoundMinutes": {
+      "type": "number",
+      "title": "Routine round timebox (minutes)",
+      "description": "The active time a routine round should take. Going over is shown and recorded, not failed; stepTimeoutMinutes is the hard limit.",
+      "default": 3
+    },
+    "waitCapMinutes": {
+      "type": "number",
+      "title": "Reviewer wait cap (minutes)",
+      "description": "The longest a post-PR round waits for reviewers before it carries on with what arrived. A repository's .github/pr-gate.json can set its own.",
+      "default": 20
+    },
+    "quietMinutes": {
+      "type": "number",
+      "title": "Quiet period (minutes)",
+      "description": "Without a roster file, collection ends once checks are done and no new feedback arrived for this long.",
+      "default": 3
     }
   }
 }

@@ -1,7 +1,7 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isBlocking, unresolvedBlockers, usedRounds } from './lifecycle'
+import { isBlocking, raisedIn, unresolvedBlockers, usedRounds } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
@@ -347,7 +347,7 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
 
 /** The advisory round's words: no high/critical finding is left, and Codex's other findings are put to the fixer. */
 function advisoryPrompt(run: Run, isMain: boolean): string {
-  const advisory = run.findings.filter(one => one.round === run.round && !isBlocking(one))
+  const advisory = run.findings.filter(one => raisedIn(one, run.round) && !isBlocking(one))
   const lines = [
     `pr-gate, round ${run.round}, advisories: Codex left no high/critical finding on ${run.branch} against origin/${run.base}, and raised ${advisory.length} advisory finding${advisory.length === 1 ? '' : 's'} (P2/P3). They do not block the PR; address each one before it opens.`,
     where(run),
@@ -375,7 +375,7 @@ function advisoryPrompt(run: Run, isMain: boolean): string {
 
 export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean): string {
   if (run.fixKind === 'advisory') return advisoryPrompt(run, isMain)
-  const current = run.findings.filter(one => one.round === run.round)
+  const current = run.findings.filter(one => raisedIn(one, run.round))
   const blocking = current.filter(isBlocking)
   const advisory = current.filter(one => !isBlocking(one))
   const lines = [
@@ -411,7 +411,7 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
 }
 
 export function verifyPrompt(run: Run, fromSha: string): string {
-  const current = run.findings.filter(one => one.round === run.round && isBlocking(one))
+  const current = run.findings.filter(one => raisedIn(one, run.round) && isBlocking(one))
   return [
     `You review a fix for pr-gate, a pre-PR gate. Round ${run.round}.`,
     where(run),

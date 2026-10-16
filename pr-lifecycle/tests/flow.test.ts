@@ -1,0 +1,145 @@
+import { expect, test } from 'claude-code/testing'
+
+import { createPr, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import type { LifecycleRecord } from '../types'
+
+const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
+const fixed = (id: string, note = 'done') => `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id, action: 'fixed', note }] })}`
+
+test('several reviewers in one cycle consume one round', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '10\t2\tsrc/auth/login.ts' // high: review and challenge run in parallel
+  await $.tool.call(createPr)
+  expect(w.spawned).toHaveLength(2)
+  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-1'))
+  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(1)
+  expect(rec.rounds[0]?.evidence.map(one => one.reviewer)).toEqual(['codex', 'codex-challenge'])
+})
+
+test('omitted findings are not marked fixed', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  // R1-2 had no answer: the fix step is asked once more, and says nothing again.
+  await $.turn.complete(turn('Nothing more.'))
+  // Round 2: Codex raises nothing and confirms nothing.
+  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'R1-1')?.status).toBe('reported-fixed')
+  expect(rec.findings.find(one => one.id === 'R1-2')?.status).toBe('open')
+})
+
+test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
+  expect(w.spawned.at(-1)?.prompt).toContain('R1-2 [P1] Second')
+  await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], held: ['R1-2'] })))
+  const rec = await recordOf(w)
+  expect(rec.findings.map(one => [one.id, one.status])).toEqual([
+    ['R1-1', 'verified-fixed'],
+    ['R1-2', 'open'],
+  ])
+})
+
+test('a held blocker goes back to the fixer instead of letting the PR open', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'guarded at :10' }] })}`))
+  await $.turn.complete(turn(review('r2-review', 'PASS', [], { held: ['R1-1'] })))
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.phase).toBe('fix')
+  expect(w.prompts.at(-1)).toContain('R1-1 [P1] Unvalidated redirect')
+  expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
+})
+
+test('a security P1 only reported fixed does not let an exhausted gate open the PR', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  const rec = await recordOf(w)
+  expect(rec.findings[0]?.isSecurity).toBe(true)
+  expect(rec.preStatus).toBe('exhausted')
+  expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+})
+
+test('new scope invalidates only the affected evidence', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, { ...P2, file: 'src/other.ts' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(
+    turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'fine as is' }] })}`),
+  )
+  await $.turn.complete(turn(review('r2-review', 'PASS'), 'agent-2'))
+  // A new commit touches src/app.ts only, and the person runs the gate again.
+  w.git.head = 'f'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await $.command.run({ command: 'pr-gate', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'R1-1')?.needsRecheck).toBe(true)
+  expect(rec.findings.find(one => one.id === 'R1-2')?.needsRecheck).toBeUndefined()
+  // History stays, and the new head gets its own round.
+  expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(2)
+  expect(w.spawned.at(-1)?.prompt).toContain('R1-1')
+})
+
+test('timeout retries record effort without recording a completed round', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(`${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'timeout' })}`))
+  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-2'))
+  const rec = await recordOf(w)
+  expect(rec.attempts).toBe(1)
+  expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(1)
+  expect(rec.rounds[0]?.isCompleted).toBe(false)
+})
+
+test('advisories are fixed even when the reserve rule leaves no Codex round for them', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  const run = await runOf(w)
+  expect(run.phase).toBe('fix')
+  expect(run.fixKind).toBe('advisory')
+  expect(w.prompts.at(-1)).toContain('R1-1 [P2] Rename this')
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1', 'renamed')))
+  expect(w.prompts.at(-1)).toContain('open the pull request to dev')
+  expect(w.spawned).toHaveLength(1)
+  expect((await runOf(w)).status).toBe('passed')
+})
+
+test('a finding left without an answer is asked about once more, then stays open', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  // The re-prompt names the finding that had no answer, and uses no round.
+  expect(w.prompts.at(-1)).toContain('These findings have no answer yet: R1-2')
+  expect(w.spawned).toHaveLength(1)
+  expect((await recordOf(w)).rounds).toHaveLength(0)
+  await $.turn.complete(turn(fixed('R1-1', 'still done')))
+  // The round ends; Codex looks at the fix and passes it, and the PR opens with R1-2 still open.
+  expect(w.spawned).toHaveLength(2)
+  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'R1-2')?.status).toBe('open')
+  expect(rec.preStatus).toBe('passed')
+  expect(w.prompts.at(-1)).toContain('open the pull request to dev')
+  expect(w.prompts.at(-1)).toContain('R1-2 [P2] Rename this')
+  expect(w.prompts.at(-1)).toContain('1 advisory finding not fixed')
+})

@@ -110,11 +110,18 @@ fullscreen terminal from 110 columns, above the prompt otherwise.
 
 ## Options
 
-Set in `/config` or under `pluginConfigs["codex-gate"].options`:
-`maxRounds`, `advisoryMinRounds`, `advisoryMaxRounds`, `bases`, `enforce`, `fixer` (`main` or `subagent`),
+Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
+`allowanceStandard` (4), `allowanceHigh` (6), `bases`, `enforce`, `enforceMerge`, `fixer` (`main` or `subagent`),
 `fixReview` (`auto`, `always`, `never`), `onExhausted` (`open-pr` or
 `stop`), `openPr`, `highRiskPaths`, `reviewEffort`, `lightBranches`,
-`lightEffort`, `stepTimeoutMinutes`.
+`lightEffort`, `stepTimeoutMinutes`, `routineRoundMinutes`, `waitCapMinutes`, `quietMinutes`.
+
+From codex-gate 0.3.1:
+
+| 0.3.1 option | Now |
+| --- | --- |
+| `maxRounds` | `allowanceStandard`, one allowance shared by pre-PR and post-PR rounds. `maxRounds` is still read when `allowanceStandard` is unset, which only happens in a hand-written options file: the manifest fills in its default of 4. |
+| `advisoryMinRounds`, `advisoryMaxRounds` | Removed. Every finding goes to the fixer inside its round; Codex re-reviews an advisory fix only while another round stays in reserve. |
 
 When the rounds run out with `onExhausted: open-pr`, the pull request says
 only that the gate did not converge, with a count. Findings, advisory

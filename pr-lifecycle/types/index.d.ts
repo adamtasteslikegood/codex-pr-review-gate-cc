@@ -175,6 +175,8 @@ export type Run = {
   /** Post-PR: the feedback ids handed to the main agent this round. */
   triaged?: string[]
   hasRefixed: boolean
+  /** The fix step was asked once more about findings it left without an answer (it costs no round). */
+  hasReprompted?: boolean
   /** What the fix step in flight (or the last one) was sent: blocking findings, or advisories alone. */
   fixKind: 'blocking' | 'advisory'
   steps: Step[]
