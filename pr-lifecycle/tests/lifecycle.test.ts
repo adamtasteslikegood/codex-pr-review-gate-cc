@@ -25,7 +25,7 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
@@ -604,4 +604,11 @@ test('R40: after the PR opens, a dispute is not put to Codex again in a review',
   expect(text).not.toContain('G2-1')
   expect(reviewPrompt(runOf({ lifecycle: 'pre', round: 3 }), 'review', [disputed()])).toContain('G2-1')
   expect(verifyPrompt(runOf({ lifecycle: 'post', round: 2 }), 'abcdef0', [disputed()])).toContain('"holds":true|false')
+})
+
+test('a fix-review answer without a readable verdict confirms nothing', () => {
+  expect(readVerify('looks fine to me')).toEqual({ isOk: false, isRead: false })
+  expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","notes":"no ok field"}`)).toEqual({ isOk: false, isRead: false })
+  expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","ok":true}`).isOk).toBe(true)
+  expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","ok":false,"notes":"x"}`)).toEqual({ isOk: false, isRead: true, notes: 'x' })
 })

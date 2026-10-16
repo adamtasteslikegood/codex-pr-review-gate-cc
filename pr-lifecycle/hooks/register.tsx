@@ -157,9 +157,12 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const top = await git($, want.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return 'Not started: this is not a git repository.'
   const root = top.out
-  const base = want.base ?? config.bases[0] ?? 'dev'
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   if (branch === '' || branch === 'HEAD') return 'Not started: HEAD is detached, so there is no branch to open a PR from.'
+  const known = await loadRecord($, root, branch)
+  // An open PR's base is fixed: a resume or a bare /pr-gate keeps it. Before the PR, no base named keeps the record's own.
+  const isKept = known !== undefined && known.phase !== 'archived' && (known.phase !== 'pre' || want.base === undefined)
+  const base = isKept ? known.base : (want.base ?? config.bases[0] ?? 'dev')
   if (branch === base) return `Not started: you are on ${base} itself. Check out the branch the PR will come from.`
   await git($, root, ['fetch', 'origin', base], 120_000)
   if (!(await git($, root, ['rev-parse', '--verify', '--quiet', `origin/${base}`])).isOk) {
@@ -200,7 +203,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
               base,
               ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
               // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
-              ...(prior.phase === 'pre' && prior.head !== head ? { preStatus: undefined, preHead: undefined } : {}),
+              // So was one about another base: a pass against dev does not open a PR against main.
+              ...(prior.phase === 'pre' && (prior.head !== head || prior.base !== base) ? { preStatus: undefined, preHead: undefined } : {}),
               postStatus: undefined,
             },
             scope.tier,
@@ -362,6 +366,8 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     one !== undefined &&
     // A reset record lets nothing through: the lifecycle starts fresh.
     one.phase !== 'archived' &&
+    // A verdict or waiver is about the base it was given for: a pass against dev opens no PR against main.
+    one.base === base &&
     // A pre waiver never releases a security blocker: only a waiver naming it does (R54).
     ((one.waivers.some(each => each.scope === 'pre' && each.head === head) && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||

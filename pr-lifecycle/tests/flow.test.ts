@@ -2383,3 +2383,38 @@ test('existing pass-through cases still skip pre-PR Codex and still get post-PR 
   expect(w.spawned).toHaveLength(0)
   expect((await recordOf(w)).phase).toBe('post')
 })
+
+// ------------------------------------------------------------- codex-gate round 1 on this branch (R1-1, R1-2)
+
+test('a fix review with no readable verdict leaves the fix unverified, and the gate does not pass on it', { options: { allowanceStandard: 4 } }, async ($, on) => {
+  const w = world(on)
+  await toFixReview($, w)
+  await done($, turn('I looked at it, seems fine.'))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.status).not.toBe('verified-fixed')
+  expect(rec.findings.find(f => f.id === 'R1-1')?.history.some(one => one.by === 'fix-reviewer')).toBe(false)
+  expect(rec.preStatus).not.toBe('passed')
+})
+
+test('a pass against one base does not open a PR against another', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  const toMain = { tool: 'Bash' as const, command: createPr.command.replace('--base dev', '--base main') }
+  const res = await $.tool.call(toMain)
+  expect(isHeld(res)).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.base).toBe('main')
+  expect(rec.preStatus).toBeUndefined()
+})
+
+test('a resume keeps the base the lifecycle was started for', async ($, on) => {
+  const w = world(on)
+  const toMain = { tool: 'Bash' as const, command: createPr.command.replace('--base dev', '--base main') }
+  await $.tool.call(toMain)
+  expect((await recordOf(w)).base).toBe('main')
+  await $.command.run({ command: 'pr-gate', args: 'stop', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  await $.command.run({ command: 'pr-gate', args: 'resume', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } } as never)
+  expect((await recordOf(w)).base).toBe('main')
+})

@@ -174,11 +174,11 @@ export function readTriage(answer: string): TriageAnswer[] {
 /** What the fixer said it did with each finding. */
 export const readDispositions = (answer: string): Answer[] => readTriage(answer)
 
-/** The fix reviewer's verdict; an unreadable one counts as fine (Codex decides next). */
-export function readVerify(answer: string): { isOk: boolean; notes?: string } {
+/** The fix reviewer's verdict. An unreadable one confirms nothing: the fixes stay unverified, still owed a check. */
+export function readVerify(answer: string): { isOk: boolean; isRead: boolean; notes?: string } {
   const trailer = readTrailer(answer)
-  if (trailer === undefined) return { isOk: true }
-  return { isOk: trailer.ok !== false, notes: text(trailer.notes)?.slice(0, 4000) }
+  if (trailer === undefined || typeof trailer.ok !== 'boolean') return { isOk: false, isRead: false }
+  return { isOk: trailer.ok, isRead: true, notes: text(trailer.notes)?.slice(0, 4000) }
 }
 
 export type Verdict = { holds: boolean; note?: string }

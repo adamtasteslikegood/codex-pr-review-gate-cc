@@ -337,8 +337,8 @@ function decidePre(rec: LifecycleRecord): Next {
       ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : passOr()
   }
-  // Commits since the last completed round: the new head needs its own review.
-  if (rec.head !== last.endHead) {
+  // Commits since the last completed round, or another base since: the new scope needs its own review.
+  if (rec.head !== last.endHead || (last.base !== undefined && last.base !== rec.base)) {
     return mayStartRound(rec, false)
       ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : { kind: 'open-pr', status: 'exhausted' }

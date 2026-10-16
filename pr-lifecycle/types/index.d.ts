@@ -85,6 +85,8 @@ export type RoundRecord = {
   isAdvisory: boolean
   startHead: string
   endHead: string
+  /** The PR base the round reviewed against; a pre-PR round's verdict covers that base only. */
+  base?: string
   isCompleted: boolean
   evidence: Evidence[]
   raised: { blocking: number; advisory: number }

@@ -1274,6 +1274,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     isAdvisory: run.fixKind === 'advisory',
     startHead: run.roundStartHead,
     endHead,
+    base: run.base,
     isCompleted,
     evidence: run.evidence,
     raised: { blocking: current.filter(isBlocking).length, advisory: current.filter(one => !isBlocking(one)).length },
@@ -1613,7 +1614,7 @@ async function afterVerify($: Engine, run: Run): Promise<void> {
   const after = await patch($, run.id, one => ({
     ...one,
     pending: [],
-    hasRefixed: !verdict.isOk,
+    hasRefixed: verdict.isRead && !verdict.isOk,
     // The fix reviewer confirmed the round's blocking fixes.
     findings: verdict.isOk
       ? one.findings.map(f => (raisedIn(f, one.round) && isBlocking(f) && f.status === 'reported-fixed' ? markVerified(f, one.round, 'fix-reviewer', now) : f))
@@ -1622,11 +1623,12 @@ async function afterVerify($: Engine, run: Run): Promise<void> {
       id: `r${one.round}-verify`,
       label: `Round ${one.round} · review the fix`,
       state: 'done',
-      detail: verdict.isOk ? 'fix holds' : 'sent back to the fixer',
+      detail: verdict.isOk ? 'fix holds' : verdict.isRead ? 'sent back to the fixer' : 'no readable verdict: the fixes stay unverified',
     }),
   }))
   if (after === null) return
-  if (verdict.isOk) await endRound($, after, true)
+  // No readable verdict: the round ends with its fixes still owed verification, which the next Codex round or exhaustion holds.
+  if (verdict.isOk || !verdict.isRead) await endRound($, after, true)
   else await beginFix($, run.id, verdict.notes ?? 'The fix does not settle the findings.')
 }
 
