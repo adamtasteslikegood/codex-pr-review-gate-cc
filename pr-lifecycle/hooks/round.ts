@@ -52,6 +52,7 @@ import {
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
+  waivedIds,
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
@@ -871,8 +872,11 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     },
   }))
   if (rec === undefined) return
-  // An item left without an answer is asked about once more, as the fix step does (R34).
-  const unanswered = (after.asked ?? []).filter(id => after.findings.some(f => f.id === id && f.status === 'open') && !said.some(each => each.id === id))
+  // An item left without an answer is asked about once more, as the fix step does (R34); one the person waived meanwhile is not.
+  const waived = waivedIds(rec)
+  const unanswered = (after.asked ?? []).filter(
+    id => after.findings.some(f => f.id === id && f.status === 'open') && !said.some(each => each.id === id) && !waived.has(id),
+  )
   if (unanswered.length > 0 && after.hasReprompted !== true) {
     const step = stepOf(after, 'triage')
     const asked = await patch($, run.id, one => ({
@@ -1338,7 +1342,10 @@ const heldFindings = (rec: LifecycleRecord): Finding[] => [...unresolvedBlockers
 /** Why the pre-PR gate holds the PR, and the next step; undefined when it does not hold it for a settled reason. */
 export function heldReason(rec: LifecycleRecord): { why: string; nextStep: string } | undefined {
   if (rec.preStatus === 'blocked') {
-    return { why: rec.message ?? 'a decision is needed', nextStep: 'fix or rebut the open findings and commit, then /pr-gate resume' }
+    // The controller's own next step for this block (R49): a deferral is never "fix or rebut".
+    const next = decideNext(rec)
+    if (next.kind === 'blocked') return { why: next.why, nextStep: next.nextStep }
+    return { why: rec.message ?? 'a decision is needed', nextStep: 'run /pr-gate resume, which decides again from the record' }
   }
   if (rec.preStatus !== 'exhausted') return undefined
   const holding = heldFindings(rec)
@@ -1354,9 +1361,8 @@ export function heldReason(rec: LifecycleRecord): { why: string; nextStep: strin
     why:
       `the pre-PR review allowance is spent with ${n} high/critical finding${n === 1 ? '' : 's'} unresolved or unverified` +
       (isSecurity ? security : ', and onExhausted is stop'),
-    nextStep:
-      `fix ${holding.map(one => one.id).join(', ') || 'the open findings'} and commit, then /pr-gate resume; ` +
-      "with the allowance spent, a new round also needs the person's /pr-gate allow 1 <reason>",
+    // With the allowance spent, a new round or a release is the person's: the agent tells them, it never types their command (R49).
+    nextStep: `tell the person why ${holding.map(one => one.id).join(', ') || 'the open findings'} still hold the PR, then stop`,
   }
 }
 
@@ -1494,7 +1500,11 @@ async function afterFix($: Engine, run: Run): Promise<void> {
   }))
   if (after === null) return
   // A finding of this round left without an answer gets the fix step once more (no round consumed); then it stays open.
-  const unanswered = after.findings.filter(one => raisedIn(one, after.round) && one.status === 'open' && !said.some(each => each.id === one.id))
+  // One the person waived while the round ran is not asked about again.
+  const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [], findings: [] })
+  const unanswered = after.findings.filter(
+    one => raisedIn(one, after.round) && one.status === 'open' && !said.some(each => each.id === one.id) && !waived.has(one.id),
+  )
   if (unanswered.length > 0 && after.hasReprompted !== true) {
     await patch($, run.id, one => ({ ...one, hasReprompted: true }))
     const ids = unanswered.map(one => one.id).join(', ')

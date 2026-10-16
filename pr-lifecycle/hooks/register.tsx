@@ -10,7 +10,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Effort, Finding, LifecycleRecord, Run, Step } from '../types'
-import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
 import {
@@ -50,7 +50,7 @@ import {
   startTicker,
 } from './round'
 import type { Config } from './round'
-import { loadRecord, saveRecord, updateRecord } from './store'
+import { archiveRecord, loadRecord, saveRecord, updateRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -100,6 +100,20 @@ const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number): Run => 
   endedAt: now,
   message: `Codex skipped: ${rec.tierWhy}.`,
 })
+
+/** The run an open-PR prompt is written from when no run is live: a waiver let the pre-PR gate pass (R48). */
+const settledRun = (rec: LifecycleRecord, now: number): Run => ({
+  ...passThroughRun(rec, rec.root, now),
+  headSha: rec.preHead ?? rec.head,
+  round: rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).length,
+  findings: rec.findings,
+  message: undefined,
+})
+
+/** Sends the agent to open the PR, once the person's waiver let the pre-PR gate pass; through the command's prompt queue. */
+const sayOpenPr = ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number): void => {
+  if (config.openPr) say($, prPrompt(settledRun(rec, now), rec, status))
+}
 
 // ------------------------------------------------------------ starting
 
@@ -188,6 +202,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         }
       : {
           ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
+          // After a reset: feedback already processed and replied to stays answered (R47).
+          ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies }),
           effort,
           ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
         }
@@ -357,12 +373,14 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
   const after = await loadRecord($, root, branch)
   if (allows(after) && after.preHead === head) return undefined
   const held = after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after)
+  const person = after === undefined ? undefined : prePerson(after)
   if (held !== undefined) {
     // No round started: the PR stays held for a settled reason, and waiting will not change it.
     return [
       `pr-gate: ${action.via} to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${held.why}.`,
       `Your next step: ${held.nextStep}. Do not create the pull request another way.`,
-      `Tell the person: they can type /${COMMAND} waive pre <reason> to let this commit through, or /${COMMAND} allow 1 <reason> for one more review round.`,
+      // The person is named only where the decision is theirs (R49).
+      ...(person === undefined ? [] : [`Tell the person why it is held. ${person}`]),
     ].join('\n') + unknownNote(action)
   }
   return (
@@ -577,8 +595,15 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   }
   if (verb === 'reset') {
     if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
-    if (stored !== undefined) await updateRecord($, root, branch, one => ({ ...one, phase: 'archived' }))
-    return `/${COMMAND}: the lifecycle for ${branch} is archived, its history kept. /${COMMAND} starts a fresh one.`
+    const last = await loadRecord($, root, branch)
+    if (last !== undefined && last.phase !== 'archived') {
+      // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
+      await archiveRecord($, last, now)
+      const { base, head: at, tier, tierWhy, lane, allowance } = last
+      const seed = newRecord({ root, branch, base, head: at, tier, tierWhy, lane, allowance, at: now })
+      await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
+    }
+    return `/${COMMAND}: the lifecycle for ${branch} is archived under its own key, its history kept. /${COMMAND} starts a fresh one.`
   }
   if (verb === 'allow') {
     const n = Number(rest[0])
@@ -608,9 +633,23 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (!mergeHolds(rec).some(one => one.id === scope)) {
       return `/${COMMAND}: ${scope} is already settled (${settledAs(rec, finding)}): there is nothing to waive.`
     }
-    await saveRecord($, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: scope, head: rec.head, reason, by: origin, at: now }] })
+    // Waived at this head: a waiver that lapsed on a file change (R50) is given again, so the finding's flag is cleared with it.
+    const findings = rec.findings.map(one => (one.id === scope ? { ...one, needsRecheck: undefined } : one))
+    const waiver = { scope: 'finding' as const, findingId: scope, head: rec.head, reason, by: origin, at: now }
+    await saveRecord($, { ...rec, findings, waivers: [...rec.waivers, waiver] })
+    // A round in flight carries its own copy of the ledger: it is not asked about again, and its flag does not come back at the round's end.
+    if (isOurs) {
+      await patch($, run.id, one => ({
+        ...one,
+        findings: one.findings.map(each => (each.id === scope ? { ...each, needsRecheck: undefined } : each)),
+        ...(one.asked === undefined ? {} : { asked: one.asked.filter(id => id !== scope) }),
+      }))
+    }
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
     if (!isRunning) await advance($, root, branch)
+    const after = await loadRecord($, root, branch)
+    const wasPassed = rec.preStatus === 'passed' && rec.preHead === after?.preHead
+    if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) sayOpenPr($, after, 'passed', now)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
   if (scope === 'pre') {
@@ -635,7 +674,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         allowance: config.allowances.standard,
         at: now,
       })
-    await saveRecord($, { ...base, preStatus: 'waived', preHead: head, waivers: [...base.waivers, { scope: 'pre', head, reason, by: origin, at: now }] })
+    const waiver = { scope: 'pre' as const, head, reason, by: origin, at: now }
+    const waived: LifecycleRecord = { ...base, preStatus: 'waived', preHead: head, waivers: [...base.waivers, waiver] }
+    await saveRecord($, waived)
+    sayOpenPr($, waived, 'waived', now)
     return `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. The PR may open; post-PR review still runs.`
   }
   // waive post: the head GitHub reports for the PR, which is what the merge guard checks.
@@ -737,12 +779,16 @@ export const register: Register = (on, options) => {
     } else {
       setLive(false)
       // A new session: a post-PR review that was under way when the last one ended goes on collecting. Processed ids and
-      // recorded replies keep it from repeating work; a record that is ready, held or awaiting the person is left as it is.
+      // recorded replies keep it from repeating work; a record that is ready, held, stopped or awaiting the person is left as it is.
       try {
         const top = await git($, e.cwd, ['rev-parse', '--show-toplevel'])
         const branch = top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : ''
         const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
-        if (rec !== undefined && rec.phase === 'post' && rec.postStatus === undefined) await holdingPrompts($, () => advance($, top.out, branch))
+        // A review that stopped on an error (gh down, a step that failed) polls again, as the spec's restart does; a stop is the person's.
+        if (rec !== undefined && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
+          if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
+          await holdingPrompts($, () => advance($, top.out, branch))
+        }
       } catch {
         // The session starts whatever the record says.
       }

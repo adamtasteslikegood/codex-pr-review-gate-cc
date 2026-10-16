@@ -1,7 +1,19 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isAcceptedRebuttal, isBlocking, isDisputed, mergeHolds, raisedIn, rejections, securityHolds, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
+import {
+  isAcceptedRebuttal,
+  isBlocking,
+  isDisputed,
+  mergeHolds,
+  raisedIn,
+  rejections,
+  securityHolds,
+  unresolvedBlockers,
+  usedRounds,
+  verificationOwed,
+  waivedIds,
+} from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, Next, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
@@ -643,6 +655,33 @@ export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: '
   return lines.join('\n')
 }
 
+/** Before the PR: blockers unresolved or only reported fixed, and blockers deferred, unless the person waived them. */
+const preHolds = (rec: LifecycleRecord): Finding[] => {
+  const waived = waivedIds(rec)
+  const deferred = rec.findings.filter(one => isBlocking(one) && one.status === 'deferred' && !waived.has(one.id))
+  const held = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+  return [...held, ...deferred.filter(one => !held.includes(one))]
+}
+
+/**
+ * Before the PR, the person's options, only where the decision is theirs (R49): a deferred blocker, a security P1, or a spent
+ * allowance that holds the PR. A deferral or a security P1 is released by a waiver naming it; only exhaustion offers a round.
+ */
+export function prePerson(rec: LifecycleRecord): string | undefined {
+  const holding = preHolds(rec)
+  const theirs = holding.filter(one => one.status === 'deferred' || one.isSecurity === true)
+  const isExhausted = rec.preStatus === 'exhausted'
+  if (theirs.length === 0 && !isExhausted) return undefined
+  const options = [
+    ...theirs.map(one => `/pr-gate waive ${one.id} <reason> releases ${one.id}`),
+    ...(isExhausted && !holding.some(one => one.isSecurity === true)
+      ? ["/pr-gate waive pre <reason> lets this commit's pull request through without the review"]
+      : []),
+    ...(isExhausted ? ['/pr-gate allow 1 <reason> grants one more review round'] : []),
+  ]
+  return `Their options: ${options.slice(0, -1).join(', ')}${options.length > 1 ? ', and ' : ''}${options.at(-1)}.`
+}
+
 /**
  * The gate holds the pull request (pre-PR) or its merge (post-PR): why, what holds it and the agent's next step. Before the PR the
  * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46).
@@ -667,15 +706,25 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string):
     }
     return post.join('\n')
   }
-  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+  // Before the PR: what holds it, deferred blockers included, then the agent's step; the person only where the decision is theirs (R49).
+  const holding = preHolds(rec)
   const lines = [`pr-gate: the pull request for ${rec.branch} → ${rec.base} is held at ${rec.head.slice(0, 7)}: ${why}.`]
   if (holding.length > 0) lines.push('', 'What holds it, with the evidence so far:', listFindings(holding))
-  lines.push(
-    '',
-    `Your next step: ${nextStep}.`,
-    'Verify each finding against the code first: fix a real one with the smallest change and commit it, or rebut a false one with file:line evidence. Then run /pr-gate resume.',
-    'Do not push for review and do not create the pull request another way: the guard holds it until the review passes or the person decides.',
-    "Tell the person why it is held. Their options: /pr-gate waive pre <reason> lets this commit's pull request through without the review, and /pr-gate allow 1 <reason> grants one more review round.",
-  )
+  lines.push('', `Your next step: ${nextStep}.`)
+  if (holding.some(one => one.status !== 'deferred')) {
+    lines.push(
+      'Verify each finding against the code first: fix a real one with the smallest change and commit it, or rebut a false one with file:line evidence. ' +
+        'Then run /pr-gate resume.',
+    )
+  }
+  const person = prePerson(rec)
+  if (person === undefined) {
+    lines.push('Do not push for review and do not create the pull request another way: the guard holds it until the review passes.')
+  } else {
+    lines.push(
+      'Do not push for review and do not create the pull request another way: the guard holds it until the review passes or the person decides.',
+      `Tell the person why it is held. ${person}`,
+    )
+  }
   return lines.join('\n')
 }

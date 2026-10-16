@@ -13,6 +13,14 @@ export async function loadRecord($: Engine, root: string, branch: string): Promi
   return value !== null && value !== undefined && value.version === 1 ? value : undefined
 }
 
+/**
+ * Keeps a reset record whole under its own key (R47): `lifecycle:<root>:<branch>:archived:<at>`. `loadRecord` reads only the
+ * branch's own key, so an archive is never read as the live record.
+ */
+export async function archiveRecord($: Engine, rec: LifecycleRecord, at: number): Promise<void> {
+  await $.store.set(`${recordKey(rec.root, rec.branch)}:archived:${at}`, { ...rec, phase: 'archived' })
+}
+
 export async function saveRecord($: Engine, rec: LifecycleRecord): Promise<void> {
   await $.store.set(recordKey(rec.root, rec.branch), { ...rec, updatedAt: Math.max(rec.updatedAt, await $.clock.now()) })
 }

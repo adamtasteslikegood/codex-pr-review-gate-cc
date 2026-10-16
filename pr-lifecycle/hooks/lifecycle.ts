@@ -191,8 +191,16 @@ export function triage(
   return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
 }
 
-const waivedIds = (rec: Pick<LifecycleRecord, 'waivers'>): Set<string> =>
-  new Set(rec.waivers.filter(one => one.scope === 'finding' && one.findingId !== undefined).map(one => one.findingId as string))
+/**
+ * The findings the person waived. A waiver lapses when its finding's file changed since (R50): the finding then holds again
+ * until the person waives it at the new head, which clears the flag.
+ */
+export const waivedIds = (rec: Pick<LifecycleRecord, 'waivers' | 'findings'>): Set<string> => {
+  const lapsed = new Set(rec.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+  return new Set(
+    rec.waivers.flatMap(one => (one.scope === 'finding' && one.findingId !== undefined && !lapsed.has(one.findingId) ? [one.findingId] : [])),
+  )
+}
 
 /** Blocking findings deferred and not waived: before the PR, a deferral past the branch waits on the person's waiver of it. */
 const deferredBlockers = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] => {
@@ -290,10 +298,12 @@ function decidePre(rec: LifecycleRecord): Next {
   const passOr = (): Next => {
     if (unresolved.length === 0) return { kind: 'open-pr', status: 'passed' }
     if (unresolved.every(one => one.status === 'deferred')) {
+      // The person's decision (R49): the agent's step is to tell them and stop, never to type their command.
+      const one = unresolved.length === 1
       return {
         kind: 'blocked',
-        why: `${ids(unresolved)} deferred, and a security P1 needs your decision`,
-        nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>`,
+        why: `${ids(unresolved)} ${one ? 'is a deferred security P1' : 'are deferred security P1s'}, which only the person's waiver settles`,
+        nextStep: `tell the person ${ids(unresolved)} ${one ? 'is a deferred security P1' : 'are deferred security P1s'} and why, then stop`,
       }
     }
     return mayStartRound(rec, false)
@@ -312,13 +322,20 @@ function decidePre(rec: LifecycleRecord): Next {
       : { kind: 'open-pr', status: 'exhausted' }
   }
   const isChanged = last.endHead !== last.startHead
+  const waived = waivedIds(rec)
+  // The round's blockers are each waived by the person, and nothing else is unresolved or owed: no round is left to run (R48).
+  const raised = rec.findings.filter(one => isBlocking(one) && raisedIn(one, last.n))
+  if (raised.length > 0 && raised.every(one => waived.has(one.id)) && unresolved.length === 0 && verificationOwed(rec).length === 0) return passOr()
   // Released only when the ledger holds the deferred blockers and the person waived every one.
-  const isAllWaived = deferredBlockers(rec).length === 0 && rec.findings.some(one => isBlocking(one) && one.status === 'deferred')
+  const deferred = deferredBlockers(rec)
+  const isAllWaived = deferred.length === 0 && rec.findings.some(one => isBlocking(one) && one.status === 'deferred')
   if (last.deferredBlocking > 0 && !isAllWaived) {
+    const named = deferred.length === 0 ? 'the deferred finding' : ids(deferred)
+    const one = deferred.length <= 1
     return {
       kind: 'blocked',
-      why: 'a blocking finding was deferred: its fix reaches past this branch',
-      nextStep: '/pr-gate waive <findingId> <reason>, or widen the branch and run /pr-gate',
+      why: `${named} ${one ? 'was' : 'were'} deferred: ${one ? 'its' : 'their'} fix reaches past this branch`,
+      nextStep: `tell the person ${named} ${one ? 'is' : 'are'} deferred and why, then stop: only their waiver settles ${one ? 'it' : 'them'}`,
     }
   }
   if (last.raised.blocking === 0) {
@@ -329,14 +346,11 @@ function decidePre(rec: LifecycleRecord): Next {
       : passOr()
   }
   if (!isChanged && last.rebutted === 0) {
-    // The round's blockers were all deferred, and the person waived each one: nothing is left for a round to say.
-    const waived = waivedIds(rec)
-    const raised = rec.findings.filter(one => isBlocking(one) && raisedIn(one, last.n))
-    if (raised.length > 0 && raised.every(one => waived.has(one.id)) && unresolved.length === 0) return passOr()
+    const open = rec.findings.filter(one => isBlocking(one) && one.status === 'open' && !waived.has(one.id))
     return {
       kind: 'blocked',
       why: 'the fixer changed nothing and rebutted nothing, so another round would say the same',
-      nextStep: 'fix or rebut the open findings, then /pr-gate resume',
+      nextStep: `fix or rebut ${open.length === 0 ? 'the open findings' : ids(open)}, then /pr-gate resume`,
     }
   }
   return mayStartRound(rec, false)
