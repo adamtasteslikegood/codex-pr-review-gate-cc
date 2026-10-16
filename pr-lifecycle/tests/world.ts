@@ -28,6 +28,8 @@ export type World = {
     changed: string
     /** `.github/pr-gate.json` at HEAD; empty means none. */
     roster: string
+    /** Local branches besides the checked-out one. */
+    locals: string[]
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -41,6 +43,10 @@ export type World = {
     issueComments: object[]
     checks: object[]
     isAuthed: boolean
+    /** Whether the branch has an open PR: false until a PR-creating Bash call succeeds, or a test opens one. */
+    hasPr: boolean
+    /** Every gh call throws, as a broken runtime would. */
+    isBroken: boolean
     calls: string[]
   }
   /** The run as the mod last wrote it. */
@@ -72,8 +78,23 @@ export function world(on: On): World {
       left: 'x',
       changed: 'src/app.ts',
       roster: '',
+      locals: [],
     },
-    gh: { pr: 1, prHead: 'a'.repeat(40), base: 'dev', headRef: 'feat/x', self: 'me', reviews: [], comments: [], issueComments: [], checks: [], isAuthed: true, calls: [] },
+    gh: {
+      pr: 1,
+      prHead: 'a'.repeat(40),
+      base: 'dev',
+      headRef: 'feat/x',
+      self: 'me',
+      reviews: [],
+      comments: [],
+      issueComments: [],
+      checks: [],
+      isAuthed: true,
+      hasPr: false,
+      isBroken: false,
+      calls: [],
+    },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
   }
@@ -99,9 +120,13 @@ export function world(on: On): World {
     })
     if (e.argv[0] === 'gh') {
       w.gh.calls.push(args)
+      if (w.gh.isBroken) throw new Error('gh broke')
       if (!w.gh.isAuthed) return out('', 4)
       if (args.startsWith('api user')) return out(`${w.gh.self}\n`)
-      if (args.startsWith('pr view')) return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: 'OPEN' }))
+      if (args.startsWith('pr view')) {
+        if (!w.gh.hasPr) return out('', 1)
+        return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: 'OPEN' }))
+      }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))
       if (/issues\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.issueComments))
@@ -112,6 +137,10 @@ export function world(on: On): World {
     if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
     if (args.startsWith('rev-parse --show-toplevel')) return out('/repo\n')
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)
+    if (args.startsWith('rev-parse --verify --quiet refs/heads/')) {
+      const name = args.slice('rev-parse --verify --quiet refs/heads/'.length)
+      return out('', name === w.git.branch || w.git.locals.includes(name) ? 0 : 1)
+    }
     if (args.startsWith('rev-parse --verify')) return out('b\n')
     if (args.startsWith('rev-parse HEAD')) return out(`${w.git.head}\n`)
     if (args.startsWith('status')) return out(w.git.dirty)
@@ -135,6 +164,9 @@ export function world(on: On): World {
   })
   on('tool.call', { tool: 'Bash' }, (_$, e) => {
     w.opened.push(e.command)
+    // A PR-creating call that ran opens the branch's PR on the fake GitHub, when it is to the fake PR's base.
+    const base = e.command.match(/--base\s+(\S+)/)?.[1]
+    if (/\bpr\s+create\b|createPullRequest|\/pulls\b/.test(e.command) && (base === undefined || base === w.gh.base)) w.gh.hasPr = true
     return { result: { stdout: 'https://github.com/me/repo/pull/1', stderr: '', interrupted: false } as never }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))

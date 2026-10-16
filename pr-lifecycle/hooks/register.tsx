@@ -87,6 +87,35 @@ const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number): Run => 
 
 // ------------------------------------------------------------ starting
 
+type OpenPr = { number: number; baseRefName: string; headRefName: string; headRefOid: string }
+
+/** The open PR from a branch, as gh reports it; undefined when there is none or gh cannot say. */
+const openPrOf = async ($: Engine, root: string, branch: string): Promise<OpenPr | undefined> => {
+  const view = await $.process.run(['gh', 'pr', 'view', branch, '--json', 'number,state,baseRefName,headRefName,headRefOid'], {
+    cwd: root,
+    timeoutMs: 30_000,
+  })
+  if (view.exitCode !== 0) return undefined
+  try {
+    const pr = JSON.parse(view.stdout) as Record<string, unknown>
+    const isOurs = pr.state === 'OPEN' && pr.headRefName === branch
+    return isOurs && typeof pr.number === 'number' && typeof pr.baseRefName === 'string' && typeof pr.headRefOid === 'string'
+      ? { number: pr.number, baseRefName: pr.baseRefName, headRefName: branch, headRefOid: pr.headRefOid }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** This machine's gh login and the repository's slug, kept so post-PR rounds read the right PR and skip their own replies. */
+const identityOf = async ($: Engine, root: string): Promise<{ self?: string; slug?: string }> => {
+  const self = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: root, timeoutMs: 30_000 })
+  const origin = await git($, root, ['remote', 'get-url', 'origin'])
+  const login = self.exitCode === 0 ? self.stdout.trim() : ''
+  const slug = origin.isOk ? slugOf(origin.out) : undefined
+  return { ...(login === '' ? {} : { self: login }), ...(slug === undefined ? {} : { slug }) }
+}
+
 const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldCall?: boolean }): Promise<string> => {
   const existing = await getRun($)
   if (existing !== null && existing.status === 'running') {
@@ -150,6 +179,24 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     const lastHead = lastReviewedHead(prior)
     const since = lastHead === undefined ? undefined : await git($, root, ['diff', '--name-only', lastHead, head])
     rec = { ...rec, findings: invalidate(rec.findings, since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : 'all') }
+  }
+  // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
+  const adopted = prior === undefined || prior.phase === 'pre' ? await openPrOf($, root, branch) : undefined
+  if (adopted !== undefined && config.bases.includes(adopted.baseRefName)) {
+    const adoptedRec: LifecycleRecord = {
+      ...rec,
+      ...(await identityOf($, root)),
+      phase: 'post',
+      base: adopted.baseRefName,
+      pr: adopted.number,
+      passThrough: undefined,
+    }
+    await saveRecord($, adoptedRec)
+    await advance($, root, branch)
+    return (
+      `PR #${adopted.number} from ${branch} to ${adopted.baseRefName} is already open: adopted into post-PR review, ` +
+      `${remaining(adoptedRec)} of ${adoptedRec.allowance} review rounds left.`
+    )
   }
   if (rec.tier === 'trivial') {
     // A pass-through runs no round: the pane shows it passed, and the held call goes straight through.
@@ -313,10 +360,10 @@ const owedOf = (rec: LifecycleRecord): string => {
   const post = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
   const open = unresolvedBlockers(rec)
   if (rec.phase === 'pre') return 'the PR is still in pre-PR review'
+  if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}`
   if (post.length === 0) return `post-PR round 1 owed on ${rec.head.slice(0, 7)}`
   if (post.length === 1 && post[0]?.endHead !== post[0]?.startHead) return `post-PR round 2 owed on ${rec.head.slice(0, 7)}`
   if (open.length > 0) return open.map(one => `${one.id} [${one.severity}] unresolved`).join(', ')
-  if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}`
   return 'review in progress'
 }
 
@@ -340,7 +387,15 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
     ].join('\n')
   }
   const view = await $.process.run(
-    ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), '--json', 'number,baseRefName,headRefName,headRefOid'],
+    [
+      'gh',
+      'pr',
+      'view',
+      ...(action.number === undefined ? [] : [String(action.number)]),
+      ...(action.repo === undefined ? [] : ['--repo', action.repo]),
+      '--json',
+      'number,baseRefName,headRefName,headRefOid',
+    ],
     { cwd: root, timeoutMs: 30_000 },
   )
   let pr: { number: number; baseRefName: string; headRefName: string; headRefOid: string } | undefined
@@ -358,6 +413,8 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   }
   if (!config.bases.includes(pr.baseRefName) || config.bases.includes(pr.headRefName)) return undefined
   const rec = await loadRecord($, root, pr.headRefName)
+  // No record and no such branch here: a PR from a branch not checked out here is not this gate's to review.
+  if (rec === undefined && !(await git($, root, ['rev-parse', '--verify', '--quiet', `refs/heads/${pr.headRefName}`])).isOk) return undefined
   if (rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true) return undefined
   if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid) return undefined
   const short = pr.headRefOid.slice(0, 7)
@@ -372,13 +429,13 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // The agent's own next step; the person is named only where the spec leaves the decision to them.
   const next =
     rec === undefined
-      ? `Your next step: check out ${pr.headRefName} and run /${COMMAND}; merging is held until its lifecycle review is complete.`
+      ? `Your next step: check out ${pr.headRefName} and run /${COMMAND}, which adopts the open PR into post-PR review; merging is held until it is complete.`
       : isRunning
         ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
         : rec.phase !== 'ready' && (rec.postStatus === 'exhausted' || rec.postStatus === 'blocked')
           ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
             `or /${COMMAND} allow 1 <reason> for one more review round.`
-          : `Your next step: run /${COMMAND} resume, which reviews ${short} and says when the PR is ready for the merge decision.`
+          : `Your next step: check out ${pr.headRefName} and run /${COMMAND} resume, which reviews ${short} and says when the PR is ready to merge.`
   return (
     [
       `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held: the lifecycle review is not complete for ${short}: ${missing}.`,
@@ -392,27 +449,12 @@ const markOpened = async ($: Engine): Promise<void> => {
   await markPr($, 'done', 'opened')
 }
 
-/** The PR opened: the lifecycle crosses into post-PR review instead of ending. */
+/** The PR opened: the lifecycle crosses into post-PR review instead of ending. Only a PR gh confirms open from this branch counts. */
 const onOpened = async ($: Engine, root: string, branch: string): Promise<void> => {
-  const view = await $.process.run(['gh', 'pr', 'view', '--json', 'number,headRefOid'], { cwd: root, timeoutMs: 30_000 })
-  const self = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: root, timeoutMs: 30_000 })
-  const origin = await git($, root, ['remote', 'get-url', 'origin'])
-  let pr: { number: number; headRefOid: string } | undefined
-  try {
-    const read = view.exitCode === 0 ? (JSON.parse(view.stdout) as { number?: unknown; headRefOid?: unknown }) : undefined
-    pr = typeof read?.number === 'number' && typeof read.headRefOid === 'string' ? { number: read.number, headRefOid: read.headRefOid } : undefined
-  } catch {
-    pr = undefined
-  }
-  const login = self.exitCode === 0 ? self.stdout.trim() : ''
-  const slug = origin.isOk ? slugOf(origin.out) : undefined
-  const saved = await updateRecord($, root, branch, rec => ({
-    ...rec,
-    phase: 'post',
-    ...(pr === undefined ? {} : { pr: pr.number, head: pr.headRefOid }),
-    ...(login === '' ? {} : { self: login }),
-    ...(slug === undefined ? {} : { slug }),
-  }))
+  const pr = await openPrOf($, root, branch)
+  if (pr === undefined) return
+  const who = await identityOf($, root)
+  const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }))
   await markOpened($)
   if (saved !== undefined) await advance($, root, branch)
 }
@@ -442,7 +484,11 @@ export const register: Register = (on, options) => {
     const action = readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
     if (action === undefined) return next(e)
     if (action.action === 'merge') {
-      const refusal = config.enforceMerge ? await judgeMerge($, action) : undefined
+      // A merge given by URL names its repository there: gh pr view reads that one, and another repo's PR is not intercepted.
+      const command = (e as unknown as Record<string, unknown>).command
+      const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
+      const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
+      const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
       return refusal !== undefined ? { deny: refusal } : next(e)
     }
     const gated = await gatedCreate($, action)
@@ -451,15 +497,15 @@ export const register: Register = (on, options) => {
     const ran = await next(e)
     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
     return ran
-  }).catch(($, e, next) =>
-    next.called || readPrAction(String(e.tool), e as unknown as Record<string, unknown>) === undefined
-      ? next(e)
-      : {
-          deny:
-            'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
-            `who can type /${COMMAND} waive <reason> to let it through.`,
-        },
-  )
+  }).catch(($, e, next) => {
+    const action = next.called ? undefined : readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
+    if (action === undefined) return next(e)
+    return {
+      deny:
+        'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
+        `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post ' : ''}<reason> to let it through.`,
+    }
+  })
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)

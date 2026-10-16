@@ -325,13 +325,15 @@ test('the github-graphql connector cannot open or merge around the gate', async 
 test('gh api merges and unknown GitHub tools are held', async ($, on) => {
   world(on)
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh api -X PUT repos/me/repo/pulls/1/merge' }))).toBe(true)
-  expect(isHeld(await $.tool.call({ tool: 'Bash', command: "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {}) { clientMutationId } }'" }))).toBe(true)
+  const autoMerge = "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {}) { clientMutationId } }'"
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: autoMerge }))).toBe(true)
   const unknown = await $.tool.call({ tool: 'mcp__acme-github__merge_pr', number: 1 } as never)
   expect(unknown.deny).toContain('mcp__acme-github__merge_pr')
 })
 
 test('a merge to an ungated base, or of a promotion, is not held', async ($, on) => {
   const w = world(on)
+  w.gh.hasPr = true
   w.gh.base = 'release'
   expect(isHeld(await $.tool.call(merge))).toBe(false)
   w.gh.base = 'main'
@@ -377,4 +379,99 @@ test('a PR opened for another branch does not move this branch into post-PR revi
   await $.turn.complete(turn(review('r1-review', 'PASS')))
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head dev --title release' }))).toBe(false)
   expect((await recordOf(w)).phase).toBe('pre')
+})
+
+// ------------------------------------------------- fix round 1: a real PR, an adopted PR
+
+const cmd = (args: string) => ({ command: 'pr-gate', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } }) as never
+
+test('a create gh cannot confirm leaves the branch before its PR', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  w.gh.isAuthed = false
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('pre')
+  expect((await runOf(w)).phase).not.toBe('collect')
+})
+
+test('a graphql create whose PR comes from another branch does not move this one into post-PR', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  w.gh.headRef = 'dev'
+  const create = "gh api graphql -f query='mutation { createPullRequest(input: {}) { pullRequest { number } } }'"
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: create }))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('pre')
+})
+
+test('a PR the gate never saw opened is adopted into post-PR review', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  await $.command.run(cmd(''))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('post')
+  expect(rec.pr).toBe(1)
+  expect(rec.slug).toBe('me/repo')
+  expect(rec.self).toBe('me')
+  const run = await runOf(w)
+  expect(run.lifecycle).toBe('post')
+  expect(run.phase).toBe('collect')
+  expect(w.spawned).toHaveLength(0)
+  expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
+})
+
+test('a merge with no record is held when its branch is here, and says how to adopt it', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  w.gh.headRef = 'feat/y'
+  w.git.locals = ['feat/y']
+  const held = await $.tool.call(merge)
+  expect(held.deny).toContain('check out feat/y and run /pr-gate')
+})
+
+test('a merge with no record of a branch not checked out here is not intercepted', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  w.gh.headRef = 'feat/z'
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('an exhausted post-PR review says so when a merge is held', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  await $.command.run(cmd('stop'))
+  w.store.set('lifecycle:/repo:feat/x', { ...(await recordOf(w)), postStatus: 'exhausted', message: 'R1-1 unresolved and the review allowance is spent' })
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('exhausted: R1-1 unresolved')
+  expect(held).toContain('waive post')
+})
+
+test('a stopped post-PR review tells the agent which branch to resume', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  await $.command.run(cmd('stop'))
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('check out feat/x and run /pr-gate resume')
+  expect(w.opened.some(one => one.includes('pr merge'))).toBe(false)
+})
+
+test('a merge given by URL reads that repository', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge https://github.com/other/thing/pull/1' }))).toBe(false)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge https://github.com/me/repo/pull/1' })
+  expect(w.gh.calls.filter(one => one.startsWith('pr view')).at(-1)).toContain('me/repo')
+})
+
+test('a merge whose guard fails is held, and the person is offered waive post', async ($, on) => {
+  const w = world(on)
+  w.gh.isBroken = true
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('guard failed')
+  expect(held).toContain('waive post')
 })
