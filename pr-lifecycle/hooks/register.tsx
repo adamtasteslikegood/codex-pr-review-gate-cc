@@ -15,7 +15,6 @@ import { readPrAction } from './github'
 import type { PrAction } from './github'
 import {
   allowanceFor,
-  invalidate,
   isAcceptedRebuttal,
   isDisputed,
   lastReviewedHead,
@@ -36,8 +35,8 @@ import {
   getRun,
   git,
   hasSecurityBlocker,
+  headMoved,
   heldReason,
-  lapsedAt,
   holdingPrompts,
   isLiveNow,
   isTurnOf,
@@ -194,7 +193,15 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     prior !== undefined && prior.phase !== 'archived'
       ? {
           ...rescope(
-            { ...prior, head, base, ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}), postStatus: undefined },
+            {
+              ...prior,
+              head,
+              base,
+              ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
+              // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
+              ...(prior.phase === 'pre' && prior.head !== head ? { preStatus: undefined, preHead: undefined } : {}),
+              postStatus: undefined,
+            },
             scope.tier,
             scope.why,
             config.allowances,
@@ -210,12 +217,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
           effort,
           ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
         }
-  if (prior !== undefined && prior.head !== head) {
-    const lastHead = lastReviewedHead(prior)
-    const since = lastHead === undefined ? undefined : await git($, root, ['diff', '--name-only', lastHead, head])
-    const files = since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : ('all' as const)
-    rec = { ...rec, findings: invalidate(rec.findings, files), waivers: await lapsedAt($, rec, head, now) }
-  }
+  // A new head since the last reviewed one (R56): answered findings on a changed file need a re-check, and their waivers lapse.
+  if (prior !== undefined && prior.head !== head) rec = { ...rec, ...(await headMoved($, root, rec, lastReviewedHead(prior), head, now)) }
   // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
   const adopted = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
   if (adopted !== undefined && config.bases.includes(adopted.baseRefName)) {

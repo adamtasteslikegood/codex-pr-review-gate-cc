@@ -227,6 +227,39 @@ export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'w
   return lapseWaivers(rec.waivers, rec.findings, from => changed.get(from) ?? 'all', head, now)
 }
 
+/**
+ * The head moved from `from` to `to` (R56): each answered finding whose file changed needs a re-check (`invalidate`), and each
+ * finding waiver whose finding's file changed since it was given lapses (R55). Git failing flags and lapses everything.
+ */
+export async function headMoved(
+  $: Engine,
+  root: string,
+  rec: Pick<LifecycleRecord, 'waivers' | 'findings'>,
+  from: string | undefined,
+  to: string,
+  now: number,
+): Promise<{ findings: Finding[]; waivers: Waiver[] }> {
+  const diff = from === undefined ? undefined : await git($, root, ['diff', '--name-only', from, to])
+  const files = diff?.isOk === true ? new Set(diff.out.split('\n').filter(Boolean)) : ('all' as const)
+  const findings = invalidate(rec.findings, files)
+  return { findings, waivers: await lapsedAt($, { root, waivers: rec.waivers, findings }, to, now) }
+}
+
+/**
+ * A run saw a new head: `headMoved` over its ledger, written to the record at once (`endCollect` and `beginTriage` read the record)
+ * and to the run's own copy, which wins over the record's when the two are merged.
+ */
+export async function onNewHead($: Engine, run: Run, from: string, to: string, now: number): Promise<void> {
+  const live = await getRun($)
+  const rec = await loadRecord($, run.root, run.branch)
+  const ledger = mergeFindings(rec?.findings ?? [], live?.id === run.id ? live.findings : run.findings)
+  const moved = await headMoved($, run.root, { findings: ledger, waivers: rec?.waivers ?? [] }, from, to, now)
+  const flagged = new Set(moved.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+  const flag = (findings: readonly Finding[]): Finding[] => findings.map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one))
+  if (rec !== undefined) await updateRecord($, run.root, run.branch, one => ({ ...one, findings: flag(one.findings), waivers: moved.waivers }))
+  await patch($, run.id, one => ({ ...one, findings: flag(one.findings) }))
+}
+
 const stopTicker = (): void => {
   ticker?.cancel()
   ticker = undefined
@@ -591,6 +624,8 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   const headAt = isNewHead ? now : collect.headAt
   // A new head restarts the quiet period: its checks may not be registered yet.
   const arrived = isNewHead || fresh.length > (run.triaged?.length ?? 0)
+  // Judged from the head the round had before this one replaces it (R56).
+  if (isNewHead) await onNewHead($, run, run.roundStartHead, got.prHead, now)
   const after = await patch($, run.id, one => ({
     ...one,
     roundStartHead: got.prHead,
@@ -933,20 +968,14 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   const endHead = prHead
   if (endHead !== run.roundStartHead) {
-    const changed = await git($, run.root, ['diff', '--name-only', run.roundStartHead, endHead])
-    const files = changed.isOk ? new Set(changed.out.split('\n').filter(Boolean)) : ('all' as const)
+    await onNewHead($, run, run.roundStartHead, endHead, await $.clock.now())
     // The answers given in this run are about the new head already, except a fix only reported: its file changed, so it is checked
     // again (R33). Nothing else is exempt: an answer run reuses its round's number, and its push can touch an accepted rebuttal's file.
     const answeredNow = new Set(said.map(each => each.id))
-    const held = await loadRecord($, run.root, run.branch)
-    const waivers = held === undefined ? undefined : await lapsedAt($, { ...held, findings: run.findings }, endHead, await $.clock.now())
-    if (waivers !== undefined) await updateRecord($, run.root, run.branch, rec => ({ ...rec, waivers }))
-    await patch($, run.id, one => ({
-      ...one,
-      findings: invalidate(one.findings, files).map(f =>
-        one.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f,
-      ),
-    }))
+    const exempt = (findings: readonly Finding[]): Finding[] =>
+      findings.map(f => (run.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f))
+    await updateRecord($, run.root, run.branch, one => ({ ...one, findings: exempt(one.findings) }))
+    await patch($, run.id, one => ({ ...one, findings: exempt(one.findings) }))
   }
   const ended = await getRun($)
   if (ended === null || ended.id !== run.id || ended.status !== 'running') return
@@ -1238,14 +1267,18 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     startedAt: run.roundStartedAt,
     endedAt: now,
   }
-  // Before the PR, a waiver lapses on a commit of this round that touches its finding's file (R52, R55); post-PR, the head check does it.
+  // Before the PR, this round's own commits are a new head (R52, R55, R56); after it, `pollOnce` and `afterTriage` see each one.
   const held = run.lifecycle === 'pre' && endHead !== run.roundStartHead ? await loadRecord($, run.root, run.branch) : undefined
-  const waivers = held === undefined ? undefined : await lapsedAt($, { ...held, findings: mergeFindings(held.findings, run.findings) }, endHead, now)
+  const moved =
+    held === undefined
+      ? undefined
+      : await headMoved($, run.root, { ...held, findings: mergeFindings(held.findings, run.findings) }, run.roundStartHead, endHead, now)
+  const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true).map(one => one.id) ?? [])
   await updateRecord($, run.root, run.branch, rec => ({
     ...withRound(rec, round),
     head: endHead,
-    findings: mergeFindings(rec.findings, run.findings),
-    ...(waivers === undefined ? {} : { waivers }),
+    findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
+    ...(moved === undefined ? {} : { waivers: moved.waivers }),
     effort: run.effort,
   }))
   if (isCompleted) await advance($, run.root, run.branch)

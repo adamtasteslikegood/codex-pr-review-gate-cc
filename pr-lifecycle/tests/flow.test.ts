@@ -1895,3 +1895,102 @@ test('R55: after the PR, a lapsed waiver keeps the merge held through a clean po
   expect(mergeHolds(rec).map(one => one.id)).toContain('G2-1')
   expect(isHeld(await $.tool.call(merge))).toBe(true)
 })
+
+/**
+ * R56: a ready record; push B, on another file, is resumed into post round 3, and push C, touching `file`, arrives while
+ * that round collects. Then the round's reviewer covers C and nothing new is said.
+ */
+const pushMidCollect = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, file: string) => {
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.changed = 'src/other.ts'
+  await say($, 'resume')
+  const collecting = await runOf(w)
+  expect([collecting.status, collecting.phase, collecting.round, collecting.roundStartHead]).toEqual(['running', 'collect', 3, 'b'.repeat(40)])
+  w.git.head = 'c'.repeat(40)
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.changed = file
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).roundStartHead).toBe('c'.repeat(40))
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).not.toBe('collect')
+}
+
+/** G2-1 is rebutted, Codex accepts the rebuttal, and the record is ready. */
+const toAccepted = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+}
+
+test('R56: a push picked up mid-collection that touches an accepted rebuttal\'s file has Codex check it again', async ($, on) => {
+  const w = world(on)
+  await toAccepted($, w)
+  const spawned = w.spawned.length
+  await pushMidCollect($, w, 'src/app.ts')
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBe(true)
+  expect(mergeHolds(rec).map(f => f.id)).toContain('G2-1')
+  // The round's end goes to Codex's rebuttal check of G2-1, on C.
+  expect(w.spawned.slice(spawned).some(one => one.prompt.includes('G2-1'))).toBe(true)
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+})
+
+test('R56: a push picked up mid-collection that touches a waived finding\'s file lapses the waiver', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  expect((await recordOf(w)).phase).toBe('ready')
+  await pushMidCollect($, w, 'src/app.ts')
+  const rec = await recordOf(w)
+  expect(rec.waivers.find(one => one.findingId === 'G2-1')?.lapsedHead).toBe('c'.repeat(40))
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(mergeHolds(rec).map(f => f.id)).toContain('G2-1')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  // A new waiver from the person settles it again.
+  await say($, 'waive G2-1 still lands with KAN-9')
+  expect(mergeHolds(await recordOf(w)).map(f => f.id)).not.toContain('G2-1')
+})
+
+test('R56: a push mid-collection on another file leaves an accepted rebuttal settled', async ($, on) => {
+  const w = world(on)
+  await toAccepted($, w)
+  await pushMidCollect($, w, 'src/other.ts')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBeUndefined()
+  expect(isAcceptedRebuttal(rec.findings.find(f => f.id === 'G2-1')!)).toBe(true)
+  expect(rec.phase).toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R56: a push mid-collection on another file leaves a waiver standing', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await pushMidCollect($, w, 'src/other.ts')
+  const rec = await recordOf(w)
+  expect(rec.waivers.find(one => one.findingId === 'G2-1')?.lapsedAt).toBeUndefined()
+  expect(rec.phase).toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R57: status during a new pre-PR run on a moved head does not say passed', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  w.git.head = 'b'.repeat(40)
+  await say($, '')
+  const run = await runOf(w)
+  expect([run.status, run.lifecycle, run.round]).toEqual(['running', 'pre', 2])
+  const rec = await recordOf(w)
+  expect(rec.preStatus).toBeUndefined()
+  expect(rec.preHead).toBeUndefined()
+  const said = (await say($, 'status')) as { text: string }
+  expect(said.text).toContain('feat/x → dev: pre,')
+  expect(said.text).not.toContain('passed')
+})
