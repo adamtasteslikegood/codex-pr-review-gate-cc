@@ -261,3 +261,34 @@ test('a pre-PR block is explained without a PR number or merge advice', async ($
   expect(text).not.toContain('PR #undefined')
   expect(text).not.toContain('Do not merge')
 })
+
+// ------------------------------------------------------------- fix round 2
+
+test('a security fix Codex does not confirm is not a pass', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  // Round 2: Codex passes but does not list R1-1 under verified.
+  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  expect((await recordOf(w)).preStatus).not.toBe('passed')
+  expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
+  // Another round asks Codex to verify it.
+  expect(w.spawned).toHaveLength(3)
+  expect(w.spawned.at(-1)?.prompt).toContain('R1-1 [P1] SQL injection in search')
+})
+
+test('a security fix still unverified when the allowance is spent holds the PR and says why', { options: { allowanceStandard: 2 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  expect((await recordOf(w)).preStatus).toBe('exhausted')
+  const held = w.prompts.at(-1) ?? ''
+  expect(held).toContain('security fix not yet verified')
+  expect(held).not.toContain('open the pull request')
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+})

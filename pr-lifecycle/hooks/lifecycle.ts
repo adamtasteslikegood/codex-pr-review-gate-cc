@@ -218,12 +218,17 @@ const ids = (findings: readonly Finding[]): string => findings.map(one => one.id
 
 function decidePre(rec: LifecycleRecord): Next {
   const last = rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).at(-1)
-  const unresolved = unresolvedBlockers(rec)
-  // Never a pass while any blocker in the ledger is unresolved, whichever round raised it.
+  // Never a pass while any blocker in the ledger is unresolved, whichever round raised it. Before the PR opens,
+  // a security fix only reported fixed counts as unresolved too, until a check confirms it.
+  const unresolved = [...unresolvedBlockers(rec), ...verificationOwed(rec).filter(one => one.isSecurity === true)]
   const passOr = (): Next => {
     if (unresolved.length === 0) return { kind: 'open-pr', status: 'passed' }
     if (unresolved.every(one => one.status === 'deferred')) {
-      return { kind: 'blocked', why: `${ids(unresolved)} deferred, and a security P1 needs your decision`, nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>` }
+      return {
+        kind: 'blocked',
+        why: `${ids(unresolved)} deferred, and a security P1 needs your decision`,
+        nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>`,
+      }
     }
     return mayStartRound(rec, false)
       ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }

@@ -179,6 +179,16 @@ test('pre-PR: an open blocker anywhere in the ledger never passes, even when the
   expect(decideNext(at([r1, r2], { findings: [finding({ status: 'deferred', isSecurity: true })] })).kind).toBe('blocked')
 })
 
+test('pre-PR: a security fix only reported fixed is not a pass until a check confirms it', async () => {
+  const r1 = pre({ raised: { blocking: 1, advisory: 0 }, endHead: 'b' })
+  const r2 = pre({ startHead: 'b', endHead: 'b' })
+  const owed = { findings: [finding({ status: 'reported-fixed', isSecurity: true })] }
+  expect(decideNext(at([r1, r2], owed))).toMatchObject({ kind: 'round', phase: 'pre', isAdvisory: false })
+  expect(decideNext(at([r1, r1, r1, r2], owed))).toEqual({ kind: 'open-pr', status: 'exhausted' })
+  // A non-security fix still owed verification does not hold the pre-PR gate.
+  expect(decideNext(at([r1, r2], { findings: [finding({ status: 'reported-fixed' })] }))).toEqual({ kind: 'open-pr', status: 'passed' })
+})
+
 test('pre-PR: a pass-through with no allowance opens the PR without a round', async () => {
   expect(decideNext(at([], { allowance: 0, tier: 'trivial', passThrough: 'docs only' }))).toEqual({ kind: 'open-pr', status: 'passed' })
 })

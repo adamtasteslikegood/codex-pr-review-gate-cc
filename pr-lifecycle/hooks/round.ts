@@ -551,7 +551,8 @@ export async function advance($: Engine, root: string, branch: string): Promise<
         ? rec.passThrough !== undefined
           ? `Codex skipped: ${rec.passThrough}.`
           : `No high/critical finding after ${used} round${used === 1 ? '' : 's'}.`
-        : `${heldFindings(rec).length} high/critical finding(s) unresolved or unverified with the allowance spent${hasSecurity ? ', one of them security: the PR stays held' : ''}.`
+        : `${heldFindings(rec).length} high/critical finding(s) unresolved or unverified with the allowance spent` +
+          `${hasSecurity ? ', one of them security: the PR stays held' : ''}.`
     const ended = id === undefined ? null : await finish($, id, next.status, message)
     if (ended === null || saved === undefined) return
     if (!opens) {
@@ -600,11 +601,18 @@ export function heldReason(rec: LifecycleRecord): { why: string; nextStep: strin
   const isSecurity = hasSecurityBlocker(rec)
   if (!isSecurity && config.onExhausted === 'open-pr') return undefined
   const n = holding.length
+  const unverified = verificationOwed(rec).filter(one => one.isSecurity === true)
+  const security =
+    unverified.length > 0
+      ? `, and a security fix not yet verified (${unverified.map(one => one.id).join(', ')}) never rides on an exhausted review`
+      : ', one of them security, which never rides on an exhausted review'
   return {
     why:
       `the pre-PR review allowance is spent with ${n} high/critical finding${n === 1 ? '' : 's'} unresolved or unverified` +
-      (isSecurity ? ', one of them security, which never rides on an exhausted review' : ', and onExhausted is stop'),
-    nextStep: `fix ${holding.map(one => one.id).join(', ') || 'the open findings'} and commit, then /pr-gate resume; with the allowance spent, a new round also needs the person's /pr-gate allow 1 <reason>`,
+      (isSecurity ? security : ', and onExhausted is stop'),
+    nextStep:
+      `fix ${holding.map(one => one.id).join(', ') || 'the open findings'} and commit, then /pr-gate resume; ` +
+      "with the allowance spent, a new round also needs the person's /pr-gate allow 1 <reason>",
   }
 }
 
