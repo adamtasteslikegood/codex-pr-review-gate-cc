@@ -217,6 +217,55 @@ test('mcp: open and new are create verbs only where they name the operation', as
   expect(readPrAction('mcp__github__open_pull_request', { title: 't' })).toMatchObject({ action: 'create', isUnknown: true })
 })
 
+// Fix round 3 (R19): structural input only; curl graphql and long mutations held.
+
+test('bash r19: curl graphql and rest on any host, upper-case gh, hostname flag, unreadable queries', async () => {
+  const mutation = '{"query":"mutation { mergePullRequest(input:{}) { clientMutationId } }"}'
+  expect(bash(`curl -X POST https://api.github.com/graphql -d '${mutation}'`)).toMatchObject({ action: 'merge' })
+  expect(bash('curl -X POST https://api.github.com/graphql -d @q.json')).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(bash('curl -X PUT https://ghe.corp/api/v3/repos/o/r/pulls/5/merge')).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('GH pr create')).toMatchObject({ action: 'create' })
+  expect(bash('gh api graphql -f query="$Q"')).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(bash('gh --hostname h.example pr merge 3')).toMatchObject({ action: 'merge', number: 3 })
+})
+
+test('bash r19: prose, other subcommands and variables inside literal queries are not commands', async () => {
+  expect(bash("gh api graphql -f query='mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}) { thread { id } } }' -f id=X")).toBeUndefined()
+  expect(bash('gh issue create --title "pr merge bug"')).toBeUndefined()
+  expect(bash('git commit -m "docs: gating of gh pr ' + 'create"')).toBeUndefined()
+  expect(bash('grep -rn "gh pr ' + 'merge" docs')).toBeUndefined()
+  expect(bash("git commit -F - <<'EOF'\nsubject\n\ngh pr " + 'create --base dev\nEOF')).toBeUndefined()
+  expect(bash("cat <<-EOF\n\tgh pr " + 'merge 5\n\tEOF\necho done')).toBeUndefined()
+})
+
+test('mcp r19: a long mutation string under any key, and pullrequest as one word', async () => {
+  const long = 'mutation M { mergePullRequest(input: { pullRequestId: "' + 'x'.repeat(150) + '" }) { clientMutationId } }'
+  expect(readPrAction('mcp__github__graphql', { mutation: long })).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(readPrAction('mcp__github__graphql', { doc: { nested: [long.replace('mergePullRequest', 'createPullRequest')] } })).toMatchObject({ action: 'create' })
+  expect(readPrAction('mcp__github__pullrequest', { action: 'merge' })).toMatchObject({ action: 'merge' })
+})
+
+test('mcp r19: file, branch, comment, search and list tools are not held', async () => {
+  const file = { path: 'pr-lifecycle/hooks/github.ts', content: 'x', message: 'fix pr gate' }
+  expect(readPrAction('mcp__plugin_github_github__create_or_update_file', file)).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__create_branch', { branch: 'feat/pr-lifecycle' })).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__pull_request_review_write', { method: 'create', body: 'Looks good, merge when green', pullNumber: 1 })).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__add_issue_comment', { body: 'ready to merge the pr' })).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__search_pull_requests', { query: 'merge conflict' })).toBeUndefined()
+  expect(readPrAction('mcp__acme-github__list_open_pull_requests', {})).toBeUndefined()
+  expect(readPrAction('mcp__acme-github__get_new_pull_requests', {})).toBeUndefined()
+  expect(readPrAction('mcp__github__pulls', { action: 'list', type: 'open' })).toBeUndefined()
+})
+
+test('mcp r19: tool-name verbs, and what stays held after the narrowing', async () => {
+  expect(readPrAction('mcp__acme-github__submit_pull_request', {})).toMatchObject({ action: 'create', isUnknown: true })
+  expect(readPrAction('mcp__acme-github__enable_pr_auto_merge', {})).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(readPrAction('mcp__plugin_github_github__merge_pull_request', { pullNumber: 3 })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__github__rest', { method: 'PUT', path: '/repos/o/r/pulls/1/merge' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__acme-github__tool', { tool: 'merge_pull_request' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__github__pulls', { title: 't', head: 'h', base: 'b', action: 'create' })).toMatchObject({ action: 'create' })
+})
+
 test('mcp: reads, reviews and long prose stay free', async () => {
   expect(readPrAction('mcp__plugin_github_github__pull_request_read', { method: 'get', pullNumber: 1 })).toBeUndefined()
   expect(readPrAction('mcp__acme-github__list_merged', {})).toBeUndefined()

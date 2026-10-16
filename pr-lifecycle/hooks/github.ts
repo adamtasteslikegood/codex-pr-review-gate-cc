@@ -202,9 +202,9 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
 
 // ----------------------------------------------------------- PR actions
 //
-// Design (ruling R18): not a shell parser. Every route an agent might reach for after a refusal is held, failing toward a hold. A false hold
-// costs one retry with a waiver; a miss costs the whole gate. Residual risk that a regex cannot see: shell indirection such as `g=gh; $g pr ...`,
-// `eval`, and commands built in files or scripts that run later.
+// Design (rulings R18, R19): not a shell parser. Every route an agent might reasonably reach for after a refusal is held, failing toward a hold.
+// A false hold costs one retry with a waiver; a miss costs the whole gate. MCP calls are read from structure only (tool name, operation keys,
+// key names, REST paths, mutation names), never from free text such as titles, bodies, messages and file contents.
 
 export type PrAction = {
   action: 'create' | 'merge'
@@ -223,10 +223,25 @@ export type PrAction = {
 
 // ------------------------------------------------------------------ Bash
 
-/** Join continuations, drop quotes, collapse whitespace. */
+/** Drop heredoc bodies: from `<<WORD`, `<<'WORD'`, `<<"WORD"` or `<<-WORD` to the line equal to WORD (leading tabs trimmed for `<<-`). */
+function dropHeredocs(command: string): string {
+  const kept: string[] = []
+  let end: { word: string; isDash: boolean } | undefined
+  for (const line of command.split('\n')) {
+    if (end !== undefined) {
+      if ((end.isDash ? line.replace(/^\t+/, '') : line) === end.word) end = undefined
+      continue
+    }
+    kept.push(line)
+    const here = line.match(/<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/)
+    if (here !== null) end = { word: here[3] ?? '', isDash: here[1] === '-' }
+  }
+  return kept.join('\n')
+}
+
+/** Join continuations, drop heredoc bodies and quotes, collapse whitespace. */
 const normalise = (command: string): string =>
-  command
-    .replace(/\\\r?\n/g, ' ')
+  dropHeredocs(command.replace(/\\\r?\n/g, ' '))
     .replace(/['"]/g, '')
     .replace(/[ \t]+/g, ' ')
 
@@ -238,7 +253,14 @@ const segmentsOf = (normal: string): string[] =>
 
 const cdOf = (normal: string): string | undefined => normal.match(/(?:^|&&|;)\s*cd\s+([^\s;&]+)/)?.[1]
 
-const isCommand = (token: string, name: string): boolean => token === name || token.endsWith(`/${name}`)
+/** The command name, as `gh` or `/usr/bin/GH` alike. */
+const isCommand = (token: string, name: string): boolean => {
+  const lower = token.toLowerCase()
+  return lower === name || lower.endsWith(`/${name}`)
+}
+
+/** Commands that print or store text, so a `gh pr ...` after them is prose. Residual risk: they can also hide a command. */
+const PROSE_COMMANDS = ['echo', 'printf', 'grep', 'rg', 'cat', 'git', 'sed', 'awk']
 
 /** The value of a flag in any of its spellings: `-R x`, `--repo x`, `--repo=x`, `-Rx`. */
 function flagValue(tokens: string[], names: string[]): string | undefined {
@@ -292,7 +314,19 @@ function mergeTarget(args: string[]): { number?: number; isUnknown?: boolean } {
   return { number: undefined }
 }
 
-/** The subcommand after `pr`, skipping global flags and their values. */
+const GH_VALUE_FLAGS = ['-R', '--repo', '--hostname']
+
+/** The first non-flag token after `gh` and its global flags: `pr`, `api`, `issue`, ... Returns its index, or -1. */
+function ghSubject(tokens: string[], gh: number): number {
+  for (let at = gh + 1; at < tokens.length; at++) {
+    const token = tokens[at] ?? ''
+    if (!token.startsWith('-')) return at
+    if (GH_VALUE_FLAGS.includes(token)) at++
+  }
+  return -1
+}
+
+/** The subcommand after `pr`, skipping flags and their values. */
 function prSubcommand(tokens: string[], from: number): number {
   for (let at = from; at < tokens.length; at++) {
     const token = tokens[at] ?? ''
@@ -304,9 +338,7 @@ function prSubcommand(tokens: string[], from: number): number {
   return -1
 }
 
-function readGhPr(tokens: string[], gh: number, cwd: string | undefined): PrAction | undefined {
-  const pr = tokens.indexOf('pr', gh + 1)
-  if (pr < 0) return undefined
+function readGhPr(tokens: string[], pr: number, cwd: string | undefined): PrAction | undefined {
   const sub = prSubcommand(tokens, pr + 1)
   const verb = sub < 0 ? '' : (tokens[sub] ?? '')
   const repo = flagValue(tokens, ['-R', '--repo'])
@@ -321,17 +353,22 @@ const PULLS_PATH = /(?:^|\/)repos\/([^/\s]+)\/([^/\s]+)\/pulls(?:\/(\d+)\/merge)
 
 type PullsPath = { repo?: string; number?: number; isMerge: boolean }
 
+function pullsPathIn(value: string): PullsPath | undefined {
+  const found = value.match(PULLS_PATH)
+  if (found === null) return undefined
+  const repo = `${found[1]}/${found[2]}`
+  return { repo: repo.includes('{') ? undefined : repo, number: found[3] === undefined ? undefined : Number(found[3]), isMerge: found[3] !== undefined }
+}
+
 function pullsPathOf(tokens: string[]): PullsPath | undefined {
   for (const token of tokens) {
-    const found = token.match(PULLS_PATH)
-    if (found === null) continue
-    const repo = `${found[1]}/${found[2]}`
-    return { repo: repo.includes('{') ? undefined : repo, number: found[3] === undefined ? undefined : Number(found[3]), isMerge: found[3] !== undefined }
+    const found = pullsPathIn(token)
+    if (found !== undefined) return found
   }
   return undefined
 }
 
-/** A REST call to the pulls API that writes: POST or PUT, or no method but fields (gh then posts). An explicit GET stays free. */
+/** A REST call to the pulls API that writes: POST or PUT, or no method but a body (gh and curl then post). An explicit GET stays free. */
 function readRest(tokens: string[], via: string, methodFlags: string[], hasBody: boolean, cwd: string | undefined): PrAction | undefined {
   const path = pullsPathOf(tokens)
   if (path === undefined) return undefined
@@ -341,34 +378,64 @@ function readRest(tokens: string[], via: string, methodFlags: string[], hasBody:
   return { action: 'create', via, repo: path.repo, base: fieldValue(tokens, 'base'), head: fieldValue(tokens, 'head'), cwd }
 }
 
-const GRAPHQL_MERGES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/
+const MERGE_MUTATIONS = ['mergePullRequest', 'enablePullRequestAutoMerge', 'enqueuePullRequest']
+const CREATE_MUTATIONS = ['createPullRequest']
 
-/** GraphQL names are matched over the whole command: its braces and parentheses split segments. */
-function readGraphql(normal: string, tokens: string[], cwd: string | undefined): PrAction | undefined {
-  const via = 'gh api graphql'
-  if (GRAPHQL_MERGES.test(normal)) return { action: 'merge', via, cwd }
-  if (/\bcreatePullRequest\b/.test(normal)) return { action: 'create', via, cwd }
-  const isUnreadable = tokens.some((token) => token.startsWith('query=@') || token === '--input') || /\$(?!\()/.test(normal)
+/** The mutation a text names, if any; merge wins. */
+function mutationIn(text: string): 'merge' | 'create' | undefined {
+  if (MERGE_MUTATIONS.some((name) => text.includes(name))) return 'merge'
+  return CREATE_MUTATIONS.some((name) => text.includes(name)) ? 'create' : undefined
+}
+
+/** GraphQL names are matched over the whole command: its braces and parentheses split segments. An unreadable query is held as unknown. */
+function readGraphql(normal: string, isUnreadable: boolean, via: string, cwd: string | undefined): PrAction | undefined {
+  const mutation = mutationIn(normal)
+  if (mutation !== undefined) return { action: mutation, via, cwd }
   return isUnreadable ? { action: 'merge', via, cwd, isUnknown: true } : undefined
+}
+
+/** `gh api graphql`: a query read from a file or input, or whose value starts with `$` or `$(`. Variables inside literal text are readable. */
+const isGhQueryUnreadable = (tokens: string[], normal: string): boolean =>
+  tokens.some((token) => token.startsWith('query=@') || token === '--input') || /query=\$/.test(normal)
+
+const BODY_FLAGS = ['-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--json']
+
+/** `curl` body flags: the body is unreadable when it comes from a file or starts with `$`. */
+function isCurlBodyUnreadable(tokens: string[]): boolean {
+  for (let at = 0; at < tokens.length; at++) {
+    const token = tokens[at] ?? ''
+    const attached = BODY_FLAGS.find((flag) => token.startsWith(flag) && token.length > flag.length)
+    const value = BODY_FLAGS.includes(token) ? tokens[at + 1] : attached === undefined ? undefined : token.slice(attached.length).replace(/^=/, '')
+    if (value !== undefined && (value.startsWith('@') || value.startsWith('$'))) return true
+  }
+  return false
+}
+
+function readCurl(tokens: string[], curl: number, normal: string, cwd: string | undefined): PrAction | undefined {
+  const rest = tokens.slice(curl + 1)
+  if (rest.some((token) => /\/graphql\/?(?:\?.*)?$/.test(token))) return readGraphql(normal, isCurlBodyUnreadable(rest), 'curl graphql', cwd)
+  const hasBody = rest.some((token) => /^(-d|--data|--json)/.test(token))
+  return readRest(rest, 'curl', ['-X', '--request'], hasBody, cwd)
 }
 
 function readSegment(segment: string, normal: string, cwd: string | undefined): PrAction | undefined {
   const tokens = segment.split(' ')
+  const first = (tokens[0] ?? '').split('/').pop()?.toLowerCase() ?? ''
+  if (PROSE_COMMANDS.includes(first)) return undefined
   const gh = tokens.findIndex((token) => isCommand(token, 'gh'))
   if (gh >= 0) {
-    const pr = readGhPr(tokens, gh, cwd)
-    if (pr !== undefined) return pr
-    const api = tokens.indexOf('api', gh + 1)
-    if (api >= 0) {
-      if (tokens.indexOf('graphql', api + 1) >= 0) return readGraphql(normal, tokens, cwd)
-      return readRest(tokens.slice(api + 1), 'gh api', ['-X', '--method'], hasFieldFlag(tokens), cwd)
+    const subject = ghSubject(tokens, gh)
+    const word = subject < 0 ? '' : (tokens[subject] ?? '')
+    if (word === 'pr') return readGhPr(tokens, subject, cwd)
+    if (word === 'api') {
+      if (tokens.indexOf('graphql', subject + 1) >= 0) return readGraphql(normal, isGhQueryUnreadable(tokens, normal), 'gh api graphql', cwd)
+      return readRest(tokens.slice(subject + 1), 'gh api', ['-X', '--method'], hasFieldFlag(tokens), cwd)
     }
   }
   const curl = tokens.findIndex((token) => isCommand(token, 'curl'))
-  if (curl >= 0 && segment.includes('api.github.com')) {
-    const hasBody = tokens.some((token) => /^(-d|--data|--json)/.test(token))
-    const rest = readRest(tokens.slice(curl + 1), 'curl', ['-X', '--request'], hasBody, cwd)
-    if (rest !== undefined) return rest
+  if (curl >= 0) {
+    const found = readCurl(tokens, curl, normal, cwd)
+    if (found !== undefined) return found
   }
   const hub = tokens.findIndex((token) => isCommand(token, 'hub'))
   if (hub >= 0 && tokens.indexOf('pull-request', hub + 1) >= 0) return { action: 'create', via: 'hub pull-request', cwd }
@@ -390,64 +457,78 @@ function readBash(command: string): PrAction | undefined {
 const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
 const MAX_PLAIN = 120
 
-/** Every key and every short string value, however nested. A GraphQL `query` is always kept; long prose (a PR body) is not. */
-function flatten(value: unknown, key: string | undefined, out: string[], depth: number): void {
+/** Camel case split, punctuation to spaces, lowercase: `mergePullRequest` and `merge_pull_request` read the same. */
+const wordsOf = (text: string): string =>
+  text
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[^A-Za-z0-9]+/g, ' ')
+    .toLowerCase()
+
+const PRIMARY_KEYS = ['action', 'method', 'operation', 'op']
+const SECONDARY_KEYS = ['command', 'type', 'name', 'tool', 'mode']
+
+/** What a call's input structurally says. Free text (titles, bodies, messages, paths to files) is never read, except for mutation names. */
+type Shape = {
+  /** Every string value, whatever its length or key: only searched for mutation names. */
+  strings: string[]
+  keys: string[]
+  /** Values under action, method, operation and op. */
+  primary: string[]
+  /** Values under command, type, name, tool and mode: they count only when no primary key is present. */
+  secondary: string[]
+  /** Values that parse as a REST path to the pulls API. */
+  paths: PullsPath[]
+  method: string
+}
+
+function shapeOf(value: unknown, key: string | undefined, shape: Shape, depth: number): void {
   if (depth > 8) return
   if (typeof value === 'string') {
-    if (value.length <= MAX_PLAIN || key === 'query') out.push(value)
+    shape.strings.push(value)
+    const lower = (key ?? '').toLowerCase()
+    if (value.length <= MAX_PLAIN) {
+      if (PRIMARY_KEYS.includes(lower)) shape.primary.push(value)
+      else if (SECONDARY_KEYS.includes(lower)) shape.secondary.push(value)
+      const path = pullsPathIn(value)
+      if (path !== undefined) shape.paths.push(path)
+      if (lower === 'method' && shape.method === '') shape.method = value.toUpperCase()
+    }
   } else if (Array.isArray(value)) {
-    for (const one of value) flatten(one, key, out, depth + 1)
+    for (const one of value) shapeOf(one, key, shape, depth + 1)
   } else if (typeof value === 'object' && value !== null) {
     for (const [name, one] of Object.entries(value)) {
-      out.push(name)
-      flatten(one, name, out, depth + 1)
+      shape.keys.push(name)
+      shapeOf(one, name, shape, depth + 1)
     }
   }
 }
 
-/** Camel case split, punctuation to spaces, lowercase: `mergePullRequest` and `merge_pull_request` read the same. */
-function wordsOf(tool: string, input: Record<string, unknown>): string {
-  const parts: string[] = [tool]
-  flatten(input, undefined, parts, 0)
-  return parts
-    .join(' ')
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/[^A-Za-z0-9]+/g, ' ')
-    .toLowerCase()
-}
-
-const OPERATION_KEYS = ['action', 'method', 'operation', 'op', 'command', 'type', 'name', 'tool', 'mode']
-
-/** The tool name and the values of keys that name an operation: the only places `open` and `new` read as verbs (`state: 'open'` is a filter). */
-function operationWords(tool: string, input: unknown, key: string | undefined, out: string[], depth: number): void {
-  if (depth > 8) return
-  if (typeof input === 'string') {
-    if (key !== undefined && OPERATION_KEYS.includes(key.toLowerCase()) && input.length <= MAX_PLAIN) out.push(input)
-  } else if (Array.isArray(input)) {
-    for (const one of input) operationWords(tool, one, key, out, depth + 1)
-  } else if (typeof input === 'object' && input !== null) {
-    for (const [name, one] of Object.entries(input)) operationWords(tool, one, name, out, depth + 1)
-  }
-}
-
-const namedOperation = (tool: string, input: Record<string, unknown>): string => {
-  const parts: string[] = [tool]
-  operationWords(tool, input, undefined, parts, 0)
-  return parts.join(' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[^A-Za-z0-9]+/g, ' ').toLowerCase()
-}
-
 const MERGE_WORDS = /\b(merge|enqueue|automerge)\b/
-const CREATE_WORDS = /\b(create|submit)\b/
-const OPEN_WORDS = /\b(open|new)\b/
-const PR_WORDS = /\b(pull|pulls|pr|prs)\b/
+const CREATE_WORDS = /\b(create|new|open|submit)\b/
+const PR_WORDS = /\b(pull|pulls|pr|prs|pullrequests?)\b/
 const REVIEW_WORDS = /\b(reviews?|comments?)\b/
 
 function readUnknownTool(tool: string, input: Record<string, unknown>, repo: string | undefined): PrAction | undefined {
-  const said = wordsOf(tool, input)
-  if (!PR_WORDS.test(said)) return undefined
-  if (MERGE_WORDS.test(said)) return { action: 'merge', via: tool, number: num(input.number ?? input.pullNumber ?? input.pull_number), repo, isUnknown: true }
-  const isCreate = CREATE_WORDS.test(said) || OPEN_WORDS.test(namedOperation(tool, input))
-  if (isCreate && !REVIEW_WORDS.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
+  const shape: Shape = { strings: [], keys: [], primary: [], secondary: [], paths: [], method: '' }
+  shapeOf(input, undefined, shape, 0)
+  const number = num(input.number ?? input.pullNumber ?? input.pull_number)
+  const create = (): PrAction => ({ action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true })
+  const merge = (): PrAction => ({ action: 'merge', via: tool, number, repo, isUnknown: true })
+
+  const mutation = mutationIn(shape.strings.join(' '))
+  if (mutation === 'merge') return merge()
+
+  const name = wordsOf(tool.split('__').pop() ?? '')
+  const operation = wordsOf((shape.primary.length > 0 ? shape.primary : shape.secondary).join(' '))
+  const path = shape.paths[0]
+  const isWrite = shape.method === 'POST' || shape.method === 'PUT'
+  const hasPr = PR_WORDS.test(name) || PR_WORDS.test(operation) || PR_WORDS.test(wordsOf(shape.keys.join(' '))) || path !== undefined
+  if (hasPr && (MERGE_WORDS.test(name) || MERGE_WORDS.test(operation) || (path?.isMerge === true && isWrite))) {
+    return { ...merge(), number: path?.number ?? number, repo: path?.repo ?? repo }
+  }
+  if (mutation === 'create') return create()
+  const isCreateVerb = CREATE_WORDS.test(`${name.split(' ')[0] ?? ''}`) || CREATE_WORDS.test(operation) || (path !== undefined && !path.isMerge && isWrite)
+  if (hasPr && isCreateVerb && !REVIEW_WORDS.test(`${name} ${operation}`)) return { ...create(), repo: path?.repo ?? repo }
   return undefined
 }
 
@@ -470,7 +551,15 @@ function readKnownTool(tool: string, input: Record<string, unknown>, repo: strin
   return undefined
 }
 
-/** Whether a tool call opens or merges a pull request, on any route this mod can see. Unknown GitHub tools fail closed. */
+/**
+ * Whether a tool call opens or merges a pull request, on any route this mod can see. Unknown GitHub tools fail closed.
+ *
+ * Residual risk, what text matching cannot see:
+ * - shell indirection (`g=gh; $g ...`, `$(which gh)`)
+ * - scripts and package-manager scripts that call gh
+ * - a segment that starts with `git`, `echo`, `cat` and so on and hides a command (for example `git -c alias.x='!gh pr ...' x`)
+ * - REST calls from other tools (`http`, `wget`, language one-liners)
+ */
 export function readPrAction(tool: string, input: Record<string, unknown>): PrAction | undefined {
   if (tool === 'Bash') return typeof input.command === 'string' ? readBash(input.command) : undefined
   const owner = str(input.owner)
