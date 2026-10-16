@@ -732,7 +732,9 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   }
   const asked = [...listedIds, ...carried.map(one => one.id)]
   if (asked.length === 0 && others.length === 0) {
-    await endRound($, run, true)
+    const rebuttals = rebuttedSecurity(run, rec)
+    if (rebuttals.length > 0) await checkRebuttals($, run, rebuttals)
+    else await endRound($, run, true)
     return
   }
   const count = asked.length
@@ -777,12 +779,17 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
     .catch(() => undefined)
 }
 
-/** Security blockers this round's triage rebutted: a rebuttal alone never settles one (R36). */
-const rebuttedSecurity = (run: Run): Finding[] =>
-  run.findings.filter(one => {
+/**
+ * Security blockers the main agent rebutted after the PR opened that Codex has not checked: a rebuttal alone never
+ * settles one (R36). A check that was held, then resumed, finds them again here.
+ */
+const rebuttedSecurity = (run: Run, rec: Pick<LifecycleRecord, 'rounds'>): Finding[] => {
+  const firstPost = Math.min(run.round, ...rec.rounds.filter(one => one.phase === 'post').map(one => one.n))
+  return run.findings.filter(one => {
     const last = one.history.at(-1)
-    return isBlocking(one) && one.isSecurity === true && one.status === 'rebutted' && last?.round === run.round && last.by === 'main'
+    return isBlocking(one) && one.isSecurity === true && one.status === 'rebutted' && last !== undefined && last.round >= firstPost && last.by === 'main'
   })
+}
 
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
@@ -881,13 +888,8 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   const ended = await getRun($)
   if (ended === null || ended.id !== run.id || ended.status !== 'running') return
-  const rebuttals = rebuttedSecurity(ended)
+  const rebuttals = rebuttedSecurity(ended, rec)
   if (rebuttals.length > 0) {
-    // Codex reads the checkout: it must be the head the rebuttal is about.
-    if (local.out !== endHead) {
-      await failPost($, ended, `the local checkout is behind the PR head ${endHead.slice(0, 7)}: pull, then pr-gate resume`)
-      return
-    }
     await checkRebuttals($, { ...ended, headSha: endHead }, rebuttals)
     return
   }
@@ -897,9 +899,16 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
 /** Codex checks the round's security rebuttals on the same head (R36); it spends no round. */
 async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]): Promise<void> {
   const now = await $.clock.now()
+  // Codex reads the checkout: it must be the head the rebuttal is about.
+  const local = await git($, run.root, ['rev-parse', 'HEAD'])
+  if (!local.isOk || local.out !== run.headSha) {
+    await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then pr-gate resume`)
+    return
+  }
   const opened = await patch($, run.id, one => ({
     ...one,
     headSha: run.headSha,
+    rechecks: rebuttals.map(each => each.id),
     phase: 'verify',
     phaseStartedAt: now,
     pending: [],
@@ -918,7 +927,7 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
 
 /** Codex could not check a security rebuttal: the merge is held, never ready on the rebuttal alone (R36). */
 async function holdPost($: Engine, run: Run, why: string): Promise<void> {
-  const ids = rebuttedSecurity(run).map(one => one.id).join(', ') || 'the rebutted security findings'
+  const ids = (run.rechecks ?? []).join(', ') || 'the rebutted security findings'
   const nextStep = `run pr-gate resume to have Codex check the rebuttal of ${ids} again, or fix ${ids} and push`
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
@@ -937,7 +946,7 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
     return
   }
   const verdict = readVerify(answer)
-  const checked = new Set(rebuttedSecurity(run).map(one => one.id))
+  const checked = new Set(run.rechecks ?? [])
   const after = await patch($, run.id, one => ({
     ...one,
     pending: [],

@@ -1014,3 +1014,17 @@ test('a ready record that is no longer ready goes back to post', async ($, on) =
   await $.command.run(cmd('resume'))
   expect((await recordOf(w)).phase).toBe('post')
 })
+
+test('R36: after a held rebuttal check, a resumed round checks the rebuttal again before ready', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await w.clock.advance(2 * 60_000)
+  expect((await recordOf(w)).postStatus).toBe('blocked')
+  const spawned = w.spawned.length
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect((await runOf(w)).phase).toBe('verify')
+})

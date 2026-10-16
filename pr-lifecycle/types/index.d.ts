@@ -176,6 +176,8 @@ export type Run = {
   triaged?: string[]
   /** Post-PR: the finding ids the triage step was asked to answer (fresh, Codex's, carried). */
   asked?: string[]
+  /** Post-PR: the security rebuttals Codex is checking (R36). */
+  rechecks?: string[]
   hasRefixed: boolean
   /** The fix step was asked once more about findings it left without an answer (it costs no round). */
   hasReprompted?: boolean
