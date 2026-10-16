@@ -587,7 +587,9 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     await beginReview($, run.id) // the Codex fallback: reviewPrompt reads run.diffBase (the last reviewed head)
     return
   }
-  if (!isCovered) {
+  // Nobody covered the head and Codex was skipped (a pass-through's round 1): fresh findings still go to triage;
+  // only a round with nothing to triage ends here.
+  if (!isCovered && !hasFindings) {
     await noteAttempt($, after, `no reviewer covered ${got.prHead.slice(0, 7)} within the wait cap`)
     await finish($, run.id, 'error', `No reviewer covered ${got.prHead.slice(0, 7)} within the wait cap. Run /pr-gate resume to wait again.`)
     return

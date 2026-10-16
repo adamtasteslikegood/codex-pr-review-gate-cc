@@ -635,13 +635,47 @@ test('a new head mid-collection restarts the quiet period', async ($, on) => {
   await toPost($, w)
   w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
   await w.clock.advance(4 * 60_000)
-  expect((await runOf(w)).phase).toBe('collect')
-  // A push: the new head has no checks registered yet.
+  const before = await runOf(w)
+  expect(before.phase).toBe('collect')
+  // Nothing arrived for longer than the quiet period: only the pending check keeps collection open.
+  const lastArrivalAt = before.collect?.lastArrivalAt ?? 0
+  expect(before.collect?.polledAt ?? 0).toBeGreaterThanOrEqual(lastArrivalAt + 3 * 60_000)
+  // A push: the new head has no checks registered yet, so by the old quiet period collection would end on this poll.
   w.gh.prHead = 'b'.repeat(40)
   w.git.head = 'b'.repeat(40)
   w.gh.checks = []
   await w.clock.advance(30_000)
-  expect((await runOf(w)).phase).toBe('collect')
+  const after = await runOf(w)
+  expect(after.phase).toBe('collect')
+  expect(after.roundStartHead).toBe('b'.repeat(40))
+  expect(after.collect?.lastArrivalAt ?? 0).toBeGreaterThan(lastArrivalAt)
+  expect(w.spawned.filter(one => one.prompt.includes('after it opened'))).toHaveLength(0)
+})
+
+test('a pass-through round whose only feedback is a human comment sends it to triage, not to an error', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  expect((await recordOf(w)).passThrough).toBeDefined()
+  w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'This paragraph contradicts the API docs.', created_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(20 * 60_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.phase).toBe('triage')
+  expect(run.triaged).toEqual(['comment:31'])
+  expect(w.spawned).toHaveLength(0)
+})
+
+test('at the wait cap with nobody covering the head, fresh findings still go to triage', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  w.git.roster = '{"reviewers":["copilot"],"checks":[]}'
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  w.gh.issueComments = [{ id: 32, user: { login: 'alice' }, body: 'Typo in the heading.', created_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.phase).toBe('triage')
 })
 
 test('when Codex also runs, the round keeps the GitHub evidence', async ($, on) => {
