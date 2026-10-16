@@ -4,6 +4,9 @@ import type { Finding } from '../types'
 import {
   allowanceFor,
   applyAnswer,
+  decideNext,
+  invalidate,
+  lastReviewedHead,
   markHeld,
   markVerified,
   mayStartRound,
@@ -125,4 +128,83 @@ test('unresolved blockers: open ones, and a deferred security P1, unless the per
   const waivers = [{ scope: 'finding' as const, findingId: 'B', head: 'a', reason: 'accepted', by: 'person', at: 1 }]
   expect(unresolvedBlockers({ findings, waivers }).map(one => one.id)).toEqual(['A'])
   expect(verificationOwed({ findings, waivers: [] }).map(one => one.id)).toEqual(['E'])
+})
+
+const pre = (over: Partial<Parameters<typeof roundOf>[0]> = {}) => roundOf({ phase: 'pre', kind: 'discretionary', ...over })
+const post = (over: Partial<Parameters<typeof roundOf>[0]> = {}) => roundOf({ phase: 'post', kind: 'baseline', ...over })
+const at = (rounds: ReturnType<typeof roundOf>[], over: object = {}) => ({ ...fresh(), rounds, head: rounds.at(-1)?.endHead ?? 'a', ...over })
+
+test('pre-PR: nothing raised opens the PR; a blocker with allowance left runs another round', async () => {
+  expect(decideNext(at([]))).toEqual({ kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' })
+  expect(decideNext(at([pre()]))).toEqual({ kind: 'open-pr', status: 'passed' })
+  // A commit after the pass is a new head: it is reviewed again.
+  expect(decideNext(at([pre()], { head: 'z' }))).toMatchObject({ kind: 'round', phase: 'pre' })
+  const blocked = pre({ raised: { blocking: 1, advisory: 0 }, endHead: 'b' })
+  expect(decideNext(at([blocked]))).toMatchObject({ kind: 'round', phase: 'pre', isAdvisory: false })
+  expect(decideNext(at([blocked, blocked, blocked, blocked]))).toEqual({ kind: 'open-pr', status: 'exhausted' })
+})
+
+test('pre-PR: a pass-through with no allowance opens the PR without a round', async () => {
+  expect(decideNext(at([], { allowance: 0, tier: 'trivial', passThrough: 'docs only' }))).toEqual({ kind: 'open-pr', status: 'passed' })
+})
+
+test('pre-PR: advisories go back to Codex only after new commits and while the reserve holds', async () => {
+  const fixedAdvisories = pre({ raised: { blocking: 0, advisory: 2 }, endHead: 'b' })
+  expect(decideNext(at([fixedAdvisories]))).toMatchObject({ kind: 'round', isAdvisory: true })
+  const rebuttedOnly = pre({ raised: { blocking: 0, advisory: 2 }, rebutted: 2 })
+  expect(decideNext(at([rebuttedOnly]))).toEqual({ kind: 'open-pr', status: 'passed' })
+  expect(decideNext(at([pre(), pre(), pre(), fixedAdvisories]))).toEqual({ kind: 'open-pr', status: 'passed' })
+})
+
+test('pre-PR: a deferred blocker or a fixer who did nothing blocks for a decision', async () => {
+  expect(decideNext(at([pre({ raised: { blocking: 1, advisory: 0 }, deferredBlocking: 1, endHead: 'b' })])).kind).toBe('blocked')
+  expect(decideNext(at([pre({ raised: { blocking: 1, advisory: 0 } })])).kind).toBe('blocked')
+})
+
+test('post-PR baseline: round 1 always, round 2 only when round 1 changed the head', async () => {
+  const opened = { phase: 'post' as const }
+  expect(decideNext(at([pre()], opened))).toEqual({ kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' })
+  expect(decideNext(at([pre(), post()], opened))).toEqual({ kind: 'ready' })
+  expect(decideNext(at([pre(), post({ endHead: 'b' })], opened))).toMatchObject({ kind: 'round', roundKind: 'baseline' })
+})
+
+test('post-PR: the baseline runs even with the allowance spent', async () => {
+  const spent = [pre(), pre(), pre(), pre({ raised: { blocking: 1, advisory: 0 }, endHead: 'b' })]
+  expect(decideNext(at(spent, { phase: 'post' }))).toMatchObject({ kind: 'round', roundKind: 'baseline' })
+})
+
+test('post-PR: an unreviewed head after the baseline gets a discretionary round, or the final-head check when spent', async () => {
+  const baseline = [post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' })]
+  expect(decideNext(at(baseline, { phase: 'post' }))).toMatchObject({ kind: 'round', roundKind: 'discretionary', scope: 'full' })
+  expect(decideNext(at(baseline, { phase: 'post', allowance: 0 }))).toMatchObject({ kind: 'round', roundKind: 'final-head-check', scope: 'delta' })
+})
+
+test('post-PR: the final-head check never certifies a head it did not review clean', async () => {
+  const check = post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'c', raised: { blocking: 1, advisory: 0 } })
+  const rec = at([post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' }), check], {
+    phase: 'post',
+    allowance: 0,
+    findings: [finding({ id: 'R3-1', round: 3, status: 'open' })],
+  })
+  expect(decideNext(rec).kind).toBe('exhausted')
+})
+
+test('post-PR: a push after ready or exhaustion continues the lifecycle on the new head', async () => {
+  const done = [post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })]
+  expect(decideNext(at(done, { phase: 'ready', head: 'b' }))).toEqual({ kind: 'ready' })
+  expect(decideNext(at(done, { phase: 'ready', head: 'c' }))).toMatchObject({ kind: 'round', phase: 'post', roundKind: 'discretionary' })
+  expect(decideNext(at(done, { phase: 'post', postStatus: 'exhausted', head: 'c', allowance: 0 }))).toMatchObject({ kind: 'round', roundKind: 'final-head-check' })
+})
+
+test('post-PR: a reported fix owed verification keeps the lifecycle from ready', async () => {
+  const rec = at([post()], { phase: 'post', findings: [finding({ status: 'reported-fixed' })] })
+  expect(decideNext(rec)).toMatchObject({ kind: 'round' })
+})
+
+test('coverage: a change touching a file flags only the answered findings in it', async () => {
+  const findings = [finding({ status: 'rebutted' }), finding({ id: 'R1-2', file: 'src/other.ts', status: 'rebutted' }), finding({ id: 'R1-3', status: 'open' })]
+  expect(invalidate(findings, new Set(['src/app.ts'])).map(one => one.needsRecheck === true)).toEqual([true, false, false])
+  // A rebase that lost the reviewed commit: every answered finding is rechecked.
+  expect(invalidate(findings, 'all').map(one => one.needsRecheck === true)).toEqual([true, true, false])
+  expect(lastReviewedHead({ rounds: [pre({ endHead: 'b' }), pre({ isCompleted: false, endHead: 'z' })] })).toBe('b')
 })

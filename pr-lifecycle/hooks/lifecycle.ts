@@ -1,7 +1,7 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundRecord, Severity, Tier } from '../types'
+import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Tier } from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -186,4 +186,103 @@ export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waiv
 export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
   return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && one.status === 'reported-fixed')
+}
+
+// --------------------------------------------------------------- coverage
+
+/** The head the last completed round left behind: what review evidence covers. */
+export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
+  rec.rounds.filter(one => one.isCompleted).at(-1)?.endHead
+
+/** Answered findings whose file changed: their evidence must be checked again. History stays. */
+export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
+  return findings.map(one =>
+    one.status !== 'open' && (changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))) ? { ...one, needsRecheck: true } : one,
+  )
+}
+
+// --------------------------------------------------------------- the next step
+
+export type Next =
+  | { kind: 'round'; phase: 'pre' | 'post'; roundKind: RoundKind; isAdvisory: boolean; scope: 'full' | 'delta' }
+  | { kind: 'open-pr'; status: 'passed' | 'exhausted' }
+  | { kind: 'ready' }
+  | { kind: 'exhausted'; why: string; nextStep: string }
+  | { kind: 'blocked'; why: string; nextStep: string }
+
+const ids = (findings: readonly Finding[]): string => findings.map(one => one.id).join(', ')
+
+function decidePre(rec: LifecycleRecord): Next {
+  const last = rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).at(-1)
+  if (last === undefined) {
+    return rec.allowance + rec.grants.reduce((sum, one) => sum + one.n, 0) > 0
+      ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+      : { kind: 'open-pr', status: 'passed' }
+  }
+  // Commits since the last completed round: the new head needs its own review.
+  if (rec.head !== last.endHead) {
+    return mayStartRound(rec, false)
+      ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+      : { kind: 'open-pr', status: 'exhausted' }
+  }
+  const isChanged = last.endHead !== last.startHead
+  if (last.deferredBlocking > 0) {
+    return { kind: 'blocked', why: 'a blocking finding was deferred: its fix reaches past this branch', nextStep: '/pr-gate waive <findingId> <reason>, or widen the branch and run /pr-gate' }
+  }
+  if (last.raised.blocking === 0) {
+    // Advisories go back to Codex only for new commits, and only while a round stays in reserve.
+    return last.raised.advisory > 0 && isChanged && mayStartRound(rec, true)
+      ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: true, scope: 'full' }
+      : { kind: 'open-pr', status: 'passed' }
+  }
+  if (!isChanged && last.rebutted === 0) {
+    return { kind: 'blocked', why: 'the fixer changed nothing and rebutted nothing, so another round would say the same', nextStep: 'fix or rebut the open findings, then /pr-gate resume' }
+  }
+  return mayStartRound(rec, false)
+    ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+    : { kind: 'open-pr', status: 'exhausted' }
+}
+
+function decidePost(rec: LifecycleRecord): Next {
+  const done = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
+  const last = done.at(-1)
+  if (last === undefined) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
+  const isChanged = last.endHead !== last.startHead
+  const unresolved = unresolvedBlockers(rec)
+  const owed = verificationOwed(rec)
+  // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
+  if (rec.head !== last.endHead) {
+    return mayStartRound(rec, false)
+      ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+      : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
+  }
+  if (last.kind === 'final-head-check') {
+    if (!isChanged && unresolved.length === 0 && owed.length === 0) return { kind: 'ready' }
+    return {
+      kind: 'exhausted',
+      why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
+      nextStep: unresolved.length > 0 ? `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>` : '/pr-gate allow 1 <reason>',
+    }
+  }
+  // The protected baseline: a second round whenever the first one changed the head, by anyone.
+  if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
+  if (isChanged || owed.length > 0) {
+    return mayStartRound(rec, false)
+      ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+      : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
+  }
+  if (unresolved.length === 0) return { kind: 'ready' }
+  if (unresolved.some(one => one.status === 'deferred')) {
+    return { kind: 'blocked', why: `${ids(unresolved)} deferred, and a security P1 needs your decision`, nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>` }
+  }
+  return mayStartRound(rec, false)
+    ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+    : { kind: 'exhausted', why: `${ids(unresolved)} unresolved and the review allowance is spent`, nextStep: `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>` }
+}
+
+/** What the controller does after a round, from the record alone. Exhaustion is never a pass. */
+export function decideNext(rec: LifecycleRecord): Next {
+  // Ready holds only for the head it was reached at: a later push continues the lifecycle.
+  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec)) return { kind: 'ready' }
+  return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
 }
