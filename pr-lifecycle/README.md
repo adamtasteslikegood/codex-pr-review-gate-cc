@@ -246,7 +246,9 @@ All fields are optional; the repository's values override the plugin options.
 
 Only feedback from someone with write access to the repository (GitHub's
 author association `OWNER`, `MEMBER` or `COLLABORATOR`) or on the roster
-(`reviewers` or `requestReview`, so a review bot counts) is read; anyone
+(`reviewers` by exact login, or `requestReview` by name, where a name also
+matches the `[bot]` login posting for it, so `copilot` keeps
+`copilot-pull-request-reviewer[bot]`) is read; anyone
 else's comment is dropped before triage and covers no head. A row that does
 not say its author association is kept.
 

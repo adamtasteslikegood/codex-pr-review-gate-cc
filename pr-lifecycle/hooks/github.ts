@@ -173,7 +173,19 @@ export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
   one.association === undefined ||
   WRITERS.includes(one.association) ||
   roster?.reviewers.includes(one.reviewer) === true ||
-  roster?.requestReview.includes(one.reviewer) === true
+  roster?.requestReview.some(name => postsFor(one.reviewer, name)) === true
+
+/**
+ * Whether a login posts for a `requestReview` name (F3): the name itself, or a GitHub App bot whose login, `[bot]` dropped, is the
+ * name or starts with `<name>-` (`copilot` posts as `copilot-pull-request-reviewer[bot]`). Only a `[bot]` login, which no person can
+ * hold, matches by prefix.
+ */
+const postsFor = (login: string, name: string): boolean => {
+  if (login === name) return true
+  if (!login.endsWith('[bot]')) return false
+  const stem = login.slice(0, -'[bot]'.length)
+  return stem === name || stem.startsWith(`${name}-`)
+}
 
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 

@@ -349,3 +349,17 @@ test('R1-8: the author association is read from either spelling, and only write 
   // A row without an association is kept: its text is still fenced.
   expect(isTrusted(one('x'), undefined)).toBe(true)
 })
+
+test('F3: a requestReview name keeps the bot that posts for it, and nothing more', async () => {
+  const [base] = readIssueComments(JSON.stringify([{ id: 3, user: { login: 'c' }, body: 'x', author_association: 'NONE' }]))
+  const by = (reviewer: string): Feedback => ({ ...(base as Feedback), reviewer })
+  const roster = { reviewers: [], checks: [], requestReview: ['copilot'] }
+  expect(isTrusted(by('copilot-pull-request-reviewer[bot]'), roster)).toBe(true)
+  expect(isTrusted(by('copilot[bot]'), roster)).toBe(true)
+  expect(isTrusted(by('copilot'), roster)).toBe(true)
+  // Not over-matched: a human login with the prefix, a longer bot name, a bot whose name only contains it.
+  expect(isTrusted(by('copilot-fan'), roster)).toBe(false)
+  expect(isTrusted(by('copilotx[bot]'), roster)).toBe(false)
+  expect(isTrusted(by('my-copilot[bot]'), roster)).toBe(false)
+  expect(isTrusted(by('copilot-pull-request-reviewer'), roster)).toBe(false)
+})
