@@ -47,6 +47,8 @@ export type World = {
     hasPr: boolean
     /** Every gh call throws, as a broken runtime would. */
     isBroken: boolean
+    /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
+    garbage?: string
     calls: string[]
   }
   /** The run as the mod last wrote it. */
@@ -55,13 +57,14 @@ export type World = {
   store: Map<string, unknown>
   stored: (key: string) => unknown
   /** The test's clock: `advance` moves it, and fires what falls due. */
-  clock?: { advance: (ms: number) => Promise<void> }
+  clock: { advance: (ms: number) => Promise<void> }
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
 
 /** Everything beneath the mod: git, the agents, the main agent's prompt queue. */
 export function world(on: On): World {
+  const clock = mock.clock(on, { now: 1_000 })
   const w: World = {
     spawned: [],
     prompts: [],
@@ -97,8 +100,8 @@ export function world(on: On): World {
     },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
+    clock,
   }
-  w.clock = mock.clock(on, { now: 1_000 })
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_$, e) => {
     w.store.set(e.key, e.value)
@@ -123,6 +126,7 @@ export function world(on: On): World {
       if (w.gh.isBroken) throw new Error('gh broke')
       if (!w.gh.isAuthed) return out('', 4)
       if (args.startsWith('api user')) return out(`${w.gh.self}\n`)
+      if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
         return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: 'OPEN' }))

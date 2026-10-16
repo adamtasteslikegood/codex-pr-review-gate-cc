@@ -1,4 +1,5 @@
 import { expect, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
 import { createPr, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { LifecycleRecord } from '../types'
@@ -474,4 +475,103 @@ test('a merge whose guard fails is held, and the person is offered waive post', 
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('guard failed')
   expect(held).toContain('waive post')
+})
+
+/** Pre-PR passes clean and the PR opens: the lifecycle is collecting post-PR round 1. */
+const toPost = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+}
+
+test('with a roster, collection waits for the listed reviewers, then needs no Codex', async ($, on) => {
+  const w = world(on)
+  const clock = w.clock
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
+  await toPost($, w)
+  await clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  const spawned = w.spawned.length
+  await clock.advance(30_000)
+  // Clean: the round completes with nothing to triage, and no Codex fallback ran.
+  expect(w.spawned).toHaveLength(spawned)
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
+  expect(rec.phase).toBe('ready')
+})
+
+test('when no reviewer covers the head by the wait cap, Codex reviews the delta', async ($, on) => {
+  const w = world(on)
+  // The PR's head is one no review has covered (the pre-PR round reviewed a...a).
+  w.gh.prHead = 'b'.repeat(40)
+  await toPost($, w)
+  await w.clock.advance(20 * 60_000)
+  const last = w.spawned.at(-1)
+  expect(last?.prompt).toContain('codex')
+  expect(last?.prompt).toContain('after it opened')
+  expect((await runOf(w)).phase).toBe('review')
+  expect((await runOf(w)).diffBase).toBe('a'.repeat(40))
+})
+
+test('a head the pre-PR Codex review already covered needs no fallback when no reviewer posts', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const spawned = w.spawned.length
+  await w.clock.advance(20 * 60_000)
+  expect(w.spawned).toHaveLength(spawned)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('gh failing mid-collect records an incomplete attempt, uses no round, and resume continues', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.isAuthed = false
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.attempts).toBe(1)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
+  expect(rec.postStatus).toBe('error')
+  expect((await runOf(w)).message).toContain('gh auth login')
+  // green in Task 13
+  // w.gh.isAuthed = true
+  // const presentation = { isFullscreen: false, columns: 120 }
+  // await $.command.run({ command: 'pr-gate', args: 'resume', origin: { kind: 'composer' }, presentation })
+  // expect((await runOf(w)).phase).toBe('collect')
+  // rec = await recordOf(w)
+  // expect(rec.postStatus).toBeUndefined()
+})
+
+test('gh printing an error page instead of JSON fails the poll closed', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  await toPost($, w)
+  w.gh.garbage = '<html>502</html>'
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.attempts).toBe(1)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
+  expect(rec.postStatus).toBe('error')
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('unreadable output')
+})
+
+test('an adopted PR is judged on its own head, not the local one', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  w.gh.hasPr = true
+  w.gh.prHead = 'c'.repeat(40)
+  await $.command.run(cmd(''))
+  // A review of the local head does not cover the PR's head.
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.git.head, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+  w.gh.reviews = [{ id: 6, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  const round = (await recordOf(w)).rounds.find(one => one.phase === 'post' && one.isCompleted)
+  expect(round?.startHead).toBe('c'.repeat(40))
+  expect(round?.evidence).toEqual([{ source: 'github', reviewer: 'claude[bot]', head: 'c'.repeat(40), isComplete: true }])
 })

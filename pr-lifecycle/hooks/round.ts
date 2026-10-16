@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { Effort, Finding, LifecycleRecord, Pending, Role, RoundRecord, Run, RunStatus, Step } from '../types'
+import type { Effort, Evidence, Finding, LifecycleRecord, Pending, Role, RoundRecord, Run, RunStatus, Step } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -26,7 +26,8 @@ import {
   TRAILER,
   verifyPrompt,
 } from './core'
-import { severityHint } from './github'
+import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
+import type { Check, Feedback, Roster } from './github'
 import {
   applyAnswer,
   decideNext,
@@ -129,6 +130,8 @@ let config: Config = configOf({})
 // Unknown after a reload, so the first event looks; false once no run is on.
 let isLive = true
 let ticker: { cancel: () => void } | undefined
+// One poll at a time: ticks overlap while gh is slow.
+let isPolling = false
 
 export function setup(c: Config): void {
   config = c
@@ -186,6 +189,10 @@ export function startTicker($: Engine): void {
         return
       }
       await update($, tickAtom, () => now)
+      if (run.phase === 'collect') {
+        await poll($, run)
+        return // waiting on reviewers is not a step: no step timeout while collecting
+      }
       if (now - run.phaseStartedAt > config.stepTimeoutMs) {
         const why = `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.`
         if (run.phase === 'review') {
@@ -374,16 +381,192 @@ async function beginVerify($: Engine, id: string, fromSha: string): Promise<void
   await patch($, id, run => ({ ...run, pending: [{ role: 'verify', step: stepOf(run, 'verify'), agentId }], activity: 'waiting on the fix reviewer…' }))
 }
 
-/** Post-PR collection waits for the repository's reviews. Task 11 builds the polling; until then the round waits in collect. */
+const POLL_MS = 30_000
+
+/** Post-PR collection: the ticker polls GitHub every 30 s until the roster, the checks and a quiet spell say it is over, or the wait cap. */
 async function beginCollect($: Engine, id: string): Promise<void> {
   const now = await $.clock.now()
-  await patch($, id, run => ({
+  const opened = await patch($, id, run => ({
     ...run,
     phase: 'collect',
     phaseStartedAt: now,
-    collect: { startedAt: now, lastArrivalAt: now, polledAt: now, headAt: now },
-    activity: 'collecting reviews…',
+    collect: { startedAt: now, lastArrivalAt: now, polledAt: 0, headAt: now },
+    activity: 'waiting on reviewers…',
+    steps: withStep(run.steps, { id: `r${run.round}-collect`, label: `Round ${run.round} · collect reviews (${run.roundKind})`, state: 'running' }),
   }))
+  if (opened === null) return
+  const rec = await loadRecord($, opened.root, opened.branch)
+  // A later post-PR round, on a new head: ask the roster's reviewers to look again.
+  if (rec !== undefined && rec.rounds.some(one => one.phase === 'post' && one.isCompleted) && rec.pr !== undefined && rec.slug !== undefined) {
+    const roster = await rosterOf($, opened.root)
+    for (const who of roster?.requestReview ?? []) {
+      await $.process.run(['gh', 'api', '-X', 'POST', `repos/${rec.slug}/pulls/${rec.pr}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
+        cwd: opened.root,
+        timeoutMs: 30_000,
+      })
+    }
+  }
+  $.ui.status(`pr-gate r${opened.round}: waiting on reviewers`)
+}
+
+async function rosterOf($: Engine, root: string): Promise<Roster | undefined> {
+  const file = await git($, root, ['show', 'HEAD:.github/pr-gate.json'])
+  return file.isOk ? readRoster(file.out) : undefined
+}
+
+async function ghJson($: Engine, root: string, path: string): Promise<{ isOk: boolean; out: string; err: string }> {
+  const ran = await $.process.run(['gh', 'api', '--paginate', path], { cwd: root, timeoutMs: 60_000 })
+  return { isOk: ran.exitCode === 0, out: ran.stdout, err: ran.stderr.trim() || `exit ${ran.exitCode}` }
+}
+
+type Fetched = { isOk: boolean; why?: string; feedback: Feedback[]; checks: Check[]; prHead: string }
+
+/** Everything GitHub holds for the PR now. Only these polls establish that feedback arrived. */
+async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> {
+  const fail = (why: string): Fetched => ({ isOk: false, why, feedback: [], checks: [], prHead: rec.head })
+  if (rec.pr === undefined || rec.slug === undefined) return fail('the PR number or repository is not known')
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid'], { cwd: rec.root, timeoutMs: 30_000 })
+  if (pr.exitCode !== 0) {
+    return fail(`gh could not read PR #${rec.pr} (${pr.stderr.trim().slice(0, 160) || `exit ${pr.exitCode}`}); check gh auth login and the network`)
+  }
+  let prHead: string | undefined
+  try {
+    prHead = (JSON.parse(pr.stdout) as { headRefOid?: unknown } | null)?.headRefOid as string | undefined
+  } catch {
+    prHead = undefined
+  }
+  if (typeof prHead !== 'string' || prHead === '') {
+    return fail(`gh returned unreadable output for PR #${rec.pr} (${pr.stdout.trim().slice(0, 80)}); check gh auth login, rate limits and the network`)
+  }
+  const at = `repos/${rec.slug}`
+  const [reviews, inline, comments, checks] = await Promise.all([
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/comments`),
+    ghJson($, rec.root, `${at}/issues/${rec.pr}/comments`),
+    ghJson($, rec.root, `${at}/commits/${prHead}/check-runs`),
+  ])
+  const bad = [reviews, inline, comments, checks].find(one => !one.isOk)
+  if (bad !== undefined) return fail(`gh api failed (${bad.err.slice(0, 160)}); check gh auth login, rate limits and the network`)
+  // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
+  try {
+    const feedback = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)].filter(
+      one => one.reviewer !== rec.self,
+    )
+    return { isOk: true, feedback, checks: readCheckRuns(checks.out), prHead }
+  } catch (error) {
+    const said = error instanceof Error ? error.message : String(error)
+    return fail(`gh returned unreadable output (${said}); check gh auth login, rate limits and the network`)
+  }
+}
+
+/** One poll of a collecting round: fail closed on gh trouble, else end collection when it is done. */
+async function poll($: Engine, seen: Run): Promise<void> {
+  if (isPolling) return
+  isPolling = true
+  try {
+    await pollOnce($, seen)
+  } finally {
+    isPolling = false
+  }
+}
+
+async function pollOnce($: Engine, seen: Run): Promise<void> {
+  const now = await $.clock.now()
+  // Read again: another tick may have polled since this one read the run.
+  const run = await getRun($)
+  const collect = run?.collect
+  if (run === null || run.id !== seen.id || run.status !== 'running' || run.phase !== 'collect' || collect === undefined) return
+  if (now - collect.polledAt < POLL_MS) return
+  await patch($, run.id, one => ({ ...one, collect: one.collect === undefined ? one.collect : { ...one.collect, polledAt: now } }))
+  const rec = await loadRecord($, run.root, run.branch)
+  if (rec === undefined) return
+  const got = await fetchFeedback($, rec)
+  if (!got.isOk) {
+    await noteAttempt($, run, got.why ?? 'gh failed')
+    await finish($, run.id, 'error', `Post-PR round ${run.round} could not read GitHub: ${got.why ?? 'gh failed'}. Fix that, then /pr-gate resume.`)
+    return
+  }
+  const fresh = got.feedback.filter(one => !rec.processed.includes(one.id))
+  const lastArrivalAt = Math.max(collect.lastArrivalAt, ...fresh.map(one => Math.min(one.at, now)))
+  // The PR's head, not the local one, is what the round covers (an adopted PR, another agent's push).
+  const headAt = got.prHead === run.roundStartHead ? collect.headAt : now
+  const after = await patch($, run.id, one => ({
+    ...one,
+    roundStartHead: got.prHead,
+    collect: { ...collect, polledAt: now, lastArrivalAt: fresh.length > (one.triaged?.length ?? 0) ? now : lastArrivalAt, headAt },
+    triaged: fresh.map(each => each.id),
+  }))
+  if (after === null) return
+  const roster = await rosterOf($, run.root)
+  const done = collectionDone({
+    roster,
+    feedback: got.feedback,
+    checks: got.checks,
+    head: got.prHead,
+    headAt,
+    startedAt: collect.startedAt,
+    lastArrivalAt: after.collect?.lastArrivalAt ?? now,
+    now,
+    quietMs: (roster?.quietMinutes ?? config.quietMs / 60_000) * 60_000,
+    capMs: (roster?.waitCapMinutes ?? config.waitCapMs / 60_000) * 60_000,
+  })
+  if (!done.isDone) {
+    const waiting = done.missing.length > 0 ? `waiting on ${done.missing.join(', ')}` : 'waiting for feedback to go quiet'
+    if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))
+    return
+  }
+  await endCollect($, after, got, done)
+}
+
+/** Collection is over: Codex covers a head nobody reviewed (or verification owed); then the feedback goes to triage. */
+async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<typeof collectionDone>): Promise<void> {
+  const now = await $.clock.now()
+  const rec = await loadRecord($, run.root, run.branch)
+  if (rec === undefined) return
+  const waitMs = now - (run.collect?.startedAt ?? now)
+  const evidence: Evidence[] = done.covered.map(reviewer => ({ source: 'github', reviewer, head: got.prHead, isComplete: done.isComplete }))
+  // Already covered: an earlier completed round holds evidence for this very head (the pre-PR Codex review of it, say).
+  const isCovered = done.covered.length > 0 || rec.rounds.some(one => one.isCompleted && one.evidence.some(each => each.head === got.prHead))
+  const owesVerification = verificationOwed(rec).length > 0
+  const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
+  const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
+  const after = await patch($, run.id, one => ({
+    ...one,
+    waitMs: one.waitMs + waitMs,
+    evidence,
+    headSha: got.prHead,
+    collect: undefined,
+    steps: withStep(one.steps, {
+      id: `r${one.round}-collect`,
+      label: `Round ${one.round} · collect reviews (${one.roundKind})`,
+      state: 'done',
+      detail: `${done.covered.length} reviewer${done.covered.length === 1 ? '' : 's'}${done.isComplete ? '' : `, missing ${done.missing.join(', ')}`}`,
+    }),
+  }))
+  if (after === null) return
+  if (run.roundKind === 'final-head-check' || ((!isCovered || owesVerification) && !isPassThroughRound1)) {
+    await beginReview($, run.id) // the Codex fallback: reviewPrompt reads run.diffBase (the last reviewed head)
+    return
+  }
+  if (!isCovered) {
+    await noteAttempt($, after, `no reviewer covered ${got.prHead.slice(0, 7)} within the wait cap`)
+    await finish($, run.id, 'error', `No reviewer covered ${got.prHead.slice(0, 7)} within the wait cap. Run /pr-gate resume to wait again.`)
+    return
+  }
+  await beginTriage($, after, hasFindings)
+}
+
+/**
+ * Task 12 builds triage. Until then (ruling R3): feedback that raises nothing (approvals, empty reviews)
+ * ends the round clean; anything else waits in triage.
+ */
+async function beginTriage($: Engine, run: Run, hasFindings: boolean): Promise<void> {
+  if (!hasFindings) {
+    await endRound($, run, true)
+    return
+  }
+  const now = await $.clock.now()
+  await patch($, run.id, one => ({ ...one, phase: 'triage', phaseStartedAt: now, activity: 'triage is not built yet' }))
 }
 
 /**
@@ -523,7 +706,8 @@ async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
         startHead: run.roundStartHead,
         endHead: run.headSha,
         isCompleted: false,
-        activeMs: now - run.phaseStartedAt,
+        activeMs: run.phase === 'collect' ? 0 : now - run.phaseStartedAt,
+        waitMs: run.waitMs + (run.phase === 'collect' && run.collect !== undefined ? now - run.collect.startedAt : 0),
         outstanding: why,
         startedAt: run.roundStartedAt,
         endedAt: now,
@@ -705,6 +889,12 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   // Whether Codex re-reviews an advisory fix before the PR opens is the controller's call (reserve rule);
   // otherwise the free post-PR baseline round reviews that head.
   const toFix = after.findings.filter(one => raisedIn(one, after.round) && one.status === 'open')
+  if (after.lifecycle === 'post') {
+    // The final-head check only reviews: no fix step. Otherwise the main agent answers Codex and GitHub together in triage.
+    if (after.roundKind === 'final-head-check') await endRound($, after, true)
+    else await beginTriage($, after, toFix.length > 0 || (after.triaged?.length ?? 0) > 0) // Task 12 reads the feedback itself
+    return
+  }
   if (toFix.length > 0) {
     await beginFix($, run.id, undefined, toFix.some(isBlocking) ? 'blocking' : 'advisory')
     return
