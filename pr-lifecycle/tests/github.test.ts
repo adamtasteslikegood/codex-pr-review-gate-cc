@@ -210,6 +210,13 @@ test('mcp: renamed, re-cased and nested calls still hold', async () => {
   expect(readPrAction('mcp__acme-github__tool', { args: { inner: [{ op: 'merge_pull_request' }] } })).toMatchObject({ action: 'merge' })
 })
 
+test('mcp: open and new are create verbs only where they name the operation', async () => {
+  expect(readPrAction('mcp__plugin_github_github__list_pull_requests', { state: 'open', owner: 'o', repo: 'r' })).toBeUndefined()
+  expect(readPrAction('mcp__claude_ai_github-graphql-mcp__manage_pull_requests', { action: 'list', state: 'OPEN' })).toBeUndefined()
+  expect(readPrAction('mcp__github__pulls', { action: 'open', title: 't' })).toMatchObject({ action: 'create', isUnknown: true })
+  expect(readPrAction('mcp__github__open_pull_request', { title: 't' })).toMatchObject({ action: 'create', isUnknown: true })
+})
+
 test('mcp: reads, reviews and long prose stay free', async () => {
   expect(readPrAction('mcp__plugin_github_github__pull_request_read', { method: 'get', pullNumber: 1 })).toBeUndefined()
   expect(readPrAction('mcp__acme-github__list_merged', {})).toBeUndefined()

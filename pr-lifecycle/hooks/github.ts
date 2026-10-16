@@ -416,8 +416,29 @@ function wordsOf(tool: string, input: Record<string, unknown>): string {
     .toLowerCase()
 }
 
+const OPERATION_KEYS = ['action', 'method', 'operation', 'op', 'command', 'type', 'name', 'tool', 'mode']
+
+/** The tool name and the values of keys that name an operation: the only places `open` and `new` read as verbs (`state: 'open'` is a filter). */
+function operationWords(tool: string, input: unknown, key: string | undefined, out: string[], depth: number): void {
+  if (depth > 8) return
+  if (typeof input === 'string') {
+    if (key !== undefined && OPERATION_KEYS.includes(key.toLowerCase()) && input.length <= MAX_PLAIN) out.push(input)
+  } else if (Array.isArray(input)) {
+    for (const one of input) operationWords(tool, one, key, out, depth + 1)
+  } else if (typeof input === 'object' && input !== null) {
+    for (const [name, one] of Object.entries(input)) operationWords(tool, one, name, out, depth + 1)
+  }
+}
+
+const namedOperation = (tool: string, input: Record<string, unknown>): string => {
+  const parts: string[] = [tool]
+  operationWords(tool, input, undefined, parts, 0)
+  return parts.join(' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[^A-Za-z0-9]+/g, ' ').toLowerCase()
+}
+
 const MERGE_WORDS = /\b(merge|enqueue|automerge)\b/
-const CREATE_WORDS = /\b(create|new|open|submit)\b/
+const CREATE_WORDS = /\b(create|submit)\b/
+const OPEN_WORDS = /\b(open|new)\b/
 const PR_WORDS = /\b(pull|pulls|pr|prs)\b/
 const REVIEW_WORDS = /\b(reviews?|comments?)\b/
 
@@ -425,7 +446,8 @@ function readUnknownTool(tool: string, input: Record<string, unknown>, repo: str
   const said = wordsOf(tool, input)
   if (!PR_WORDS.test(said)) return undefined
   if (MERGE_WORDS.test(said)) return { action: 'merge', via: tool, number: num(input.number ?? input.pullNumber ?? input.pull_number), repo, isUnknown: true }
-  if (CREATE_WORDS.test(said) && !REVIEW_WORDS.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
+  const isCreate = CREATE_WORDS.test(said) || OPEN_WORDS.test(namedOperation(tool, input))
+  if (isCreate && !REVIEW_WORDS.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
   return undefined
 }
 
