@@ -198,7 +198,13 @@ test('post-PR: a push after ready or exhaustion continues the lifecycle on the n
 
 test('post-PR: a reported fix owed verification keeps the lifecycle from ready', async () => {
   const rec = at([post()], { phase: 'post', findings: [finding({ status: 'reported-fixed' })] })
-  expect(decideNext(rec)).toMatchObject({ kind: 'round' })
+  expect(decideNext(rec)).toMatchObject({ kind: 'round', roundKind: 'discretionary' })
+  expect(decideNext({ ...rec, allowance: 0 })).toMatchObject({ kind: 'round', roundKind: 'final-head-check' })
+})
+
+test('post-PR: the second baseline round survives a later push, free of the allowance', async () => {
+  const rec = at([pre(), post({ endHead: 'b' })], { phase: 'post', head: 'c', allowance: 0 })
+  expect(decideNext(rec)).toEqual({ kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' })
 })
 
 test('coverage: a change touching a file flags only the answered findings in it', async () => {

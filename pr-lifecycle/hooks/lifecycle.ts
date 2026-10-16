@@ -227,7 +227,11 @@ function decidePre(rec: LifecycleRecord): Next {
   }
   const isChanged = last.endHead !== last.startHead
   if (last.deferredBlocking > 0) {
-    return { kind: 'blocked', why: 'a blocking finding was deferred: its fix reaches past this branch', nextStep: '/pr-gate waive <findingId> <reason>, or widen the branch and run /pr-gate' }
+    return {
+      kind: 'blocked',
+      why: 'a blocking finding was deferred: its fix reaches past this branch',
+      nextStep: '/pr-gate waive <findingId> <reason>, or widen the branch and run /pr-gate',
+    }
   }
   if (last.raised.blocking === 0) {
     // Advisories go back to Codex only for new commits, and only while a round stays in reserve.
@@ -236,7 +240,11 @@ function decidePre(rec: LifecycleRecord): Next {
       : { kind: 'open-pr', status: 'passed' }
   }
   if (!isChanged && last.rebutted === 0) {
-    return { kind: 'blocked', why: 'the fixer changed nothing and rebutted nothing, so another round would say the same', nextStep: 'fix or rebut the open findings, then /pr-gate resume' }
+    return {
+      kind: 'blocked',
+      why: 'the fixer changed nothing and rebutted nothing, so another round would say the same',
+      nextStep: 'fix or rebut the open findings, then /pr-gate resume',
+    }
   }
   return mayStartRound(rec, false)
     ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
@@ -250,6 +258,8 @@ function decidePost(rec: LifecycleRecord): Next {
   const isChanged = last.endHead !== last.startHead
   const unresolved = unresolvedBlockers(rec)
   const owed = verificationOwed(rec)
+  // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
+  if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
   if (rec.head !== last.endHead) {
     return mayStartRound(rec, false)
@@ -261,11 +271,12 @@ function decidePost(rec: LifecycleRecord): Next {
     return {
       kind: 'exhausted',
       why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
-      nextStep: unresolved.length > 0 ? `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>` : '/pr-gate allow 1 <reason>',
+      nextStep:
+        unresolved.length > 0
+          ? `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>`
+          : '/pr-gate allow 1 <reason>',
     }
   }
-  // The protected baseline: a second round whenever the first one changed the head, by anyone.
-  if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   if (isChanged || owed.length > 0) {
     return mayStartRound(rec, false)
       ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
@@ -273,11 +284,19 @@ function decidePost(rec: LifecycleRecord): Next {
   }
   if (unresolved.length === 0) return { kind: 'ready' }
   if (unresolved.some(one => one.status === 'deferred')) {
-    return { kind: 'blocked', why: `${ids(unresolved)} deferred, and a security P1 needs your decision`, nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>` }
+    return {
+      kind: 'blocked',
+      why: `${ids(unresolved)} deferred, and a security P1 needs your decision`,
+      nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>`,
+    }
   }
   return mayStartRound(rec, false)
     ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
-    : { kind: 'exhausted', why: `${ids(unresolved)} unresolved and the review allowance is spent`, nextStep: `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>` }
+    : {
+        kind: 'exhausted',
+        why: `${ids(unresolved)} unresolved and the review allowance is spent`,
+        nextStep: `fix ${unresolved[0]?.id} and push, /pr-gate waive ${unresolved[0]?.id} <reason>, or /pr-gate allow 1 <reason>`,
+      }
 }
 
 /** What the controller does after a round, from the record alone. Exhaustion is never a pass. */
