@@ -2509,3 +2509,33 @@ test('R62: a bare /pr-gate does not collect again for a merged PR: it archives t
   expect((await runOf(w)).status).not.toBe('running')
   expect((await recordOf(w)).phase).toBe('archived')
 })
+
+test('R63: resuming a pre-PR block on the same head re-opens the fix step; a rebuttal then goes to Codex in the next round', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  expect((await recordOf(w)).preStatus).toBe('blocked')
+  const rounds = (await recordOf(w)).rounds.length
+  const spawned = w.spawned.length
+  await $.command.run(cmd('resume'))
+  // The resume itself starts no round and spends nothing: it re-opens the fix step for R1-1.
+  expect((await recordOf(w)).rounds).toHaveLength(rounds)
+  expect(w.spawned).toHaveLength(spawned)
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.phase).toBe('fix')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('R1-1 [P1] Unvalidated redirect')
+  expect(w.prompts.at(-1)?.startsWith('/')).toBe(false)
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'validated at :8' }] })}`))
+  // The record moves on: R1-1 is rebutted, and Codex rules on it in round 2.
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'R1-1')?.status).toBe('rebutted')
+  expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(1)
+  expect((await runOf(w)).phase).toBe('review')
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect(w.spawned.at(-1)?.prompt).toContain('R1-1')
+  expect((await runOf(w)).round).toBe(2)
+})

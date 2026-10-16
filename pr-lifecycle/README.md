@@ -140,6 +140,10 @@ so a resumed session never replies twice.
 
 ### Rebuttals
 
+- **Before the PR opens, a rebuttal goes to Codex in the next round**, which
+  costs a round. When a round's fix step changed nothing and rebutted nothing,
+  the gate holds the PR; `/pr-gate resume` re-opens that fix step on the same
+  head for the open findings, using no round.
 - **After the PR opens, Codex checks every rebuttal** on the same head. The
   check spends no allowance. A rebuttal Codex accepts settles the finding; one
   it rejects reopens it.

@@ -265,7 +265,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     return `Gate passed without Codex: ${scope.why}.`
   }
   await saveRecord($, rec)
-  await advance($, root, branch)
+  await advance($, root, branch, want.isHeldCall !== true)
   const run = await getRun($)
   if (run === null || run.status !== 'running') {
     const after = (await loadRecord($, root, branch)) ?? rec

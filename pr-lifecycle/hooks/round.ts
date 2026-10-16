@@ -1260,6 +1260,53 @@ async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string
   await patch($, run.id, one => ({ ...one, outbox: triagePrompt(run, rec, [], [], { carried: findings, intro, carriedHeading: heading }) }))
 }
 
+/**
+ * Re-opens the fix step on the same head for findings a pre-PR block left to the agent (R63, the pre-PR twin of `startAnswer`). It
+ * records no round: a fix or a rebuttal goes to Codex in the controller's next round, which is what a rebuttal costs before the PR (R40).
+ */
+async function startFixAnswer($: Engine, rec: LifecycleRecord, ids: readonly string[], why: string): Promise<void> {
+  const now = await $.clock.now()
+  const last = rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).at(-1)
+  const round = last?.n ?? 1
+  const isMain = config.fixer === 'main'
+  const step = `r${round}-fix`
+  const run: Run = {
+    ...answerRun(rec, ids, now),
+    round,
+    phase: 'fix',
+    lifecycle: 'pre',
+    roundKind: last?.kind ?? 'discretionary',
+    diffBase: `origin/${rec.base}`,
+    triaged: undefined,
+    steps: [
+      { id: 'scope', label: 'Scope & blast radius', state: 'done', detail: `${rec.tier}${rec.lane === 'light' ? ', light lane' : ''}: ${rec.tierWhy}` },
+      { id: step, label: `Round ${round} · answer ${ids.join(', ')} (${isMain ? 'main agent' : 'sub-agent'})`, state: 'running' },
+      { id: 'pr', label: `Open PR → ${rec.base}`, state: 'pending' },
+    ],
+    pending: isMain ? [{ role: 'fix', step, isMain: true }] : [],
+    activity: isMain ? 'waiting on the main agent to answer the open findings…' : 'starting the fixer…',
+  }
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  $.ui.status(`pr-gate r${round}: answering the open findings`)
+  const intro = `pr-gate: the pre-PR review was resumed on the same head: ${why}. Answer ${ids.join(', ')} below; this uses no review round.`
+  const prompt = `${intro}\n\n${fixPrompt(run, undefined, isMain)}`
+  if (isMain) {
+    // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
+    await patch($, run.id, one => ({ ...one, outbox: prompt }))
+    return
+  }
+  const { isStarted, agentId } = await spawn($, run, 'fix', prompt)
+  if (!isStarted) {
+    await finish($, run.id, 'error', 'The fixer sub-agent could not be started.')
+    return
+  }
+  await patch($, run.id, one => ({ ...one, pending: [{ role: 'fix', step, agentId }], activity: 'waiting on the fixer…' }))
+}
+
 /** Codex checks rebuttals it never ruled on, on the same head, as an answer run: no round, no allowance (R39). */
 async function startRecheck($: Engine, rec: LifecycleRecord, ids: readonly string[]): Promise<void> {
   const now = await $.clock.now()
@@ -1404,8 +1451,11 @@ async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
 /** A security P1 that is open, or only reported fixed, never rides on exhaustion. */
 export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresolvedBlockers(rec), ...verificationOwed(rec)].some(one => one.isSecurity === true)
 
-/** After a round, or at start: the controller reads the record and does what `decideNext` says. */
-export async function advance($: Engine, root: string, branch: string): Promise<void> {
+/**
+ * After a round, or at start: the controller reads the record and does what `decideNext` says. `isResume`: the person or agent ran
+ * /pr-gate or resume, which alone re-opens a pre-PR fix step on the same head (R63); a held create or a grant does not.
+ */
+export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
   const rec = await loadRecord($, root, branch)
   if (rec === undefined) return
   const next = decideNext(rec)
@@ -1451,6 +1501,11 @@ export async function advance($: Engine, root: string, branch: string): Promise<
     return
   }
   const isPre = rec.phase === 'pre'
+  // A resume of a pre-PR block the agent can answer on the same head re-opens the fix step for it: no round, no allowance (R63).
+  if (isPre && isResume && id === undefined && next.kind === 'blocked' && (next.answer ?? []).length > 0) {
+    await startFixAnswer($, rec, next.answer ?? [], next.why)
+    return
+  }
   // A resume of a post-PR block the agent can answer on the same head re-opens triage for it: no round, no allowance (R37).
   if (!isPre && id === undefined && next.kind === 'blocked' && (next.answer ?? []).length > 0) {
     await startAnswer($, rec, next.answer ?? [], next.why)

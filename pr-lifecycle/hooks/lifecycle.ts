@@ -311,7 +311,7 @@ export type Next =
   | { kind: 'open-pr'; status: 'passed' | 'exhausted' }
   | { kind: 'ready' }
   | { kind: 'exhausted'; why: string; nextStep: string }
-  /** answer: the findings the agent can settle on the same head (R37); a resume re-opens triage for them. */
+  /** answer: the findings the agent can settle on the same head (R37, R63); a resume re-opens triage, or the pre-PR fix step, for them. */
   | { kind: 'blocked'; why: string; nextStep: string; answer?: string[]; recheck?: string[] }
   /** Only deferrals stand between the PR and the merge: the person decides (R39). */
   | { kind: 'awaiting-decision'; why: string; nextStep: string }
@@ -377,12 +377,16 @@ function decidePre(rec: LifecycleRecord): Next {
       ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: true, scope: 'full' }
       : passOr()
   }
-  if (!isChanged && last.rebutted === 0) {
+  // A rebuttal of the round's findings given since, in a resumed fix step (R63), goes to Codex in the next round, as any rebuttal does.
+  const isRebutted = rec.findings.some(one => raisedIn(one, last.n) && one.status === 'rebutted' && !isAcceptedRebuttal(one))
+  if (!isChanged && last.rebutted === 0 && !isRebutted) {
     const open = rec.findings.filter(one => isBlocking(one) && one.status === 'open' && !waived.has(one.id))
     return {
       kind: 'blocked',
       why: 'the fixer changed nothing and rebutted nothing, so another round would say the same',
       nextStep: `fix or rebut ${open.length === 0 ? 'the open findings' : ids(open)}, then /pr-gate resume`,
+      // A resume re-opens the fix step for them on this head, using no round (R63, the pre-PR twin of R37).
+      ...(open.length === 0 ? {} : { answer: open.map(one => one.id) }),
     }
   }
   return mayStartRound(rec, false)
