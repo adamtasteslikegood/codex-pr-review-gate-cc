@@ -63,6 +63,8 @@ export type World = {
     state: string
     /** The repository's default branch, as `gh repo view` reports it; undefined makes the lookup fail. */
     defaultBranch?: string
+    /** `gh pr checks` fails with an error instead of reporting the checks. */
+    isChecksUnreadable: boolean
     /** Every gh call throws, as a broken runtime would. */
     isBroken: boolean
     /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
@@ -142,6 +144,7 @@ export function world(on: On): World {
       hasPr: false,
       state: 'OPEN',
       defaultBranch: 'dev',
+      isChecksUnreadable: false,
       isBroken: false,
       calls: [],
     },
@@ -185,13 +188,37 @@ export function world(on: On): World {
       if (!w.gh.isAuthed) return out('', 4)
       if (args.startsWith('api user')) return out(`${w.gh.self}\n`)
       if (args.startsWith('repo view')) {
-        if (w.gh.defaultBranch === undefined) return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        if (w.gh.defaultBranch === undefined) {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
         return out(JSON.stringify({ defaultBranchRef: { name: w.gh.defaultBranch } }))
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
         return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
+      }
+      // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
+      if (args.startsWith('pr checks')) {
+        const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+        if (w.gh.isChecksUnreadable) return fail('HTTP 502: Bad Gateway')
+        if (w.gh.checks.length === 0) return fail(`no checks reported on the '${w.gh.headRef}' branch`)
+        const bucket = (one: Record<string, unknown>): string =>
+          one.status !== 'completed'
+            ? 'pending'
+            : one.conclusion === 'success' || one.conclusion === 'neutral'
+              ? 'pass'
+              : one.conclusion === 'skipped'
+                ? 'skipping'
+                : one.conclusion === 'cancelled'
+                  ? 'cancel'
+                  : 'fail'
+        const rows = (w.gh.checks as Record<string, unknown>[]).map(one => ({
+          name: one.name,
+          state: String(one.conclusion ?? one.status).toUpperCase(),
+          bucket: bucket(one),
+        }))
+        return out(JSON.stringify(rows))
       }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))

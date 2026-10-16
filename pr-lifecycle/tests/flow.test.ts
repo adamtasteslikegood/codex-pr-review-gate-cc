@@ -2749,3 +2749,68 @@ test('R1-5: a bare /pr-gate with no record starts against the default branch, an
   expect((await recordOf(w)).base).toBe('main')
   expect(w.spawned).toHaveLength(1)
 })
+
+/** The lifecycle is ready for the PR's head: through the controller, as R65 does it, with no checks on the PR yet. */
+const toReady = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  await w.clock.advance(20 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+}
+
+test('R1-9: a ready PR with failing CI is held, the checks are named, and no waiver is offered', async ($, on) => {
+  const w = world(on)
+  await toReady($, w)
+  w.gh.checks = [
+    { name: 'ci', status: 'completed', conclusion: 'failure' },
+    { name: 'lint', status: 'completed', conclusion: 'success' },
+  ]
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('failing: ci')
+  expect(held).not.toContain('lint')
+  expect(held).toContain('rerun')
+  expect(held).not.toContain('waive')
+  expect(w.gh.calls.some(one => one.startsWith('pr checks 1'))).toBe(true)
+})
+
+test('R1-9: a ready PR with CI still running is held', async ($, on) => {
+  const w = world(on)
+  await toReady($, w)
+  w.gh.checks = [{ name: 'build', status: 'in_progress', conclusion: null }]
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('still running: build')
+  expect(held).not.toContain('waive')
+})
+
+test('R1-9: a ready PR with no checks, or all of them green or skipped, merges', async ($, on) => {
+  const w = world(on)
+  await toReady($, w)
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  w.gh.checks = [
+    { name: 'ci', status: 'completed', conclusion: 'success' },
+    { name: 'deploy', status: 'completed', conclusion: 'skipped' },
+  ]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on) => {
+  const w = world(on)
+  await toReady($, w)
+  w.gh.isChecksUnreadable = true
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('could not be read')
+  expect(held).toContain('HTTP 502')
+  expect(held).not.toContain('waive')
+})
+
+test('R1-9: a post waiver does not let a head with failing CI merge', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  await $.command.run(cmd('waive post shipping it'))
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'cancelled' }]
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('failing: ci')
+  expect(held).not.toContain('waive')
+})

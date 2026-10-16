@@ -533,6 +533,57 @@ const owedOf = (rec: LifecycleRecord): string => {
 }
 
 /**
+ * The CI hold on a merge the review lets through (R1-9): the PR head's checks, from `gh pr checks`. A failing, cancelled or running
+ * check holds it, and so do checks gh cannot read (fail closed); none at all, or every one passed or skipped, lets it merge. This hold is
+ * the agent's to clear, never the person's: no waiver releases it.
+ */
+type MergedPr = { number: number; baseRefName: string; headRefOid: string }
+
+const ciHold = async ($: Engine, root: string, action: PrAction, pr: MergedPr): Promise<string | undefined> => {
+  const head = `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held`
+  let ran: { exitCode: number; stdout: string; stderr: string }
+  try {
+    ran = await $.process.run(
+      ['gh', 'pr', 'checks', String(pr.number), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'name,state,bucket'],
+      { cwd: root, timeoutMs: 30_000 },
+    )
+  } catch (error) {
+    ran = { exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
+  }
+  let checks: { name: string; bucket: string }[] | undefined
+  try {
+    const read = JSON.parse(ran.stdout) as unknown
+    const row = (one: unknown): Record<string, unknown> => (typeof one === 'object' && one !== null ? (one as Record<string, unknown>) : {})
+    checks = Array.isArray(read) ? read.map(one => ({ name: String(row(one).name ?? '?'), bucket: String(row(one).bucket ?? '') })) : undefined
+  } catch {
+    checks = undefined
+  }
+  // gh reports a PR without checks as an error: nothing to wait for.
+  if (checks === undefined && /no checks reported/i.test(ran.stderr)) return undefined
+  if (checks === undefined) {
+    const said = ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}`
+    return [
+      `${head}: the CI checks on ${pr.headRefOid.slice(0, 7)} could not be read (${said}), and a merge waits until they can.`,
+      'Do not merge another way. Check gh auth status and the network, then try the merge again.',
+    ].join('\n')
+  }
+  const failing = checks.filter(one => one.bucket === 'fail' || one.bucket === 'cancel').map(one => one.name)
+  const running = checks.filter(one => one.bucket === 'pending' || !['pass', 'skipping', 'fail', 'cancel'].includes(one.bucket)).map(one => one.name)
+  if (failing.length === 0 && running.length === 0) return undefined
+  const said = [...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]), ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`])]
+  return [
+    `${head}: CI on ${pr.headRefOid.slice(0, 7)} is not green (${said.join('; ')}).`,
+    'Do not merge another way.',
+    ...(failing.length === 0
+      ? []
+      : ['Your next step: fix what the failing checks report and push, or rerun a check that failed for a flaky reason (gh run rerun <run-id> --failed).']),
+    ...(running.length === 0
+      ? []
+      : [`${failing.length === 0 ? 'Your next step: wait' : 'Wait'} for the running checks (gh pr checks ${pr.number} --watch), then try the merge again.`]),
+  ].join('\n') + unknownNote(action)
+}
+
+/**
  * Whether a PR may be merged now (merge, enqueue or auto-merge): its lifecycle must be ready for the PR's current head,
  * or the person waived post for it. A refusal never starts work, and tells the agent its own next step.
  */
@@ -584,9 +635,10 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   if (rec === undefined && !(await git($, root, ['rev-parse', '--verify', '--quiet', `refs/heads/${pr.headRefName}`])).isOk) return undefined
   // The person's post waiver for this head, unless a security P1 holds: only a waiver naming it releases that (spec §3).
   const isWaived = rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
-  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return undefined
+  // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a red check.
+  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
-  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) return undefined
+  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) return ciHold($, root, action, pr)
   const short = pr.headRefOid.slice(0, 7)
   const missing =
     rec === undefined

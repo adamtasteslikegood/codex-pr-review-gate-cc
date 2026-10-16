@@ -200,6 +200,14 @@ the person waived that finding. The refusal names what is missing ("post-PR
 round 1 owed", "R3-2 [P1] unresolved"). A refusal never starts work. A new push
 holds the merge again until the new head is reviewed.
 
+**CI must be green too.** Once the review lets a merge through, ready or
+waived, the guard reads the PR head's checks with `gh pr checks <n> --json
+name,state,bucket`. A failing or cancelled check, or one still running, holds
+the merge; the refusal names the checks and tells the agent to fix them, rerun
+a flaky one, or wait for the running ones. No waiver releases this hold: a
+`waive post` covers the review, not CI. A PR with no checks merges. Checks gh
+cannot read hold the merge (fail closed), with gh's error.
+
 ### Who decides
 
 The gate settles review itself and gives the agent its own next step: fix this,
