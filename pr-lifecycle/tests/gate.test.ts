@@ -401,6 +401,7 @@ test('the pane lists the to-dos and the findings on each surface', async ($, on)
     expect(await ui.find({ type: 'Text', text: 'in progress: fixing round 1' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'R1-1 [P1] Unvalidated redirect' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: 'Round 1 · codex review — FAIL · 1 blocking' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'pre-PR · 0/4 rounds used' })).toBeDefined()
     if (surface === 'desktop') {
       await ui.press({ key: 'stop' })
       expect(await ui.find({ type: 'Text', text: 'STOPPED' })).toBeDefined()

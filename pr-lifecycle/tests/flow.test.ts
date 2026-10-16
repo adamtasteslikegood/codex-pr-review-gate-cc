@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import { invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
-import type { LifecycleRecord } from '../types'
+import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
 const fixed = (id: string, note = 'done') => `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id, action: 'fixed', note }] })}`
@@ -2160,4 +2160,125 @@ test('R59: with no commit after the fix, the fix-review verify stands and R1-1 i
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'R1-1')?.status).toBe('verified-fixed')
   expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBeUndefined()
+})
+
+// ------------------------------------------------------------- task 14 (the pane)
+
+const mountPane = ($: Parameters<TestBody>[0]) =>
+  $.ui.mount({
+    plugin: 'pr-lifecycle',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'pr-lifecycle',
+    props: { title: 'PR lifecycle', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { top: 0, bodyRows: 40, rows: 40 } as never, view: {} as never },
+  })
+
+const paneFinding = (id: string, change: Partial<Finding>): Finding => ({
+  id,
+  round: 1,
+  source: 'github',
+  reviewer: 'claude[bot]',
+  severity: 'P2',
+  title: `Title of ${id}`,
+  headSeen: 'a'.repeat(40),
+  status: 'open',
+  history: [],
+  ...change,
+})
+
+const codexSaid = (status: 'rebutted' | 'open'): FindingEvent => ({ round: 2, status, note: 'checked', by: 'codex', at: 1 })
+const agentRebutted: FindingEvent = { round: 2, status: 'rebutted', note: 'not reachable', by: 'agent', at: 1 }
+
+test('the pane shows the phase, the shared budget, who is awaited, and reported vs verified fixes', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]","copilot"],"checks":[]}'
+  await toPost($, w)
+  await w.clock.advance(30_000)
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: 'post-PR · 1/4 rounds used · baseline 0/2' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'waiting on claude[bot], copilot' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the pane counts a deferred P3 as holding the merge and says what the person is awaited for', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(mergeHolds(rec)).toHaveLength(1)
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: 'Findings (1, 1 holding the merge' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'awaiting your decision on G2-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'G2-1 [P3]' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '— deferred' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the pane names each finding state, and its hold count is what mergeHolds returns', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const key = 'lifecycle:/repo:feat/x'
+  const rec = await recordOf(w)
+  const head = rec.head
+  const next: LifecycleRecord = {
+    ...rec,
+    findings: [
+      paneFinding('A1', { status: 'verified-fixed', needsRecheck: true, severity: 'P1' }),
+      paneFinding('A2', { status: 'verified-fixed' }),
+      paneFinding('A3', { status: 'reported-fixed', severity: 'P1' }),
+      paneFinding('A4', { status: 'rebutted', history: [agentRebutted, codexSaid('rebutted')] }),
+      paneFinding('A5', { status: 'rebutted', needsRecheck: true, history: [agentRebutted, codexSaid('rebutted')] }),
+      paneFinding('A6', { status: 'rebutted', history: [agentRebutted] }),
+      paneFinding('A7', { status: 'rebutted', history: [agentRebutted, codexSaid('open'), agentRebutted] }),
+      paneFinding('A8', { status: 'deferred' }),
+      paneFinding('A9', { status: 'deferred' }),
+      paneFinding('B1', { status: 'deferred', severity: 'P3' }),
+    ],
+    waivers: [
+      { scope: 'finding', findingId: 'A8', head, reason: 'tracked in KAN-9', by: 'composer', at: 1 },
+      { scope: 'finding', findingId: 'A9', head, reason: 'old reason', by: 'composer', at: 1, lapsedAt: 2, lapsedHead: head },
+    ],
+  }
+  w.store.set(key, next)
+  const holds = mergeHolds(next).map(one => one.id)
+  // A2 and A4 settled, A8 waived; the rest hold.
+  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1'])
+  const ui = await mountPane($)
+  expect(await ui.find({ type: 'Text', text: 'Findings (10, 7 holding the merge' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A1 [P1] Title of A1 — re-verify owed (file changed)' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A2 [P2] Title of A2 — verified fixed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A3 [P1] Title of A3 — reported fixed, unverified' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A4 [P2] Title of A4 — rebuttal accepted' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A5 [P2] Title of A5 — re-verify owed (file changed)' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A6 [P2] Title of A6 — rebuttal awaiting Codex' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A7 [P2] Title of A7 — disputed: awaiting the person' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A8 [P2] Title of A8 — waived: tracked in KAN-9' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'A9 [P2] Title of A9 — deferred (waiver lapsed)' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the pane shows the record\'s message, truncated', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const key = 'lifecycle:/repo:feat/x'
+  w.store.set(key, { ...(await recordOf(w)), message: `Stopped for a reason. ${'long '.repeat(80)}` })
+  const ui = await mountPane($)
+  const shown = (await ui.find({ type: 'Text', text: /Stopped for a reason\./ }))?.text ?? ''
+  expect(shown).toContain('…')
+  expect(shown.length).toBeLessThan(250)
+  await ui.unmount()
+})
+
+test('rendering the pane starts no run and writes no state', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  const snapshot = (): string => JSON.stringify({ store: [...w.store.entries()], run: w.run, spawned: w.spawned.length, prompts: w.prompts, opened: w.opened })
+  const before = snapshot()
+  const ui = await mountPane($)
+  await ui.find({ type: 'Text', text: 'Findings' })
+  await w.clock.advance(5_000)
+  await ui.unmount()
+  expect(snapshot()).toBe(before)
 })

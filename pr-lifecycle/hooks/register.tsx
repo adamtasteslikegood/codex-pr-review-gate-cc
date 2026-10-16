@@ -9,8 +9,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Effort, Finding, LifecycleRecord, Run, Step } from '../types'
-import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+import type { Effort, Finding, LifecycleRecord, Run } from '../types'
+import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
 import {
@@ -32,7 +32,6 @@ import {
 import {
   advance,
   configOf,
-  elapsed,
   finish,
   getRun,
   git,
@@ -50,10 +49,10 @@ import {
   say,
   setLive,
   setup,
-  SPINNER,
   startTicker,
 } from './round'
 import type { Config } from './round'
+import { renderPane } from './pane'
 import { archiveRecord, loadRecord, saveRecord, updateRecord } from './store'
 
 const COMMAND = 'pr-gate'
@@ -824,125 +823,13 @@ export const register: Register = (on, options) => {
   // ------------------------------------------------------------ the pane
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
     const run = await read($, runAtom)
     const now = await read($, tickAtom)
-
-    if (run === null) {
-      return (
-        <Box flexDirection="column">
-          <Text bold>PR lifecycle</Text>
-          <Text dimColor>Not run yet. /{COMMAND} starts it; opening a PR to a gated base starts it too.</Text>
-        </Box>
-      )
-    }
-
-    const isRunning = run.status === 'running'
-    const frame = SPINNER[Math.floor(now / 1000) % SPINNER.length] ?? '⠋'
-    const waiting = run.pending.filter(one => one.answer === undefined).length
-    const headline =
-      run.phase === 'review'
-        ? `codex round ${run.round}`
-        : run.phase === 'fix'
-          ? run.fixKind === 'advisory'
-            ? `addressing advisories, round ${run.round}`
-            : `fixing round ${run.round}`
-          : run.phase === 'verify'
-            ? `reviewing the fix, round ${run.round}`
-            : 'sizing the change'
-    const mark = (step: Step): string =>
-      step.state === 'done' ? '✔' : step.state === 'failed' ? '✖' : step.state === 'skipped' ? '–' : step.state === 'running' ? (isRunning ? frame : '◐') : '○'
-    const current = run.findings.filter(one => one.round === run.round)
-    const earlier = run.findings.filter(one => one.round !== run.round)
-    const room = Math.max(4, (e.viewport?.rows ?? 30) - run.steps.length - 12)
-    const shown = [...current, ...earlier].slice(0, room)
-    const hidden = run.findings.length - shown.length
-    const statusColor = run.status === 'passed' ? 'success' : run.status === 'running' ? 'claude' : run.status === 'waived' ? 'warning' : 'error'
-
-    return (
-      <Box flexDirection="column">
-        <Text bold wrap="truncate-end">
-          {run.branch} → {run.base}
-        </Text>
-        <Text dimColor wrap="truncate-end">
-          round {run.round}
-          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex {run.effort} ·{' '}
-          {elapsed((run.endedAt ?? now) - run.startedAt)}
-        </Text>
-
-        <Box marginTop={1} flexDirection="column">
-          {isRunning ? (
-            <Text color="claude" wrap="truncate-end">
-              {frame} in progress: {headline}
-              {waiting > 0 ? ` · waiting on ${waiting} agent${waiting === 1 ? '' : 's'}` : ''} · {elapsed(now - run.phaseStartedAt)}
-            </Text>
-          ) : (
-            <Text color={statusColor} bold wrap="truncate-end">
-              {run.status.toUpperCase()}
-            </Text>
-          )}
-          {isRunning && run.activity !== '' && (
-            <Text dimColor wrap="truncate-end">
-              {'  '}
-              {run.activity}
-            </Text>
-          )}
-          {!isRunning && run.message !== undefined && <Text wrap="wrap">{run.message}</Text>}
-        </Box>
-
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>To do</Text>
-          {run.steps.map(step => (
-            <Text
-              key={`step-${step.id}`}
-              wrap="truncate-end"
-              dimColor={step.state === 'pending' || step.state === 'skipped'}
-              color={step.state === 'failed' ? 'error' : step.state === 'running' ? 'claude' : undefined}
-            >
-              {mark(step)} {step.label}
-              {step.detail === undefined ? '' : ` — ${step.detail}`}
-            </Text>
-          ))}
-        </Box>
-
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>
-            Codex findings ({run.findings.length}
-            {current.some(isBlocking) ? `, ${current.filter(one => isBlocking(one) && one.status === 'open').length} blocking open` : ''})
-          </Text>
-          {run.findings.length === 0 && <Text dimColor>None yet.</Text>}
-          {shown.map(one => (
-            <Text
-              key={`finding-${one.id}`}
-              wrap="truncate-end"
-              dimColor={one.round !== run.round || !isBlocking(one)}
-              color={one.round === run.round && isBlocking(one) && one.status === 'open' ? 'error' : undefined}
-              strikethrough={one.status === 'verified-fixed' || one.status === 'reported-fixed'}
-            >
-              {one.status === 'verified-fixed' || one.status === 'reported-fixed'
-                ? '✔'
-                : one.status === 'rebutted'
-                  ? '↩'
-                  : one.status === 'deferred'
-                    ? '⏸'
-                    : isBlocking(one)
-                      ? '●'
-                      : '·'}{' '}
-              {one.id} [
-              {one.severity}] {one.title}
-              {one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`}
-              {one.status === 'open' ? '' : ` — ${one.status}`}
-            </Text>
-          ))}
-          {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
-        </Box>
-
-        {isRunning && (
-          <Box marginTop={1}>
-            <Button key="stop" label="Stop the gate" onPress={() => void finish($, run.id, 'stopped', 'Stopped by the person.')} />
-          </Box>
-        )}
-      </Box>
-    )
+    // Read-only: the run's own root and branch find its record; with no run, the checkout's.
+    const top = run === null ? await git($, undefined, ['rev-parse', '--show-toplevel']) : undefined
+    const root = run !== null ? run.root : top?.isOk === true ? top.out : ''
+    const branch = run !== null ? run.branch : root === '' ? '' : (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+    const rec = root !== '' && branch !== '' && branch !== 'HEAD' ? await loadRecord($, root, branch) : undefined
+    return renderPane($, e, run, rec, now)
   })
 }
