@@ -571,11 +571,7 @@ const ciHold = async ($: Engine, root: string, action: PrAction, pr: MergedPr): 
     ].join('\n')
   }
   const failing = checks.filter(one => one.bucket === 'fail' || one.bucket === 'cancel').map(one => one.name)
-  // An auto-merge waits for running checks on GitHub itself (F7): only a failing one holds it.
-  const running =
-    action.isAuto === true
-      ? []
-      : checks.filter(one => one.bucket === 'pending' || !['pass', 'skipping', 'fail', 'cancel'].includes(one.bucket)).map(one => one.name)
+  const running = checks.filter(one => one.bucket === 'pending' || !['pass', 'skipping', 'fail', 'cancel'].includes(one.bucket)).map(one => one.name)
   if (failing.length === 0 && running.length === 0) return undefined
   const said = [...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]), ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`])]
   return [

@@ -2906,19 +2906,3 @@ test('F5: the controller does not write ready from a read a finding has since ch
   expect(rec.findings.some(one => one.id === 'G2-9')).toBe(true)
   expect(rec.phase).not.toBe('ready')
 })
-
-test('F7: an auto-merge is not held by checks still running, since GitHub waits for them; a failing check still holds it', async ($, on) => {
-  const w = world(on)
-  await toReady($, w)
-  const auto = { tool: 'Bash' as const, command: 'gh pr merge 1 --auto --squash' }
-  w.gh.checks = [{ name: 'build', status: 'in_progress', conclusion: null }]
-  expect(isHeld(await $.tool.call(merge))).toBe(true)
-  expect(isHeld(await $.tool.call(auto))).toBe(false)
-  w.gh.checks = [
-    { name: 'build', status: 'in_progress', conclusion: null },
-    { name: 'ci', status: 'completed', conclusion: 'failure' },
-  ]
-  const held = (await $.tool.call(auto)).deny ?? ''
-  expect(held).toContain('failing: ci')
-  expect(held).not.toContain('build')
-})
