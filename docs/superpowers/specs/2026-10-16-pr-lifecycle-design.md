@@ -132,7 +132,14 @@ After each round:
 - **Post-PR baseline**, free of allowance: post-PR round 1 always runs; round
   2 runs when round 1 changed the head, by anyone.
 - **After the baseline**: the last round clean, verified and head unchanged →
-  `ready`. A new unreviewed head → a discretionary round if allowance
+  `ready`. Clean means no finding from either phase, at any severity, is
+  `open`, `deferred`, `reported-fixed` without verification, or `rebutted`
+  without Codex accepting the rebuttal. Post-PR, Codex checks every rebuttal
+  on the same head (free of allowance); a rejected rebuttal reopens the
+  finding. A deferral is an honest answer that lets triage end, but it keeps
+  the merge held: only the person's waiver of that finding (or `waive post`)
+  releases it. Opening a PR and merging it are separate actions; open
+  findings may ride into the PR, never into the merge. A new unreviewed head → a discretionary round if allowance
   remains, otherwise a `final-head-check` (Codex on the delta only), which is
   always permitted. Budget exhaustion never certifies an unreviewed head.
   Substantive issues and no allowance → `exhausted`, with a report of what
@@ -275,7 +282,8 @@ Guards:
   still rides. Success switches to `post` and starts post-PR round 1.
 - `gh pr merge` and the GitHub MCP merge tool (new, `enforceMerge`): held for
   gated bases unless the phase is `ready` for the PR's current head or the
-  person waived post. The refusal names what is missing (for example "round 2
+  person waived post. Any open, deferred, unverified or unaccepted finding
+  keeps the merge held, whatever its severity. The refusal names what is missing (for example "round 2
   owed on a1b2c3d", "R3-2 [P1] unresolved"). A refusal never starts work.
 - Not intercepted: PRs from a branch not checked out here, other repos
   (`--repo`), promotions between gated bases.
