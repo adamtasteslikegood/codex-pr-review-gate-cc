@@ -136,7 +136,10 @@ its merits. Every review prompt carries a "prior rounds" section: the
 still-applicable findings in the touched files, their dispositions and
 evidence, and what verification is owed. Inline findings are answered in their
 own thread, top-level reviews with an issue comment; the reply id is recorded
-so a resumed session never replies twice.
+so a resumed session never replies twice. Of the comments made under this
+machine's gh login, only those replies are skipped (an inline reply in a
+thread, or a comment whose id is a recorded reply): the person's own other
+comments reach triage. Their reviews never count as covering a head.
 
 ### Rebuttals
 

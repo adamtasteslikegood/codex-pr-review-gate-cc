@@ -2539,3 +2539,30 @@ test('R63: resuming a pre-PR block on the same head re-opens the fix step; a reb
   expect(w.spawned.at(-1)?.prompt).toContain('R1-1')
   expect((await runOf(w)).round).toBe(2)
 })
+
+test('R64: the person\'s own top-level comment reaches triage; the mod\'s recorded reply and inline replies do not', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.store.set(KEY, { ...(await recordOf(w)), replies: { 'inline:9': '41' } })
+  w.gh.issueComments = [
+    { id: 40, user: { login: 'me' }, body: 'Also handle the empty list.', created_at: '1970-01-01T00:01:00Z' },
+    { id: 41, user: { login: 'me' }, body: 'Fixed in abc1234.', created_at: '1970-01-01T00:01:00Z' },
+  ]
+  w.gh.comments = [{ ...inline(42, 'Done, thanks.', w.gh.prHead), user: { login: 'me' }, in_reply_to_id: 9 }]
+  await w.clock.advance(20 * 60_000)
+  const run = await runOf(w)
+  expect(run.phase).toBe('triage')
+  expect(run.triaged).toEqual(['comment:40'])
+  expect(w.prompts.at(-1)).toContain('Also handle the empty list.')
+})
+
+test('R64: the person\'s own approval does not cover a head', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.head = 'b'.repeat(40)
+  w.gh.reviews = [{ id: 7, user: { login: 'me' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(20 * 60_000)
+  expect((await runOf(w)).phase).toBe('review')
+  expect((await runOf(w)).evidence.some(one => one.reviewer === 'me')).toBe(false)
+})

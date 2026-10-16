@@ -565,6 +565,8 @@ type Fetched = {
   /** The PR was merged or closed (R62): nothing more to collect. */
   closed?: 'MERGED' | 'CLOSED'
   feedback: Feedback[]
+  /** Feedback from others: only theirs covers a head; this machine's login never reviews its own PR. */
+  cover?: Feedback[]
   checks: Check[]
   prHead: string
   /** Feedback id to the id of this machine's own reply in its thread, posted after it (R35). */
@@ -613,19 +615,25 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
     const all = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)]
-    // This machine's own comments are never feedback; its inline ones are its replies, which no turn may post twice (R35).
-    const feedback = all.filter(one => one.reviewer !== self)
-    const own = all.filter(one => one.reviewer === self && one.kind === 'inline')
+    // Of this machine's own comments, only the mod's replies are not feedback (R64): an inline reply in a thread, or a comment
+    // whose id is a recorded reply. The person's other top-level and review comments reach triage. Its inline replies are
+    // its replies, which no turn may post twice (R35).
+    const replied = new Set(Object.values(rec.replies))
+    const isReply = (one: Feedback): boolean =>
+      one.kind === 'inline' ? one.threadId !== one.id.slice('inline:'.length) : replied.has(one.id.slice(one.id.indexOf(':') + 1))
+    const feedback = all.filter(one => one.reviewer !== self || !isReply(one))
+    const own = all.filter(one => one.reviewer === self && one.kind === 'inline' && isReply(one))
+    const others = feedback.filter(one => one.reviewer !== self)
     // One to one (R38): each own reply answers the latest reviewer comment in its thread posted before it that no reply answered yet.
     const ownReplies: Record<string, string> = {}
     for (const mine of [...own].sort((a, b) => a.at - b.at)) {
-      const answered = feedback
+      const answered = others
         .filter(one => one.kind === 'inline' && one.threadId === mine.threadId && one.at <= mine.at && ownReplies[one.id] === undefined)
         .sort((a, b) => a.at - b.at)
         .at(-1)
       if (answered !== undefined) ownReplies[answered.id] = mine.id.slice('inline:'.length)
     }
-    return { isOk: true, feedback, checks: readCheckRuns(checks.out), prHead, ownReplies }
+    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies }
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
     return fail(`gh returned unreadable output (${said}); check gh auth login, rate limits and the network`)
@@ -691,7 +699,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   const roster = await rosterOf($, run.root)
   const done = collectionDone({
     roster,
-    feedback: got.feedback,
+    feedback: got.cover ?? got.feedback,
     checks: got.checks,
     head: got.prHead,
     headAt,
