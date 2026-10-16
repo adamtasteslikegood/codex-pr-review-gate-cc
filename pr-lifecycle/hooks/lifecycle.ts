@@ -233,10 +233,13 @@ export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waiv
   )
 }
 
-/** Blockers the fixer reported fixed that no check has confirmed yet. */
+/** A verified fix whose file changed since: Codex re-verifies it on the current head before it settles anything again (R58). */
+export const isReverifyOwed = (f: Pick<Finding, 'status' | 'needsRecheck'>): boolean => f.status === 'verified-fixed' && f.needsRecheck === true
+
+/** Blockers the fixer reported fixed that no check has confirmed yet, and verified fixes whose file changed since (R58). */
 export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && one.status === 'reported-fixed')
+  return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && (one.status === 'reported-fixed' || isReverifyOwed(one)))
 }
 
 /** A rebuttal Codex ruled on and accepted, with its file unchanged since. */
@@ -268,13 +271,16 @@ const disputeOf = (f: Finding): string => {
 
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
- * reported fixed without verification, or rebutted without Codex accepting it, unless the person waived it.
- * The controller's ready and the merge guard both read this, so they never disagree.
+ * reported fixed without verification, verified fixed but its file changed since (R58), or rebutted without Codex
+ * accepting it, unless the person waived it. The controller's ready and the merge guard both read this, so they never disagree.
  */
 export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => !waived.has(one.id) && one.status !== 'verified-fixed' && !isAcceptedRebuttal(one))
+  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one))
 }
+
+/** A held verified fix in words, as the merge refusal and the texts name it (R58). */
+export const reverifyOwed = (f: Pick<Finding, 'id' | 'severity'>): string => `${f.id} [${f.severity}] fixed, re-verify owed (file changed)`
 
 /** Security P1s that hold the merge: only a waiver naming each one releases it, never `waive post` (spec §3). */
 export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] =>
@@ -309,7 +315,8 @@ function decidePre(rec: LifecycleRecord): Next {
   const last = rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).at(-1)
   // Never a pass while any blocker in the ledger is unresolved, whichever round raised it. Before the PR opens,
   // a security fix only reported fixed counts as unresolved too, until a check confirms it.
-  const unresolved = [...unresolvedBlockers(rec), ...verificationOwed(rec).filter(one => one.isSecurity === true)]
+  // A verified fix whose file changed since is owed its re-verification too (R58): the next Codex review carries the note.
+  const unresolved = [...unresolvedBlockers(rec), ...verificationOwed(rec).filter(one => one.isSecurity === true || isReverifyOwed(one))]
   const passOr = (): Next => {
     if (unresolved.length === 0) return { kind: 'open-pr', status: 'passed' }
     if (unresolved.every(one => one.status === 'deferred')) {
@@ -387,7 +394,8 @@ function decidePost(rec: LifecycleRecord): Next {
   const owed = holding.filter(one => one.status === 'reported-fixed')
   // A dispute is the person's (R40); every other rebuttal Codex has not accepted is Codex's to check.
   const disputed = holding.filter(isDisputed)
-  const unchecked = holding.filter(one => one.status === 'rebutted' && !isDisputed(one))
+  // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58).
+  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one))
   const open = holding.filter(one => one.status === 'open')
   const deferred = holding.filter(one => one.status === 'deferred')
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
@@ -403,11 +411,15 @@ function decidePost(rec: LifecycleRecord): Next {
   if (!isChanged && open.length > 0) {
     // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding; it may be fixed or deferred, not rebutted again (R40).
     const rejected = open.filter(one => rejections(one) > 0)
-    const ignored = open.filter(one => !rejected.includes(one))
-    const isFeedbackOnly = ignored.length > 0 && rejected.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))
+    // A fix Codex re-verified after its file changed and found no longer holds (R58): the agent's to fix or rebut again.
+    const refuted = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-2)?.status === 'verified-fixed')
+    const ignored = open.filter(one => !rejected.includes(one) && !refuted.includes(one))
+    const isFeedbackOnly =
+      ignored.length > 0 && rejected.length + refuted.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))
     const codexSaid = (one: Finding): string => one.history.filter(each => each.by === 'codex').at(-1)?.note ?? 'no reason given'
     const said = [
       ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${codexSaid(one)}`),
+      ...refuted.map(one => `Codex re-verified ${one.id} after its file changed, and the fix no longer holds: ${codexSaid(one)}`),
       ...(ignored.length === 0
         ? []
         : isFeedbackOnly
@@ -416,16 +428,27 @@ function decidePost(rec: LifecycleRecord): Next {
     ]
     const steps = isFeedbackOnly
       ? [`answer ${ids(open)} in ${open.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer)`]
-      : [...(ignored.length === 0 ? [] : [`fix or rebut ${ids(ignored)}`]), ...(rejected.length === 0 ? [] : [`fix or defer ${ids(rejected)}`])]
+      : [
+          ...(ignored.length + refuted.length === 0 ? [] : [`fix or rebut ${ids([...refuted, ...ignored])}`]),
+          ...(rejected.length === 0 ? [] : [`fix or defer ${ids(rejected)}`]),
+        ]
     return { kind: 'blocked', why: said.join('; '), nextStep: `${steps.join('; ')}, then /pr-gate resume`, answer: open.map(one => one.id) }
   }
   // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
-  const recheck = (): Next => ({
-    kind: 'blocked',
-    why: `Codex has not checked the rebuttal of ${ids(unchecked)} on ${last.endHead.slice(0, 7)}`,
-    nextStep: 'run /pr-gate resume: Codex checks the rebuttal on this head, using no review round',
-    recheck: unchecked.map(one => one.id),
-  })
+  const recheck = (): Next => {
+    const rebuttals = unchecked.filter(one => !isReverifyOwed(one))
+    const reverify = unchecked.filter(isReverifyOwed)
+    const said = [
+      ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
+      ...reverify.map(reverifyOwed),
+    ]
+    return {
+      kind: 'blocked',
+      why: said.join('; '),
+      nextStep: `run /pr-gate resume: Codex checks ${reverify.length === 0 ? 'the rebuttal' : 'them'} on this head, using no review round`,
+      recheck: unchecked.map(one => one.id),
+    }
+  }
   if (!isChanged && unchecked.length > 0) return recheck()
   if (last.kind === 'final-head-check') {
     if (!isChanged && holding.length === 0) return { kind: 'ready' }

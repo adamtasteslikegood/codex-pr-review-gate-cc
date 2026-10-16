@@ -18,7 +18,9 @@ import {
   isAcceptedRebuttal,
   isDisputed,
   lastReviewedHead,
+  isReverifyOwed,
   mergeHolds,
+  reverifyOwed,
   newRecord,
   remaining,
   rescope,
@@ -416,9 +418,10 @@ const owedOf = (rec: LifecycleRecord): string => {
   if (rec.phase === 'pre') return 'the PR is still in pre-PR review'
   // Every finding that holds the merge, named, whatever its severity (R39).
   const said = (one: Finding): string => (isDisputed(one) ? 'disputed: the person decides' : (HOLD[one.status] ?? one.status))
-  const holding = mergeHolds(rec).map(one => `${one.id} [${one.severity}] ${said(one)}`)
+  // A verified fix whose file changed since is named as such (R58).
+  const holding = mergeHolds(rec).map(one => (isReverifyOwed(one) ? reverifyOwed(one) : `${one.id} [${one.severity}] ${said(one)}`))
   if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}${holding.length === 0 ? '' : `; ${holding.join(', ')}`}`
-  if (holding.length > 0 && (rec.phase === 'ready' || post.length > 1)) return holding.join(', ')
+  if (holding.length > 0 && (rec.phase === 'ready' || post.length > 1 || mergeHolds(rec).some(isReverifyOwed))) return holding.join(', ')
   if (post.length === 0) return `post-PR round 1 owed on ${rec.head.slice(0, 7)}`
   if (post.length === 1 && post[0]?.endHead !== post[0]?.startHead) return `post-PR round 2 owed on ${rec.head.slice(0, 7)}`
   if (open.length > 0) return open.map(one => `${one.id} [${one.severity}] unresolved`).join(', ')

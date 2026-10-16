@@ -5,6 +5,7 @@ import {
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
+  isReverifyOwed,
   mergeHolds,
   raisedIn,
   rejections,
@@ -300,9 +301,10 @@ const listFindings = (findings: readonly Finding[]): string =>
     .map(one => {
       const at = one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`
       const detail = one.detail === undefined ? '' : `\n    ${one.detail.replace(/\n/g, '\n    ')}`
-      const said = one.status === 'reported-fixed' ? 'reported-fixed, verification owed' : one.status
+      const said =
+        one.status === 'reported-fixed' ? 'reported-fixed, verification owed' : isReverifyOwed(one) ? 'fixed, re-verify owed (file changed)' : one.status
       const note = one.status === 'open' && one.note === undefined ? '' : `\n    ${said}${one.note === undefined || one.note === '' ? '' : `: ${one.note}`}`
-      const recheck = one.needsRecheck === true ? ' (file changed since: re-verify)' : ''
+      const recheck = one.needsRecheck === true && !isReverifyOwed(one) ? ' (file changed since: re-verify)' : ''
       return `- ${one.id} [${one.severity}] ${one.title}${at}${recheck}${detail}${note}`
     })
     .join('\n')
@@ -437,15 +439,25 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
 
 export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Finding[]): string {
   if (rebuttals !== undefined) {
+    // The same check re-verifies a verified fix whose file changed since (R58).
+    const fixes = rebuttals.filter(isReverifyOwed)
+    const argued = rebuttals.filter(one => !isReverifyOwed(one))
     return [
-      `You check rebuttals for pr-gate's post-PR review. Round ${run.round}.`,
+      `You check ${fixes.length === 0 ? 'rebuttals' : argued.length === 0 ? 'fixes' : 'rebuttals and fixes'} for pr-gate's post-PR review. Round ${run.round}.`,
       where(run),
+      ...(argued.length === 0
+        ? []
+        : [
+            '',
+            'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
+            listFindings(argued),
+          ]),
+      ...(fixes.length === 0
+        ? []
+        : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
       '',
-      'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
-      listFindings(rebuttals),
-      '',
-      'For each one: read the code at HEAD and decide whether the rebuttal holds. Give one verdict per finding id, each on its own:',
-      'holds is true when the rebuttal holds, false when it does not, with a note saying why it fails. Leave out no id.',
+      'For each one: read the code at HEAD and decide whether the rebuttal, or the fix, still holds. Give one verdict per finding id, each on its own:',
+      'holds is true when it holds, false when it does not, with a note saying why it fails. Leave out no id.',
       'You are read-only: do not edit, commit or push.',
       '',
       trailerRule(

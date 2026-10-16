@@ -878,7 +878,8 @@ test('GitHub findings in a final-head check enter the ledger and are never ready
   w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  await done($, turn(review('r4-review', 'PASS'), `agent-${w.spawned.length}`))
+  // R58: f touched G2-1's file after Codex verified it; the final-head check's review re-verifies it.
+  await done($, turn(review('r4-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
   expect(w.prompts.at(-1)).toContain('G4-1')
   await w.clock.advance(1000)
   await done($, triaged('r4-triage', []))
@@ -1993,4 +1994,131 @@ test('R57: status during a new pre-PR run on a moved head does not say passed', 
   const said = (await say($, 'status')) as { text: string }
   expect(said.text).toContain('feat/x → dev: pre,')
   expect(said.text).not.toContain('passed')
+})
+
+// ------------------------------------------------------------- task 13 fix round 5 (R58)
+
+/** G2-1 is verified fixed after the PR opened (Codex confirmed it), and the record is ready. */
+const toVerified = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await toAccepted($, w)
+  const ready = await recordOf(w)
+  const verified = { round: 2, status: 'verified-fixed' as const, by: 'codex', at: 2 }
+  const findings = ready.findings.map(f => (f.id === 'G2-1' ? { ...f, status: 'verified-fixed' as const, history: [...f.history, verified] } : f))
+  w.store.set(KEY, { ...ready, findings })
+  expect(mergeHolds(await recordOf(w))).toEqual([])
+}
+
+/** A push touching `file`, resumed into post round 3, which the repo's reviewer covers with nothing new to say. */
+const pushCovered = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, file: string) => {
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.changed = file
+  await say($, 'resume')
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).not.toBe('collect')
+}
+
+test('R58: a verified fix whose file a push touched holds the merge until Codex re-verifies it, then goes ready', async ($, on) => {
+  const w = world(on)
+  await toVerified($, w)
+  const spawned = w.spawned.length
+  const rounds = (await recordOf(w)).rounds.length
+  await pushCovered($, w, 'src/app.ts')
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBe(true)
+  expect(mergeHolds(rec).map(f => f.id)).toEqual(['G2-1'])
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('G2-1 [P3] fixed, re-verify owed (file changed)')
+  // Codex re-verifies G2-1 on the same head, as the rebuttal check does.
+  const check = w.spawned.slice(spawned).at(-1)
+  expect(check?.prompt).toContain('G2-1')
+  expect(check?.prompt).toContain('"verdicts"')
+  expect(check?.prompt).toContain('verified fixed, but their file changed since')
+  expect(check?.prompt).not.toContain('rebutted these findings')
+  await done($, accept('r3-verify', w))
+  const after = await recordOf(w)
+  const g = after.findings.find(f => f.id === 'G2-1')
+  expect(g?.status).toBe('verified-fixed')
+  expect(g?.needsRecheck).toBeUndefined()
+  expect(g?.history.at(-1)?.by).toBe('codex')
+  expect(after.phase).toBe('ready')
+  // The check spent no round beyond the one the push itself owed.
+  expect(after.rounds.filter(one => one.isCompleted).length).toBe(rounds + 1)
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R58: a re-verify Codex rejects reopens the finding and sends it back to the agent', async ($, on) => {
+  const w = world(on)
+  await toVerified($, w)
+  await pushCovered($, w, 'src/app.ts')
+  await done($, accept('r3-verify', w, { 'G2-1': 'the new branch skips the guard' }))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('open')
+  expect(rec.phase).not.toBe('ready')
+  expect(w.prompts.at(-1)).toContain('fix or rebut G2-1')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+})
+
+test('R58: a re-verify that cannot run holds the merge with the agent\'s /pr-gate resume', async ($, on) => {
+  const w = world(on)
+  await toVerified($, w)
+  await pushCovered($, w, 'src/app.ts')
+  await done($, turn(`v\n${TRAILER}\n{"step":"r3-verify","verdicts":"maybe"}`, `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBe('blocked')
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('is held')
+  expect(said).toContain('fixed, re-verify owed (file changed)')
+  expect(said).toContain('run /pr-gate resume to have Codex check G2-1 again')
+  expect(said).not.toContain('person')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('G2-1 [P3] fixed, re-verify owed (file changed)')
+  // The agent's resume runs the check again, using no round.
+  const spawned = w.spawned.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect(w.spawned.at(-1)?.prompt).toContain('G2-1')
+  await done($, accept('r3-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R58: a push on another file leaves a verified fix settled', async ($, on) => {
+  const w = world(on)
+  await toVerified($, w)
+  await pushCovered($, w, 'src/other.ts')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBeUndefined()
+  expect(rec.phase).toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R58: before the PR, a flagged verified fix blocks the pass until a Codex review re-verifies it', { options: { allowanceStandard: 4 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  // A new commit touches the fixed file: the next review carries the re-verify note.
+  w.git.head = 'f'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await say($, '')
+  expect((await recordOf(w)).findings.find(f => f.id === 'R1-1')?.needsRecheck).toBe(true)
+  expect(w.spawned.at(-1)?.prompt).toContain('re-verify')
+  // A review that says nothing of it leaves it owed: the gate does not pass.
+  await done($, turn(review('r3-review', 'PASS'), `agent-${w.spawned.length}`))
+  let rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBe(true)
+  expect(rec.preStatus).not.toBe('passed')
+  // The next review's verified ruling clears it, and the gate passes.
+  await done($, turn(review('r4-review', 'PASS', [], { verified: ['R1-1'] }), `agent-${w.spawned.length}`))
+  rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBeUndefined()
+  expect(rec.preStatus).toBe('passed')
 })
