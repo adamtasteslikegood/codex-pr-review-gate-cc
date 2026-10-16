@@ -357,3 +357,11 @@ test('verified and held that are not lists of strings read as empty or lose the 
   expect(read({ verified: 'R1-1', held: { a: 1 } })).toMatchObject({ gate: 'PASS', verified: [], held: [] })
   expect(read({ verified: ['R1-1', 3, null, {}, ''], held: [['x'], 'R1-2'] })).toMatchObject({ verified: ['R1-1'], held: ['R1-2'] })
 })
+
+test('post-PR: a ready record is ready no longer once its ledger holds a blocker or an owed security fix', async () => {
+  const done = [post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })]
+  expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [finding()] })).kind).not.toBe('ready')
+  const owed = [finding({ status: 'reported-fixed', isSecurity: true })]
+  expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: owed })).kind).not.toBe('ready')
+  expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [finding({ status: 'rebutted' })] }))).toEqual({ kind: 'ready' })
+})

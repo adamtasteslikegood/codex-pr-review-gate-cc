@@ -273,6 +273,8 @@ const listFindings = (findings: readonly Finding[]): string =>
     })
     .join('\n')
 
+export const listFindingsOf = listFindings
+
 /** Earlier findings that still apply to the files under review, so a round checks their answers instead of re-arguing them. */
 export function priorRounds(findings: readonly Finding[], files?: ReadonlySet<string>): string {
   const applies = findings.filter(

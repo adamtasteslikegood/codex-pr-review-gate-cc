@@ -26,6 +26,8 @@ export type World = {
     left: string
     /** `git diff --name-only` between two heads: the files a new commit touched. */
     changed: string
+    /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
+    isAncestor: boolean
     /** `.github/pr-gate.json` at HEAD; empty means none. */
     roster: string
     /** Local branches besides the checked-out one. */
@@ -80,6 +82,7 @@ export function world(on: On): World {
       pkgDiff: '',
       left: 'x',
       changed: 'src/app.ts',
+      isAncestor: false,
       roster: '',
       locals: [],
     },
@@ -151,6 +154,7 @@ export function world(on: On): World {
     if (args.startsWith('diff --numstat origin/')) return out(w.git.numstat)
     if (args.startsWith('diff --raw')) return out(w.git.raw)
     if (args.startsWith('diff -U0')) return out(w.git.pkgDiff)
+    if (args.startsWith(`merge-base --is-ancestor ${w.git.head}`)) return out('', w.git.isAncestor ? 0 : 1)
     if (args.startsWith('merge-base --is-ancestor')) return out('', w.git.isLanded ? 0 : 1)
     if (args.startsWith('rev-list --no-merges')) return out(w.git.left)
     if (args.startsWith('diff --numstat')) return out(w.git.since)

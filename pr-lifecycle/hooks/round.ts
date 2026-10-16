@@ -13,10 +13,12 @@ import {
   fixPrompt,
   lowerOf,
   heldPrompt,
+  listFindingsOf,
   prPrompt,
   readDispositions,
   readReview,
   readTrailer,
+  readTriage,
   readVerify,
   readyPrompt,
   reportPrompt,
@@ -24,6 +26,7 @@ import {
   stepDown,
   stepOf,
   TRAILER,
+  triagePrompt,
   verifyPrompt,
 } from './core'
 import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
@@ -31,13 +34,16 @@ import type { Check, Feedback, Roster } from './github'
 import {
   applyAnswer,
   decideNext,
+  invalidate,
   isBlocking,
   lastReviewedHead,
   markHeld,
   markVerified,
   mergeFindings,
+  nextIds,
   raisedIn,
   roundOf,
+  triage,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -594,20 +600,195 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     await finish($, run.id, 'error', `No reviewer covered ${got.prHead.slice(0, 7)} within the wait cap. Run /pr-gate resume to wait again.`)
     return
   }
-  await beginTriage($, after, hasFindings)
+  await beginTriage($, after.id)
+}
+
+/** A post-PR step could not read GitHub or the checkout: an attempt, no round used, and the agent is told its next step. */
+async function failPost($: Engine, run: Run, why: string): Promise<void> {
+  await noteAttempt($, run, why)
+  await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
+  void $.prompt.submit({ text: `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.` }).catch(() => undefined)
 }
 
 /**
- * Task 12 builds triage. Until then (ruling R3): feedback that raises nothing (approvals, empty reviews)
- * ends the round clean; anything else waits in triage.
+ * Triage: the round's fresh GitHub feedback, and Codex's open findings when it ran, go to the main agent in one turn.
+ * Feedback that raises nothing (approvals, empty reviews) and no commits from elsewhere end the round clean (R3).
  */
-async function beginTriage($: Engine, run: Run, hasFindings: boolean): Promise<void> {
-  if (!hasFindings) {
+async function beginTriage($: Engine, id: string): Promise<void> {
+  const now = await $.clock.now()
+  const run = await getRun($)
+  if (run === null || run.id !== id || run.status !== 'running') return
+  const rec = await loadRecord($, run.root, run.branch)
+  if (rec === undefined) {
+    await finish($, run.id, 'error', `The lifecycle record of ${run.branch} is gone, so post-PR round ${run.round} cannot go on. Run /pr-gate to start it again.`)
+    return
+  }
+  let got: Fetched
+  try {
+    got = await fetchFeedback($, rec)
+  } catch (error) {
+    const said = error instanceof Error ? error.message : String(error)
+    got = { isOk: false, why: `gh failed (${said.slice(0, 160)}); check gh auth login, rate limits and the network`, feedback: [], checks: [], prHead: rec.head }
+  }
+  if (!got.isOk) {
+    await failPost($, run, `GitHub could not be read: ${got.why ?? 'gh failed'}; fix that, then run pr-gate resume`)
+    return
+  }
+  const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id))
+  const lastHead = lastReviewedHead(rec)
+  // What changed since the last reviewed head; nothing when this round reviews that same head.
+  const changed = lastHead === undefined || lastHead === run.headSha ? undefined : await git($, run.root, ['diff', '--name-only', lastHead, run.headSha])
+  const changedFiles = new Set(changed?.isOk === true ? changed.out.split('\n').filter(Boolean) : [])
+  const ledger = mergeFindings(rec.findings, run.findings)
+  // Fresh ids number after every G{round}-k already in the run or the record (R23).
+  const idOf = nextIds(`G${run.round}-`, [run.findings, rec.findings])
+  const fresh: Finding[] = []
+  const listed = items.map(feedback => {
+    const title = feedback.body.split('\n')[0]?.replace(/[*_`#>]/g, '').trim().slice(0, 200) || `${feedback.reviewer} ${feedback.kind}`
+    // Feedback an interrupted attempt already numbered keeps its finding: one id per piece of feedback.
+    const known = ledger.find(one => one.externalId === feedback.id)
+    const placed = triage({ file: feedback.file, line: feedback.line, title }, ledger.filter(one => one.externalId !== feedback.id), changedFiles)
+    if (known !== undefined) return { feedback, cls: placed.cls, matchId: placed.matchId, findingId: known.id }
+    const hint = severityHint(feedback.body)
+    const finding: Finding = {
+      id: idOf(fresh.length + 1),
+      round: run.round,
+      source: 'github',
+      reviewer: feedback.reviewer,
+      externalId: feedback.id,
+      ...(feedback.threadId === undefined ? {} : { threadId: feedback.threadId }),
+      ...(feedback.url === undefined ? {} : { url: feedback.url }),
+      severity: hint.severity,
+      ...(hint.isSecurity ? { isSecurity: true } : {}),
+      title,
+      ...(feedback.file === undefined ? {} : { file: feedback.file }),
+      ...(feedback.line === undefined ? {} : { line: feedback.line }),
+      detail: feedback.body.slice(0, 4000),
+      headSeen: run.headSha,
+      status: 'open',
+      history: [{ round: run.round, status: 'open', by: feedback.reviewer, at: now }],
+    }
+    fresh.push(finding)
+    return { feedback, cls: placed.cls, matchId: placed.matchId, findingId: finding.id }
+  })
+  // Codex's findings of this round still open (the fallback or the final-head check): answered in the same turn.
+  const codex = run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
+  // Commits on the PR that this machine did not make.
+  const log = got.prHead === rec.head ? undefined : await git($, run.root, ['log', '--format=%h %an %s', `${rec.head}..${got.prHead}`])
+  const others = log?.isOk === true ? log.out.split('\n').filter(Boolean) : []
+  if (listed.length === 0 && codex.length === 0 && others.length === 0) {
     await endRound($, run, true)
     return
   }
+  const count = listed.length + codex.length
+  const opened = await patch($, id, one => ({
+    ...one,
+    phase: 'triage',
+    phaseStartedAt: now,
+    findings: mergeFindings(one.findings, fresh),
+    triaged: items.map(each => each.id),
+    pending: [{ role: 'triage', step: stepOf(one, 'triage'), isMain: true }],
+    activity: 'waiting on the main agent to answer the reviews…',
+    steps: withStep(one.steps, {
+      id: `r${one.round}-triage`,
+      label: `Round ${one.round} · answer ${count} review item${count === 1 ? '' : 's'} (main agent)`,
+      state: 'running',
+    }),
+  }))
+  if (opened === null) return
+  $.ui.status(`pr-gate r${opened.round}: answering the reviews`)
+  const text = triagePrompt(opened, rec, listed, others)
+  const range = `${opened.diffBase.slice(0, 7)}..${opened.headSha.slice(0, 7)}`
+  const prompt = codex.length === 0 ? text : `${text}\n\nCodex also reviewed ${range}; answer these too:\n${listFindingsOf(codex)}`
+  // As with the fix step: armed once its turn starts, so a turn already running is never read as the answer.
+  void $.prompt
+    .submit({ text: prompt })
+    .then(async entered => {
+      if ('drop' in entered && typeof entered.drop === 'string') {
+        await finish($, id, 'error', `The reviews could not be sent to the main agent: ${entered.drop}`)
+        return
+      }
+      const startedAt = await $.clock.now()
+      await patch($, id, one =>
+        one.phase === 'triage' ? { ...one, phaseStartedAt: startedAt, pending: one.pending.map(each => ({ ...each, isArmed: true })) } : one,
+      )
+    })
+    .catch(() => undefined)
+}
+
+/** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
+async function afterTriage($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
-  await patch($, run.id, one => ({ ...one, phase: 'triage', phaseStartedAt: now, activity: 'triage is not built yet' }))
+  const said = readTriage(run.pending[0]?.answer ?? '')
+  const after = await patch($, run.id, one => ({
+    ...one,
+    pending: [],
+    findings: one.findings.map(finding => {
+      const answer = said.find(each => each.id === finding.id)
+      return answer === undefined ? finding : applyAnswer(finding, answer, one.round, 'main', now)
+    }),
+    steps: withStep(one.steps, {
+      id: `r${one.round}-triage`,
+      label: `Round ${one.round} · answer the reviews (main agent)`,
+      state: 'done',
+      detail: `${said.length} answered`,
+    }),
+  }))
+  if (after === null) return
+  // Before anything can end the round: the feedback is processed and its replies are known, so no reply is ever asked for twice.
+  const triaged = run.triaged ?? []
+  const rec = await updateRecord($, run.root, run.branch, one => ({
+    ...one,
+    findings: mergeFindings(one.findings, after.findings),
+    processed: [...new Set([...one.processed, ...triaged])],
+    replies: {
+      ...one.replies,
+      ...Object.fromEntries(
+        said.flatMap(each => {
+          const externalId = after.findings.find(f => f.id === each.id)?.externalId
+          return each.replyId === undefined || externalId === undefined ? [] : [[externalId, each.replyId]]
+        }),
+      ),
+    },
+  }))
+  if (rec === undefined) return
+  const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
+  if (dirty.isOk && dirty.out !== '') {
+    await failPost($, after, 'the reviews were answered with uncommitted changes left: commit and push them, then run pr-gate resume')
+    return
+  }
+  // The round ends on the PR head as GitHub reports it now (R28): this machine's push, or another agent's on top of it.
+  const local = await git($, run.root, ['rev-parse', 'HEAD'])
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr ?? ''), '--json', 'headRefOid'], { cwd: run.root, timeoutMs: 30_000 })
+  let prHead: string | undefined
+  try {
+    const read = pr.exitCode === 0 ? (JSON.parse(pr.stdout) as { headRefOid?: unknown } | null)?.headRefOid : undefined
+    prHead = typeof read === 'string' && read !== '' ? read : undefined
+  } catch {
+    prHead = undefined
+  }
+  if (!local.isOk || prHead === undefined) {
+    const what = !local.isOk ? 'the local HEAD could not be read' : `gh could not read the head of PR #${rec.pr}; check gh auth login and the network`
+    await failPost($, after, `${what}, then run pr-gate resume`)
+    return
+  }
+  const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
+  if (!isContained) {
+    await failPost($, after, `commits on ${run.branch} are not pushed: push, then pr-gate resume`)
+    return
+  }
+  const endHead = prHead
+  if (endHead !== run.roundStartHead) {
+    const changed = await git($, run.root, ['diff', '--name-only', run.roundStartHead, endHead])
+    const files = changed.isOk ? new Set(changed.out.split('\n').filter(Boolean)) : ('all' as const)
+    // This round's answers are about the new head already; earlier answers on touched files need checking again.
+    await patch($, run.id, one => ({
+      ...one,
+      findings: invalidate(one.findings, files).map(f => (f.round === one.round ? { ...f, needsRecheck: undefined } : f)),
+    }))
+  }
+  const ended = await getRun($)
+  if (ended !== null && ended.id === run.id && ended.status === 'running') await endRound($, { ...ended, headSha: endHead }, true)
 }
 
 /**
@@ -863,11 +1044,7 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   }
   const prior = await loadRecord($, run.root, run.branch)
   // A rerun of round N (after a stop, an error or uncommitted changes) numbers after what that round already raised.
-  const prefix = `R${run.round}-`
-  const taken = Math.max(
-    0,
-    ...[...run.findings, ...(prior?.findings ?? [])].filter(one => one.id.startsWith(prefix)).map(one => Number(one.id.slice(prefix.length)) || 0),
-  )
+  const idOf = nextIds(`R${run.round}-`, [run.findings, prior?.findings ?? []])
   // Blockers still open from earlier rounds go to this round's fix step too; the fixer can still rebut a stale one.
   const carried = new Set(prior === undefined ? [] : unresolvedBlockers(prior).filter(one => one.status === 'open').map(one => one.id))
   const fresh: Finding[] = []
@@ -875,7 +1052,7 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     for (const one of result.findings) {
       fresh.push({
         ...one,
-        id: `${prefix}${taken + fresh.length + 1}`,
+        id: idOf(fresh.length + 1),
         round: run.round,
         source: role === 'challenge' ? 'codex-challenge' : 'codex-review',
         reviewer: 'codex',
@@ -936,9 +1113,10 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   // otherwise the free post-PR baseline round reviews that head.
   const toFix = after.findings.filter(one => raisedIn(one, after.round) && one.status === 'open')
   if (after.lifecycle === 'post') {
-    // The final-head check only reviews: no fix step. Otherwise the main agent answers Codex and GitHub together in triage.
-    if (after.roundKind === 'final-head-check') await endRound($, after, true)
-    else await beginTriage($, after, toFix.length > 0 || (after.triaged?.length ?? 0) > 0) // Task 12 reads the feedback itself
+    // The main agent answers Codex and GitHub together in triage. A final-head check goes there too, so the
+    // reviewers' feedback on it enters the ledger and gets its reply; a fix it makes changes the head, which
+    // the controller never certifies (exhausted, not ready).
+    await beginTriage($, after.id)
     return
   }
   if (toFix.length > 0) {
@@ -1058,4 +1236,5 @@ export async function onAnswer($: Engine, agentId: string | undefined, answer: s
   if (after.phase === 'review') await afterReview($, after)
   else if (after.phase === 'fix') await afterFix($, after)
   else if (after.phase === 'verify') await afterVerify($, after)
+  else if (after.phase === 'triage') await afterTriage($, after)
 }

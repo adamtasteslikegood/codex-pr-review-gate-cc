@@ -148,6 +148,12 @@ export function mergeFindings(kept: readonly Finding[], changed: readonly Findin
   return out
 }
 
+/** The next free id under a prefix (`R3-`, `G3-`): after the highest one in any of the lists, so an id is never reused (R23). */
+export function nextIds(prefix: string, lists: readonly (readonly Pick<Finding, 'id'>[])[]): (n: number) => string {
+  const taken = Math.max(0, ...lists.flat().filter(one => one.id.startsWith(prefix)).map(one => Number(one.id.slice(prefix.length)) || 0))
+  return n => `${prefix}${taken + n}`
+}
+
 export type TriageClass = 'duplicate' | 'new-on-reviewed' | 'new-on-changed'
 
 const words = (title: string): Set<string> => new Set(title.toLowerCase().split(/[^a-z0-9]+/).filter(one => one.length > 2))
@@ -323,6 +329,8 @@ function decidePost(rec: LifecycleRecord): Next {
 /** What the controller does after a round, from the record alone. Exhaustion is never a pass. */
 export function decideNext(rec: LifecycleRecord): Next {
   // Ready holds only for the head it was reached at: a later push continues the lifecycle.
-  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec)) return { kind: 'ready' }
+  // It never holds over an unresolved blocker or a fix still owed its check, whatever wrote them after ready.
+  const isSettled = unresolvedBlockers(rec).length === 0 && verificationOwed(rec).length === 0
+  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && isSettled) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
 }

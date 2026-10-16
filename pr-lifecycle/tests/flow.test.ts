@@ -693,7 +693,9 @@ test('when Codex also runs, the round keeps the GitHub evidence', async ($, on) 
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('review')
   await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] }), `agent-${w.spawned.length}`))
-  const sources = (await runOf(w)).evidence.map(one => `${one.source}:${one.reviewer}`)
+  // Nothing left to triage: the round is recorded with both.
+  const round = (await recordOf(w)).rounds.find(one => one.phase === 'post' && one.isCompleted)
+  const sources = (round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)
   expect(sources).toEqual(['github:claude[bot]', 'codex:codex'])
 })
 
@@ -730,4 +732,152 @@ test('an unknown gh login found again is kept on the record', async ($, on) => {
   w.store.set(KEY, { ...rec, self: undefined })
   await w.clock.advance(30_000)
   expect((await recordOf(w)).self).toBe('me')
+})
+
+const inline = (id: number, body: string, head: string, line = 4) => ({
+  id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: `u${id}`,
+})
+const roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+const covers = (head: string) => [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
+
+/** Round 1 ends with the reviewer's feedback handed to the main agent. */
+const toTriage = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = '**P1** SQL injection') => {
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, body, w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+}
+
+const triaged = (step: string, dispositions: object[]) => turn(`ok\n${TRAILER}\n${JSON.stringify({ step, dispositions })}`)
+
+test('code changes in the first post-PR round require review of the resulting head', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  expect(w.prompts.at(-1)).toContain('G')
+  expect(w.prompts.at(-1)).toContain('reply to thread 11')
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
+  const rec = await recordOf(w)
+  expect(rec.replies['inline:11']).toBe('991')
+  expect(rec.processed).toContain('inline:11')
+  expect(rec.findings.find(one => one.externalId === 'inline:11')?.status).toBe('reported-fixed')
+  // Round 2, the protected one, is collecting on the new head.
+  const run = await runOf(w)
+  expect(run.phase).toBe('collect')
+  expect(run.roundKind).toBe('baseline')
+  expect(rec.phase).toBe('post')
+})
+
+test('a clean first post-PR round does not force a second', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+
+test('another agent pushing during triage makes the PR head the round\'s end head', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  w.gh.prHead = '7'.repeat(40) // pushed by someone else; local HEAD unchanged
+  w.git.isAncestor = true
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post').at(-1)?.endHead).toBe('7'.repeat(40))
+  expect((await runOf(w)).roundKind).toBe('baseline')
+})
+
+test('duplicate comments and polling consume no new round', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  const before = await recordOf(w)
+  await w.clock.advance(10 * 60_000) // ready: nothing polls, nothing counts
+  const after = await recordOf(w)
+  expect(after.rounds).toHaveLength(before.rounds.length)
+  expect(w.prompts.filter(one => one.includes('New review feedback'))).toHaveLength(1)
+})
+
+test('fresh GitHub finding ids number after the ones the round already has', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  // An earlier attempt of this round already raised G2-1 for other feedback.
+  const rec = await recordOf(w)
+  const earlier = {
+    id: 'G2-1', round: 2, source: 'github', reviewer: 'alice', externalId: 'comment:77', severity: 'P1', title: 'x',
+    headSeen: 'a'.repeat(40), status: 'rebutted', history: [],
+  }
+  w.store.set(KEY, { ...rec, findings: [earlier], processed: ['comment:77'] })
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect(w.prompts.at(-1)).toContain('G2-2 from claude[bot]')
+  expect((await runOf(w)).findings.find(one => one.externalId === 'inline:11')?.id).toBe('G2-2')
+})
+
+test('commits the PR does not have end triage as an attempt, keeping the replies', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40) // committed here, never pushed
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('commits on feat/x are not pushed: push, then pr-gate resume')
+  const rec = await recordOf(w)
+  expect(rec.attempts).toBe(1)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
+  expect(rec.replies['inline:11']).toBe('991')
+  expect(rec.processed).toContain('inline:11')
+})
+
+test('uncommitted changes after triage still record the replies, so none is posted twice', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.dirty = ' M src/app.ts'
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  expect((await runOf(w)).status).toBe('error')
+  const rec = await recordOf(w)
+  expect(rec.replies['inline:11']).toBe('991')
+  expect(rec.processed).toContain('inline:11')
+  expect(rec.findings.filter(one => one.externalId === 'inline:11')).toHaveLength(1)
+})
+
+test('GitHub findings in a final-head check enter the ledger and can make it exhausted, never ready', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  // Round 2: the P1 is fixed and pushed.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  // Round 3, the protected one: Codex verifies the fix, a nit is fixed and pushed.
+  w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('review')
+  await $.turn.complete(turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  expect((await runOf(w)).phase).toBe('triage')
+  await w.clock.advance(1000) // the triage prompt enters the main agent's queue
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await $.turn.complete(triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
+  // The allowance is spent: round 4 is the final-head check, and a reviewer raises a P1 on it.
+  expect((await runOf(w)).roundKind).toBe('final-head-check')
+  w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await $.turn.complete(turn(review('r4-review', 'PASS'), `agent-${w.spawned.length}`))
+  expect(w.prompts.at(-1)).toContain('G4-1')
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r4-triage', []))
+  const rec = await recordOf(w)
+  const raised = rec.findings.find(one => one.externalId === 'inline:13')
+  expect(raised?.severity).toBe('P1')
+  expect(raised?.status).toBe('open')
+  expect(rec.processed).toContain('inline:13')
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.postStatus).toBe('exhausted')
 })
