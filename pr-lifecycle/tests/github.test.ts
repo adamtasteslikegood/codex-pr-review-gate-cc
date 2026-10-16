@@ -7,11 +7,34 @@ const at = (iso: string) => Date.parse(iso)
 test('paginated gh output is read as one list', async () => {
   expect(readJsonList('[{"id":1}]\n[{"id":2}]')).toEqual([{ id: 1 }, { id: 2 }])
   expect(readJsonList('')).toEqual([])
-  expect(readJsonList('not json')).toEqual([])
+  expect(() => readJsonList('not json')).toThrow()
   // A page's body may hold `] [`: only a page boundary splits the text.
   const pages = readJsonList('[{"id":1,"body":"a ] [ b"}][{"id":2,"body":"c"}]')
   expect(pages).toHaveLength(2)
   expect((pages[0] as { body: string }).body).toBe('a ] [ b')
+  // Escaped quotes and braces inside a string are data, not boundaries.
+  const escaped = readJsonList('[{"body":"say \\"}{\\" ok"}][{"body":"x"}]')
+  expect(escaped).toHaveLength(2)
+  expect((escaped[0] as { body: string }).body).toBe('say "}{" ok')
+  // Consecutive top-level objects are separate pages too.
+  expect(readJsonList('{"id":1}{"id":2}')).toEqual([{ id: 1 }, { id: 2 }])
+})
+
+test('unreadable gh output fails loudly; blank output is still nothing', async () => {
+  expect(() => readJsonList('oops')).toThrow('unreadable JSON from gh')
+  expect(() => readReviews('oops')).toThrow()
+  expect(() => readCheckRuns('oops')).toThrow()
+  expect(readCheckRuns('')).toEqual([])
+  expect(readReviews('  \n')).toEqual([])
+})
+
+test('check runs from paginated pages, or one unpaginated object', async () => {
+  const pages = '{"total_count":2,"check_runs":[{"name":"a","status":"completed","conclusion":"success"}]}'
+    + '{"total_count":2,"check_runs":[{"name":"b","status":"in_progress","conclusion":null}]}'
+  expect(readCheckRuns(pages)).toEqual([
+    { name: 'a', status: 'completed', conclusion: 'success' },
+    { name: 'b', status: 'in_progress', conclusion: null },
+  ])
 })
 
 test('reviews, inline comments and issue comments become feedback with stable ids', async () => {
@@ -52,6 +75,8 @@ test('a severity is read from the reviewer\'s own words, P2 when it says none', 
   expect(severityHint('**P1** SQL injection')).toEqual({ severity: 'P1', isSecurity: true })
   expect(severityHint('Critical: crashes on empty input')).toEqual({ severity: 'P1', isSecurity: false })
   expect(severityHint('nit: typo')).toEqual({ severity: 'P3', isSecurity: false })
+  // A security hint never drops below P2 unless the reviewer tagged a severity itself.
+  expect(severityHint('minor: possible XSS here')).toEqual({ severity: 'P2', isSecurity: true })
   expect(severityHint('Consider renaming')).toEqual({ severity: 'P2', isSecurity: false })
 })
 
