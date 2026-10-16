@@ -46,6 +46,7 @@ import {
   markVerified,
   mergeFindings,
   mergeHolds,
+  newRecord,
   nextIds,
   raisedIn,
   rejections,
@@ -58,7 +59,7 @@ import {
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { loadRecord, updateRecord } from './store'
+import { archiveRecord, loadRecord, saveRecord, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -332,7 +333,8 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
       pending: [],
       activity: '',
       steps: one.steps.map(step =>
-        step.id === 'pr'
+        // After the PR opened, its step stays done.
+        step.id === 'pr' && one.lifecycle !== 'post'
           ? { ...step, state: isOpenable ? 'pending' : 'skipped', detail: undefined }
           : step.state === 'running'
             ? { ...step, state: status === 'error' || status === 'stopped' ? 'failed' : 'done' }
@@ -361,6 +363,48 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
   $.ui.status(undefined)
   $.ui.toast(`pr-gate ${status}: ${message}`.slice(0, 300))
   return ended
+}
+
+/**
+ * Archives the branch's record (R47): the whole record under its own key, and on the branch's key a seed that keeps only what a
+ * fresh start must not repeat (processed feedback and recorded replies). False when there was no live record.
+ */
+export async function archiveLifecycle($: Engine, root: string, branch: string, now: number): Promise<boolean> {
+  const last = await loadRecord($, root, branch)
+  if (last === undefined || last.phase === 'archived') return false
+  await archiveRecord($, last, now)
+  const { base, head, tier, tierWhy, lane, allowance } = last
+  const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
+  await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
+  return true
+}
+
+export type PrState = 'OPEN' | 'MERGED' | 'CLOSED'
+
+/** Reads a PR's state from gh's JSON; undefined when it is not there. */
+export const prStateIn = (json: unknown): PrState | undefined => {
+  const state = (json as { state?: unknown } | null)?.state
+  return state === 'OPEN' || state === 'MERGED' || state === 'CLOSED' ? state : undefined
+}
+
+/** The state of PR `pr`, as gh reports it; undefined when gh cannot say. */
+export async function prStateOf($: Engine, root: string, pr: number): Promise<PrState | undefined> {
+  const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'state'], { cwd: root, timeoutMs: 30_000 })
+  if (view.exitCode !== 0) return undefined
+  try {
+    return prStateIn(JSON.parse(view.stdout))
+  } catch {
+    return undefined
+  }
+}
+
+/** The PR was merged or closed (R62): the branch's live run ends with a short message, and its record is archived. */
+export async function closeLifecycle($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+  const said = `PR #${pr ?? '?'} from ${branch} was ${state === 'MERGED' ? 'merged' : 'closed'}: its lifecycle is archived, its history kept`
+  const run = await getRun($)
+  if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'stopped', `${said}.`)
+  await archiveLifecycle($, root, branch, await $.clock.now())
+  return said
 }
 
 // ----------------------------------------------------------- the steps
@@ -518,6 +562,8 @@ async function ghJson($: Engine, root: string, path: string): Promise<{ isOk: bo
 type Fetched = {
   isOk: boolean
   why?: string
+  /** The PR was merged or closed (R62): nothing more to collect. */
+  closed?: 'MERGED' | 'CLOSED'
   feedback: Feedback[]
   checks: Check[]
   prHead: string
@@ -538,16 +584,20 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     const found = self
     await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }))
   }
-  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid'], { cwd: rec.root, timeoutMs: 30_000 })
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state'], { cwd: rec.root, timeoutMs: 30_000 })
   if (pr.exitCode !== 0) {
     return fail(`gh could not read PR #${rec.pr} (${pr.stderr.trim().slice(0, 160) || `exit ${pr.exitCode}`}); check gh auth login and the network`)
   }
   let prHead: string | undefined
+  let state: PrState | undefined
   try {
-    prHead = (JSON.parse(pr.stdout) as { headRefOid?: unknown } | null)?.headRefOid as string | undefined
+    const read = JSON.parse(pr.stdout) as { headRefOid?: unknown } | null
+    prHead = read?.headRefOid as string | undefined
+    state = prStateIn(read)
   } catch {
     prHead = undefined
   }
+  if (state === 'MERGED' || state === 'CLOSED') return { ...fail(`PR #${rec.pr} was ${state.toLowerCase()}`), closed: state }
   if (typeof prHead !== 'string' || prHead === '') {
     return fail(`gh returned unreadable output for PR #${rec.pr} (${pr.stdout.trim().slice(0, 80)}); check gh auth login, rate limits and the network`)
   }
@@ -612,6 +662,10 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
     got = { isOk: false, why: `gh failed (${said.slice(0, 160)}); check gh auth login, rate limits and the network`, feedback: [], checks: [], prHead: rec.head }
+  }
+  if (got.closed !== undefined) {
+    await closeLifecycle($, run.root, run.branch, rec.pr, got.closed)
+    return
   }
   if (!got.isOk) {
     await noteAttempt($, run, got.why ?? 'gh failed')
@@ -742,6 +796,10 @@ async function beginTriage($: Engine, id: string): Promise<void> {
     const said = error instanceof Error ? error.message : String(error)
     const why = `gh failed (${said.slice(0, 160)}); check gh auth login, rate limits and the network`
     got = { isOk: false, why, feedback: [], checks: [], prHead: prior.head }
+  }
+  if (got.closed !== undefined) {
+    await closeLifecycle($, run.root, run.branch, prior.pr, got.closed)
+    return
   }
   if (!got.isOk) {
     await failPost($, run, `GitHub could not be read: ${got.why ?? 'gh failed'}; fix that, then run /pr-gate resume`)
@@ -951,13 +1009,20 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   // The round ends on the PR head as GitHub reports it now (R28): this machine's push, or another agent's on top of it.
   const local = await git($, run.root, ['rev-parse', 'HEAD'])
-  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr ?? ''), '--json', 'headRefOid'], { cwd: run.root, timeoutMs: 30_000 })
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr ?? ''), '--json', 'headRefOid,state'], { cwd: run.root, timeoutMs: 30_000 })
   let prHead: string | undefined
+  let state: PrState | undefined
   try {
-    const read = pr.exitCode === 0 ? (JSON.parse(pr.stdout) as { headRefOid?: unknown } | null)?.headRefOid : undefined
+    const json = pr.exitCode === 0 ? (JSON.parse(pr.stdout) as { headRefOid?: unknown } | null) : undefined
+    const read = json?.headRefOid
     prHead = typeof read === 'string' && read !== '' ? read : undefined
+    state = prStateIn(json)
   } catch {
     prHead = undefined
+  }
+  if (state === 'MERGED' || state === 'CLOSED') {
+    await closeLifecycle($, run.root, run.branch, rec.pr, state)
+    return
   }
   if (!local.isOk || prHead === undefined) {
     const what = !local.isOk ? 'the local HEAD could not be read' : `gh could not read the head of PR #${rec.pr}; check gh auth login and the network`

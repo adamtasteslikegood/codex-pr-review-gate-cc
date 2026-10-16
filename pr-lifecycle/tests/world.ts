@@ -50,6 +50,8 @@ export type World = {
     isAuthed: boolean
     /** Whether the branch has an open PR: false until a PR-creating Bash call succeeds, or a test opens one. */
     hasPr: boolean
+    /** The PR's state as gh reports it: OPEN, MERGED or CLOSED. */
+    state: string
     /** Every gh call throws, as a broken runtime would. */
     isBroken: boolean
     /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
@@ -123,6 +125,7 @@ export function world(on: On): World {
       checks: [],
       isAuthed: true,
       hasPr: false,
+      state: 'OPEN',
       isBroken: false,
       calls: [],
     },
@@ -168,7 +171,7 @@ export function world(on: On): World {
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
-        return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: 'OPEN' }))
+        return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
       }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))

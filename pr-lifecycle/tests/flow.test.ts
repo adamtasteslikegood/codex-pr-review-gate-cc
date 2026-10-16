@@ -2459,3 +2459,53 @@ test('R61: a GitHub MCP create outside a checkout is held', async ($, on) => {
   const held = (await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', base: 'dev', head: 'feat/x', title: 'x' } as never)).deny ?? ''
   expect(held).toContain("run it from the repository's checkout so the gate can check it")
 })
+
+test('R62: waive post during collection ends the run, and the merge goes through', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  expect((await runOf(w)).phase).toBe('collect')
+  await $.command.run(cmd('waive post hotfix'))
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  const spawned = w.spawned.length
+  await w.clock.advance(30 * 60_000)
+  expect(w.spawned).toHaveLength(spawned)
+  expect((await runOf(w)).status).not.toBe('running')
+})
+
+test('R62: a poll that reads the PR merged archives the record and ends the run', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const before = await recordOf(w)
+  w.gh.state = 'MERGED'
+  await w.clock.advance(30_000)
+  const run = await runOf(w)
+  expect(run.status).not.toBe('running')
+  expect(run.message).toContain('merged')
+  expect((await recordOf(w)).phase).toBe('archived')
+  const archived = [...w.store.keys()].filter(key => key.startsWith(`${KEY}:archived:`))
+  expect(archived).toHaveLength(1)
+  expect((w.stored(archived[0] ?? '') as LifecycleRecord).pr).toBe(before.pr)
+  expect((await recordOf(w)).postStatus).toBeUndefined()
+})
+
+test('R62: a session start does not collect again for a closed PR: it archives the record', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.state = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect(w.run?.status === 'running').toBe(false)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('R62: a bare /pr-gate does not collect again for a merged PR: it archives the record', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await $.command.run(cmd('stop'))
+  w.gh.state = 'MERGED'
+  const said = await $.command.run(cmd(''))
+  expect(JSON.stringify(said)).toContain('merged')
+  expect((await runOf(w)).status).not.toBe('running')
+  expect((await recordOf(w)).phase).toBe('archived')
+})

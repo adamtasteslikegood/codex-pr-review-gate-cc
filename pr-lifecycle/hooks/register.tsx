@@ -31,6 +31,8 @@ import {
 } from './lifecycle'
 import {
   advance,
+  archiveLifecycle,
+  closeLifecycle,
   configOf,
   finish,
   getRun,
@@ -46,6 +48,7 @@ import {
   onTurnStart,
   PANE,
   patch,
+  prStateOf,
   say,
   setLive,
   setup,
@@ -53,7 +56,7 @@ import {
 } from './round'
 import type { Config } from './round'
 import { renderPane } from './pane'
-import { archiveRecord, loadRecord, saveRecord, updateRecord } from './store'
+import { loadRecord, saveRecord, updateRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -160,6 +163,10 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   if (branch === '' || branch === 'HEAD') return 'Not started: HEAD is detached, so there is no branch to open a PR from.'
   const known = await loadRecord($, root, branch)
+  // A PR merged or closed since: nothing more to review on it, and its record is archived (R62).
+  const isOpened = known !== undefined && (known.phase === 'post' || known.phase === 'ready') && known.pr !== undefined
+  const state = isOpened ? await prStateOf($, root, known.pr ?? 0) : undefined
+  if (state === 'MERGED' || state === 'CLOSED') return `${await closeLifecycle($, root, branch, known?.pr, state)}. Nothing to review.`
   // An open PR's base is fixed: a resume or a bare /pr-gate keeps it. Before the PR, no base named keeps the record's own.
   const isKept = known !== undefined && known.phase !== 'archived' && (known.phase !== 'pre' || want.base === undefined)
   const base = isKept ? known.base : (want.base ?? config.bases[0] ?? 'dev')
@@ -623,14 +630,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   }
   if (verb === 'reset') {
     if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
-    const last = await loadRecord($, root, branch)
-    if (last !== undefined && last.phase !== 'archived') {
-      // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
-      await archiveRecord($, last, now)
-      const { base, head: at, tier, tierWhy, lane, allowance } = last
-      const seed = newRecord({ root, branch, base, head: at, tier, tierWhy, lane, allowance, at: now })
-      await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
-    }
+    // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
+    await archiveLifecycle($, root, branch, now)
     return `/${COMMAND}: the lifecycle for ${branch} is archived under its own key, its history kept. /${COMMAND} starts a fresh one.`
   }
   if (verb === 'allow') {
@@ -729,6 +730,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     rec ??
     newRecord({ root, branch, base: config.bases[0] ?? 'dev', head, tier: 'standard', tierWhy: 'waived before scoping', lane: 'full', allowance: 0, at: now })
   await saveRecord($, { ...base, waivers: [...base.waivers, { scope: 'post', head: at, reason, by: origin, at: now }] })
+  // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
+  if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.`
 }
 
@@ -826,6 +829,12 @@ export const register: Register = (on, options) => {
         const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
         // A review that stopped on an error (gh down, a step that failed) polls again, as the spec's restart does; a stop is the person's.
         if (rec !== undefined && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
+          // A PR merged or closed meanwhile is not collected again: its record is archived (R62).
+          const state = rec.pr === undefined ? undefined : await prStateOf($, top.out, rec.pr)
+          if (state === 'MERGED' || state === 'CLOSED') {
+            await closeLifecycle($, top.out, branch, rec.pr, state)
+            return next(e)
+          }
           if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
           await holdingPrompts($, () => advance($, top.out, branch))
         }

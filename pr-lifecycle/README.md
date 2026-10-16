@@ -346,7 +346,7 @@ transcript or above the prompt, depending on the host.
 | `/pr-gate stop` | stop the round in flight; the record stays, and opening and merging stay held |
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review; post-PR review still runs. Refused while a security P1 holds |
-| `/pr-gate waive post <reason>` | let this head merge without the review; a security P1 needs its own waiver first |
+| `/pr-gate waive post <reason>` | let this head merge without the review, and stop the post-PR review in flight; a security P1 needs its own waiver first |
 | `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test, security P1 included |
 | `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
 | `/pr-gate reset` | archive the record under its own key, history kept, and start fresh |
@@ -356,6 +356,11 @@ command run is refused. Each waiver records who, when, head, scope and reason,
 and covers its scope at that head; a new code commit needs a new one (a finding
 waiver lapses only when that finding's file changes). `reset` keeps what a
 fresh start must not repeat: feedback already answered is not answered again.
+
+A PR merged or closed outside the gate ends its lifecycle the same way: when a
+poll, the triage step, a session start, `/pr-gate` or `resume` reads it merged
+or closed, the run in flight stops and the record is archived. Collection does
+not start again for it.
 
 ## Options
 
