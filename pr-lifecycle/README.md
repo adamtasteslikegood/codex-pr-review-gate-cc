@@ -64,6 +64,13 @@ The gate fails closed: a review that did not complete (timeout, auth, no
 verdict, `gh` failing) is an incomplete attempt. It records its effort, spends
 no round, and `/pr-gate resume` retries it.
 
+Nothing is reviewed against a stale base. Each fetch the gate makes before a
+review (the base, the other gated base, a changed submodule's `main` and `dev`,
+and after the PR opens, the PR's new commits) is tried once more when it fails.
+A second failure starts no round: the agent and the status line get git's
+error, and the next `/pr-gate` or create fetches again. A ref the remote does
+not have is not a failed fetch.
+
 ## One round
 
 One round means:

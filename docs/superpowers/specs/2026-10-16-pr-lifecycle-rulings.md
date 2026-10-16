@@ -79,3 +79,9 @@ Each ruling settled a question the spec and plan left open, during subagent-driv
 - Task 12: fix round 5 committed 7b3c60d (198 pass, tsc 0); controller-checked the 3-file diff: R45 guard in afterReview + deferred filtered from post review prompt, R46 heldPrompt from mergeHolds, person only for awaiting-decision/deferred security P1; accepted: R45 also applies pre-PR (consistent with R39); parked: untested awaiting-decision branch of heldPrompt (unreachable today)
 - Parked: onNewHead read-then-write race with a concurrent waive command (pre-existing, tiny window); pre-PR rounds now flag their own verified fixes for re-verify (safe side).
 - Parked (final): dev waiver dropped silently after a main round (held text could say so); waive post leaves postStatus undefined (harmless); openPrOf state; untested beginVerify inside an R63 answer run.
+
+## Adam's rulings on codex-gate's deferred items
+
+Five items codex-gate 0.3.1 left open, decided by Adam and built into 1.0.0. Same format as above.
+
+- Ruling R1-10 (Adam): every fetch before a review (startGate's base, the other gated base in isAlreadyOnBase, a changed submodule's main and dev, the post-PR triage fetch) goes through fetchTwice: a failure is retried once, and a second failure starts no round; the agent gets git's error (a held create says so instead of "wait for the review", a post-PR round stops through failPost) and the status line says the fetch failed; the next /pr-gate or create fetches again. A "couldn't find remote ref" failure is not a failure (the caller already handles a missing ref), and a submodule fetches main and dev one at a time — codex-gate ignored fetch results, so a round could review against a stale base — cost if wrong: a flaky network holds a create until a retry.

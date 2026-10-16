@@ -34,6 +34,7 @@ import {
   archiveLifecycle,
   closeLifecycle,
   configOf,
+  fetchTwice,
   finish,
   getRun,
   git,
@@ -152,6 +153,23 @@ const identityOf = async ($: Engine, root: string): Promise<{ self?: string; slu
   return { ...(login === '' ? {} : { self: login }), ...(slug === undefined ? {} : { slug }) }
 }
 
+/** The start of what `startGate` says when a fetch failed twice (R1-10): a held create says so instead of promising a review. */
+const NOT_FETCHED = 'Not started: git could not fetch'
+
+type NotFetched = { notFetched: string }
+
+/** A fetch failed twice: no round starts, and the agent and the status line are told why. The next start fetches again. */
+const notFetched = ($: Engine, what: string, err: string): NotFetched => {
+  $.ui.status(`pr-gate: could not fetch ${what}`)
+  return {
+    notFetched:
+      `${NOT_FETCHED} ${what}, twice: ${err}. Nothing is reviewed against a stale base; ` +
+      `the next /${COMMAND} or pull request create fetches again.`,
+  }
+}
+
+const isNotFetched = (value: unknown): value is NotFetched => typeof value === 'object' && value !== null && 'notFetched' in value
+
 const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldCall?: boolean }): Promise<string> => {
   const existing = await getRun($)
   if (existing !== null && existing.status === 'running') {
@@ -171,7 +189,9 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const isKept = known !== undefined && known.phase !== 'archived' && (known.phase !== 'pre' || want.base === undefined)
   const base = isKept ? known.base : (want.base ?? config.bases[0] ?? 'dev')
   if (branch === base) return `Not started: you are on ${base} itself. Check out the branch the PR will come from.`
-  await git($, root, ['fetch', 'origin', base], 120_000)
+  const fetched = await fetchTwice($, root, ['origin', base], 120_000)
+  if (!fetched.isOk) return notFetched($, `origin/${base}`, fetched.err).notFetched
+  $.ui.status(undefined)
   if (!(await git($, root, ['rev-parse', '--verify', '--quiet', `origin/${base}`])).isOk) {
     return `Not started: origin/${base} does not exist here.`
   }
@@ -185,7 +205,9 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const lines = rows.reduce((sum, row) => sum + (Number(row[0]) || 0) + (Number(row[1]) || 0), 0)
   if (files.length === 0) return `Not started: ${branch} has no changes against origin/${base}.`
   const settled = await settledFiles($, root, base, files)
+  if (isNotFetched(settled)) return settled.notFetched
   const landedOn = await isAlreadyOnBase($, root, base)
+  if (isNotFetched(landedOn)) return landedOn.notFetched
   const scope =
     landedOn !== undefined
       ? { tier: 'trivial' as const, why: `already reviewed: every commit is on ${landedOn}` }
@@ -291,12 +313,16 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
  * already on that submodule's origin/main or origin/dev, and a package.json or lock change
  * that touches only "version" lines. A pointer to an unlanded commit is not settled.
  */
-const settledFiles = async ($: Engine, root: string, base: string, files: readonly string[]): Promise<string[]> => {
+const settledFiles = async ($: Engine, root: string, base: string, files: readonly string[]): Promise<string[] | NotFetched> => {
   const out: string[] = []
   const raw = await git($, root, ['diff', '--raw', `origin/${base}...HEAD`])
   for (const link of raw.isOk ? readGitlinks(raw.out) : []) {
     const at = `${root}/${link.path}`
-    await git($, at, ['fetch', 'origin', 'main', 'dev'], 120_000)
+    // One ref at a time: a submodule whose origin has no dev still fetches its main.
+    for (const ref of ['main', 'dev']) {
+      const fetched = await fetchTwice($, at, ['origin', ref], 120_000)
+      if (!fetched.isOk) return notFetched($, `origin/${ref} in ${link.path}`, fetched.err)
+    }
     for (const ref of ['origin/main', 'origin/dev']) {
       if ((await git($, at, ['merge-base', '--is-ancestor', link.sha, ref])).isOk) {
         out.push(link.path)
@@ -315,7 +341,7 @@ const settledFiles = async ($: Engine, root: string, base: string, files: readon
  * The other gated base whose origin already holds every commit this branch adds (a
  * back-sync of main into dev), with no merge commit carrying edits of its own; else undefined.
  */
-const isAlreadyOnBase = async ($: Engine, root: string, base: string): Promise<string | undefined> => {
+const isAlreadyOnBase = async ($: Engine, root: string, base: string): Promise<string | NotFetched | undefined> => {
   const merges = await git($, root, ['rev-list', '--merges', `origin/${base}..HEAD`])
   const isCleanMerges =
     merges.isOk &&
@@ -328,7 +354,8 @@ const isAlreadyOnBase = async ($: Engine, root: string, base: string): Promise<s
       )
     ).every(Boolean)
   for (const other of isCleanMerges ? config.bases.filter(one => one !== base) : []) {
-    await git($, root, ['fetch', 'origin', other], 120_000)
+    const fetched = await fetchTwice($, root, ['origin', other], 120_000)
+    if (!fetched.isOk) return notFetched($, `origin/${other}`, fetched.err)
     // A back-sync can be one clean merge and nothing else: every commit it brings is on the other base.
     const left = await git($, root, ['rev-list', '--no-merges', `origin/${base}..HEAD`, `^origin/${other}`])
     if (left.isOk && left.out === '') return `origin/${other}`
@@ -404,6 +431,13 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     }
   }
   const started = await startGate($, { base, cwd: root, isHeldCall: true })
+  // A fetch that failed twice started no round (R1-10): the create is held, and nothing will prompt the agent, so it is told.
+  if (started.startsWith(NOT_FETCHED)) {
+    return [
+      `pr-gate: ${action.via} to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${started.slice('Not started: '.length)}`,
+      'Your next step: check the network and the origin remote, then run the create again. Do not create the pull request another way.',
+    ].join('\n') + unknownNote(action)
+  }
   // A change Codex is not needed for passes at once: the held call goes straight through.
   const after = await loadRecord($, root, branch)
   if (allows(after) && after.preHead === head) return undefined

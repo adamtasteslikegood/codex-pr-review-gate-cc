@@ -2628,3 +2628,63 @@ test('R66: a reply reported as the URL gh prints does not come back as feedback 
   expect((await runOf(w)).findings.some(one => one.externalId === 'comment:60')).toBe(false)
   expect(w.prompts.some(one => one.includes('Fixed in eeeeeee.'))).toBe(false)
 })
+
+test('R1-10: a base fetch that fails once is tried again, and the round starts', async ($, on) => {
+  const w = world(on)
+  w.git.fetchFails = 1
+  await $.tool.call(createPr)
+  expect(w.git.fetches.filter(one => one === 'fetch origin dev')).toHaveLength(2)
+  expect(w.spawned).toHaveLength(1)
+  expect((await runOf(w)).status).toBe('running')
+})
+
+test('R1-10: a base fetch that fails twice starts no round, says why, and the next attempt fetches again', async ($, on) => {
+  const w = world(on)
+  w.git.fetchFails = 2
+  const held = (await $.tool.call(createPr)).deny ?? ''
+  expect(held).toContain('could not fetch origin/dev')
+  expect(held).toContain('Could not resolve host')
+  expect(held).not.toContain('End your turn')
+  expect(w.spawned).toHaveLength(0)
+  expect(w.run?.status === 'running').toBe(false)
+  w.git.fetchFails = 2
+  const said = JSON.stringify(await $.command.run(cmd('')))
+  expect(said).toContain('Could not resolve host')
+  expect(w.spawned).toHaveLength(0)
+  // The network is back: the next create fetches again, and the round starts.
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect(w.spawned).toHaveLength(1)
+})
+
+test('R1-10: a fetch of the other base that fails twice starts no round', async ($, on) => {
+  const w = world(on)
+  w.git.fetchFails = 2
+  w.git.fetchOnly = 'main'
+  const held = (await $.tool.call(createPr)).deny ?? ''
+  expect(held).toContain('could not fetch origin/main')
+  expect(w.spawned).toHaveLength(0)
+})
+
+test('R1-10: a base the remote does not have is not a failed fetch', async ($, on) => {
+  const w = world(on)
+  w.git.missingRefs = ['main']
+  await $.tool.call(createPr)
+  expect(w.spawned).toHaveLength(1)
+})
+
+test('R1-10: a post-PR fetch that fails twice stops the round before triage and tells the agent', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.head = 'b'.repeat(40)
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  w.git.fetchFails = 2
+  await w.clock.advance(30_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('Could not resolve host')
+  expect(w.prompts.at(-1)).toContain('could not fetch origin')
+  expect(w.prompts.some(one => one.includes('SQL injection'))).toBe(false)
+})

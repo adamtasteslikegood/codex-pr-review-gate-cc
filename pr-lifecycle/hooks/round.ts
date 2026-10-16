@@ -219,6 +219,20 @@ export async function git($: Engine, cwd: string | undefined, args: string[], ti
   return { isOk: ran.exitCode === 0, out: ran.stdout.trim(), err: ran.stderr.trim() }
 }
 
+/**
+ * A `git fetch` tried once more when it fails (R1-10), so nothing is reviewed against a stale base. A ref the remote does not have is
+ * no failure: there is nothing to fetch, and the caller finds the ref missing itself. `err` is git's own words, cut short.
+ */
+export async function fetchTwice($: Engine, cwd: string | undefined, args: string[], timeoutMs: number): Promise<{ isOk: boolean; err: string }> {
+  let err = ''
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ran = await git($, cwd, ['fetch', ...args], timeoutMs)
+    if (ran.isOk || /couldn't find remote ref/i.test(ran.err)) return { isOk: true, err: '' }
+    err = ran.err.split('\n').filter(Boolean).at(-1)?.slice(0, 200) ?? ''
+  }
+  return { isOk: false, err: err === '' ? 'git fetch failed' : err }
+}
+
 /** The record's waivers at `head`, with each finding waiver whose finding's file changed since it was given marked lapsed (R55). */
 export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'waivers' | 'findings'>, head: string, now: number): Promise<Waiver[]> {
   const froms = [...new Set(rec.waivers.filter(one => one.scope === 'finding' && one.lapsedAt === undefined && one.head !== head).map(one => one.head))]
@@ -889,7 +903,12 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
   let others: string[] = []
   if (got.prHead !== rec.head) {
-    await git($, run.root, ['fetch', '--quiet', 'origin'], 60_000)
+    // A failed fetch, twice, stops the round here (R1-10): the log would read a stale origin.
+    const fetched = await fetchTwice($, run.root, ['--quiet', 'origin'], 60_000)
+    if (!fetched.isOk) {
+      await failPost($, run, `git could not fetch origin, twice (${fetched.err}); check the network and the remote, then run /pr-gate resume`)
+      return
+    }
     const log = await git($, run.root, ['log', '--format=%h %an %s', `${rec.head}..${got.prHead}`])
     others = log.isOk ? log.out.split('\n').filter(Boolean) : []
   }

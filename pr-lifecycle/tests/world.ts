@@ -35,6 +35,15 @@ export type World = {
     locals: string[]
     /** The session is outside any checkout: `rev-parse --show-toplevel` fails wherever it runs. */
     isOutside: boolean
+    /** How many `git fetch` calls fail from now on, each with `fetchError` on stderr. */
+    fetchFails: number
+    fetchError: string
+    /** When set, only a fetch whose arguments end with this ref counts toward `fetchFails`. */
+    fetchOnly?: string
+    /** Refs the remote does not have: a fetch naming one fails as git does, with "couldn't find remote ref". */
+    missingRefs: string[]
+    /** Every `git fetch` call's arguments. */
+    fetches: string[]
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -112,6 +121,10 @@ export function world(on: On): World {
       roster: '',
       locals: [],
       isOutside: false,
+      fetchFails: 0,
+      fetchError: 'fatal: unable to access origin: Could not resolve host: github.com',
+      fetches: [],
+      missingRefs: [],
     },
     gh: {
       pr: 1,
@@ -179,6 +192,15 @@ export function world(on: On): World {
       if (/commits\/[0-9a-f]+\/check-runs/.test(args)) return out(JSON.stringify({ check_runs: w.gh.checks }))
       if (/requested_reviewers/.test(args)) return out('{}')
       return out('')
+    }
+    if (args.startsWith('fetch')) {
+      w.git.fetches.push(args)
+      const fail = (stderr: string) => ({ value: { exitCode: 128, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+      const missing = w.git.missingRefs.find(ref => e.argv.slice(3).includes(ref))
+      if (missing !== undefined) return fail(`fatal: couldn't find remote ref ${missing}`)
+      if (w.git.fetchFails <= 0 || (w.git.fetchOnly !== undefined && !args.endsWith(` ${w.git.fetchOnly}`))) return out('')
+      w.git.fetchFails -= 1
+      return fail(w.git.fetchError)
     }
     if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
     // Outside a checkout (`cd /tmp && ...`), git finds no repository.
