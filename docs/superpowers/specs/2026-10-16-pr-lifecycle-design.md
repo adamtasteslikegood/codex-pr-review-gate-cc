@@ -97,13 +97,17 @@ type RoundResult = {
 
 - **Pre-PR round**: Codex review (plus challenge in parallel on `high`),
   fixer answers each finding, optional verify of the fix (`fixReview`).
-  Completed when every reviewer returned a verdict and the fix step (when
-  one ran) ended with an answer; a finding the fixer gave no disposition
-  stays `open` and is reported as unresolved. A blocker is always fixed
-  inside its round; an advisory fix runs only while the reserve rule leaves
-  a round to review it. A Codex timeout or missing verdict is an
-  incomplete attempt: effort recorded, no round consumed. Timeout step-down
-  and retry behave as in 0.3.1.
+  Completed when every reviewer returned a verdict and the fix step ended
+  with an answer. The fix step runs on every finding of the round, blocking
+  and advisory alike: each is answered fixed, rebutted with a reason, or
+  deferred with a reason. A finding left without an answer gets the fix
+  step prompted once more for the missing ids, which consumes no round; one
+  still unanswered stays `open` and is reported as unresolved. A blocker's
+  fix is re-reviewed on the allowance. The reserve rule decides only whether
+  Codex re-reviews advisory fixes before the PR opens; when it does not, the
+  free post-PR baseline round reviews that head. A Codex timeout or missing
+  verdict is an incomplete attempt: effort recorded, no round consumed.
+  Timeout step-down and retry behave as in 0.3.1.
 - **Post-PR round**:
   1. *Collect* (section 4) until the end condition or the wait cap.
   2. *Codex fallback*: when no repo reviewer covered the current head and the
@@ -119,8 +123,9 @@ type RoundResult = {
 
 After each round:
 
-- **Pre-PR**: nothing blocking, and either no advisories or no allowance to
-  spend on them under the reserve rule → pre-PR gate complete; prompt the
+- **Pre-PR**: nothing blocking, every finding answered by the fix step, and
+  either no advisory fixes to re-review or no allowance to re-review them
+  under the reserve rule → pre-PR gate complete; prompt the
   main agent to open the PR. Blocking findings and allowance left → next
   round. Allowance spent with blockers → `exhausted`, then `onExhausted`
   decides whether the PR may open.
@@ -318,8 +323,9 @@ Budget:
   (4), high `allowanceHigh` (6), plus person grants.
 - Pre-PR and post-PR rounds, blocking, advisory and rebuttal rounds all draw
   from it.
-- Reserve rule: an advisory-only round runs only while at least one round
-  would remain afterwards.
+- Reserve rule: an advisory-only round (Codex re-reviewing advisory fixes)
+  runs only while at least one round would remain afterwards. The advisory
+  fix itself never waits on the reserve.
 - Baseline rounds and the final-head check do not draw from it.
 
 Exhaustion is its own status, never read as passed. The record and pane show

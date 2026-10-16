@@ -1835,7 +1835,7 @@ test('timeout retries record effort without recording a completed round', async 
 
 Adjust `tests/gate.test.ts` (each change keeps the test's intent, and its name says so):
 - `'five rounds without agreement end the gate as exhausted'` → rename to `'the shared allowance (4) without agreement ends the pre-PR gate as exhausted'`, loop 4 reviews instead of 5, and expect `rec.preStatus === 'exhausted'`.
-- Advisory tests: rename `'advisory rounds stop at three, and the PR opens with what is left'` → `'advisory rounds stop when the reserve rule would leave no round, and the PR opens with what is left'`; with allowance 4, rounds 1 (advisories, fixed), 2 (advisories, fixed), 3 (advisories) → no advisory fix in round 3 (reserve), PR opens.
+- Advisory tests: rename `'advisory rounds stop at three, and the PR opens with what is left'` → `'advisory re-reviews stop when the reserve rule would leave no round; the last advisories are still fixed before the PR opens'`; with allowance 4, rounds 1 (advisories, fixed), 2 (advisories, fixed), 3 (advisories) → the fixer is still prompted in round 3 (R17), answer it, then no fourth Codex round (reserve), PR opens as passed.
 - `'with the minimum at one advisory round, a rebuttal with no new commit opens the PR'` → rename to `'an advisory rebuttal with no new commit opens the PR without another round'`.
 - `'a chore/ branch gets one Codex round at low effort, then the PR carries the rest'` → rename to `'a chore/ branch gets one Codex round at low effort; its fix is reviewed after the PR opens'`: after the FAIL the fixer is prompted (a blocker is always fixed inside its round), answer that turn, then expect `preStatus === 'exhausted'` and the PR prompt.
 - Every `expect(run.findings[0]?.status).toBe('fixed')` → `'reported-fixed'`.
@@ -2031,6 +2031,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
     status: 'running',
     phase: 'scope',
     hasRefixed: false,
+    hasReprompted: false,
     fixKind: next.isAdvisory ? 'advisory' : 'blocking',
     steps: existing !== null && existing.status === 'running' ? existing.steps : [{ id: 'scope', label: 'Scope & blast radius', state: 'done', detail: `${rec.tier}: ${rec.tierWhy}` }, { id: 'pr', label: `Open PR → ${rec.base}`, state: next.phase === 'pre' ? 'pending' : 'done' }],
     findings: rec.findings,
@@ -2147,16 +2148,11 @@ const afterReview = async ($: Engine, run: Run): Promise<void> => {
   }
   const rec = await loadRecord($, run.root, run.branch)
   if (rec === undefined) return
-  // A blocker is always fixed inside its round: on the last allowed round the fix is reviewed after the PR opens
-  // (or in a round the person allows). An advisory fix runs only while a round stays to review it.
-  const projected = withRound(rec, roundOf({ kind: run.roundKind, isCompleted: true }))
-  const blocking = fresh.filter(isBlocking)
-  if (blocking.length > 0) {
-    await beginFix($, run.id, undefined, 'blocking')
-    return
-  }
-  if (blocking.length === 0 && fresh.length > 0 && mayStartRound(projected, true)) {
-    await beginFix($, run.id, undefined, 'advisory')
+  // Every finding is answered inside its round, blocking and advisory alike (R17): fixing costs no review round.
+  // Whether Codex re-reviews an advisory fix before the PR opens is the controller's call (reserve rule);
+  // otherwise the free post-PR baseline round reviews that head.
+  if (fresh.length > 0) {
+    await beginFix($, run.id, undefined, fresh.some(isBlocking) ? 'blocking' : 'advisory')
     return
   }
   await endRound($, after, true)
@@ -2197,6 +2193,14 @@ const afterFix = async ($: Engine, run: Run): Promise<void> => {
     steps: /* 0.3.1 fix-step detail update, with 'fixed' counted from count('fixed') */ one.steps,
   }))
   if (after === null) return
+  // A finding of this round left without an answer gets the fix step once more (no round consumed); then it stays open.
+  const unanswered = after.findings.filter(one => one.round === after.round && one.status === 'open' && !said.some(each => each.id === one.id))
+  if (unanswered.length > 0 && after.hasReprompted !== true) {
+    await patch($, run.id, one => ({ ...one, hasReprompted: true }))
+    const ids = unanswered.map(one => one.id).join(', ')
+    await beginFix($, run.id, `These findings have no answer yet: ${ids}. Answer each one: fix it, rebut it with a reason, or defer it with a reason, in the same ${TRAILER} block.`, after.fixKind)
+    return
+  }
   if (dirty.isOk && dirty.out !== '') {
     await noteAttempt($, after, 'the fixer left uncommitted changes')
     await finish($, run.id, 'error', 'The fixer left uncommitted changes. Reviews read committed code only: commit them and run /pr-gate resume.')
