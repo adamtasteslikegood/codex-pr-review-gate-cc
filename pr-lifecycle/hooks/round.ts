@@ -1382,8 +1382,13 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
   const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
   const endHead = head?.isOk === true ? head.out : run.headSha
   if (run.isAnswer === true) {
+    // A fix committed in a resumed pre-PR fix step is a new head (R63, R55, R56): flagged findings and lapsed waivers, as a round's
+    // own commits get. `onNewHead` patches the live run, so its findings are read again before they are merged.
+    if (run.lifecycle === 'pre' && endHead !== run.roundStartHead) await onNewHead($, run, run.roundStartHead, endHead, now)
+    const live = await getRun($)
+    const findings = live !== null && live.id === run.id ? live.findings : run.findings
     // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
-    await updateRecord($, run.root, run.branch, rec => ({ ...rec, head: endHead, findings: mergeFindings(rec.findings, run.findings), effort: run.effort }))
+    await updateRecord($, run.root, run.branch, rec => ({ ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.effort }))
     if (isCompleted) await advance($, run.root, run.branch)
     return
   }

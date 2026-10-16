@@ -2584,3 +2584,21 @@ test('R1-1: a pre waiver covers the base it was given for, not a round against a
   expect((await recordOf(w)).preHead).toBe(w.git.head)
   expect(isHeld(await $.tool.call(toMain))).toBe(true)
 })
+
+test('R63: a fix committed in a resumed pre-PR fix step is a new head: a waiver on its changed file lapses', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  await $.command.run(cmd('waive R1-2 cosmetic'))
+  expect((await recordOf(w)).preStatus).toBe('blocked')
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  w.git.head = 'd'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await done($, turn(fixed('R1-1')))
+  const rec = await recordOf(w)
+  expect(rec.head).toBe('d'.repeat(40))
+  expect(rec.waivers.find(one => one.findingId === 'R1-2')?.lapsedAt).toBeDefined()
+})
