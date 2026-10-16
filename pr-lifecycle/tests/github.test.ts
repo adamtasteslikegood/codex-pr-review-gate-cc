@@ -363,3 +363,11 @@ test('F3: a requestReview name keeps the bot that posts for it, and nothing more
   expect(isTrusted(by('my-copilot[bot]'), roster)).toBe(false)
   expect(isTrusted(by('copilot-pull-request-reviewer'), roster)).toBe(false)
 })
+
+test('F7: an auto-merge is told from a merge now', async () => {
+  expect(bash('gh pr merge 5 --auto --squash')?.isAuto).toBe(true)
+  expect(bash('gh pr merge 5 --squash')?.isAuto).toBeUndefined()
+  const auto = "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {}) { clientMutationId } }'"
+  expect(bash(auto)).toMatchObject({ action: 'merge', isAuto: true })
+  expect(bash("gh api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'")?.isAuto).toBeUndefined()
+})

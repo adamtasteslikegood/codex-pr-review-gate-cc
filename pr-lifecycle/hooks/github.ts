@@ -252,6 +252,8 @@ export type PrAction = {
   cwd?: string
   /** A GitHub tool this mod does not know, held because it reads as opening or merging a PR. */
   isUnknown?: boolean
+  /** An auto-merge (`gh pr merge --auto`, `enablePullRequestAutoMerge`): GitHub itself waits for the checks before it merges (F7). */
+  isAuto?: boolean
 }
 
 // ------------------------------------------------------------------ Bash
@@ -403,7 +405,10 @@ function readGhPr(tokens: string[], pr: number, cwd: string | undefined): PrActi
   const sub = prSubcommand(tokens, pr + 1)
   const verb = sub < 0 ? '' : (tokens[sub] ?? '')
   const repo = flagValue(tokens, ['-R', '--repo'])
-  if (verb === 'merge') return { action: 'merge', via: 'gh pr merge', repo, cwd, ...mergeTarget(tokens.slice(sub + 1)) }
+  if (verb === 'merge') {
+    const isAuto = tokens.slice(sub + 1).includes('--auto')
+    return { action: 'merge', via: 'gh pr merge', repo, cwd, ...mergeTarget(tokens.slice(sub + 1)), ...(isAuto ? { isAuto: true } : {}) }
+  }
   if (verb === 'create' || verb === 'new') {
     return { action: 'create', via: 'gh pr create', repo, cwd, base: flagValue(tokens, ['--base', '-B']), head: flagValue(tokens, ['--head', '-H']) }
   }
@@ -442,6 +447,10 @@ function readRest(tokens: string[], via: string, methodFlags: string[], hasBody:
 const MERGE_MUTATIONS = ['mergePullRequest', 'enablePullRequestAutoMerge', 'enqueuePullRequest']
 const CREATE_MUTATIONS = ['createPullRequest']
 
+/** Whether a text's only merge mutation is the auto-merge one: GitHub merges later, once the checks pass. */
+const isAutoOnly = (text: string): boolean =>
+  text.includes('enablePullRequestAutoMerge') && !text.includes('mergePullRequest') && !text.includes('enqueuePullRequest')
+
 /** The mutation a text names, if any; merge wins. */
 function mutationIn(text: string): 'merge' | 'create' | undefined {
   if (MERGE_MUTATIONS.some((name) => text.includes(name))) return 'merge'
@@ -451,7 +460,7 @@ function mutationIn(text: string): 'merge' | 'create' | undefined {
 /** GraphQL names are matched over the whole command: its braces and parentheses split segments. An unreadable query is held as unknown. */
 function readGraphql(normal: string, isUnreadable: boolean, via: string, cwd: string | undefined): PrAction | undefined {
   const mutation = mutationIn(normal)
-  if (mutation !== undefined) return { action: mutation, via, cwd }
+  if (mutation !== undefined) return { action: mutation, via, cwd, ...(mutation === 'merge' && isAutoOnly(normal) ? { isAuto: true } : {}) }
   return isUnreadable ? { action: 'merge', via, cwd, isUnknown: true } : undefined
 }
 
@@ -591,7 +600,7 @@ function readUnknownTool(tool: string, input: Record<string, unknown>, repo: str
   const merge = (): PrAction => ({ action: 'merge', via: tool, number, repo, isUnknown: true })
 
   const mutation = mutationIn(shape.strings.join(' '))
-  if (mutation === 'merge') return merge()
+  if (mutation === 'merge') return { ...merge(), ...(isAutoOnly(shape.strings.join(' ')) ? { isAuto: true } : {}) }
 
   const name = wordsOf(tool.split('__').pop() ?? '')
   const operation = operationOf(shape)

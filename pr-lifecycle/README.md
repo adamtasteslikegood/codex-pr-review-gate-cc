@@ -206,7 +206,9 @@ holds the merge again until the new head is reviewed.
 waived, the guard reads the PR head's checks with `gh pr checks <n> --json
 name,state,bucket`. A failing or cancelled check, or one still running, holds
 the merge; the refusal names the checks and tells the agent to fix them, rerun
-a flaky one, or wait for the running ones. No waiver releases this hold: a
+a flaky one, or wait for the running ones. An auto-merge (`--auto`, or the
+`enablePullRequestAutoMerge` mutation) is held only by a failing check, since
+GitHub itself waits for running ones before it merges. No waiver releases this hold: a
 `waive post` covers the review, not CI. A PR with no checks merges. Checks gh
 cannot read hold the merge (fail closed), with gh's error.
 
