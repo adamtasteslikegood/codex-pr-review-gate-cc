@@ -146,6 +146,7 @@ let isPolling = false
 
 export function setup(c: Config): void {
   config = c
+  queued = []
 }
 
 export const isLiveNow = (): boolean => isLive
@@ -156,6 +157,36 @@ export const setLive = (v: boolean): void => {
 /** The effort a branch's tier and lane call for, before any carried or timeout step-down. */
 export const defaultEffort = (rec: Pick<LifecycleRecord, 'tier' | 'lane'>): Effort =>
   rec.tier === 'high' ? 'high' : rec.lane === 'light' ? config.lightEffort : config.effort
+
+// Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
+let holdDepth = 0
+let queued: string[] = []
+
+/** Runs `body` with the prompts it decides held back; once it has returned, they are sent one second later, in order. */
+export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
+  holdDepth += 1
+  try {
+    return await body()
+  } finally {
+    holdDepth -= 1
+    if (holdDepth === 0 && queued.length > 0) {
+      $.clock.after(1000, () => {
+        const texts = queued
+        queued = []
+        for (const text of texts) void $.prompt.submit({ text }).catch(() => undefined)
+      })
+    }
+  }
+}
+
+/** Sends a prompt to the main agent now, or after the command that holds the turn has returned. */
+export function say($: Engine, text: string): void {
+  if (holdDepth > 0) {
+    queued.push(text)
+    return
+  }
+  void $.prompt.submit({ text }).catch(() => undefined)
+}
 
 export async function getRun($: Engine): Promise<Run | null> {
   return (await $.state.get(RUN)).value ?? null
@@ -639,7 +670,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
 async function failPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
-  void $.prompt.submit({ text: `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.` }).catch(() => undefined)
+  say($, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
 }
 
 /**
@@ -948,7 +979,7 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
   const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
-  if (saved !== undefined) void $.prompt.submit({ text: heldPrompt(saved, why, nextStep) }).catch(() => undefined)
+  if (saved !== undefined) say($, heldPrompt(saved, why, nextStep))
 }
 
 /**
@@ -1260,19 +1291,19 @@ export async function advance($: Engine, root: string, branch: string): Promise<
       // The round that just ended leaves the PR held: say so once, with why and what can move it.
       const held = heldReason(saved)
       await markPr($, 'skipped', 'held')
-      if (held !== undefined) void $.prompt.submit({ text: heldPrompt(saved, held.why, held.nextStep) }).catch(() => undefined)
+      if (held !== undefined) say($, heldPrompt(saved, held.why, held.nextStep))
       return
     }
     if (config.openPr) {
       await markPr($, 'running', 'handed to the main agent')
-      void $.prompt.submit({ text: prPrompt(ended, saved, next.status) }).catch(() => undefined)
+      say($, prPrompt(ended, saved, next.status))
     }
     return
   }
   if (next.kind === 'ready') {
     const saved = await updateRecord($, root, branch, one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined }))
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${rec.head.slice(0, 7)}: ready for the merge decision.`)
-    if (saved !== undefined) void $.prompt.submit({ text: readyPrompt(saved) }).catch(() => undefined)
+    if (saved !== undefined) say($, readyPrompt(saved))
     return
   }
   const isPre = rec.phase === 'pre'
@@ -1295,10 +1326,10 @@ export async function advance($: Engine, root: string, branch: string): Promise<
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
   if (isPre) {
-    if (id !== undefined) void $.prompt.submit({ text: heldPrompt(saved, next.why, next.nextStep) }).catch(() => undefined)
+    if (id !== undefined) say($, heldPrompt(saved, next.why, next.nextStep))
     return
   }
-  void $.prompt.submit({ text: reportPrompt(saved, next) }).catch(() => undefined)
+  say($, reportPrompt(saved, next))
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */

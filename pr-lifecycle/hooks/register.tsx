@@ -13,7 +13,21 @@ import type { Effort, Finding, LifecycleRecord, Run, Step } from '../types'
 import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
-import { allowanceFor, invalidate, isDisputed, lastReviewedHead, mergeHolds, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
+import {
+  allowanceFor,
+  invalidate,
+  isAcceptedRebuttal,
+  isDisputed,
+  lastReviewedHead,
+  mergeHolds,
+  newRecord,
+  remaining,
+  rescope,
+  securityHolds,
+  unresolvedBlockers,
+  usedRounds,
+  verificationOwed,
+} from './lifecycle'
 import {
   advance,
   configOf,
@@ -23,11 +37,13 @@ import {
   git,
   hasSecurityBlocker,
   heldReason,
+  holdingPrompts,
   isLiveNow,
   markPr,
   onAnswer,
   PANE,
   patch,
+  say,
   setLive,
   setup,
   SPINNER,
@@ -181,7 +197,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     rec = { ...rec, findings: invalidate(rec.findings, since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : 'all') }
   }
   // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
-  const adopted = prior === undefined || prior.phase === 'pre' ? await openPrOf($, root, branch) : undefined
+  const adopted = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
   if (adopted !== undefined && config.bases.includes(adopted.baseRefName)) {
     const adoptedRec: LifecycleRecord = {
       ...rec,
@@ -209,7 +225,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     const saved = await loadRecord($, root, branch)
     if (want.isHeldCall !== true && config.openPr && saved !== undefined) {
       await markPr($, 'running', 'handed to the main agent')
-      void $.prompt.submit({ text: prPrompt(shown, saved, 'passed') }).catch(() => undefined)
+      say($, prPrompt(shown, saved, 'passed'))
     }
     return `Gate passed without Codex: ${scope.why}.`
   }
@@ -320,6 +336,8 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
   const allows = (one: LifecycleRecord | undefined): one is LifecycleRecord =>
     one !== undefined &&
+    // A reset record lets nothing through: the lifecycle starts fresh.
+    one.phase !== 'archived' &&
     (one.waivers.some(each => each.scope === 'pre' && each.head === head) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'exhausted' && config.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
@@ -344,7 +362,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     return [
       `pr-gate: ${action.via} to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${held.why}.`,
       `Your next step: ${held.nextStep}. Do not create the pull request another way.`,
-      `Tell the person: they can type /${COMMAND} waive <reason> to let this commit through, or /${COMMAND} allow 1 <reason> for one more review round.`,
+      `Tell the person: they can type /${COMMAND} waive pre <reason> to let this commit through, or /${COMMAND} allow 1 <reason> for one more review round.`,
     ].join('\n') + unknownNote(action)
   }
   return (
@@ -353,7 +371,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
       started,
       'Do not retry this command and do not open the pull request another way.',
       'End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
-      `(The person can type /${COMMAND} status, or /${COMMAND} waive <reason> to open it without the gate.)`,
+      `(The person can type /${COMMAND} status, or /${COMMAND} waive pre <reason> to open it without the gate.)`,
     ].join('\n') + unknownNote(action)
   )
 }
@@ -426,10 +444,14 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
     ].join('\n')
   }
   if (!config.bases.includes(pr.baseRefName) || config.bases.includes(pr.headRefName)) return undefined
-  const rec = await loadRecord($, root, pr.headRefName)
+  const stored = await loadRecord($, root, pr.headRefName)
+  // A reset record counts as none: the lifecycle starts fresh.
+  const rec = stored?.phase === 'archived' ? undefined : stored
   // No record and no such branch here: a PR from a branch not checked out here is not this gate's to review.
   if (rec === undefined && !(await git($, root, ['rev-parse', '--verify', '--quiet', `refs/heads/${pr.headRefName}`])).isOk) return undefined
-  if (rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true) return undefined
+  // The person's post waiver for this head, unless a security P1 holds: only a waiver naming it releases that (spec §3).
+  const isWaived = rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
+  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return undefined
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
   if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) return undefined
   const short = pr.headRefOid.slice(0, 7)
@@ -479,6 +501,162 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   if (saved !== undefined) await advance($, root, branch)
 }
 
+// ------------------------------------------------------------ the command
+
+const ids = (findings: readonly Finding[]): string => findings.map(one => one.id).join(', ')
+
+/** One line on where the lifecycle stands: phase, budget, baseline, what is open, owed and holding the merge. */
+const statusText = async ($: Engine, run: Run | null): Promise<string> => {
+  // Says where the pane stands too: a surface that places no panes gives its reason here.
+  const pane = await $.ui
+    .open({ id: PANE, title: 'PR lifecycle' })
+    .then(opened => (opened.isPlaced ? ' The pane is open.' : ` The pane is not drawn here: ${opened.reason}`))
+    .catch(() => ' The pane could not be opened.')
+  const top = run === null ? await git($, undefined, ['rev-parse', '--show-toplevel']) : { isOk: true, out: run.root }
+  const branch = run?.branch ?? (top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : '')
+  const rec = top.isOk && branch !== '' ? await loadRecord($, top.out, branch) : undefined
+  const live = run === null ? '' : ` The run: ${run.status}, round ${run.round}${run.status === 'running' ? `, ${run.phase}` : ''}.`
+  if (rec === undefined) return `/${COMMAND} has not run${branch === '' ? '' : ` for ${branch}`}.${live}${pane}`
+  const standing = rec.phase === 'pre' ? rec.preStatus : rec.phase === 'post' ? rec.postStatus : undefined
+  const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
+  const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
+  const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
+  return (
+    `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
+    `${usedRounds(rec)}/${rec.allowance + granted} rounds used, baseline ${baseline}/2, ${unresolvedBlockers(rec).length} blocking open, ` +
+    `${verificationOwed(rec).length} owed, ${mergeHolds(rec).length} holding the merge.${rec.message === undefined ? '' : ` ${rec.message}.`}${live}${pane}`
+  )
+}
+
+/** Why a finding is settled, for a waiver that has nothing to release. */
+const settledAs = (rec: LifecycleRecord, one: Finding): string =>
+  rec.waivers.some(each => each.scope === 'finding' && each.findingId === one.id)
+    ? 'waived'
+    : isAcceptedRebuttal(one)
+      ? 'its rebuttal is accepted by Codex'
+      : one.status === 'verified-fixed'
+        ? 'verified fixed'
+        : one.status
+
+/**
+ * `/pr-gate start|<base>`, `status`, `stop`, `resume`, `waive pre|post|<findingId> <reason>`, `allow <n> <reason>`, `reset`.
+ * Waivers, `allow` and `reset` are the person's alone. The replies may start with the command; prompts never do (R21).
+ */
+const runCommand = async ($: Engine, args: string, origin: string): Promise<string> => {
+  const [verb = '', ...rest] = args.trim().split(/\s+/)
+  const run = await getRun($)
+  if (verb === 'status') return statusText($, run)
+  if (verb === 'stop') {
+    if (run === null || run.status !== 'running') return `/${COMMAND} is not running.`
+    await finish($, run.id, 'stopped', 'Stopped by the person.')
+    return `/${COMMAND} stopped. The record stays: /${COMMAND} resume continues it. Opening and merging stay held.`
+  }
+  const isPersons = verb === 'waive' || verb === 'allow' || verb === 'reset'
+  // An agent's or a plugin's command run never grants one.
+  if (isPersons && origin !== 'composer' && origin !== 'bridge') return 'Only the person can waive, allow rounds or reset.'
+  if (!isPersons && verb !== 'resume') {
+    const base = verb === '' || verb === 'start' ? rest[0] : verb
+    return `/${COMMAND}: ${await startGate($, { base })}`
+  }
+  const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
+  if (!top.isOk) return 'Not a git repository.'
+  const root = top.out
+  const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  const head = (await git($, root, ['rev-parse', 'HEAD'])).out
+  const stored = await loadRecord($, root, branch)
+  const rec = stored?.phase === 'archived' ? undefined : stored
+  const now = await $.clock.now()
+  const isRunning = run !== null && run.status === 'running'
+  const isOurs = isRunning && run.root === root && run.branch === branch
+  const none = `/${COMMAND}: there is no lifecycle for ${branch} yet: /${COMMAND} starts one.`
+  if (verb === 'resume') {
+    // The controller re-decides from the record (startGate clears a post-PR stop): an answerable block re-opens triage (R37),
+    // a held rebuttal check runs again (R36, R39), and a post-PR record reports its post-PR standing (M3).
+    if (rec === undefined) return none
+    return `/${COMMAND}: ${await startGate($, { base: rest[0] })}`
+  }
+  if (verb === 'reset') {
+    if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
+    if (stored !== undefined) await updateRecord($, root, branch, one => ({ ...one, phase: 'archived' }))
+    return `/${COMMAND}: the lifecycle for ${branch} is archived, its history kept. /${COMMAND} starts a fresh one.`
+  }
+  if (verb === 'allow') {
+    const n = Number(rest[0])
+    const reason = rest.slice(1).join(' ').trim()
+    if (!Number.isInteger(n) || n < 1 || n > 5 || reason === '') return `Say how many and why: /${COMMAND} allow <1-5> <reason>`
+    if (rec === undefined) return none
+    await saveRecord($, { ...rec, grants: [...rec.grants, { n, reason, head, at: now }] })
+    // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
+    if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
+    const after = (await loadRecord($, root, branch)) ?? rec
+    // Rounds never settle a deferral or a dispute (R42): only the person's waiver of each does.
+    const theirs = mergeHolds(after).filter(one => one.status === 'deferred' || isDisputed(one))
+    const settles =
+      theirs.length === 0
+        ? ''
+        : ` Rounds settle no deferral or dispute: ${theirs.map(one => `/${COMMAND} waive ${one.id} <reason>`).join(', ')} ` +
+          `${theirs.length === 1 ? 'releases' : 'release'} ${ids(theirs)}.`
+    return `/${COMMAND}: ${n} more round${n === 1 ? '' : 's'} allowed for ${branch}: ${reason}.${settles}`
+  }
+  const [scope = '', ...why] = rest
+  const reason = why.join(' ').trim()
+  const isFinding = /^[RG]\d+-\d+$/.test(scope)
+  if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|<findingId> <reason>`
+  if (isFinding) {
+    const finding = rec?.findings.find(one => one.id === scope)
+    if (rec === undefined || finding === undefined) return `/${COMMAND}: there is no finding ${scope} in the lifecycle of ${branch}.`
+    if (!mergeHolds(rec).some(one => one.id === scope)) {
+      return `/${COMMAND}: ${scope} is already settled (${settledAs(rec, finding)}): there is nothing to waive.`
+    }
+    await saveRecord($, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: scope, head: rec.head, reason, by: origin, at: now }] })
+    // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
+    if (!isRunning) await advance($, root, branch)
+    return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
+  }
+  if (scope === 'pre') {
+    if (rec !== undefined && rec.phase !== 'pre') {
+      return (
+        `/${COMMAND}: PR #${rec.pr ?? '?'} from ${branch} is already open, so there is no pre-PR review to waive. ` +
+        `/${COMMAND} waive post <reason> lets this head merge.`
+      )
+    }
+    if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
+    // A waiver covers this commit for every gated base, and is kept in the record's history.
+    const base =
+      rec ??
+      newRecord({
+        root,
+        branch,
+        base: config.bases[0] ?? 'dev',
+        head,
+        tier: 'standard',
+        tierWhy: 'not scoped: waived before the gate ran',
+        lane: 'full',
+        allowance: config.allowances.standard,
+        at: now,
+      })
+    await saveRecord($, { ...base, preStatus: 'waived', preHead: head, waivers: [...base.waivers, { scope: 'pre', head, reason, by: origin, at: now }] })
+    return `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. The PR may open; post-PR review still runs.`
+  }
+  // waive post: the head GitHub reports for the PR, which is what the merge guard checks.
+  const security = rec === undefined ? [] : securityHolds(rec)
+  if (security.length > 0) {
+    const one = security.length === 1
+    return (
+      `/${COMMAND}: ${ids(security)} ${one ? 'is a security P1' : 'are security P1s'} holding the merge of ${branch}, and only a waiver naming ` +
+      `${one ? 'it' : 'each'} releases ${one ? 'it' : 'them'}: ${security.map(each => `/${COMMAND} waive ${each.id} <reason>`).join(', ')}. ` +
+      'No post waiver was recorded.'
+    )
+  }
+  const pr = await openPrOf($, root, branch)
+  const at = pr?.headRefOid ?? head
+  const base =
+    rec ??
+    newRecord({ root, branch, base: config.bases[0] ?? 'dev', head, tier: 'standard', tierWhy: 'waived before scoping', lane: 'full', allowance: 0, at: now })
+  await saveRecord($, { ...base, waivers: [...base.waivers, { scope: 'post', head: at, reason, by: origin, at: now }] })
+  return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.`
+}
+
 export const register: Register = (on, options) => {
   config = configOf(options)
   setup(config)
@@ -523,7 +701,7 @@ export const register: Register = (on, options) => {
     return {
       deny:
         'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
-        `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post ' : ''}<reason> to let it through.`,
+        `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
     }
   })
 
@@ -547,8 +725,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pr-gate',
-      description: 'Run the PR lifecycle review on this branch (start, resume, status, stop, waive)',
-      argumentHint: '[base] | resume | status | stop | waive <reason>',
+      description: "Run /pr-gate: pre-PR Codex review, then the PR's own reviews, under one budget (start, status, stop, resume, waive, allow, reset)",
+      argumentHint: '[base] | status | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
       immediate: true,
     })
     const run = await getRun($)
@@ -558,72 +736,22 @@ export const register: Register = (on, options) => {
       void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
     } else {
       setLive(false)
+      // A new session: a post-PR review that was under way when the last one ended goes on collecting. Processed ids and
+      // recorded replies keep it from repeating work; a record that is ready, held or awaiting the person is left as it is.
+      try {
+        const top = await git($, e.cwd, ['rev-parse', '--show-toplevel'])
+        const branch = top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : ''
+        const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
+        if (rec !== undefined && rec.phase === 'post' && rec.postStatus === undefined) await holdingPrompts($, () => advance($, top.out, branch))
+      } catch {
+        // The session starts whatever the record says.
+      }
     }
     return next(e)
   })
 
-  on('command.run', { command: 'pr-gate' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
-    const run = await getRun($)
-    if (verb === 'status') {
-      // Says where the pane stands too: a surface that places no panes gives its reason here.
-      const pane = await $.ui
-        .open({ id: PANE, title: 'PR lifecycle' })
-        .then(opened => (opened.isPlaced ? ' The pane is open.' : ` The pane is not drawn here: ${opened.reason}`))
-        .catch(() => ' The pane could not be opened.')
-      if (run === null) return { text: `pr-gate has not run in this session.${pane}` }
-      const rec = await loadRecord($, run.root, run.branch)
-      const open = (rec?.findings ?? run.findings).filter(one => isBlocking(one) && one.status === 'open').length
-      const budget = rec === undefined ? '' : `, ${remaining(rec)} of ${rec.allowance} review rounds left`
-      return {
-        text:
-          `pr-gate ${run.status} for ${run.branch} → ${run.base}: round ${run.round}${run.fixKind === 'advisory' ? ' (advisories)' : ''}, ` +
-          `codex at ${run.effort}, ${run.findings.length} findings raised, ${open} high/critical open${budget}.` +
-          `${run.message === undefined ? '' : ` ${run.message}`}${pane}`,
-      }
-    }
-    if (verb === 'stop') {
-      if (run === null || run.status !== 'running') return { text: 'pr-gate is not running.' }
-      await finish($, run.id, 'stopped', 'Stopped by the person.')
-      return { text: 'pr-gate stopped. Pull requests to a gated base stay held until it passes or is waived.' }
-    }
-    if (verb === 'waive') {
-      const reason = rest.join(' ').trim()
-      // A waiver is the person's alone: an agent's or a plugin's command run never grants one.
-      if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return { text: 'Only the person can waive the gate.' }
-      if (reason === '') return { text: `Give a reason: /${COMMAND} waive <reason>` }
-      if (run !== null && run.status === 'running') await finish($, run.id, 'waived', `Waived: ${reason}`)
-      const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
-      if (!top.isOk) return { text: 'Not a git repository.' }
-      const branch = (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
-      const head = (await git($, top.out, ['rev-parse', 'HEAD'])).out
-      const now = await $.clock.now()
-      // A waiver covers this commit for every gated base, and is kept in the record's history.
-      const prior = await loadRecord($, top.out, branch)
-      const rec =
-        prior ??
-        newRecord({
-          root: top.out,
-          branch,
-          base: config.bases[0] ?? 'dev',
-          head,
-          tier: 'standard',
-          tierWhy: 'not scoped: waived before the gate ran',
-          lane: 'full',
-          allowance: config.allowances.standard,
-          at: now,
-        })
-      await saveRecord($, {
-        ...rec,
-        preStatus: 'waived',
-        preHead: head,
-        waivers: [...rec.waivers, { scope: 'pre', head, reason, by: e.origin.kind, at: now }],
-      })
-      return { text: `pr-gate waived for ${branch} at ${head.slice(0, 7)}: ${reason}. A new commit needs a new review or waiver.` }
-    }
-    const base = verb === '' || verb === 'start' || verb === 'resume' ? rest[0] : verb
-    return { text: `pr-gate: ${await startGate($, { base })}` }
-  })
+  // Prompts a command decides wait until it has returned: the host refuses a submit while the command holds the turn.
+  on('command.run', { command: 'pr-gate' }, async ($, e) => ({ text: await holdingPrompts($, () => runCommand($, e.args, e.origin.kind)) }))
 
   // ------------------------------------------------------------ the pane
 

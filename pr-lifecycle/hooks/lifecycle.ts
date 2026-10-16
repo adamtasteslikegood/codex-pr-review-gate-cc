@@ -194,6 +194,12 @@ export function triage(
 const waivedIds = (rec: Pick<LifecycleRecord, 'waivers'>): Set<string> =>
   new Set(rec.waivers.filter(one => one.scope === 'finding' && one.findingId !== undefined).map(one => one.findingId as string))
 
+/** Blocking findings deferred and not waived: before the PR, a deferral past the branch waits on the person's waiver of it. */
+const deferredBlockers = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] => {
+  const waived = waivedIds(rec)
+  return rec.findings.filter(one => isBlocking(one) && one.status === 'deferred' && !waived.has(one.id))
+}
+
 /** Blockers nobody settled: open ones, and a deferred security P1, which only the person's waiver settles. */
 export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
@@ -244,6 +250,10 @@ export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): 
   const waived = waivedIds(rec)
   return rec.findings.filter(one => !waived.has(one.id) && one.status !== 'verified-fixed' && !isAcceptedRebuttal(one))
 }
+
+/** Security P1s that hold the merge: only a waiver naming each one releases it, never `waive post` (spec §3). */
+export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] =>
+  mergeHolds(rec).filter(one => isBlocking(one) && one.isSecurity === true)
 
 // --------------------------------------------------------------- coverage
 
@@ -302,7 +312,9 @@ function decidePre(rec: LifecycleRecord): Next {
       : { kind: 'open-pr', status: 'exhausted' }
   }
   const isChanged = last.endHead !== last.startHead
-  if (last.deferredBlocking > 0) {
+  // Released only when the ledger holds the deferred blockers and the person waived every one.
+  const isAllWaived = deferredBlockers(rec).length === 0 && rec.findings.some(one => isBlocking(one) && one.status === 'deferred')
+  if (last.deferredBlocking > 0 && !isAllWaived) {
     return {
       kind: 'blocked',
       why: 'a blocking finding was deferred: its fix reaches past this branch',
@@ -317,6 +329,10 @@ function decidePre(rec: LifecycleRecord): Next {
       : passOr()
   }
   if (!isChanged && last.rebutted === 0) {
+    // The round's blockers were all deferred, and the person waived each one: nothing is left for a round to say.
+    const waived = waivedIds(rec)
+    const raised = rec.findings.filter(one => isBlocking(one) && raisedIn(one, last.n))
+    if (raised.length > 0 && raised.every(one => waived.has(one.id)) && unresolved.length === 0) return passOr()
     return {
       kind: 'blocked',
       why: 'the fixer changed nothing and rebutted nothing, so another round would say the same',
@@ -381,6 +397,10 @@ function decidePost(rec: LifecycleRecord): Next {
   if (!isChanged && unchecked.length > 0) return recheck()
   if (last.kind === 'final-head-check') {
     if (!isChanged && holding.length === 0) return { kind: 'ready' }
+    // The person allowed more rounds after it: the head it left unreviewed, or a fix only reported, gets a real round.
+    if ((isChanged || owed.length > 0) && mayStartRound(rec, false)) {
+      return { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
+    }
     if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)
     return {
       kind: 'exhausted',

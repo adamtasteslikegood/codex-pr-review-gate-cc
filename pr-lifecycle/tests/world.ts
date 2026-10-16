@@ -60,12 +60,14 @@ export type World = {
   stored: (key: string) => unknown
   /** The test's clock: `advance` moves it, and fires what falls due. */
   clock: { advance: (ms: number) => Promise<void> }
+  /** A new session: the run state reads as empty until the mod writes it again; the store stays. */
+  clearState: () => void
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
 
 /** Everything beneath the mod: git, the agents, the main agent's prompt queue. */
-export function world(on: On): World {
+export function world(on: On, { canRestart = false } = {}): World {
   const clock = mock.clock(on, { now: 1_000 })
   const w: World = {
     spawned: [],
@@ -104,7 +106,15 @@ export function world(on: On): World {
     store: new Map(),
     stored: (key: string) => w.store.get(key),
     clock,
+    clearState: () => {
+      if (!canRestart) throw new Error('clearState needs world(on, { canRestart: true })')
+      isCleared = true
+      w.run = undefined
+    },
   }
+  let isCleared = false
+  // Only where a test restarts the session: a read hook on the run adds a hop to every read of it, which the other tests' timing does not expect.
+  if (canRestart) on('state.get', RUN, (_$, e, next) => (isCleared ? next(e).then(read => (read.value === undefined ? read : { value: { ...read.value, value: null } })) : next(e)))
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_$, e) => {
     w.store.set(e.key, e.value)
@@ -116,6 +126,7 @@ export function world(on: On): World {
   })
   on('store.keys', () => ({ value: [...w.store.keys()] }))
   on('state.set', RUN, (_$, e, next) => {
+    isCleared = false
     w.run = e.value as Run
     return next(e)
   })
@@ -182,6 +193,7 @@ export function world(on: On): World {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
   return w
 }
 

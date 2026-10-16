@@ -103,10 +103,19 @@ fullscreen terminal from 110 columns, above the prompt otherwise.
 
 | | |
 | --- | --- |
-| `/pr-gate [base]` | start the gate for the current branch |
-| `/pr-gate status` | one line of where it stands, and open the pane |
-| `/pr-gate stop` | stop a running gate |
-| `/pr-gate waive <reason>` | let this commit's PR through without the gate; the person's alone |
+| `/pr-gate [base]` | start or resume the lifecycle for the current branch |
+| `/pr-gate status` | one line of where it stands (phase, rounds used, baseline, what is open, owed and holding the merge), and open the pane |
+| `/pr-gate stop` | stop the round in flight; the record stays |
+| `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
+| `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review; post-PR review still runs |
+| `/pr-gate waive post <reason>` | let this head merge without the review; a security P1 needs its own waiver first |
+| `/pr-gate waive <findingId> <reason>` | release one finding (deferred, disputed or open) from the merge test, security P1 included |
+| `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
+| `/pr-gate reset` | archive the record and start fresh |
+
+Waivers, `allow` and `reset` are the person's alone: an agent's or a plugin's
+command run is refused. Each waiver records who, when, head, scope and reason.
+A new session goes on collecting a post-PR review that was under way.
 
 ## Options
 

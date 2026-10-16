@@ -1,7 +1,7 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isAcceptedRebuttal, isBlocking, isDisputed, mergeHolds, raisedIn, rejections, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
+import { isAcceptedRebuttal, isBlocking, isDisputed, mergeHolds, raisedIn, rejections, securityHolds, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, Next, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
@@ -598,7 +598,12 @@ export function readyPrompt(rec: LifecycleRecord): string {
 const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRound = true): string => {
   const theirs = mergeHolds(rec).filter(one => one.status === 'deferred' || isDisputed(one))
   const waive = theirs.map(one => `/pr-gate waive ${one.id} <reason> lets the ${one.status === 'deferred' ? 'deferred' : 'disputed'} ${one.id} into the merge`)
-  const post = '/pr-gate waive post <reason> lets this head merge without the review'
+  // A security P1 is released only by a waiver naming it (spec §3): waive post covers the rest once it is.
+  const security = securityHolds(rec).map(one => one.id)
+  const post =
+    security.length === 0
+      ? '/pr-gate waive post <reason> lets this head merge without the review'
+      : `/pr-gate waive post <reason> lets this head merge without the review once the security P1 ${security.join(', ')} is waived by name`
   const options = withRound ? [post, ...waive, '/pr-gate allow 1 <reason> grants one more review round'] : [...waive, post]
   return `Their options: ${options.slice(0, -1).join(', ')}${options.length > 1 ? ', and ' : ''}${options.at(-1)}.`
 }
@@ -670,7 +675,7 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string):
     `Your next step: ${nextStep}.`,
     'Verify each finding against the code first: fix a real one with the smallest change and commit it, or rebut a false one with file:line evidence. Then run /pr-gate resume.',
     'Do not push for review and do not create the pull request another way: the guard holds it until the review passes or the person decides.',
-    "Tell the person why it is held. Their options: /pr-gate waive <reason> lets this commit's pull request through without the review, and /pr-gate allow 1 <reason> grants one more review round.",
+    "Tell the person why it is held. Their options: /pr-gate waive pre <reason> lets this commit's pull request through without the review, and /pr-gate allow 1 <reason> grants one more review round.",
   )
   return lines.join('\n')
 }

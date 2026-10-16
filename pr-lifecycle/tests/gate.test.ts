@@ -366,15 +366,15 @@ test('a docs-only commit after the pass rides on it; a code commit does not', as
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
 })
 
-test('only the person waives the gate, and a waiver lets that commit through', async ($, on) => {
+test('only the person waives the pre-PR review, and a waiver lets that commit open its PR', async ($, on) => {
   const w = world(on)
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   const presentation = { isFullscreen: false, columns: 120 }
-  const asAgent = await $.command.run({ command: 'pr-gate', args: 'waive hotfix', origin: { kind: 'sdk' }, presentation })
+  const asAgent = await $.command.run({ command: 'pr-gate', args: 'waive pre hotfix', origin: { kind: 'sdk' }, presentation })
   expect(asAgent.text).toContain('Only the person')
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
-  const asPerson = await $.command.run({ command: 'pr-gate', args: 'waive hotfix', origin: { kind: 'composer' }, presentation })
-  expect(asPerson.text).toContain('waived for feat/x')
+  const asPerson = await $.command.run({ command: 'pr-gate', args: 'waive pre hotfix', origin: { kind: 'composer' }, presentation })
+  expect(asPerson.text).toContain('waived pre-PR review for feat/x')
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   expect(w.opened).toHaveLength(1)
 })

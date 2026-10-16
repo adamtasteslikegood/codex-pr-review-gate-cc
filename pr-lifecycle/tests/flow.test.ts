@@ -539,13 +539,12 @@ test('gh failing mid-collect records an incomplete attempt, uses no round, and r
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
   expect(rec.postStatus).toBe('error')
   expect((await runOf(w)).message).toContain('gh auth login')
-  // green in Task 13
-  // w.gh.isAuthed = true
-  // const presentation = { isFullscreen: false, columns: 120 }
-  // await $.command.run({ command: 'pr-gate', args: 'resume', origin: { kind: 'composer' }, presentation })
-  // expect((await runOf(w)).phase).toBe('collect')
-  // rec = await recordOf(w)
-  // expect(rec.postStatus).toBeUndefined()
+  w.gh.isAuthed = true
+  const presentation = { isFullscreen: false, columns: 120 }
+  await $.command.run({ command: 'pr-gate', args: 'resume', origin: { kind: 'composer' }, presentation })
+  expect((await runOf(w)).phase).toBe('collect')
+  const after = await recordOf(w)
+  expect(after.postStatus).toBeUndefined()
 })
 
 test('gh printing an error page instead of JSON fails the poll closed', async ($, on) => {
@@ -1359,4 +1358,215 @@ test('R46: a P2 rebuttal with an unreadable verdict gives the agent /pr-gate res
   expect(said).toContain('/pr-gate resume')
   expect(said).not.toContain('person')
   expect(said).not.toContain('allow')
+})
+
+// ------------------------------------------------------------- task 13: commands, waivers, resume, restarts
+
+const asPerson = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 120 } }
+const say = ($: Parameters<TestBody>[0], args: string, as: object = asPerson) => $.command.run({ command: 'pr-gate', args, ...as } as never)
+
+test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
+  const w = world(on)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect((await say($, 'waive pre hotfix for the outage')).text).toContain('post-PR review still runs')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('post')
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(true)
+  await say($, 'waive post reviewed by hand')
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  const waivers = (await recordOf(w)).waivers
+  expect(waivers.map(one => [one.scope, one.reason, one.by])).toEqual([
+    ['pre', 'hotfix for the outage', 'composer'],
+    ['post', 'reviewed by hand', 'composer'],
+  ])
+})
+
+test('only the person waives, allows or resets', async ($, on) => {
+  world(on)
+  for (const args of ['waive pre x', 'waive post x', 'allow 1 x', 'reset']) {
+    expect((await say($, args, { ...asPerson, origin: { kind: 'sdk' } })).text).toContain('Only the person')
+  }
+  expect((await say($, 'waive hotfix')).text).toContain('waive pre|post|<findingId> <reason>')
+})
+
+test('exhaustion is distinct from passing, and the person can allow one more round', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  expect((await recordOf(w)).preStatus).toBe('exhausted')
+  expect((await runOf(w)).status).toBe('exhausted')
+  const before = w.spawned.length
+  await say($, 'allow 1 the fix is small')
+  expect(w.spawned.length).toBeGreaterThan(before)
+  expect((await recordOf(w)).grants).toHaveLength(1)
+})
+
+test('fix commits and a session restart keep the budget and the history', async ($, on) => {
+  const w = world(on, { canRestart: true })
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  // This world reads the run through a hook (it can restart): the fix prompt is armed a moment after it is sent.
+  await w.clock.advance(1000)
+  await $.turn.complete(turn(fixed('R1-1')))
+  await $.turn.complete(turn(review('r2-review', 'PASS'), 'agent-2'))
+  await $.tool.call(createPr)
+  const before = await recordOf(w)
+  // A new session: the session state is gone, the store is not.
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  const after = await recordOf(w)
+  expect(after.rounds).toEqual(before.rounds)
+  expect(after.findings).toEqual(before.findings)
+  expect((await runOf(w)).phase).toBe('collect')
+})
+
+test('a restart during triage neither re-triages nor replies twice', async ($, on) => {
+  const w = world(on, { canRestart: true })
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-triage', dispositions: [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }] })}`))
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  // The new session goes on collecting the PR's reviews.
+  expect((await runOf(w)).lifecycle).toBe('post')
+  await w.clock.advance(60_000)
+  expect(w.prompts.filter(one => one.includes('New review feedback'))).toHaveLength(1)
+})
+
+test('a session start leaves a ready, held or awaiting record alone', async ($, on) => {
+  const w = world(on, { canRestart: true })
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(60_000)
+  expect(w.prompts).toHaveLength(prompts)
+  expect(w.spawned).toHaveLength(spawned)
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+})
+
+/** Probe: a deferred finding after the PR opened leaves the record awaiting the person's decision. */
+const toAwaiting = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = 'Consider renaming this', extra: object = {}) => {
+  await toTriage($, w, body)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', ...extra }]))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+}
+
+test('a resume that ends awaiting the person\'s decision delivers its report once the command returns', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('G2-1')
+  expect(said).toContain('Their options:')
+  expect(said.startsWith('/')).toBe(false)
+})
+
+test('waiving the last deferral makes the record ready, delivers the ready prompt, and lets the merge through', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  const said = await say($, 'waive G2-1 the rename lands with KAN-9')
+  expect(said.text).toBe('/pr-gate waived G2-1 for feat/x: the rename lands with KAN-9.')
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.postStatus).toBeUndefined()
+  expect(rec.waivers.map(one => [one.scope, one.findingId, one.by])).toEqual([['finding', 'G2-1', 'composer']])
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('a finding waiver for an id that does not exist, or one already settled, is refused', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await say($, 'waive G9-9 because')).text).toContain('no finding G9-9')
+  expect((await say($, 'waive G2-1 because')).text).toContain('G2-1 is already settled')
+  expect((await recordOf(w)).waivers).toHaveLength(0)
+})
+
+test('allow adds rounds but settles no deferral: the record stays awaiting, and its report is delivered', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const spawned = w.spawned.length
+  const said = await say($, 'allow 2 more review')
+  expect(said.text).toContain('2 more rounds allowed')
+  expect(said.text).toContain('/pr-gate waive G2-1 <reason>')
+  const rec = await recordOf(w)
+  expect(rec.grants).toHaveLength(1)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('deferred')
+  expect(w.spawned).toHaveLength(spawned)
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('Their options:')
+})
+
+test('a deferred security P1 is released only by a waiver naming it, not by waive post', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, '**P1** SQL injection', { isSecurity: true })
+  const post = await say($, 'waive post shipping today')
+  expect(post.text).toContain('G2-1')
+  expect(post.text).toContain('/pr-gate waive G2-1 <reason>')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  await say($, 'waive G2-1 the query is internal only')
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('before the PR, waiving a deferred blocker lets the gate pass', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await $.turn.complete(turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'needs the auth service' }] })}`))
+  expect((await recordOf(w)).preStatus).toBe('blocked')
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect((await say($, 'waive R1-1 tracked in KAN-7')).text).toBe('/pr-gate waived R1-1 for feat/x: tracked in KAN-7.')
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+})
+
+test('reset archives the record, and an archived record lets nothing through', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  expect((await say($, 'reset')).text).toContain('archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect((await say($, 'resume')).text).not.toContain('No lifecycle')
+})
+
+test('status names the phase, the budget, the baseline and what is open', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const said = (await say($, 'status')).text
+  expect(said).toContain('feat/x → dev: post (awaiting-decision)')
+  expect(said).toContain('baseline 1/2')
+  expect(said).toContain('1 holding the merge')
+  expect(said).toContain('The pane is open.')
+})
+
+test('the pre-PR held texts name the waiver the parser takes', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  expect(w.prompts.at(-1)).toContain('/pr-gate waive pre <reason>')
+  const held = (await $.tool.call(createPr)).deny ?? ''
+  expect(held).toContain('/pr-gate waive pre <reason>')
+  expect(held).not.toMatch(/waive <reason>/)
 })
