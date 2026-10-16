@@ -149,3 +149,71 @@ test('an unknown GitHub tool that reads as opening or merging a PR is held; othe
   expect(readPrAction('mcp__acme-github__issues', { action: 'create' })).toBeUndefined()
   expect(readPrAction('Read', { file_path: 'merge.ts' })).toBeUndefined()
 })
+
+// Fix round 1 (R18): the classifier fails closed on flags, aliases, quoting, nesting and other routes.
+
+test('bash: global flags, aliases, quoting and line continuations still hold', async () => {
+  expect(bash('gh -R me/r pr merge 5')).toMatchObject({ action: 'merge', number: 5, repo: 'me/r' })
+  expect(bash('gh --repo=me/r pr create')).toMatchObject({ action: 'create', repo: 'me/r' })
+  expect(bash('gh pr new')).toMatchObject({ action: 'create' })
+  expect(bash('"gh" pr \'create\'')).toMatchObject({ action: 'create' })
+  expect(bash('gh pr \\\ncreate')).toMatchObject({ action: 'create' })
+  expect(bash('/usr/bin/gh pr create')).toMatchObject({ action: 'create' })
+})
+
+test('bash: mixed commands, merge wins', async () => {
+  expect(bash('gh pr merge 5 --auto && gh pr create')).toMatchObject({ action: 'merge' })
+  expect(bash('gh pr create && gh pr merge 5')).toMatchObject({ action: 'merge' })
+  expect(bash('echo hi; $(gh pr create)')).toMatchObject({ action: 'create' })
+})
+
+test('bash: the merge target', async () => {
+  expect(bash('gh pr merge --body 7 5')).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('gh pr merge feat-x')).toMatchObject({ action: 'merge', number: undefined, isUnknown: true })
+  expect(bash('gh pr merge https://github.com/o/r/pull/9')).toMatchObject({ action: 'merge', number: 9 })
+  expect(bash('gh pr merge --auto --squash')?.isUnknown).toBeUndefined()
+})
+
+test('bash: gh api route forms', async () => {
+  expect(bash('gh api -XPOST repos/o/r/pulls')).toMatchObject({ action: 'create' })
+  expect(bash('gh api repos/o/r/pulls/ -f title=t')).toMatchObject({ action: 'create' })
+  expect(bash('gh api repos/o/r/pulls?x=1 -ftitle=t')).toMatchObject({ action: 'create' })
+  expect(bash('gh api --field=title=t repos/o/r/pulls')).toMatchObject({ action: 'create' })
+  expect(bash('gh api --method=PUT /repos/o/r/pulls/4/merge')).toMatchObject({ action: 'merge', number: 4 })
+  expect(bash('gh api graphql -F query=@m.gql')).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(bash("gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{}) { clientMutationId } }'")).toMatchObject({ action: 'merge' })
+  expect(bash('curl -X PUT https://api.github.com/repos/o/r/pulls/5/merge')).toMatchObject({ action: 'merge' })
+  expect(bash('curl --request POST https://api.github.com/repos/o/r/pulls -d {}')).toMatchObject({ action: 'create' })
+  expect(bash('hub pull-request -m x')).toMatchObject({ action: 'create' })
+})
+
+test('bash: reads stay free', async () => {
+  expect(bash('gh api repos/o/r/pulls -f state=open -X GET')).toBeUndefined()
+  expect(bash('gh pr view 5')).toBeUndefined()
+  expect(bash('gh pr list')).toBeUndefined()
+  expect(bash('gh api repos/o/r/pulls/5/comments')).toBeUndefined()
+  expect(bash("gh api graphql -f query='{ viewer { login } }'")).toBeUndefined()
+})
+
+test('mcp: renamed, re-cased and nested calls still hold', async () => {
+  const graphql = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+  const written = readPrAction('mcp__plugin_github_github__pull_request_write', { method: 'create', owner: 'o', repo: 'r', title: 't', head: 'h', base: 'b' })
+  expect(written).toMatchObject({ action: 'create', repo: 'o/r', base: 'b', head: 'h' })
+  expect(written?.isUnknown).toBeUndefined()
+  expect(readPrAction(graphql, { action: 'MERGE', number: 2 })).toMatchObject({ action: 'merge', number: 2 })
+  expect(readPrAction(graphql, { action: 'enable_auto_merge' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction(graphql, { operation: 'merge' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__github__pulls', { title: 't', head: 'h', base: 'b', action: 'create' })).toMatchObject({ action: 'create' })
+  expect(readPrAction('mcp__github__rest', { method: 'PUT', path: '/repos/o/r/pulls/1/merge' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__github__graphql', { query: 'mutation { mergePullRequest(input:{}) { clientMutationId } }' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__acme-github__tool', { tool: 'merge_pull_request' })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__acme-github__tool', { args: { inner: [{ op: 'merge_pull_request' }] } })).toMatchObject({ action: 'merge' })
+})
+
+test('mcp: reads, reviews and long prose stay free', async () => {
+  expect(readPrAction('mcp__plugin_github_github__pull_request_read', { method: 'get', pullNumber: 1 })).toBeUndefined()
+  expect(readPrAction('mcp__acme-github__list_merged', {})).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__create_pull_request_review', { body: 'x' })).toBeUndefined()
+  expect(readPrAction('mcp__claude_ai_github-graphql-mcp__manage_pull_requests', { action: 'list' })).toBeUndefined()
+  expect(readPrAction('mcp__acme-github__pulls', { body: 'please merge this later, it will create a pull request when the long prose runs on and on'.padEnd(130, '.') })).toBeUndefined()
+})

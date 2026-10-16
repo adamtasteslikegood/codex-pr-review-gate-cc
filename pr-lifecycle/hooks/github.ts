@@ -2,7 +2,6 @@
 // per-repo roster; when collection is over; and which calls open or merge a PR.
 
 import type { Severity } from '../types'
-import { readPrCreate } from './core'
 
 export type Feedback = {
   /** `review:<id>`, `inline:<id>` or `comment:<id>`: stable across polls and sessions. */
@@ -202,6 +201,10 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
 }
 
 // ----------------------------------------------------------- PR actions
+//
+// Design (ruling R18): not a shell parser. Every route an agent might reach for after a refusal is held, failing toward a hold. A false hold
+// costs one retry with a waiver; a miss costs the whole gate. Residual risk that a regex cannot see: shell indirection such as `g=gh; $g pr ...`,
+// `eval`, and commands built in files or scripts that run later.
 
 export type PrAction = {
   action: 'create' | 'merge'
@@ -218,42 +221,232 @@ export type PrAction = {
   isUnknown?: boolean
 }
 
-const cdOf = (command: string): string | undefined => command.match(/(?:^|&&|;)\s*cd\s+["']?([^\s"';&]+)/)?.[1]
-const flagOf = (command: string, names: string): string | undefined =>
-  command.match(new RegExp(`(?:^|\\s)(?:${names})(?:=|\\s+)["']?([^\\s"']+)`))?.[1]
-const fieldOf = (command: string, name: string): string | undefined =>
-  command.match(new RegExp(`(?:-f|-F|--field|--raw-field)\\s+["']?${name}=([^\\s"']+)`))?.[1]
+// ------------------------------------------------------------------ Bash
 
-function readBash(command: string): PrAction | undefined {
-  const cwd = cdOf(command)
-  const create = readPrCreate(command)
-  if (create !== undefined) {
-    return { action: 'create', via: 'gh pr create', base: create.base, repo: create.repo, cwd: create.cwd, head: flagOf(command, '--head|-H') }
-  }
-  const merge = command.match(/\bgh\s+pr\s+merge\b([^;&|]*)/)
-  if (merge !== null) {
-    const args = merge[1] ?? ''
-    const number = args.match(/\/pull\/(\d+)/)?.[1] ?? args.match(/(?:^|\s)(\d+)(?=\s|$)/)?.[1]
-    return { action: 'merge', via: 'gh pr merge', number: number === undefined ? undefined : Number(number), repo: flagOf(command, '--repo|-R'), cwd }
-  }
-  if (!/\bgh\s+api\b/.test(command)) return undefined
-  if (/\bgraphql\b/.test(command)) {
-    if (/\b(mergePullRequest|enqueuePullRequest|enablePullRequestAutoMerge)\b/.test(command)) return { action: 'merge', via: 'gh api graphql', cwd }
-    if (/\bcreatePullRequest\b/.test(command)) return { action: 'create', via: 'gh api graphql', cwd }
-    return undefined
-  }
-  const merged = command.match(/repos\/([^/\s]+\/[^/\s]+)\/pulls\/(\d+)\/merge\b/)
-  if (merged !== null) return { action: 'merge', via: 'gh api', repo: merged[1], number: Number(merged[2]), cwd }
-  const pulls = command.match(/repos\/([^/\s]+\/[^/\s]+)\/pulls(?=["'\s]|$)/)
-  const method = (flagOf(command, '-X|--method') ?? '').toUpperCase()
-  const hasFields = /(?:^|\s)(-f|-F|--field|--raw-field|--input)\s/.test(command)
-  if (pulls !== null && (method === 'POST' || (method === '' && hasFields))) {
-    return { action: 'create', via: 'gh api', repo: pulls[1], base: fieldOf(command, 'base'), head: fieldOf(command, 'head'), cwd }
+/** Join continuations, drop quotes, collapse whitespace. */
+const normalise = (command: string): string =>
+  command
+    .replace(/\\\r?\n/g, ' ')
+    .replace(/['"]/g, '')
+    .replace(/[ \t]+/g, ' ')
+
+const segmentsOf = (normal: string): string[] =>
+  normal
+    .split(/;|&&|\|\||\||\n|\$\(|`|\(|\)/)
+    .map((one) => one.trim())
+    .filter((one) => one !== '')
+
+const cdOf = (normal: string): string | undefined => normal.match(/(?:^|&&|;)\s*cd\s+([^\s;&]+)/)?.[1]
+
+const isCommand = (token: string, name: string): boolean => token === name || token.endsWith(`/${name}`)
+
+/** The value of a flag in any of its spellings: `-R x`, `--repo x`, `--repo=x`, `-Rx`. */
+function flagValue(tokens: string[], names: string[]): string | undefined {
+  for (let at = 0; at < tokens.length; at++) {
+    const token = tokens[at] ?? ''
+    for (const name of names) {
+      if (token === name) return tokens[at + 1]
+      if (name.startsWith('--') && token.startsWith(`${name}=`)) return token.slice(name.length + 1)
+      if (!name.startsWith('--') && token.startsWith(name) && token.length > name.length && !token.startsWith('--')) return token.slice(name.length)
+    }
   }
   return undefined
 }
 
+const FIELD_FLAGS = ['-f', '-F', '--field', '--raw-field']
+
+/** The value of a `-f name=value` style field in any spelling. */
+function fieldValue(tokens: string[], name: string): string | undefined {
+  for (let at = 0; at < tokens.length; at++) {
+    const token = tokens[at] ?? ''
+    let pair: string | undefined
+    if (FIELD_FLAGS.includes(token)) pair = tokens[at + 1]
+    else if (token.startsWith('--field=')) pair = token.slice(8)
+    else if (token.startsWith('--raw-field=')) pair = token.slice(12)
+    else if (/^-[fF][^-]/.test(token)) pair = token.slice(2)
+    if (pair !== undefined && pair.startsWith(`${name}=`)) return pair.slice(name.length + 1)
+  }
+  return undefined
+}
+
+const hasFieldFlag = (tokens: string[]): boolean => tokens.some((token) => /^(-[fF]|--field|--raw-field|--input)/.test(token))
+
+/** `-X POST`, `-XPOST`, `--method POST`, `--method=POST`, uppercased; '' when none. */
+const methodOf = (tokens: string[], names: string[]): string => (flagValue(tokens, names) ?? '').toUpperCase()
+
+const MERGE_VALUE_FLAGS = ['--body', '-b', '--subject', '-t', '--match-head-commit', '-R', '--repo', '--author-email', '-A']
+
+/** The PR a `gh pr merge` names: a number, a /pull/ URL, or something else (a branch) that is held as unknown. */
+function mergeTarget(args: string[]): { number?: number; isUnknown?: boolean } {
+  for (let at = 0; at < args.length; at++) {
+    const token = args[at] ?? ''
+    if (token.startsWith('-')) {
+      if (MERGE_VALUE_FLAGS.includes(token)) at++
+      continue
+    }
+    const url = token.match(/\/pull\/(\d+)/)?.[1]
+    if (url !== undefined) return { number: Number(url) }
+    if (/^\d+$/.test(token)) return { number: Number(token) }
+    return { number: undefined, isUnknown: true }
+  }
+  return { number: undefined }
+}
+
+/** The subcommand after `pr`, skipping global flags and their values. */
+function prSubcommand(tokens: string[], from: number): number {
+  for (let at = from; at < tokens.length; at++) {
+    const token = tokens[at] ?? ''
+    if (token.startsWith('-')) continue
+    const before = tokens[at - 1] ?? ''
+    if (before === '-R' || before === '--repo') continue
+    return at
+  }
+  return -1
+}
+
+function readGhPr(tokens: string[], gh: number, cwd: string | undefined): PrAction | undefined {
+  const pr = tokens.indexOf('pr', gh + 1)
+  if (pr < 0) return undefined
+  const sub = prSubcommand(tokens, pr + 1)
+  const verb = sub < 0 ? '' : (tokens[sub] ?? '')
+  const repo = flagValue(tokens, ['-R', '--repo'])
+  if (verb === 'merge') return { action: 'merge', via: 'gh pr merge', repo, cwd, ...mergeTarget(tokens.slice(sub + 1)) }
+  if (verb === 'create' || verb === 'new') {
+    return { action: 'create', via: 'gh pr create', repo, cwd, base: flagValue(tokens, ['--base', '-B']), head: flagValue(tokens, ['--head', '-H']) }
+  }
+  return undefined
+}
+
+const PULLS_PATH = /(?:^|\/)repos\/([^/\s]+)\/([^/\s]+)\/pulls(?:\/(\d+)\/merge)?\/?(?:\?.*)?$/
+
+type PullsPath = { repo?: string; number?: number; isMerge: boolean }
+
+function pullsPathOf(tokens: string[]): PullsPath | undefined {
+  for (const token of tokens) {
+    const found = token.match(PULLS_PATH)
+    if (found === null) continue
+    const repo = `${found[1]}/${found[2]}`
+    return { repo: repo.includes('{') ? undefined : repo, number: found[3] === undefined ? undefined : Number(found[3]), isMerge: found[3] !== undefined }
+  }
+  return undefined
+}
+
+/** A REST call to the pulls API that writes: POST or PUT, or no method but fields (gh then posts). An explicit GET stays free. */
+function readRest(tokens: string[], via: string, methodFlags: string[], hasBody: boolean, cwd: string | undefined): PrAction | undefined {
+  const path = pullsPathOf(tokens)
+  if (path === undefined) return undefined
+  const method = methodOf(tokens, methodFlags)
+  if (!(method === 'POST' || method === 'PUT' || (method === '' && hasBody))) return undefined
+  if (path.isMerge) return { action: 'merge', via, repo: path.repo, number: path.number, cwd }
+  return { action: 'create', via, repo: path.repo, base: fieldValue(tokens, 'base'), head: fieldValue(tokens, 'head'), cwd }
+}
+
+const GRAPHQL_MERGES = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b/
+
+/** GraphQL names are matched over the whole command: its braces and parentheses split segments. */
+function readGraphql(normal: string, tokens: string[], cwd: string | undefined): PrAction | undefined {
+  const via = 'gh api graphql'
+  if (GRAPHQL_MERGES.test(normal)) return { action: 'merge', via, cwd }
+  if (/\bcreatePullRequest\b/.test(normal)) return { action: 'create', via, cwd }
+  const isUnreadable = tokens.some((token) => token.startsWith('query=@') || token === '--input') || /\$(?!\()/.test(normal)
+  return isUnreadable ? { action: 'merge', via, cwd, isUnknown: true } : undefined
+}
+
+function readSegment(segment: string, normal: string, cwd: string | undefined): PrAction | undefined {
+  const tokens = segment.split(' ')
+  const gh = tokens.findIndex((token) => isCommand(token, 'gh'))
+  if (gh >= 0) {
+    const pr = readGhPr(tokens, gh, cwd)
+    if (pr !== undefined) return pr
+    const api = tokens.indexOf('api', gh + 1)
+    if (api >= 0) {
+      if (tokens.indexOf('graphql', api + 1) >= 0) return readGraphql(normal, tokens, cwd)
+      return readRest(tokens.slice(api + 1), 'gh api', ['-X', '--method'], hasFieldFlag(tokens), cwd)
+    }
+  }
+  const curl = tokens.findIndex((token) => isCommand(token, 'curl'))
+  if (curl >= 0 && segment.includes('api.github.com')) {
+    const hasBody = tokens.some((token) => /^(-d|--data|--json)/.test(token))
+    const rest = readRest(tokens.slice(curl + 1), 'curl', ['-X', '--request'], hasBody, cwd)
+    if (rest !== undefined) return rest
+  }
+  const hub = tokens.findIndex((token) => isCommand(token, 'hub'))
+  if (hub >= 0 && tokens.indexOf('pull-request', hub + 1) >= 0) return { action: 'create', via: 'hub pull-request', cwd }
+  return undefined
+}
+
+/** Merge wins over create when one command holds both. */
+function readBash(command: string): PrAction | undefined {
+  const normal = normalise(command)
+  const cwd = cdOf(normal)
+  const found = segmentsOf(normal)
+    .map((segment) => readSegment(segment, normal, cwd))
+    .filter((one): one is PrAction => one !== undefined)
+  return found.find((one) => one.action === 'merge') ?? found[0]
+}
+
+// ------------------------------------------------------------------- MCP
+
 const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+const MAX_PLAIN = 120
+
+/** Every key and every short string value, however nested. A GraphQL `query` is always kept; long prose (a PR body) is not. */
+function flatten(value: unknown, key: string | undefined, out: string[], depth: number): void {
+  if (depth > 8) return
+  if (typeof value === 'string') {
+    if (value.length <= MAX_PLAIN || key === 'query') out.push(value)
+  } else if (Array.isArray(value)) {
+    for (const one of value) flatten(one, key, out, depth + 1)
+  } else if (typeof value === 'object' && value !== null) {
+    for (const [name, one] of Object.entries(value)) {
+      out.push(name)
+      flatten(one, name, out, depth + 1)
+    }
+  }
+}
+
+/** Camel case split, punctuation to spaces, lowercase: `mergePullRequest` and `merge_pull_request` read the same. */
+function wordsOf(tool: string, input: Record<string, unknown>): string {
+  const parts: string[] = [tool]
+  flatten(input, undefined, parts, 0)
+  return parts
+    .join(' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[^A-Za-z0-9]+/g, ' ')
+    .toLowerCase()
+}
+
+const MERGE_WORDS = /\b(merge|enqueue|automerge)\b/
+const CREATE_WORDS = /\b(create|new|open|submit)\b/
+const PR_WORDS = /\b(pull|pulls|pr|prs)\b/
+const REVIEW_WORDS = /\b(reviews?|comments?)\b/
+
+function readUnknownTool(tool: string, input: Record<string, unknown>, repo: string | undefined): PrAction | undefined {
+  const said = wordsOf(tool, input)
+  if (!PR_WORDS.test(said)) return undefined
+  if (MERGE_WORDS.test(said)) return { action: 'merge', via: tool, number: num(input.number ?? input.pullNumber ?? input.pull_number), repo, isUnknown: true }
+  if (CREATE_WORDS.test(said) && !REVIEW_WORDS.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
+  return undefined
+}
+
+/** The tools this mod knows by name, and what each one's arguments say. */
+function readKnownTool(tool: string, input: Record<string, unknown>, repo: string | undefined): PrAction | undefined {
+  const create = (via: string): PrAction => ({ action: 'create', via, base: str(input.base), head: str(input.head), repo })
+  const merge = (via: string, number: unknown): PrAction => ({ action: 'merge', via, number: num(number), repo })
+  if (tool === 'mcp__plugin_github_github__create_pull_request') return create(tool)
+  if (tool === 'mcp__plugin_github_github__merge_pull_request') return merge(tool, input.pullNumber)
+  if (tool === 'mcp__plugin_github_github__pull_request_write') {
+    const method = String(input.method ?? '').toLowerCase()
+    if (method === 'create') return create(`${tool} (create)`)
+    if (method === 'merge') return merge(`${tool} (merge)`, input.pullNumber)
+  }
+  if (tool === GRAPHQL_MCP) {
+    const action = String(input.action ?? '').toLowerCase()
+    if (action === 'create') return create(`${tool} (create)`)
+    if (action === 'merge' || action === 'enqueue') return merge(`${tool} (${action})`, input.number)
+  }
+  return undefined
+}
 
 /** Whether a tool call opens or merges a pull request, on any route this mod can see. Unknown GitHub tools fail closed. */
 export function readPrAction(tool: string, input: Record<string, unknown>): PrAction | undefined {
@@ -261,19 +454,8 @@ export function readPrAction(tool: string, input: Record<string, unknown>): PrAc
   const owner = str(input.owner)
   const repoName = str(input.repo)
   const repo = owner !== undefined && repoName !== undefined ? `${owner}/${repoName}` : repoName
-  if (tool === 'mcp__plugin_github_github__create_pull_request') {
-    return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo }
-  }
-  if (tool === 'mcp__plugin_github_github__merge_pull_request') return { action: 'merge', via: tool, number: num(input.pullNumber), repo }
-  if (tool === GRAPHQL_MCP) {
-    const action = String(input.action ?? '')
-    if (action === 'create') return { action: 'create', via: `${tool} (create)`, base: str(input.base), head: str(input.head), repo }
-    if (action === 'merge' || action === 'enqueue') return { action: 'merge', via: `${tool} (${action})`, number: num(input.number), repo }
-    return undefined
-  }
+  const known = readKnownTool(tool, input, repo)
+  if (known !== undefined) return known
   if (!tool.startsWith('mcp__') || !/github/i.test(tool)) return undefined
-  const said = `${tool} ${String(input.action ?? input.method ?? input.operation ?? '')}`.toLowerCase()
-  if (/merge|enqueue|auto[_\s-]?merge/.test(said)) return { action: 'merge', via: tool, number: num(input.number ?? input.pullNumber ?? input.pull_number), repo, isUnknown: true }
-  if (/(create|open)[_\s-]*(pull|pr\b)/.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
-  return undefined
+  return readUnknownTool(tool, input, repo)
 }
