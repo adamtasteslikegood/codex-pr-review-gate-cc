@@ -143,3 +143,121 @@ test('a finding left without an answer is asked about once more, then stays open
   expect(w.prompts.at(-1)).toContain('R1-2 [P2] Rename this')
   expect(w.prompts.at(-1)).toContain('1 advisory finding not fixed')
 })
+
+// ------------------------------------------------------------- fix round 1
+
+const run$ = (args: string) => ({ command: 'pr-gate', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } }) as never
+
+test('an open security blocker that a later review leaves out never lets the gate pass', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn('Tried.'))
+  await $.turn.complete(turn('Tried.'))
+  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  const rec = await recordOf(w)
+  expect(rec.preStatus).not.toBe('passed')
+  expect(rec.findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  // The carried blocker goes back to the fixer with round 2.
+  expect((await runOf(w)).phase).toBe('fix')
+  expect(w.prompts.at(-1)).toContain('R1-1 [P1] SQL injection in search')
+  expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+})
+
+test('a rerun after uncommitted fixer changes numbers its findings after the ones already raised', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  w.git.dirty = ' M src/app.ts'
+  await $.turn.complete(turn(fixed('R1-1')))
+  expect((await runOf(w)).status).toBe('error')
+  w.git.dirty = ''
+  w.git.head = 'e'.repeat(40)
+  await $.command.run(run$('resume'))
+  const run = await runOf(w)
+  await $.turn.complete(turn(review(`r${run.round}-review`, 'FAIL', [{ ...P1, title: 'Another thing', line: 80 }]), `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.map(one => [one.id, one.title])).toEqual([
+    ['R1-1', 'Unvalidated redirect'],
+    ['R1-2', 'Another thing'],
+  ])
+  expect(rec.findings[0]?.status).toBe('reported-fixed')
+})
+
+test('a stop and resume keeps the earlier findings under their ids, and records the attempt', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await $.command.run(run$('stop'))
+  expect((await recordOf(w)).attempts).toBe(1)
+  await $.command.run(run$('resume'))
+  const run = await runOf(w)
+  await $.turn.complete(turn(review(`r${run.round}-review`, 'PASS', [{ ...P1, severity: 'P2', title: 'Other nit', line: 90 }]), `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.map(one => [one.id, one.severity, one.title])).toEqual([
+    ['R1-1', 'P1', 'Unvalidated redirect'],
+    ['R1-2', 'P2', 'Other nit'],
+  ])
+})
+
+test('a fix step that times out records an attempt', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await w.clock?.advance(62_000)
+  expect((await runOf(w)).status).toBe('error')
+  expect((await recordOf(w)).attempts).toBe(1)
+})
+
+test('an exhausted gate that holds the PR says why, with the findings and the next steps', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn(fixed('R1-1')))
+  const run = await runOf(w)
+  // The count is the same set the security check reads: unresolved and unverified.
+  expect(run.message).toContain('1 high/critical finding')
+  expect(run.steps.find(one => one.id === 'pr')?.state).not.toBe('pending')
+  const held = w.prompts.at(-1) ?? ''
+  expect(held).toContain('held')
+  expect(held).toContain('R1-1 [P1] SQL injection in search')
+  expect(held).toContain('pr-gate resume')
+  expect(held).toContain('waive')
+  expect(held).toContain('allow')
+  expect(held).not.toContain('open the pull request')
+  expect(held.startsWith('/')).toBe(false)
+  // Asking again starts no round, and the refusal says the PR is held and why.
+  const again = await $.tool.call(createPr)
+  expect(again.deny).toContain('held')
+  expect(again.deny).not.toContain('prompts you to open')
+})
+
+test('with onExhausted stop, a spent allowance holds the PR and says so', { options: { allowanceStandard: 1, onExhausted: 'stop' } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await $.turn.complete(turn('Tried.'))
+  await $.turn.complete(turn('Tried.'))
+  expect((await recordOf(w)).preStatus).toBe('exhausted')
+  expect(w.prompts.at(-1)).toContain('held')
+  expect(w.prompts.at(-1)).not.toContain('open the pull request')
+})
+
+test('a pre-PR block is explained without a PR number or merge advice', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  // No commit and no rebuttal: another round would say the same.
+  await $.turn.complete(turn('Tried.'))
+  await $.turn.complete(turn('Tried.'))
+  expect((await recordOf(w)).preStatus).toBe('blocked')
+  const text = w.prompts.at(-1) ?? ''
+  expect(text).toContain('R1-1')
+  expect(text).not.toContain('PR #undefined')
+  expect(text).not.toContain('Do not merge')
+})

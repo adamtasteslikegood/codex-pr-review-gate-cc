@@ -21,6 +21,7 @@ import {
   getRun,
   git,
   hasSecurityBlocker,
+  heldReason,
   isLiveNow,
   markPr,
   onAnswer,
@@ -170,11 +171,18 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const run = await getRun($)
   if (run === null || run.status !== 'running') {
     const after = (await loadRecord($, root, branch)) ?? rec
-    return `Nothing to review for ${branch} at ${head.slice(0, 7)}: the pre-PR gate stands at ${after.preStatus ?? 'not run'}${after.message === undefined ? '' : ` (${after.message})`}, ${remaining(after)} of ${after.allowance} review rounds left.`
+    const said = after.message === undefined ? '' : ` (${after.message})`
+    return (
+      `Nothing to review for ${branch} at ${head.slice(0, 7)}: the pre-PR gate stands at ${after.preStatus ?? 'not run'}${said}, ` +
+      `${remaining(after)} of ${after.allowance} review rounds left.`
+    )
   }
   const tierNote = rec.tier === 'high' ? ' Review and challenge run in parallel, and fixes are reviewed before each new round.' : ''
   const lightNote = rec.lane === 'light' ? ` Light lane: ${branch} matches lightBranches.` : ''
-  return `Lifecycle ${prior === undefined ? 'started' : 'resumed'} for ${branch} → ${base}: ${rec.tier} blast radius (${rec.tierWhy}), Codex at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.${tierNote}${lightNote}`
+  return (
+    `Lifecycle ${prior === undefined ? 'started' : 'resumed'} for ${branch} → ${base}: ${rec.tier} blast radius (${rec.tierWhy}), ` +
+    `Codex at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.${tierNote}${lightNote}`
+  )
 }
 
 /**
@@ -250,7 +258,7 @@ const judge = async ($: Engine, pr: PrCreate & { head?: string }): Promise<strin
   const allows = (one: LifecycleRecord | undefined): one is LifecycleRecord =>
     one !== undefined &&
     (one.waivers.some(each => each.scope === 'pre' && each.head === head) ||
-      one.preStatus === 'passed' ||
+      (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'exhausted' && config.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
   if (allows(rec) && rec.preHead === head) return undefined
@@ -267,10 +275,20 @@ const judge = async ($: Engine, pr: PrCreate & { head?: string }): Promise<strin
   // A change Codex is not needed for passes at once: the held call goes straight through.
   const after = await loadRecord($, root, branch)
   if (allows(after) && after.preHead === head) return undefined
+  const held = after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after)
+  if (held !== undefined) {
+    // No round started: the PR stays held for a settled reason, and waiting will not change it.
+    return [
+      `pr-gate: the pull request to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${held.why}.`,
+      `Your next step: ${held.nextStep}. Do not create the pull request another way.`,
+      `Tell the person: they can type /${COMMAND} waive <reason> to let this commit through, or /${COMMAND} allow 1 <reason> for one more review round.`,
+    ].join('\n')
+  }
   return [
     `pr-gate: a pull request to ${base} waits for the pre-PR review of ${branch} at ${head.slice(0, 7)}.`,
     started,
-    'Do not retry this command and do not open the pull request another way. End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
+    'Do not retry this command and do not open the pull request another way.',
+    'End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
     `(The person can type /${COMMAND} status, or /${COMMAND} waive <reason> to open it without the gate.)`,
   ].join('\n')
 }
@@ -385,7 +403,10 @@ export const register: Register = (on, options) => {
       const open = (rec?.findings ?? run.findings).filter(one => isBlocking(one) && one.status === 'open').length
       const budget = rec === undefined ? '' : `, ${remaining(rec)} of ${rec.allowance} review rounds left`
       return {
-        text: `pr-gate ${run.status} for ${run.branch} → ${run.base}: round ${run.round}${run.fixKind === 'advisory' ? ' (advisories)' : ''}, codex at ${run.effort}, ${run.findings.length} findings raised, ${open} high/critical open${budget}.${run.message === undefined ? '' : ` ${run.message}`}${pane}`,
+        text:
+          `pr-gate ${run.status} for ${run.branch} → ${run.base}: round ${run.round}${run.fixKind === 'advisory' ? ' (advisories)' : ''}, ` +
+          `codex at ${run.effort}, ${run.findings.length} findings raised, ${open} high/critical open${budget}.` +
+          `${run.message === undefined ? '' : ` ${run.message}`}${pane}`,
       }
     }
     if (verb === 'stop') {
@@ -476,7 +497,8 @@ export const register: Register = (on, options) => {
         </Text>
         <Text dimColor wrap="truncate-end">
           round {run.round}
-          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex {run.effort} · {elapsed((run.endedAt ?? now) - run.startedAt)}
+          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex {run.effort} ·{' '}
+          {elapsed((run.endedAt ?? now) - run.startedAt)}
         </Text>
 
         <Box marginTop={1} flexDirection="column">
@@ -528,7 +550,16 @@ export const register: Register = (on, options) => {
               color={one.round === run.round && isBlocking(one) && one.status === 'open' ? 'error' : undefined}
               strikethrough={one.status === 'verified-fixed' || one.status === 'reported-fixed'}
             >
-              {one.status === 'verified-fixed' || one.status === 'reported-fixed' ? '✔' : one.status === 'rebutted' ? '↩' : one.status === 'deferred' ? '⏸' : isBlocking(one) ? '●' : '·'} {one.id} [
+              {one.status === 'verified-fixed' || one.status === 'reported-fixed'
+                ? '✔'
+                : one.status === 'rebutted'
+                  ? '↩'
+                  : one.status === 'deferred'
+                    ? '⏸'
+                    : isBlocking(one)
+                      ? '●'
+                      : '·'}{' '}
+              {one.id} [
               {one.severity}] {one.title}
               {one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`}
               {one.status === 'open' ? '' : ` — ${one.status}`}

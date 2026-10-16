@@ -22,7 +22,7 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
@@ -168,6 +168,17 @@ test('pre-PR: nothing raised opens the PR; a blocker with allowance left runs an
   expect(decideNext(at([blocked, blocked, blocked, blocked]))).toEqual({ kind: 'open-pr', status: 'exhausted' })
 })
 
+test('pre-PR: an open blocker anywhere in the ledger never passes, even when the last round raised nothing', async () => {
+  const r1 = pre({ raised: { blocking: 1, advisory: 0 }, endHead: 'b' })
+  const r2 = pre({ startHead: 'b', endHead: 'b' })
+  const open = { findings: [finding({ status: 'open' })] }
+  expect(decideNext(at([r1, r2], open))).toMatchObject({ kind: 'round', phase: 'pre', isAdvisory: false })
+  // With the allowance spent it is exhausted, never passed.
+  expect(decideNext(at([r1, r1, r1, r2], open))).toEqual({ kind: 'open-pr', status: 'exhausted' })
+  // A blocker only deferred as security needs the person, not another round.
+  expect(decideNext(at([r1, r2], { findings: [finding({ status: 'deferred', isSecurity: true })] })).kind).toBe('blocked')
+})
+
 test('pre-PR: a pass-through with no allowance opens the PR without a round', async () => {
   expect(decideNext(at([], { allowance: 0, tier: 'trivial', passThrough: 'docs only' }))).toEqual({ kind: 'open-pr', status: 'passed' })
 })
@@ -293,6 +304,7 @@ test('no prompt opens with a slash, which would be read as a command', async () 
     reviewPrompt(runOf(), 'review', []),
     reviewPrompt(runOf(), 'challenge', []),
     verifyPrompt(runOf(), 'abcdef0'),
+    heldPrompt(rec, 'the allowance is spent', 'fix R1-1, commit, then /pr-gate resume'),
   ]
   for (const one of prompts) expect(one.startsWith('/')).toBe(false)
 })

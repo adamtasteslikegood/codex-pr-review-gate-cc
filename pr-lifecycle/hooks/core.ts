@@ -1,7 +1,7 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isBlocking, raisedIn, unresolvedBlockers, usedRounds } from './lifecycle'
+import { isBlocking, raisedIn, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
@@ -526,4 +526,19 @@ export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep
   const open = unresolvedBlockers(rec)
   const head = `pr-gate stopped short of ready on PR #${rec.pr}: ${next.why}. Tell the person, with each open finding and its evidence, and the smallest next step: ${next.nextStep}. Do not merge.`
   return open.length === 0 ? head : `${head}\n\n${listFindings(open)}`
+}
+
+/** The pre-PR gate ended holding the pull request: why, what holds it, the agent's next step and the person's options. */
+export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string): string {
+  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+  const lines = [`pr-gate: the pull request for ${rec.branch} → ${rec.base} is held at ${rec.head.slice(0, 7)}: ${why}.`]
+  if (holding.length > 0) lines.push('', 'What holds it, with the evidence so far:', listFindings(holding))
+  lines.push(
+    '',
+    `Your next step: ${nextStep}.`,
+    'Verify each finding against the code first: fix a real one with the smallest change and commit it, or rebut a false one with file:line evidence. Then run /pr-gate resume.',
+    'Do not push for review and do not create the pull request another way: the guard holds it until the review passes or the person decides.',
+    "Tell the person why it is held. Their options: /pr-gate waive <reason> lets this commit's pull request through without the review, and /pr-gate allow 1 <reason> grants one more review round.",
+  )
+  return lines.join('\n')
 }

@@ -32,6 +32,8 @@ export type World = {
   /** The plugin's store, as the mod wrote it. */
   store: Map<string, unknown>
   stored: (key: string) => unknown
+  /** The test's clock: `advance` moves it, and fires what falls due. */
+  clock?: { advance: (ms: number) => Promise<void> }
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
@@ -57,7 +59,7 @@ export function world(on: On): World {
     store: new Map(),
     stored: (key: string) => w.store.get(key),
   }
-  mock.clock(on, { now: 1_000 })
+  w.clock = mock.clock(on, { now: 1_000 })
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_$, e) => {
     w.store.set(e.key, e.value)

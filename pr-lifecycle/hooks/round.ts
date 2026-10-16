@@ -12,6 +12,7 @@ import {
   compileRisk,
   fixPrompt,
   lowerOf,
+  heldPrompt,
   prPrompt,
   readDispositions,
   readReview,
@@ -190,7 +191,10 @@ export function startTicker($: Engine): void {
         if (run.phase === 'review') {
           await noteAttempt($, run, why)
           await retryLower($, run, why)
-        } else await finish($, run.id, 'error', why, true)
+        } else {
+          await noteAttempt($, run, why)
+          await finish($, run.id, 'error', why, true)
+        }
       }
     })().catch(() => undefined)
   })
@@ -205,6 +209,9 @@ export function startTicker($: Engine): void {
 export async function finish($: Engine, id: string, status: RunStatus, message: string, hasTimedOut = false): Promise<Run | null> {
   const now = await $.clock.now()
   const isOpenable = status === 'passed' || status === 'exhausted' || status === 'waived'
+  // A stop mid-round is an attempt: its effort and its findings are kept.
+  const before = status === 'stopped' ? await getRun($) : null
+  if (before !== null && before.id === id && before.status === 'running') await noteAttempt($, before, message)
   let isEnded = false
   const run = await patch($, id, one => {
     isEnded = true
@@ -498,9 +505,10 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
 /** An attempt that did not complete: its effort is recorded, no round is used. */
 async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
   const now = await $.clock.now()
+  // The attempt's findings and answers stay in the ledger, so a rerun of the round numbers its own after them.
   await updateRecord($, run.root, run.branch, rec =>
     withRound(
-      rec,
+      { ...rec, findings: mergeFindings(rec.findings, run.findings) },
       roundOf({
         n: run.round,
         phase: run.lifecycle,
@@ -543,9 +551,17 @@ export async function advance($: Engine, root: string, branch: string): Promise<
         ? rec.passThrough !== undefined
           ? `Codex skipped: ${rec.passThrough}.`
           : `No high/critical finding after ${used} round${used === 1 ? '' : 's'}.`
-        : `${unresolvedBlockers(rec).length} high/critical finding(s) still open with the allowance spent${hasSecurity ? ', one of them security: the PR stays held' : ''}.`
+        : `${heldFindings(rec).length} high/critical finding(s) unresolved or unverified with the allowance spent${hasSecurity ? ', one of them security: the PR stays held' : ''}.`
     const ended = id === undefined ? null : await finish($, id, next.status, message)
-    if (opens && config.openPr && saved !== undefined && ended !== null) {
+    if (ended === null || saved === undefined) return
+    if (!opens) {
+      // The round that just ended leaves the PR held: say so once, with why and what can move it.
+      const held = heldReason(saved)
+      await markPr($, 'skipped', 'held')
+      if (held !== undefined) void $.prompt.submit({ text: heldPrompt(saved, held.why, held.nextStep) }).catch(() => undefined)
+      return
+    }
+    if (config.openPr) {
       await markPr($, 'running', 'handed to the main agent')
       void $.prompt.submit({ text: prPrompt(ended, saved, next.status) }).catch(() => undefined)
     }
@@ -562,7 +578,34 @@ export async function advance($: Engine, root: string, branch: string): Promise<
     isPre ? { ...one, preStatus: next.kind, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why },
   )
   if (id !== undefined) await finish($, id, next.kind, `${next.why}. Next: ${next.nextStep}`)
-  if (saved !== undefined) void $.prompt.submit({ text: reportPrompt(saved, next) }).catch(() => undefined)
+  if (saved === undefined) return
+  // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
+  if (isPre) {
+    if (id !== undefined) void $.prompt.submit({ text: heldPrompt(saved, next.why, next.nextStep) }).catch(() => undefined)
+    return
+  }
+  void $.prompt.submit({ text: reportPrompt(saved, next) }).catch(() => undefined)
+}
+
+/** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
+const heldFindings = (rec: LifecycleRecord): Finding[] => [...unresolvedBlockers(rec), ...verificationOwed(rec)]
+
+/** Why the pre-PR gate holds the PR, and the next step; undefined when it does not hold it for a settled reason. */
+export function heldReason(rec: LifecycleRecord): { why: string; nextStep: string } | undefined {
+  if (rec.preStatus === 'blocked') {
+    return { why: rec.message ?? 'a decision is needed', nextStep: 'fix or rebut the open findings and commit, then /pr-gate resume' }
+  }
+  if (rec.preStatus !== 'exhausted') return undefined
+  const holding = heldFindings(rec)
+  const isSecurity = hasSecurityBlocker(rec)
+  if (!isSecurity && config.onExhausted === 'open-pr') return undefined
+  const n = holding.length
+  return {
+    why:
+      `the pre-PR review allowance is spent with ${n} high/critical finding${n === 1 ? '' : 's'} unresolved or unverified` +
+      (isSecurity ? ', one of them security, which never rides on an exhausted review' : ', and onExhausted is stop'),
+    nextStep: `fix ${holding.map(one => one.id).join(', ') || 'the open findings'} and commit, then /pr-gate resume; with the allowance spent, a new round also needs the person's /pr-gate allow 1 <reason>`,
+  }
 }
 
 // ------------------------------------------------- what each answer does
@@ -577,12 +620,21 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     await retryLower($, run, `Codex ${failed.role} timed out at ${run.effort}: ${failed.result.note ?? 'no verdict'}.`)
     return
   }
+  const prior = await loadRecord($, run.root, run.branch)
+  // A rerun of round N (after a stop, an error or uncommitted changes) numbers after what that round already raised.
+  const prefix = `R${run.round}-`
+  const taken = Math.max(
+    0,
+    ...[...run.findings, ...(prior?.findings ?? [])].filter(one => one.id.startsWith(prefix)).map(one => Number(one.id.slice(prefix.length)) || 0),
+  )
+  // Blockers still open from earlier rounds go to this round's fix step too; the fixer can still rebut a stale one.
+  const carried = new Set(prior === undefined ? [] : unresolvedBlockers(prior).filter(one => one.status === 'open').map(one => one.id))
   const fresh: Finding[] = []
   for (const { role, result } of results) {
     for (const one of result.findings) {
       fresh.push({
         ...one,
-        id: `R${run.round}-${fresh.length + 1}`,
+        id: `${prefix}${taken + fresh.length + 1}`,
         round: run.round,
         source: role === 'challenge' ? 'codex-challenge' : 'codex-review',
         reviewer: 'codex',
@@ -600,7 +652,10 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     pending: [],
     // A finding this review left out keeps its status: only an explicit verified or held moves it.
     findings: [
-      ...one.findings.map(old => (verified.has(old.id) ? markVerified(old, one.round, 'codex', now) : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old)),
+      ...one.findings.map(old => {
+        const ruled = verified.has(old.id) ? markVerified(old, one.round, 'codex', now) : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
+        return carried.has(ruled.id) && ruled.status === 'open' && !raisedIn(ruled, one.round) ? markHeld(ruled, one.round, 'pr-gate', now) : ruled
+      }),
       ...fresh,
     ],
     evidence: results
