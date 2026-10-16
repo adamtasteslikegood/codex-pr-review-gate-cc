@@ -2418,3 +2418,21 @@ test('a resume keeps the base the lifecycle was started for', async ($, on) => {
   await $.command.run({ command: 'pr-gate', args: 'resume', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } } as never)
   expect((await recordOf(w)).base).toBe('main')
 })
+
+// ------------------------------------------------------------- final fix wave (R60-R65)
+
+test('R60: the post-PR Codex fallback reviews from the last head a review covered, not one pushed during triage', async ($, on) => {
+  const w = world(on)
+  // A reviewer comments on a...a; the agent pushes e...e while it answers.
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  expect((await runOf(w)).roundKind).toBe('baseline')
+  // Nobody reviews e...e by the wait cap: Codex falls back, on the range nobody read.
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  expect(run.phase).toBe('review')
+  expect(run.diffBase).toBe('a'.repeat(40))
+  expect(w.spawned.at(-1)?.prompt).toContain(`The base is ${'a'.repeat(40)}`)
+})

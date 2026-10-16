@@ -292,6 +292,13 @@ export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>
 export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
   rec.rounds.filter(one => one.isCompleted).at(-1)?.endHead
 
+/**
+ * The last head a reviewer read in full: the latest complete evidence of a completed round (R60). A round's end head can hold
+ * commits pushed while it was answered, which nobody reviewed, so a Codex review's base is this head, not `lastReviewedHead`.
+ */
+export const lastCoveredHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
+  rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence.filter(each => each.isComplete)).at(-1)?.head
+
 /** Answered findings whose file changed: their evidence must be checked again. History stays. (A waiver's lapse is `lapseWaivers`.) */
 export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
   return findings.map(one => (one.status !== 'open' && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))

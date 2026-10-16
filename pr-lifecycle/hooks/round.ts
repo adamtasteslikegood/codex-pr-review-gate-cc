@@ -41,7 +41,7 @@ import {
   isBlocking,
   isDisputed,
   isReverifyOwed,
-  lastReviewedHead,
+  lastCoveredHead,
   markHeld,
   markVerified,
   mergeFindings,
@@ -701,7 +701,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
       await finish($, run.id, 'error', `Post-PR round ${run.round} needs a Codex review, but ${why}.`)
       return
     }
-    await beginReview($, run.id) // the Codex fallback: reviewPrompt reads run.diffBase (the last reviewed head)
+    await beginReview($, run.id) // the Codex fallback: reviewPrompt reads run.diffBase (the last head a review covered, R60)
     return
   }
   // Nobody covered the head and Codex was skipped (a pass-through's round 1): fresh findings still go to triage;
@@ -1127,7 +1127,8 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
   const isOn = existing !== null && existing.status === 'running'
   // An attempt that did not complete is run again under its own number.
   const round = rec.rounds.length === 0 ? 1 : Math.max(...rec.rounds.map(one => one.n)) + (rec.rounds.at(-1)?.isCompleted === false ? 0 : 1)
-  const lastHead = lastReviewedHead(rec)
+  // A post-PR or delta review starts from the last head a reviewer read in full, never from commits nobody read (R60).
+  const lastHead = lastCoveredHead(rec)
   const run: Run = {
     id: isOn ? existing.id : `${now}`,
     cwd: rec.root,
