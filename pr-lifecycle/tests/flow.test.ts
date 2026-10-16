@@ -1326,3 +1326,37 @@ test('R40: a dispute a later Codex review rules on stays the person\'s', async (
   expect(one?.status).toBe('rebutted')
   expect(one?.history.at(-1)?.by).toBe('main')
 })
+
+test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+  // Someone pushes; no reviewer covers the new head, so Codex reviews it and calls G2-1 verified.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(21 * 60_000)
+  expect((await runOf(w)).phase).toBe('review')
+  expect(w.spawned.at(-1)?.prompt).not.toContain('G2-1')
+  await $.turn.complete(turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('deferred')
+  expect(rec.phase).not.toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+})
+
+test('R46: a P2 rebuttal with an unreadable verdict gives the agent /pr-gate resume, not the person', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await $.turn.complete(turn(`v\n${TRAILER}\n{"step":"r2-verify","verdicts":"maybe"}`, `agent-${w.spawned.length}`))
+  expect((await recordOf(w)).postStatus).toBe('blocked')
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('is held')
+  expect(said).toContain('G2-1 [P2]')
+  expect(said).toContain('rebutted')
+  expect(said).toContain('/pr-gate resume')
+  expect(said).not.toContain('person')
+  expect(said).not.toContain('allow')
+})

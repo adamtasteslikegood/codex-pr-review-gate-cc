@@ -1373,7 +1373,8 @@ async function afterReview($: Engine, run: Run): Promise<void> {
         // A rebuttal Codex accepts stays rebutted, with Codex's entry (R44); a fix it confirms is verified.
         const confirmed = old.status === 'rebutted' ? acceptRebuttal(old, one.round, now) : markVerified(old, one.round, 'codex', now)
         // After the PR opens, a dispute is the person's (R40): a review's ruling does not move it.
-        const isTheirs = one.lifecycle === 'post' && isDisputed(old)
+        // Only a fix or a rebuttal is Codex's to rule on (R45): a deferral is released by the person's waiver alone.
+        const isTheirs = (one.lifecycle === 'post' && isDisputed(old)) || (old.status !== 'reported-fixed' && old.status !== 'rebutted')
         const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
         return carried.has(ruled.id) && ruled.status === 'open' && !raisedIn(ruled, one.round) ? markHeld(ruled, one.round, 'pr-gate', now) : ruled
       }),

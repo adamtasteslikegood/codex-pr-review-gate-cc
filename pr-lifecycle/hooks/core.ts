@@ -338,8 +338,8 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
       '4. Challenge mode output carries no severity tags. Read the code for each problem Codex raised, then report it as P1 only when it is a concrete, reachable failure or security hole in code this branch changes; report the rest as P2. gate is FAIL when any P1 stands, else PASS. If Codex did not complete, gate is ERROR, and error is timeout when Codex timed out or stalled, other otherwise.',
     )
   }
-  // After the PR opens, a dispute is the person's (R40): Codex is not asked about it again.
-  const answered = priorRounds(run.lifecycle === 'post' ? prior.filter(one => !isDisputed(one)) : prior)
+  // After the PR opens, a dispute or a deferral is the person's (R40, R45): Codex is not asked about it again.
+  const answered = priorRounds(run.lifecycle === 'post' ? prior.filter(one => !isDisputed(one) && one.status !== 'deferred') : prior)
   if (answered !== '' && role === 'review') {
     lines.push(
       '',
@@ -638,21 +638,31 @@ export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: '
   return lines.join('\n')
 }
 
-/** The pre-PR gate ended holding the pull request: why, what holds it, the agent's next step and the person's options. */
+/**
+ * The gate holds the pull request (pre-PR) or its merge (post-PR): why, what holds it and the agent's next step. Before the PR the
+ * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46).
+ */
 export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string): string {
-  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
   if (rec.phase !== 'pre') {
-    // After the PR opened: the merge is what is held.
+    // After the PR opened: the merge is what is held, by every finding the merge guard names (R39, R46).
+    const holds = mergeHolds(rec)
     const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
-    if (holding.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holding))
-    post.push(
-      '',
-      `Your next step: ${nextStep}.`,
-      'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
-      `Tell the person why it is held. ${personPost(rec)}`,
-    )
+    if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds))
+    post.push('', `Your next step: ${nextStep}.`)
+    // The person is named only for a decision of theirs, as in reportPrompt (R42): a check that could not run is the agent's to rerun.
+    const isAwaiting = rec.postStatus === 'awaiting-decision'
+    const isSecurityHold = holds.some(one => isBlocking(one) && one.isSecurity === true && one.status === 'deferred')
+    if (isAwaiting || isSecurityHold) {
+      post.push(
+        'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
+        `Tell the person why it is held. ${personPost(rec, !isAwaiting)}`,
+      )
+    } else {
+      post.push('Do not merge, and do not merge another way: the guard holds the merge until the review is complete.')
+    }
     return post.join('\n')
   }
+  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
   const lines = [`pr-gate: the pull request for ${rec.branch} → ${rec.base} is held at ${rec.head.slice(0, 7)}: ${why}.`]
   if (holding.length > 0) lines.push('', 'What holds it, with the evidence so far:', listFindings(holding))
   lines.push(
