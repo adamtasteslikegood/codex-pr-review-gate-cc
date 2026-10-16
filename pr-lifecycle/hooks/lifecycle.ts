@@ -118,10 +118,9 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
   ],
 })
 
-/** The fixer's word: fixed is only reported until a check confirms it. */
 const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 
-/** A fixer cannot downgrade its own finding; disagreement is a rebuttal. */
+/** The fixer's word: fixed is only reported until a check confirms it. A fixer cannot downgrade its own finding; disagreement is a rebuttal. */
 export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at: number): Finding {
   const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action
   const next = moved(f, status, round, by, at, a.note, a.evidence)
