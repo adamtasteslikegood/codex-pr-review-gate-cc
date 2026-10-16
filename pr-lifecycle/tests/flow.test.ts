@@ -227,7 +227,7 @@ test('an exhausted gate that holds the PR says why, with the findings and the ne
   const held = w.prompts.at(-1) ?? ''
   expect(held).toContain('held')
   expect(held).toContain('R1-1 [P1] SQL injection in search')
-  expect(held).toContain('pr-gate resume')
+  expect(held).not.toContain('pr-gate resume')
   expect(held).toContain('waive')
   expect(held).toContain('allow')
   expect(held).not.toContain('open the pull request')
@@ -1744,4 +1744,109 @@ test('R51: a main turn that ends before the fix turn starts is not the fix', asy
   expect(run.phase).toBe('fix')
   expect(run.findings.find(one => one.id === 'R1-1')?.status).toBe('open')
   expect(w.prompts.some(one => one.includes('have no answer yet'))).toBe(false)
+})
+
+// ------------------------------------------------------------- task 13 fix round 2 (R52–R54)
+
+test('R52: a blocker waived during its fix step, then a new head, still gets the next round', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  const spawned = w.spawned.length
+  await say($, 'waive R1-1 checked by hand')
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  expect((await recordOf(w)).preStatus).not.toBe('passed')
+  expect(w.spawned.length).toBeGreaterThan(spawned)
+  expect((await runOf(w)).round).toBe(2)
+})
+
+const openPrOnce = { options: { allowanceStandard: 1, onExhausted: 'open-pr' } }
+
+test('R53: a waived open blocker holds again before the PR when its file changes', openPrOnce, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  await say($, 'waive R1-1 the input is a constant')
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  w.git.head = 'e'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  const held = await $.tool.call(createPr)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('R1-1')
+})
+
+test('R53: a waived open finding holds the merge again when its file changes', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w)
+  await say($, 'waive G2-1 the input is a constant')
+  expect(mergeHolds(await recordOf(w)).map(one => one.id)).not.toContain('G2-1')
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await say($, 'resume')
+  expect(mergeHolds(await recordOf(w)).map(one => one.id)).toContain('G2-1')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+})
+
+test('R54: a pre waiver is refused while a security blocker holds; it names the finding waiver', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  expect((await recordOf(w)).preStatus).toBe('exhausted')
+  const said = (await say($, 'waive pre ship it')).text ?? ''
+  expect(said).toContain('/pr-gate waive R1-1 <reason>')
+  expect((await recordOf(w)).waivers.some(one => one.scope === 'pre')).toBe(false)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+})
+
+const stopOnce = { options: { allowanceStandard: 1, onExhausted: 'stop' } }
+
+test('an exhausted pre-PR hold offers a waiver for each holding finding, with no resume line', stopOnce, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  const held = w.prompts.at(-1) ?? ''
+  expect(held).toContain('/pr-gate waive R1-1 <reason>')
+  expect(held).toContain('why R1-1 still holds the PR')
+  expect(held).not.toContain('pr-gate resume')
+})
+
+test('the open-PR prompt after a finding waiver names the waiver', stopOnce, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  await say($, 'waive R1-1 checked by hand')
+  await w.clock.advance(1000)
+  const said = w.prompts.find(one => one.includes('Now open the pull request')) ?? ''
+  expect(said).toContain('R1-1 waived by the person: checked by hand')
+  expect(said).not.toContain('no high/critical finding left')
+})
+
+test('R51: a second turn with the step\'s text does not take over a step already armed', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const asked = w.prompts.at(-1) ?? ''
+  await $.turn.start({ text: asked, turnId: 'turn-triage' })
+  await $.turn.start({ text: asked, turnId: 'turn-again' })
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', note: 'parameterised', replyId: '991' }]), turnId: 'turn-triage' })
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('reported-fixed')
+})
+
+test('a main step whose turn never started times out saying so', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('turn was never seen')
 })

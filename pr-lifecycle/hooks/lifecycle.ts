@@ -269,12 +269,20 @@ export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>
 export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
   rec.rounds.filter(one => one.isCompleted).at(-1)?.endHead
 
-/** Answered findings whose file changed: their evidence must be checked again. History stays. */
-export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
-  return findings.map(one =>
-    one.status !== 'open' && (changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))) ? { ...one, needsRecheck: true } : one,
-  )
+const touches = (one: Finding, changedFiles: ReadonlySet<string> | 'all'): boolean =>
+  changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))
+
+/**
+ * Answered findings whose file changed: their evidence must be checked again. History stays. A waived finding is flagged at
+ * any status, open included, so its waiver lapses (R53): `waived` is the record's `waivedIds`.
+ */
+export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all', waived: ReadonlySet<string> = new Set()): Finding[] {
+  return findings.map(one => ((one.status !== 'open' || waived.has(one.id)) && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 }
+
+/** Only the waivers lapse: waived findings whose file changed (R52, R53). Other findings are left for the next review to judge. */
+export const lapseWaivers = (findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all', waived: ReadonlySet<string>): Finding[] =>
+  findings.map(one => (waived.has(one.id) && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 
 // --------------------------------------------------------------- the next step
 
@@ -325,7 +333,10 @@ function decidePre(rec: LifecycleRecord): Next {
   const waived = waivedIds(rec)
   // The round's blockers are each waived by the person, and nothing else is unresolved or owed: no round is left to run (R48).
   const raised = rec.findings.filter(one => isBlocking(one) && raisedIn(one, last.n))
-  if (raised.length > 0 && raised.every(one => waived.has(one.id)) && unresolved.length === 0 && verificationOwed(rec).length === 0) return passOr()
+  // New commits since the round started still get their own review while a round is left (R52).
+  if (raised.length > 0 && raised.every(one => waived.has(one.id)) && unresolved.length === 0 && verificationOwed(rec).length === 0) {
+    return isChanged && mayStartRound(rec, false) ? { kind: 'round', phase: 'pre', roundKind: 'discretionary', isAdvisory: false, scope: 'full' } : passOr()
+  }
   // Released only when the ledger holds the deferred blockers and the person waived every one.
   const deferred = deferredBlockers(rec)
   const isAllWaived = deferred.length === 0 && rec.findings.some(one => isBlocking(one) && one.status === 'deferred')

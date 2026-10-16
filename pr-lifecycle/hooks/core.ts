@@ -550,7 +550,8 @@ export function triagePrompt(
   return lines.join('\n')
 }
 
-export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exhausted' | 'waived'): string {
+/** `waivedNote`: the person's finding waiver that let a held gate pass, said in place of a clean pass. */
+export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exhausted' | 'waived', waivedNote?: string): string {
   const hasConverged = status !== 'exhausted'
   const blocking = unresolvedBlockers(rec).length
   const total = rec.findings.length
@@ -562,9 +563,12 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
       ? `pr-gate was waived for ${run.branch} at ${run.headSha.slice(0, 7)}.`
       : run.tier === 'trivial'
         ? `pr-gate skipped Codex for ${run.branch}: ${run.tierWhy}.`
-        : hasConverged
-          ? `pr-gate passed for ${run.branch} at ${run.headSha.slice(0, 7)}: no high/critical finding left after ${run.round} round${run.round === 1 ? '' : 's'} (${budget}; ${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
-          : `pr-gate did not converge for ${run.branch}: ${blocking} high/critical finding${blocking === 1 ? '' : 's'} still open after ${run.round} rounds (${budget}).`
+        : waivedNote !== undefined && status === 'passed'
+          ? `pr-gate let ${run.branch} through at ${run.headSha.slice(0, 7)}: ${waivedNote} ` +
+            `(${budget}; ${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
+          : hasConverged
+            ? `pr-gate passed for ${run.branch} at ${run.headSha.slice(0, 7)}: no high/critical finding left after ${run.round} round${run.round === 1 ? '' : 's'} (${budget}; ${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
+            : `pr-gate did not converge for ${run.branch}: ${blocking} high/critical finding${blocking === 1 ? '' : 's'} still open after ${run.round} rounds (${budget}).`
   const lines = [
     summary,
     '',
@@ -665,15 +669,16 @@ const preHolds = (rec: LifecycleRecord): Finding[] => {
 
 /**
  * Before the PR, the person's options, only where the decision is theirs (R49): a deferred blocker, a security P1, or a spent
- * allowance that holds the PR. A deferral or a security P1 is released by a waiver naming it; only exhaustion offers a round.
+ * allowance that holds the PR. Each holding finding is released by a waiver naming it; only exhaustion offers a round.
  */
 export function prePerson(rec: LifecycleRecord): string | undefined {
   const holding = preHolds(rec)
-  const theirs = holding.filter(one => one.status === 'deferred' || one.isSecurity === true)
+  const isTheirs = holding.some(one => one.status === 'deferred' || one.isSecurity === true)
   const isExhausted = rec.preStatus === 'exhausted'
-  if (theirs.length === 0 && !isExhausted) return undefined
+  if (!isTheirs && !isExhausted) return undefined
+  // Once the decision is theirs, every holding finding has its own waiver.
   const options = [
-    ...theirs.map(one => `/pr-gate waive ${one.id} <reason> releases ${one.id}`),
+    ...holding.map(one => `/pr-gate waive ${one.id} <reason> releases ${one.id}`),
     ...(isExhausted && !holding.some(one => one.isSecurity === true)
       ? ["/pr-gate waive pre <reason> lets this commit's pull request through without the review"]
       : []),
@@ -711,7 +716,8 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string):
   const lines = [`pr-gate: the pull request for ${rec.branch} → ${rec.base} is held at ${rec.head.slice(0, 7)}: ${why}.`]
   if (holding.length > 0) lines.push('', 'What holds it, with the evidence so far:', listFindings(holding))
   lines.push('', `Your next step: ${nextStep}.`)
-  if (holding.some(one => one.status !== 'deferred')) {
+  // The agent's own work only while a finding is open and a round can still check it: never once the allowance is spent.
+  if (holding.some(one => one.status === 'open') && rec.preStatus !== 'exhausted') {
     lines.push(
       'Verify each finding against the code first: fix a real one with the smallest change and commit it, or rebut a false one with file:line evidence. ' +
         'Then run /pr-gate resume.',

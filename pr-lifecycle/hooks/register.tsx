@@ -27,6 +27,7 @@ import {
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
+  waivedIds,
 } from './lifecycle'
 import {
   advance,
@@ -113,8 +114,8 @@ const settledRun = (rec: LifecycleRecord, now: number): Run => ({
 })
 
 /** Sends the agent to open the PR, once the person's waiver let the pre-PR gate pass; through the command's prompt queue. */
-const sayOpenPr = ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number): void => {
-  if (config.openPr) say($, prPrompt(settledRun(rec, now), rec, status))
+const sayOpenPr = ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number, waivedNote?: string): void => {
+  if (config.openPr) say($, prPrompt(settledRun(rec, now), rec, status, waivedNote))
 }
 
 // ------------------------------------------------------------ starting
@@ -212,7 +213,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (prior !== undefined && prior.head !== head) {
     const lastHead = lastReviewedHead(prior)
     const since = lastHead === undefined ? undefined : await git($, root, ['diff', '--name-only', lastHead, head])
-    rec = { ...rec, findings: invalidate(rec.findings, since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : 'all') }
+    const files = since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : ('all' as const)
+    rec = { ...rec, findings: invalidate(rec.findings, files, waivedIds(rec)) }
   }
   // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
   const adopted = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
@@ -356,7 +358,8 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     one !== undefined &&
     // A reset record lets nothing through: the lifecycle starts fresh.
     one.phase !== 'archived' &&
-    (one.waivers.some(each => each.scope === 'pre' && each.head === head) ||
+    // A pre waiver never releases a security blocker: only a waiver naming it does (R54).
+    ((one.waivers.some(each => each.scope === 'pre' && each.head === head) && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'exhausted' && config.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
@@ -651,7 +654,9 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (!isRunning) await advance($, root, branch)
     const after = await loadRecord($, root, branch)
     const wasPassed = rec.preStatus === 'passed' && rec.preHead === after?.preHead
-    if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) sayOpenPr($, after, 'passed', now)
+    if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {
+      sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
+    }
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
   if (scope === 'pre') {
@@ -659,6 +664,16 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       return (
         `/${COMMAND}: PR #${rec.pr ?? '?'} from ${branch} is already open, so there is no pre-PR review to waive. ` +
         `/${COMMAND} waive post <reason> lets this head merge.`
+      )
+    }
+    // A security blocker is released only by a waiver naming it, never by waiving the whole review (R54).
+    const security = rec === undefined ? [] : [...unresolvedBlockers(rec), ...verificationOwed(rec)].filter(one => one.isSecurity === true)
+    if (security.length > 0) {
+      const one = security.length === 1
+      return (
+        `/${COMMAND}: ${ids(security)} ${one ? 'is a security P1' : 'are security P1s'} holding the pull request for ${branch}, and only a waiver naming ` +
+        `${one ? 'it' : 'each'} releases ${one ? 'it' : 'them'}: ${security.map(each => `/${COMMAND} waive ${each.id} <reason>`).join(', ')}. ` +
+        'No pre waiver was recorded.'
       )
     }
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)

@@ -36,6 +36,7 @@ import {
   applyAnswer,
   decideNext,
   invalidate,
+  lapseWaivers,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
@@ -243,7 +244,11 @@ export function startTicker($: Engine): void {
         return // waiting on reviewers is not a step: no step timeout while collecting
       }
       if (now - run.phaseStartedAt > config.stepTimeoutMs) {
-        const why = `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.`
+        // A main-agent step whose prompt's turn never started could not have been answered: say so, not only that it ran long.
+        const isUnseen = run.pending.some(one => one.isMain === true && one.answer === undefined && one.turnId === undefined)
+        const why =
+          `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.` +
+          (isUnseen ? ' Its prompt\'s turn was never seen: the main agent never started on it, so no answer could count.' : '')
         if (run.phase === 'review') {
           await noteAttempt($, run, why)
           await retryLower($, run, why)
@@ -922,9 +927,10 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     // The answers given in this run are about the new head already, except a fix only reported: its file changed, so it is checked
     // again (R33). Nothing else is exempt: an answer run reuses its round's number, and its push can touch an accepted rebuttal's file.
     const answeredNow = new Set(said.map(each => each.id))
+    const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [], findings: [] })
     await patch($, run.id, one => ({
       ...one,
-      findings: invalidate(one.findings, files).map(f =>
+      findings: invalidate(one.findings, files, waived).map(f =>
         one.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f,
       ),
     }))
@@ -1219,12 +1225,15 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     startedAt: run.roundStartedAt,
     endedAt: now,
   }
-  await updateRecord($, run.root, run.branch, rec => ({
-    ...withRound(rec, round),
-    head: endHead,
-    findings: mergeFindings(rec.findings, run.findings),
-    effort: run.effort,
-  }))
+  // Before the PR, a waiver lapses on a commit of this round that touches its finding's file (R52); post-PR, the head check does it.
+  const isMoved = run.lifecycle === 'pre' && endHead !== run.roundStartHead
+  const changed = isMoved ? await git($, run.root, ['diff', '--name-only', run.roundStartHead, endHead]) : undefined
+  const files = changed === undefined ? undefined : changed.isOk ? new Set(changed.out.split('\n').filter(Boolean)) : ('all' as const)
+  await updateRecord($, run.root, run.branch, rec => {
+    const findings = mergeFindings(rec.findings, run.findings)
+    const lapsed = files === undefined ? findings : lapseWaivers(findings, files, waivedIds(rec))
+    return { ...withRound(rec, round), head: endHead, findings: lapsed, effort: run.effort }
+  })
   if (isCompleted) await advance($, run.root, run.branch)
 }
 
@@ -1355,7 +1364,7 @@ export function heldReason(rec: LifecycleRecord): { why: string; nextStep: strin
       `the pre-PR review allowance is spent with ${n} high/critical finding${n === 1 ? '' : 's'} unresolved or unverified` +
       (isSecurity ? security : ', and onExhausted is stop'),
     // With the allowance spent, a new round or a release is the person's: the agent tells them, it never types their command (R49).
-    nextStep: `tell the person why ${holding.map(one => one.id).join(', ') || 'the open findings'} still hold the PR, then stop`,
+    nextStep: `tell the person why ${holding.map(one => one.id).join(', ') || 'the open findings'} still ${n === 1 ? 'holds' : 'hold'} the PR, then stop`,
   }
 }
 
@@ -1565,7 +1574,9 @@ export async function onTurnStart($: Engine, agentId: string | undefined, turnId
   mainTurn = turnId
   const run = await getRun($)
   if (run === null || run.status !== 'running') return
-  const isStep = (one: Pending): boolean => one.isMain === true && one.answer === undefined && text.includes(`"step":"${one.step}"`)
+  // Armed once: a later turn carrying the same text (the prompt pasted again) does not take the step from its own turn.
+  const isStep = (one: Pending): boolean =>
+    one.isMain === true && one.answer === undefined && one.turnId === undefined && text.includes(`"step":"${one.step}"`)
   if (!run.pending.some(isStep)) return
   const now = await $.clock.now()
   await patch($, run.id, one => ({ ...one, phaseStartedAt: now, pending: one.pending.map(each => (isStep(each) ? { ...each, turnId } : each)) }))
