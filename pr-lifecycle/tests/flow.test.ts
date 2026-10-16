@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import { createPr, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import { invalidate, isAcceptedRebuttal, mergeHolds } from '../hooks/lifecycle'
 import type { LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -605,7 +606,7 @@ test('the Codex fallback does not review a local checkout that is not the PR hea
   expect(w.spawned).toHaveLength(spawned)
   const run = await runOf(w)
   expect(run.status).toBe('error')
-  expect(run.message).toContain(`the local checkout aaaaaaa is not the PR head bbbbbbb: pull (or push), then run pr-gate resume`)
+  expect(run.message).toContain(`the local checkout aaaaaaa is not the PR head bbbbbbb: pull (or push), then run /pr-gate resume`)
   expect((await recordOf(w)).attempts).toBe(1)
 })
 
@@ -752,8 +753,11 @@ const toTriage = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>,
 }
 
 const triaged = (step: string, dispositions: object[]) => turn(`ok\n${TRAILER}\n${JSON.stringify({ step, dispositions })}`)
-const accept = (step: string, w: ReturnType<typeof world>, ok = true, notes?: string) =>
-  turn(`v\n${TRAILER}\n${JSON.stringify({ step, ok, ...(notes === undefined ? {} : { notes }) })}`, `agent-${w.spawned.length}`)
+/** Codex's rebuttal check: one verdict per finding id (R41); true holds, a string is why it fails. */
+const accept = (step: string, w: ReturnType<typeof world>, said: Record<string, true | string> = { 'G2-1': true }) => {
+  const verdicts = Object.entries(said).map(([id, one]) => (one === true ? { id, holds: true } : { id, holds: false, note: one }))
+  return turn(`v\n${TRAILER}\n${JSON.stringify({ step, verdicts })}`, `agent-${w.spawned.length}`)
+}
 
 test('code changes in the first post-PR round require review of the resulting head', async ($, on) => {
   const w = world(on)
@@ -832,7 +836,7 @@ test('commits the PR does not have end triage as an attempt, keeping the replies
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   const run = await runOf(w)
   expect(run.status).toBe('error')
-  expect(run.message).toContain('commits on feat/x are not on the PR: pull or push, then pr-gate resume')
+  expect(run.message).toContain('commits on feat/x are not on the PR: pull or push, then /pr-gate resume')
   const rec = await recordOf(w)
   expect(rec.attempts).toBe(1)
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(0)
@@ -852,7 +856,7 @@ test('uncommitted changes after triage still record the replies, so none is post
   expect(rec.findings.filter(one => one.externalId === 'inline:11')).toHaveLength(1)
 })
 
-test('GitHub findings in a final-head check enter the ledger and can make it exhausted, never ready', { options: { allowanceStandard: 1 } }, async ($, on) => {
+test('GitHub findings in a final-head check enter the ledger and are never ready; left open on its head, they go back to the agent', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await toTriage($, w)
   // Round 2: the P1 is fixed and pushed.
@@ -888,7 +892,9 @@ test('GitHub findings in a final-head check enter the ledger and can make it exh
   expect(raised?.status).toBe('open')
   expect(rec.processed).not.toContain('inline:13')
   expect(rec.phase).not.toBe('ready')
-  expect(rec.postStatus).toBe('exhausted')
+  // R43: on the same head the answerable block comes before exhaustion; the agent can still answer it.
+  expect(rec.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('G4-1')
 })
 
 // ------------------------------------------------------------- task 12 fix round 1
@@ -906,7 +912,7 @@ test('R32: an open blocker left unanswered on an unchanged head blocks with the 
   expect((await runOf(w)).status).toBe('blocked')
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('G2-1')
-  expect(said).toContain('Your next step: fix or rebut G2-1, then pr-gate resume')
+  expect(said).toContain('Your next step: fix or rebut G2-1, then /pr-gate resume')
 })
 
 test('R32: an open blocker from an earlier round is carried into triage', async ($, on) => {
@@ -978,7 +984,7 @@ test('R36: a rebutted security blocker is not ready until Codex checks the rebut
   expect((await recordOf(w)).phase).not.toBe('ready')
   expect(w.spawned).toHaveLength(spawned + 1)
   expect(w.spawned.at(-1)?.prompt).toContain('rebutted')
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', ok: true })}`, `agent-${w.spawned.length}`))
+  await $.turn.complete(accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
   expect(rec.phase).toBe('ready')
@@ -988,8 +994,7 @@ test('R36: a rebuttal Codex does not accept reopens the security blocker and goe
   const w = world(on)
   await toTriage($, w)
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
-  const verdict = JSON.stringify({ step: 'r2-verify', ok: false, notes: 'G2-1: reachable from /search' })
-  await $.turn.complete(turn(`no\n${TRAILER}\n${verdict}`, `agent-${w.spawned.length}`))
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'G2-1: reachable from /search' }))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
   expect(rec.phase).not.toBe('ready')
@@ -1062,7 +1067,7 @@ test('R37: resuming a blocked post-PR review re-opens triage; a security rebutta
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
   expect((await recordOf(w)).replies['inline:11']).toBe('995')
   expect((await runOf(w)).phase).toBe('verify')
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', ok: true })}`, `agent-${w.spawned.length}`))
+  await $.turn.complete(accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   expect(postRounds(rec)).toBe(before)
@@ -1088,8 +1093,7 @@ test('M2: a rebuttal Codex rejects is reported as rejected, not as unanswered', 
   const w = world(on)
   await toTriage($, w)
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
-  const verdict = JSON.stringify({ step: 'r2-verify', ok: false, notes: 'reachable from /search' })
-  await $.turn.complete(turn(`no\n${TRAILER}\n${verdict}`, `agent-${w.spawned.length}`))
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'reachable from /search' }))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('Codex did not accept the rebuttal of G2-1: reachable from /search')
   expect(said).not.toContain('with no fix or rebuttal')
@@ -1151,7 +1155,7 @@ test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'fine as is', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w, false, 'G2-1: the name misleads'))
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'G2-1: the name misleads' }))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
   expect(rec.phase).not.toBe('ready')
@@ -1172,4 +1176,131 @@ test('R39: a pre-PR deferred advisory carried into the PR holds the merge', asyn
   const held = await $.tool.call(merge)
   expect(isHeld(held)).toBe(true)
   expect(held.deny).toContain('R1-1 [P2] deferred')
+})
+
+// ------------------------------------------------------------- task 12 fix round 4 (R40–R44)
+
+/** Round 1 ends with two reviewer comments handed to the main agent: G2-1 and G2-2. */
+const toTwo = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, 'Consider renaming this', w.gh.prHead), inline(12, 'Consider a guard on the empty list', w.gh.prHead, 40)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+}
+
+const bothRebutted = triaged('r2-triage', [
+  { id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '991' },
+  { id: 'G2-2', action: 'rebutted', note: 'guarded at src/app.ts:38', replyId: '992' },
+])
+
+test('R41: two rebuttals get one verdict each, and are settled independently', async ($, on) => {
+  const w = world(on)
+  await toTwo($, w)
+  await $.turn.complete(bothRebutted)
+  expect(w.spawned.at(-1)?.prompt).toContain('"verdicts"')
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': true, 'G2-2': 'G2-2: no guard on /search' }))
+  const rec = await recordOf(w)
+  const one = rec.findings.find(f => f.id === 'G2-1')
+  const two = rec.findings.find(f => f.id === 'G2-2')
+  expect(one?.status).toBe('rebutted')
+  expect(one?.history.at(-1)?.by).toBe('codex')
+  expect(two?.status).toBe('open')
+  // R44: the note is stored without the id Codex put in front of it.
+  expect(two?.history.at(-1)?.note).toBe('no guard on /search')
+  expect(w.prompts.at(-1)).toContain('Codex did not accept the rebuttal of G2-2: no guard on /search')
+  expect(w.prompts.at(-1)).not.toContain('G2-2: G2-2')
+  expect(mergeHolds(rec).map(f => f.id)).toEqual(['G2-2'])
+})
+
+test('R41: a verdict missing for one id holds that id only', async ($, on) => {
+  const w = world(on)
+  await toTwo($, w)
+  await $.turn.complete(bothRebutted)
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': true }))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.history.at(-1)?.by).toBe('codex')
+  const two = rec.findings.find(f => f.id === 'G2-2')
+  expect(two?.status).toBe('rebutted')
+  expect(two?.history.at(-1)?.by).toBe('main')
+  expect(rec.phase).not.toBe('ready')
+  expect(mergeHolds(rec).map(f => f.id)).toEqual(['G2-2'])
+})
+
+test('R40: rebut, reject, rebut again costs one Codex check, and the dispute goes to the person', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  const spawned = w.spawned.length
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
+  // After one rejection, the agent's step offers only fix or defer.
+  expect(w.prompts.at(-1)).toContain('fix or defer G2-1')
+  expect(w.prompts.at(-1)).not.toContain('fix or rebut G2-1')
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('fix it or defer it')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
+  expect(w.spawned).toHaveLength(spawned + 1)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('rebutted')
+  expect(rec.postStatus).toBe('awaiting-decision')
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('renaming breaks the public API')
+  expect(said).toContain('the name misleads callers')
+  expect(said).toContain('/pr-gate waive G2-1 <reason>')
+  expect(said).not.toContain('allow 1')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('disputed')
+})
+
+test('a re-check flag is cleared only for this run\'s answers: an accepted rebuttal whose file a later fix touched is checked again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'the name is the API\'s', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w))
+  const ready = await recordOf(w)
+  expect(ready.phase).toBe('ready')
+  const g1 = ready.findings[0]!
+  const g2 = { ...g1, id: 'G2-2', source: 'codex-review' as const, reviewer: 'codex', externalId: undefined, threadId: undefined, severity: 'P2' as const,
+    status: 'open' as const, note: undefined, history: [{ round: 2, status: 'open' as const, by: 'codex', at: 1 }] }
+  w.store.set(KEY, { ...ready, findings: [...ready.findings, g2] })
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  expect((await runOf(w)).isAnswer).toBe(true)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-2', action: 'fixed', note: 'guarded' }]))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBe(true)
+  expect(mergeHolds(rec).map(f => f.id)).toContain('G2-1')
+})
+
+test('a record that goes ready keeps no stale message', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w)
+  expect((await recordOf(w)).message).toBeDefined()
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
+  await $.turn.complete(accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.message).toBeUndefined()
+})
+
+test('R44: before the PR, a rebuttal Codex accepts stays rebutted with Codex\'s entry, settles the gate, and lapses on a file change', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'validated at :10' }] })}`))
+  await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
+  const rec = await recordOf(w)
+  const one = rec.findings.find(f => f.id === 'R1-1')!
+  expect(one.status).toBe('rebutted')
+  expect(one.history.at(-1)).toMatchObject({ status: 'rebutted', by: 'codex' })
+  expect(isAcceptedRebuttal(one)).toBe(true)
+  expect(rec.preStatus).toBe('passed')
+  expect(isAcceptedRebuttal(invalidate([one], new Set(['src/app.ts']))[0]!)).toBe(false)
 })

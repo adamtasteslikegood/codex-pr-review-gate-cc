@@ -214,6 +214,27 @@ export const isAcceptedRebuttal = (f: Finding): boolean => {
   return f.status === 'rebutted' && f.needsRecheck !== true && last?.status === 'rebutted' && last.by === 'codex'
 }
 
+/** Codex accepts a rebuttal: the finding stays rebutted, with Codex's entry last (what `isAcceptedRebuttal` reads), in either phase. */
+export const acceptRebuttal = (f: Finding, round: number, at: number, note = 'Codex: the rebuttal holds'): Finding => ({
+  ...f,
+  needsRecheck: undefined,
+  history: [...f.history, { round, status: 'rebutted', note, by: 'codex', at }],
+})
+
+/** How many times Codex rejected a rebuttal of this finding: a Codex `open` entry right after a `rebutted` one. */
+export const rejections = (f: Pick<Finding, 'history'>): number =>
+  f.history.filter((one, i) => one.by === 'codex' && one.status === 'open' && f.history[i - 1]?.status === 'rebutted').length
+
+/** Rebutted again after Codex rejected a rebuttal: a dispute only the person settles; it never goes to Codex again (R40). */
+export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !isAcceptedRebuttal(f) && rejections(f) > 0
+
+/** The dispute in words: the agent's last argument and Codex's last rejection. */
+const disputeOf = (f: Finding): string => {
+  const argued = f.history.filter(one => one.status === 'rebutted' && one.by !== 'codex').at(-1)?.note ?? 'no argument recorded'
+  const codex = f.history.filter(one => one.status === 'open' && one.by === 'codex').at(-1)?.note ?? 'no reason given'
+  return `${f.id} is disputed: the agent says "${argued}"; Codex said "${codex}"`
+}
+
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
  * reported fixed without verification, or rebutted without Codex accepting it, unless the person waived it.
@@ -316,7 +337,9 @@ function decidePost(rec: LifecycleRecord): Next {
   // The merge test (R39): every finding of either phase, at any severity, verified fixed or rebutted with Codex accepting.
   const holding = mergeHolds(rec)
   const owed = holding.filter(one => one.status === 'reported-fixed')
-  const unchecked = holding.filter(one => one.status === 'rebutted')
+  // A dispute is the person's (R40); every other rebuttal Codex has not accepted is Codex's to check.
+  const disputed = holding.filter(isDisputed)
+  const unchecked = holding.filter(one => one.status === 'rebutted' && !isDisputed(one))
   const open = holding.filter(one => one.status === 'open')
   const deferred = holding.filter(one => one.status === 'deferred')
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
@@ -327,39 +350,45 @@ function decidePost(rec: LifecycleRecord): Next {
       ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
   }
-  if (last.kind === 'final-head-check') {
-    if (!isChanged && holding.length === 0) return { kind: 'ready' }
-    if (!isChanged && deferred.length === holding.length) return awaiting(deferred)
-    return {
-      kind: 'exhausted',
-      why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
-      nextStep:
-        unresolved.length > 0
-          ? `fix ${ids(unresolved)} and push, then pr-gate resume`
-          : 'tell the person the final head is not reviewed clean; a new round needs their allowance',
-    }
-  }
+  // On an unchanged head, what the agent can answer, and Codex's free rebuttal check, come before the final-head check's verdict (R43).
   // The pre-PR backstop (R32), at any severity (R39): findings left open on an unchanged head; another round would say the same.
   if (!isChanged && open.length > 0) {
-    // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding.
-    const rejected = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-1)?.status === 'open')
+    // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding; it may be fixed or deferred, not rebutted again (R40).
+    const rejected = open.filter(one => rejections(one) > 0)
     const ignored = open.filter(one => !rejected.includes(one))
-    const isFeedbackOnly = open.every(one => one.source === 'github' && !isBlocking(one))
+    const isFeedbackOnly = ignored.length > 0 && rejected.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))
+    const codexSaid = (one: Finding): string => one.history.filter(each => each.by === 'codex').at(-1)?.note ?? 'no reason given'
     const said = [
-      ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${one.history.at(-1)?.note ?? 'no reason given'}`),
+      ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${codexSaid(one)}`),
       ...(ignored.length === 0
         ? []
         : isFeedbackOnly
           ? [`${ids(ignored)} from reviewers ${ignored.length === 1 ? 'has' : 'have'} no answer`]
           : [`${ids(ignored)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`]),
     ]
+    const steps = isFeedbackOnly
+      ? [`answer ${ids(open)} in ${open.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer)`]
+      : [...(ignored.length === 0 ? [] : [`fix or rebut ${ids(ignored)}`]), ...(rejected.length === 0 ? [] : [`fix or defer ${ids(rejected)}`])]
+    return { kind: 'blocked', why: said.join('; '), nextStep: `${steps.join('; ')}, then /pr-gate resume`, answer: open.map(one => one.id) }
+  }
+  // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
+  const recheck = (): Next => ({
+    kind: 'blocked',
+    why: `Codex has not checked the rebuttal of ${ids(unchecked)} on ${last.endHead.slice(0, 7)}`,
+    nextStep: 'run /pr-gate resume: Codex checks the rebuttal on this head, using no review round',
+    recheck: unchecked.map(one => one.id),
+  })
+  if (!isChanged && unchecked.length > 0) return recheck()
+  if (last.kind === 'final-head-check') {
+    if (!isChanged && holding.length === 0) return { kind: 'ready' }
+    if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)
     return {
-      kind: 'blocked',
-      why: said.join('; '),
-      nextStep: isFeedbackOnly
-        ? `answer ${ids(open)} in ${open.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer), then pr-gate resume`
-        : `fix or rebut ${ids(open)}, then pr-gate resume`,
-      answer: open.map(one => one.id),
+      kind: 'exhausted',
+      why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
+      nextStep:
+        unresolved.length > 0
+          ? `fix ${ids(unresolved)} and push, then /pr-gate resume`
+          : 'tell the person the final head is not reviewed clean; a new round needs their allowance',
     }
   }
   if (isChanged || owed.length > 0) {
@@ -367,26 +396,22 @@ function decidePost(rec: LifecycleRecord): Next {
       ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
   }
-  // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
-  if (unchecked.length > 0) {
-    return {
-      kind: 'blocked',
-      why: `Codex has not checked the rebuttal of ${ids(unchecked)} on ${last.endHead.slice(0, 7)}`,
-      nextStep: 'run pr-gate resume: Codex checks the rebuttal on this head, using no review round',
-      recheck: unchecked.map(one => one.id),
-    }
-  }
+  if (unchecked.length > 0) return recheck()
   if (holding.length === 0) return { kind: 'ready' }
-  return awaiting(deferred)
+  return awaiting(deferred, disputed)
 }
 
-/** Deferrals are honest answers, but only the person's waiver lets them into the merge (R39). */
-function awaiting(deferred: readonly Finding[]): Next {
-  const one = deferred.length === 1
+/** Deferrals are honest answers, and a dispute is the agent's word against Codex's: only the person's waiver lets either into the merge (R39, R40). */
+function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = []): Next {
+  const all = [...deferred, ...disputed]
+  const one = all.length === 1
+  const are = (list: readonly Finding[], word: string): string[] => (list.length === 0 ? [] : [`${ids(list)} ${list.length === 1 ? 'is' : 'are'} ${word}`])
+  const what = [...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')
+  const told = [...are(deferred, 'deferred'), ...are(disputed, 'disputed')]
   return {
     kind: 'awaiting-decision',
-    why: `${ids(deferred)} ${one ? 'is' : 'are'} deferred, and only the person's waiver lets ${one ? 'it' : 'them'} into the merge`,
-    nextStep: `tell the person ${ids(deferred)} ${one ? 'is' : 'are'} deferred and why, then stop: only their waiver settles ${one ? 'it' : 'them'}`,
+    why: `${what}; only the person's waiver lets ${one ? 'it' : 'them'} into the merge`,
+    nextStep: `tell the person ${told.join(' and ')} and why, then stop: only their waiver settles ${one ? 'it' : 'them'}`,
   }
 }
 

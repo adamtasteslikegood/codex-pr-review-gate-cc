@@ -10,10 +10,12 @@ import {
   markHeld,
   markVerified,
   mayStartRound,
+  isDisputed,
   mergeHolds,
   mergeFindings,
   newRecord,
   remaining,
+  rejections,
   rescope,
   roundOf,
   triage,
@@ -23,7 +25,7 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
@@ -232,7 +234,12 @@ test('post-PR: the final-head check never certifies a head it did not review cle
     allowance: 0,
     findings: [finding({ id: 'R3-1', round: 3, status: 'open' })],
   })
-  expect(decideNext(rec).kind).toBe('exhausted')
+  // R43: on the head it checked, a finding left open is the agent's to answer first; it is never ready.
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', answer: ['R3-1'] })
+  // A final-head check that changed the head never certifies it.
+  const moved = post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'd', raised: { blocking: 1, advisory: 0 } })
+  const fixed = finding({ id: 'R3-1', round: 3, status: 'reported-fixed' })
+  expect(decideNext({ ...rec, head: 'd', rounds: [...rec.rounds.slice(0, 2), moved], findings: [fixed] }).kind).toBe('exhausted')
 })
 
 test('post-PR: a push after ready or exhaustion continues the lifecycle on the new head', async () => {
@@ -311,7 +318,7 @@ test('no prompt opens with a slash, which would be read as a command', async () 
     fixPrompt(runOf({ fixKind: 'advisory', findings: [finding({ severity: 'P2' })] }), undefined, true),
     triagePrompt(runOf({ lifecycle: 'post', roundKind: 'baseline' }), rec, items, []),
     readyPrompt(rec),
-    reportPrompt(rec, { why: 'budget spent', nextStep: 'ask for more rounds' }),
+    reportPrompt(rec, { kind: 'exhausted', why: 'budget spent', nextStep: 'ask for more rounds' }),
     reviewPrompt(runOf(), 'review', []),
     reviewPrompt(runOf(), 'challenge', []),
     verifyPrompt(runOf(), 'abcdef0'),
@@ -381,20 +388,20 @@ test('R33: a comment posted after the rebuttal is not a duplicate of it', async 
 test('R32: post-PR, a round that left a blocker open on the same head without a rebuttal blocks instead of spending a round', async () => {
   const round = post({ n: 2, startHead: 'b', endHead: 'b', raised: { blocking: 1, advisory: 0 } })
   const rec = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2 })] })
-  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'fix or rebut G2-1, then pr-gate resume' })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'fix or rebut G2-1, then /pr-gate resume' })
   // R39: Codex already checked the round's rebuttals on this head, so another round would say the same either way.
   expect(decideNext({ ...rec, rounds: [rec.rounds[0]!, { ...round, rebutted: 1 }] })).toMatchObject({ kind: 'blocked', answer: ['G2-1'] })
 })
 
 test('R34: post-PR, reviewer feedback left unanswered never reaches ready', async () => {
   const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2, source: 'github', severity: 'P2' })] })
-  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'answer G2-1 in its thread (fix, rebut or defer), then pr-gate resume' })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'answer G2-1 in its thread (fix, rebut or defer), then /pr-gate resume' })
 })
 
 test('the post-PR report names the agent\'s next step and the person\'s options apart, with what is owed', async () => {
   const rec = { ...fresh(), pr: 7, phase: 'post' as const, findings: [finding(), finding({ id: 'R1-2', status: 'reported-fixed' })] }
-  const text = reportPrompt(rec, { why: 'R1-1 unresolved and the review allowance is spent', nextStep: 'fix R1-1 and push, then pr-gate resume' })
-  expect(text).toContain('Your next step: fix R1-1 and push, then pr-gate resume.')
+  const text = reportPrompt(rec, { kind: 'exhausted', why: 'R1-1 unresolved and the review allowance is spent', nextStep: 'fix R1-1 and push, then /pr-gate resume' })
+  expect(text).toContain('Your next step: fix R1-1 and push, then /pr-gate resume.')
   expect(text).toContain('Their options:')
   expect(text).toContain('R1-2 [P1]')
   expect(text).toContain('waive post')
@@ -415,7 +422,7 @@ test('M1: a deferred security P1 post-PR: the agent tells the person, the waiver
   const next = decideNext(rec)
   // R39: every deferral, security or not, awaits the person's decision.
   expect(next).toMatchObject({ kind: 'awaiting-decision', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
-  const text = reportPrompt(rec, next as { why: string; nextStep: string })
+  const text = reportPrompt(rec, next as Parameters<typeof reportPrompt>[1])
   expect(text).toContain('Their options:')
   expect(text).toContain('/pr-gate waive G2-1 <reason>')
   expect(text.split('Your next step:')[1]?.split('\n')[0]).not.toContain('/pr-gate')
@@ -469,8 +476,125 @@ test('R39: deferrals alone end post-PR review awaiting the person\'s decision, n
 test('R39: the post-PR report lists every finding that holds the merge, and offers the waiver of each deferral', async () => {
   const findings = [finding({ id: 'G2-1', severity: 'P3', status: 'deferred' }), finding({ id: 'G2-2', severity: 'P2', status: 'rebutted' })]
   const rec = { ...fresh(), pr: 7, phase: 'post' as const, findings }
-  const text = reportPrompt(rec, { why: 'x', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
+  const text = reportPrompt(rec, { kind: 'awaiting-decision', why: 'x', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
   expect(text).toContain('G2-1 [P3]')
   expect(text).toContain('G2-2 [P2]')
   expect(text).toContain('/pr-gate waive G2-1 <reason>')
+})
+
+// ------------------------------------------------------------- task 12 fix round 4 (R40–R44)
+
+/** A rebuttal by the agent that Codex rejected once: the finding is open again. */
+const rejected = (over: Partial<Finding> = {}): Finding =>
+  finding({
+    id: 'G2-1',
+    round: 2,
+    severity: 'P2',
+    status: 'open',
+    history: [
+      { round: 2, status: 'open', by: 'bot', at: 1 },
+      { round: 2, status: 'rebutted', note: 'the name is the API\'s', by: 'main', at: 2 },
+      { round: 2, status: 'open', note: 'the name misleads callers', by: 'codex', at: 3 },
+    ],
+    ...over,
+  })
+
+/** The same finding rebutted a second time: a dispute. */
+const disputed = (): Finding => {
+  const one = rejected()
+  return { ...one, status: 'rebutted', history: [...one.history, { round: 2, status: 'rebutted', note: 'renaming breaks the public API', by: 'main', at: 4 }] }
+}
+
+test('R40: after one rejection the agent may fix or defer; a second rebuttal is a dispute for the person, not a Codex check', async () => {
+  const round = post({ n: 2, startHead: 'b', endHead: 'b' })
+  const once = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [rejected()] })
+  expect(decideNext(once)).toMatchObject({ kind: 'blocked', answer: ['G2-1'], nextStep: 'fix or defer G2-1, then /pr-gate resume' })
+  expect(rejections(rejected())).toBe(1)
+  expect(isDisputed(disputed())).toBe(true)
+  const twice = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [disputed()] })
+  const next = decideNext(twice)
+  expect(next.kind).toBe('awaiting-decision')
+  expect(next).not.toHaveProperty('recheck')
+  const why = (next as { why: string }).why
+  expect(why).toContain('renaming breaks the public API')
+  expect(why).toContain('the name misleads callers')
+})
+
+test('R43: a final-head check that ends on its own head with a rejected rebuttal is an answerable block, not exhausted', async () => {
+  const check = post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'c' })
+  const rec = at([post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' }), check], {
+    phase: 'post',
+    allowance: 0,
+    findings: [rejected({ id: 'G3-1', round: 3 })],
+  })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', answer: ['G3-1'] })
+  // A rebuttal Codex never ruled on is checked there too, before exhaustion.
+  const unruled = finding({ id: 'G3-1', round: 3, severity: 'P2', status: 'rebutted', history: [{ round: 3, status: 'rebutted', by: 'main', at: 1 }] })
+  expect(decideNext({ ...rec, findings: [unruled] })).toMatchObject({ kind: 'blocked', recheck: ['G3-1'] })
+})
+
+test('R42: the awaiting-decision report has the agent tell the person and stop, with only the waivers as options', async () => {
+  const rec = at([pre({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })], {
+    phase: 'post', pr: 7, findings: [disputed(), finding({ id: 'G2-2', severity: 'P3', status: 'deferred', note: 'KAN-9' })],
+  })
+  const next = decideNext(rec)
+  expect(next.kind).toBe('awaiting-decision')
+  const text = reportPrompt(rec, next as Parameters<typeof reportPrompt>[1])
+  const step = text.split('Your next step:')[1]?.split('\n')[0] ?? ''
+  expect(step).toContain('tell the person')
+  expect(step).toContain('then stop')
+  expect(text).not.toMatch(/\bfix\b|\brebut\b|\bpush\b|allow/)
+  expect(text).toContain('/pr-gate waive G2-1 <reason>')
+  expect(text).toContain('/pr-gate waive G2-2 <reason>')
+  expect(text).toContain('/pr-gate waive post <reason>')
+})
+
+test('the report names the person only for a decision of theirs; an answerable block gives the agent its step alone', async () => {
+  const rec = at([pre({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })], { phase: 'post', pr: 7, findings: [rejected()] })
+  const next = decideNext(rec)
+  const text = reportPrompt(rec, next as Parameters<typeof reportPrompt>[1])
+  expect(text).toContain('Your next step: fix or defer G2-1, then /pr-gate resume.')
+  expect(text).not.toContain('Their options')
+  expect(text).not.toContain('the person')
+  const recheck = reportPrompt(rec, { kind: 'blocked', why: 'x', nextStep: 'run /pr-gate resume', recheck: ['G2-1'] })
+  expect(recheck).not.toContain('Their options')
+  const exhausted = reportPrompt(rec, { kind: 'exhausted', why: 'x', nextStep: 'fix G2-1 and push, then /pr-gate resume' })
+  expect(exhausted).toContain('Their options:')
+  expect(exhausted).toContain('allow 1')
+})
+
+test('R44: every next step writes the resume command with its slash', async () => {
+  const round = post({ n: 2, startHead: 'b', endHead: 'b' })
+  const cases = [
+    at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2 })] }),
+    at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [rejected()] }),
+    at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', severity: 'P2', status: 'rebutted' })] }),
+    at([post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' }), post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'd' })], {
+      phase: 'post', allowance: 0, head: 'd', findings: [finding({ id: 'R3-1', status: 'open' })],
+    }),
+  ]
+  for (const rec of cases) {
+    const next = decideNext(rec) as { nextStep?: string }
+    expect(next.nextStep).toContain('/pr-gate resume')
+    expect(next.nextStep).not.toMatch(/(^|[^/])pr-gate resume/)
+  }
+})
+
+test('R41: the rebuttal check asks for one verdict per finding id, and each is read on its own', async () => {
+  const text = verifyPrompt(runOf({ lifecycle: 'post', round: 2 }), 'abcdef0', [finding({ id: 'G2-1', status: 'rebutted' }), finding({ id: 'G2-2', status: 'rebutted' })])
+  expect(text).toContain('"verdicts"')
+  expect(text).toContain('one verdict per finding id')
+  const said = readVerdicts(
+    trailerOf({ step: 'r2-verify', verdicts: [{ id: 'G2-1', holds: true }, { id: 'G2-2', holds: false, note: 'G2-2: no guard' }, { id: 'G2-3', holds: 'maybe' }, 'junk'] }),
+  )
+  expect(said.get('G2-1')).toEqual({ holds: true })
+  expect(said.get('G2-2')).toEqual({ holds: false, note: 'no guard' })
+  expect(said.has('G2-3')).toBe(false)
+  expect(readVerdicts('no trailer').size).toBe(0)
+})
+
+test('R44: prior rounds leave out a rebuttal Codex accepted, until its file changes', async () => {
+  const accepted = finding({ status: 'rebutted', history: [{ round: 1, status: 'rebutted', by: 'main', at: 1 }, { round: 2, status: 'rebutted', by: 'codex', at: 2 }] })
+  expect(priorRounds([accepted])).toBe('')
+  expect(priorRounds([{ ...accepted, needsRecheck: true }])).toContain('R1-1')
 })

@@ -1,9 +1,9 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isBlocking, mergeHolds, raisedIn, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
+import { isAcceptedRebuttal, isBlocking, isDisputed, mergeHolds, raisedIn, rejections, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
 import type { Feedback } from './github'
-import type { Answer, TriageClass } from './lifecycle'
+import type { Answer, Next, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
 
 export const TRAILER = 'PR_GATE_RESULT'
@@ -168,6 +168,28 @@ export function readVerify(answer: string): { isOk: boolean; notes?: string } {
   return { isOk: trailer.ok !== false, notes: text(trailer.notes)?.slice(0, 4000) }
 }
 
+export type Verdict = { holds: boolean; note?: string }
+
+/**
+ * Codex's rebuttal check, one verdict per finding id (R41). An entry without an id or a boolean `holds` is dropped, so that id
+ * stays unruled. A note that repeats the id in front ("G2-1: ...") is stored without it (R44).
+ */
+export function readVerdicts(answer: string): Map<string, Verdict> {
+  const out = new Map<string, Verdict>()
+  const listed = readTrailer(answer)?.verdicts
+  if (!Array.isArray(listed)) return out
+  for (const one of listed) {
+    if (typeof one !== 'object' || one === null) continue
+    const row = one as Record<string, unknown>
+    const id = text(row.id)
+    if (id === undefined || typeof row.holds !== 'boolean' || out.has(id)) continue
+    const raw = text(row.note)
+    const note = text(raw?.startsWith(id) === true && /^\s*:/.test(raw.slice(id.length)) ? raw.slice(id.length).replace(/^\s*:\s*/, '') : raw)
+    out.set(id, { holds: row.holds, ...(note === undefined ? {} : { note: note.slice(0, 2000) }) })
+  }
+  return out
+}
+
 // ------------------------------------------------------------ blast radius
 
 const DOCS = /(\.(md|mdx|txt|rst)$)|(^|\/)(docs?|specs)\/|(^|\/)(LICENSE|CHANGELOG)[^/]*$/i
@@ -278,7 +300,11 @@ export const listFindingsOf = listFindings
 /** Earlier findings that still apply to the files under review, so a round checks their answers instead of re-arguing them. */
 export function priorRounds(findings: readonly Finding[], files?: ReadonlySet<string>): string {
   const applies = findings.filter(
-    one => one.status !== 'open' && one.status !== 'verified-fixed' && (files === undefined || one.file === undefined || files.has(one.file)),
+    one =>
+      one.status !== 'open' &&
+      one.status !== 'verified-fixed' &&
+      !isAcceptedRebuttal(one) &&
+      (files === undefined || one.file === undefined || files.has(one.file)),
   )
   const recheck = findings.filter(one => one.needsRecheck === true && !applies.includes(one))
   const all = [...applies, ...recheck]
@@ -405,10 +431,14 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
       listFindings(rebuttals),
       '',
-      'For each one: read the code at HEAD and decide whether the rebuttal holds. ok is true only when every rebuttal holds.',
+      'For each one: read the code at HEAD and decide whether the rebuttal holds. Give one verdict per finding id, each on its own:',
+      'holds is true when the rebuttal holds, false when it does not, with a note saying why it fails. Leave out no id.',
       'You are read-only: do not edit, commit or push.',
       '',
-      trailerRule(stepOf(run, 'verify'), '{"ok":true,"notes":"when ok is false: why the rebuttal fails, by finding id"}'),
+      trailerRule(
+        stepOf(run, 'verify'),
+        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true,"note":"when holds is false: why"}`).join(',')}]}`,
+      ),
     ].join('\n')
   }
   const current = run.findings.filter(one => raisedIn(one, run.round) && isBlocking(one))
@@ -472,6 +502,16 @@ export function triagePrompt(
       lines.push(`Where to reply: ${threads.map(at).join('; ')}.`)
     }
   }
+  // After one rejection a finding is fixed or deferred (R40): a second rebuttal goes to the person, not to Codex.
+  const rejected = [...(more.carried ?? []), ...(more.codex ?? [])].filter(one => one.status === 'open' && rejections(one) > 0)
+  if (rejected.length > 0) {
+    const which = rejected.map(one => one.id).join(', ')
+    lines.push(
+      '',
+      `Codex did not accept your rebuttal of ${which}: fix it or defer it with the reason.`,
+      'Do not rebut it again: a second rebuttal is not sent to Codex, it goes to the person as a dispute.',
+    )
+  }
   const owed = rec.findings.filter(one => isBlocking(one) && one.status === 'reported-fixed')
   if (owed.length > 0) lines.push('', 'Reported fixed, verification still owed:', listFindings(owed))
   // Replied feedback by its finding id (M4), not the internal key.
@@ -501,7 +541,7 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
   const hasConverged = status !== 'exhausted'
   const blocking = unresolvedBlockers(rec).length
   const total = rec.findings.length
-  const left = rec.findings.filter(one => !isBlocking(one) && one.status !== 'verified-fixed').length
+  const left = rec.findings.filter(one => !isBlocking(one) && one.status !== 'verified-fixed' && !isAcceptedRebuttal(one)).length
   const budget = `${usedRounds(rec)} of ${rec.allowance} review rounds used`
   const advisory = left === 0 ? '' : ` ${left} advisory finding${left === 1 ? '' : 's'} not fixed.`
   const summary =
@@ -550,30 +590,50 @@ export function readyPrompt(rec: LifecycleRecord): string {
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }
 
-/** The person's options after the PR opened; a deferred security blocker adds the waiver only the person can give (M1). */
-const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): string => {
-  const deferred = mergeHolds(rec).filter(one => one.status === 'deferred')
-  const waive = deferred.map(one => `/pr-gate waive ${one.id} <reason> lets the deferred ${one.id} into the merge`).join(', ')
-  return (
-    'Their options: /pr-gate waive post <reason> lets this head merge without the review, ' +
-    `${waive === '' ? '' : `${waive}, `}and /pr-gate allow 1 <reason> grants one more review round.`
-  )
+/**
+ * The person's options after the PR opened: the waiver of each deferral or dispute (M1, R40), and `waive post`.
+ * One more review round is offered only where a round could help (not when the person is only asked to decide, R42).
+ */
+const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRound = true): string => {
+  const theirs = mergeHolds(rec).filter(one => one.status === 'deferred' || isDisputed(one))
+  const waive = theirs.map(one => `/pr-gate waive ${one.id} <reason> lets the ${one.status === 'deferred' ? 'deferred' : 'disputed'} ${one.id} into the merge`)
+  const post = '/pr-gate waive post <reason> lets this head merge without the review'
+  const options = withRound ? [post, ...waive, '/pr-gate allow 1 <reason> grants one more review round'] : [...waive, post]
+  return `Their options: ${options.slice(0, -1).join(', ')}${options.length > 1 ? ', and ' : ''}${options.at(-1)}.`
 }
 
-/** Post-PR review stopped short of ready: why, what holds the merge, the agent's next step, and apart from it the person's options. */
-export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep: string }): string {
+/**
+ * Post-PR review stopped short of ready: why, what holds the merge, and the agent's next step. The person is named, with their
+ * options, only where the decision is theirs: awaiting-decision, exhaustion, a deferred security P1. An answerable block gives
+ * the agent's step alone.
+ */
+export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: 'round' | 'open-pr' | 'ready' }>): string {
   // Every finding that holds the merge, at any severity (R39): the same list the merge guard names.
   const holding = mergeHolds(rec)
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
   if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
+  lines.push('', `Your next step: ${next.nextStep}.`)
+  if (next.kind === 'awaiting-decision') {
+    // The person decides (R42): nothing for the agent to change, only to say and stop.
+    lines.push(
+      'Do not merge, and do not merge another way: only the person can release these findings.',
+      `Tell the person what is deferred or disputed and why. ${personPost(rec, false)}`,
+    )
+    return lines.join('\n')
+  }
   lines.push(
-    '',
-    `Your next step: ${next.nextStep}.`,
     'Verify each finding against the code first: fix a real one with the smallest change, commit and push it,',
-    'or rebut a false one with file:line evidence in its thread.',
-    'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
-    `Tell the person why it stopped. ${personPost(rec)}`,
+    'or rebut a false one with file:line evidence in its thread (one Codex already rejected a rebuttal of is fixed or deferred).',
   )
+  const isSecurityHold = holding.some(one => isBlocking(one) && one.isSecurity === true && one.status === 'deferred')
+  if (next.kind === 'exhausted' || isSecurityHold) {
+    lines.push(
+      'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
+      `Tell the person why it stopped. ${personPost(rec)}`,
+    )
+  } else {
+    lines.push('Do not merge, and do not merge another way: the guard holds the merge until the review is complete.')
+  }
   return lines.join('\n')
 }
 

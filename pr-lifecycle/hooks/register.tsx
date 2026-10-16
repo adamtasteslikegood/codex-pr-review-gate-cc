@@ -9,11 +9,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Effort, LifecycleRecord, Run, Step } from '../types'
+import type { Effort, Finding, LifecycleRecord, Run, Step } from '../types'
 import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
-import { allowanceFor, invalidate, lastReviewedHead, mergeHolds, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
+import { allowanceFor, invalidate, isDisputed, lastReviewedHead, mergeHolds, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
 import {
   advance,
   configOf,
@@ -371,7 +371,8 @@ const owedOf = (rec: LifecycleRecord): string => {
   const open = unresolvedBlockers(rec)
   if (rec.phase === 'pre') return 'the PR is still in pre-PR review'
   // Every finding that holds the merge, named, whatever its severity (R39).
-  const holding = mergeHolds(rec).map(one => `${one.id} [${one.severity}] ${HOLD[one.status] ?? one.status}`)
+  const said = (one: Finding): string => (isDisputed(one) ? 'disputed: the person decides' : (HOLD[one.status] ?? one.status))
+  const holding = mergeHolds(rec).map(one => `${one.id} [${one.severity}] ${said(one)}`)
   if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}${holding.length === 0 ? '' : `; ${holding.join(', ')}`}`
   if (holding.length > 0 && (rec.phase === 'ready' || post.length > 1)) return holding.join(', ')
   if (post.length === 0) return `post-PR round 1 owed on ${rec.head.slice(0, 7)}`
@@ -447,7 +448,7 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
       : isRunning
         ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
         : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'
-          ? `This needs the person's decision: tell them which findings are deferred and why, then stop. They can type ` +
+          ? `This needs the person's decision: tell them which findings are deferred or disputed and why, then stop. They can type ` +
             `/${COMMAND} waive <findingId> <reason> for each one, or /${COMMAND} waive post <reason> to let this head merge.`
           : rec.phase !== 'ready' && rec.postStatus === 'blocked'
           ? `Your next step: run /${COMMAND} resume on ${pr.headRefName}; it sends you the open items to answer, or has Codex check a rebuttal.`
