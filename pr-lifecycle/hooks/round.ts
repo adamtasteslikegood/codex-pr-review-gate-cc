@@ -368,7 +368,7 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
 async function spawn($: Engine, run: Run, role: Role, prompt: string): Promise<{ isStarted: boolean; agentId?: string }> {
   const started = await $.agent.spawn({
     prompt,
-    description: `codex-gate r${run.round} ${role}`,
+    description: `pr-lifecycle r${run.round} ${role}`,
     subagentType: 'general-purpose',
     cwd: run.root,
   })

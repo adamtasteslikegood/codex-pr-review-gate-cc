@@ -39,8 +39,8 @@ Plugin name `pr-lifecycle` (state keys, store keys, pane id and
 | `hooks/core.ts` | `classify`, pass-through helpers, trailer readers, prompts (now history-aware) | yes |
 | `hooks/lifecycle.ts` | Lifecycle record operations: budget policy, baseline rules, controller decision, finding ledger transitions, coverage | yes |
 | `hooks/github.ts` | Parse `gh api` JSON (reviews, review comments, issue comments, check runs) into `Feedback` with stable ids; read `gh pr merge`; read the roster file | yes |
-| `hooks/round.ts` | Execute one round (review, fix, verify; post-PR collect) and return a `RoundResult` | no |
-| `hooks/pane.tsx` | The pane, moved out of `register.tsx` with the new budget/phase lines | UI |
+| `hooks/round.ts` | Execute one round (review, fix, verify; post-PR collect) and return a `RoundResult`; also holds `advance`, the decide-and-start loop, moved here from `lifecycle.ts` for the engine binding (`lifecycle.ts` stays pure) | no |
+| `hooks/pane.tsx` | `renderPane`: the pane, moved out of `register.tsx` with the new budget/phase lines | UI |
 | `hooks/register.tsx` | Hooks, guards, commands, controller wiring | no |
 
 State is split in two:

@@ -2352,3 +2352,34 @@ test('with no run, a pre-PR record shows its verdict, not PRE', async ($, on) =>
   expect(await ui.find({ type: 'Text', text: 'PRE' })).toBeUndefined()
   await ui.unmount()
 })
+
+test('an exhausted pre-PR allowance still permits the protected post-PR baseline', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'Off by one in pagination' }])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  expect((await recordOf(w)).preStatus).toBe('exhausted')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false) // onExhausted: open-pr, not security
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).roundKind).toBe('baseline')
+})
+
+test('two repositories with different roster files each wait for their own reviewers', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["junie[bot]"],"checks":[]}'
+  await toPost($, w)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toContain('junie[bot]')
+  w.git.roster = '{"reviewers":["rovodev[bot]"],"checks":[]}'
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toContain('rovodev[bot]')
+})
+
+test('existing pass-through cases still skip pre-PR Codex and still get post-PR round 1', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  expect(w.spawned).toHaveLength(0)
+  expect((await recordOf(w)).phase).toBe('post')
+})

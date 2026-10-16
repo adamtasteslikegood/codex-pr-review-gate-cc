@@ -248,7 +248,7 @@ test('a high blast-radius change runs review and challenge in parallel and revie
   const w = world(on)
   w.git.numstat = '30\t4\tserver/security.ts'
   await $.tool.call(createPr)
-  expect(w.spawned.map(one => one.description)).toEqual(['codex-gate r1 review', 'codex-gate r1 challenge'])
+  expect(w.spawned.map(one => one.description)).toEqual(['pr-lifecycle r1 review', 'pr-lifecycle r1 challenge'])
   expect(w.spawned.every(one => !/args "\w+ --(xhigh|effort xhigh)/.test(one.prompt))).toBe(true)
   expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(["--effort high", "--effort high"])
 
@@ -261,7 +261,7 @@ test('a high blast-radius change runs review and challenge in parallel and revie
   await done($, turn(`Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }] })}`))
   const run = await runOf(w)
   expect(run.phase).toBe('verify')
-  expect(w.spawned.at(-1)?.description).toBe('codex-gate r1 verify')
+  expect(w.spawned.at(-1)?.description).toBe('pr-lifecycle r1 verify')
 })
 
 test('a docs-only change passes without Codex, and other bases are not gated', async ($, on) => {
@@ -390,7 +390,7 @@ test('the pane lists the to-dos and the findings on each surface', async ($, on)
       component: 'Pane',
       requestId: 'pr-lifecycle',
       props: {
-        title: 'Codex gate',
+        title: 'PR lifecycle',
         isFocused: false,
         bodyColumns: 48,
         placement: 'dock',
