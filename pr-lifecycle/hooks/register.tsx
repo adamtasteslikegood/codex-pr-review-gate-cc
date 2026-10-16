@@ -13,7 +13,7 @@ import type { Effort, LifecycleRecord, Run, Step } from '../types'
 import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
-import { allowanceFor, invalidate, lastReviewedHead, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
+import { allowanceFor, invalidate, lastReviewedHead, mergeHolds, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
 import {
   advance,
   configOf,
@@ -359,11 +359,21 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
 }
 
 /** What still stands between a record and ready, in a few words. */
+const HOLD: Record<string, string> = {
+  open: 'unresolved',
+  deferred: 'deferred',
+  'reported-fixed': 'fixed, not verified',
+  rebutted: 'rebuttal not accepted by Codex',
+}
+
 const owedOf = (rec: LifecycleRecord): string => {
   const post = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
   const open = unresolvedBlockers(rec)
   if (rec.phase === 'pre') return 'the PR is still in pre-PR review'
-  if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}`
+  // Every finding that holds the merge, named, whatever its severity (R39).
+  const holding = mergeHolds(rec).map(one => `${one.id} [${one.severity}] ${HOLD[one.status] ?? one.status}`)
+  if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}${holding.length === 0 ? '' : `; ${holding.join(', ')}`}`
+  if (holding.length > 0 && (rec.phase === 'ready' || post.length > 1)) return holding.join(', ')
   if (post.length === 0) return `post-PR round 1 owed on ${rec.head.slice(0, 7)}`
   if (post.length === 1 && post[0]?.endHead !== post[0]?.startHead) return `post-PR round 2 owed on ${rec.head.slice(0, 7)}`
   if (open.length > 0) return open.map(one => `${one.id} [${one.severity}] unresolved`).join(', ')
@@ -419,12 +429,13 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // No record and no such branch here: a PR from a branch not checked out here is not this gate's to review.
   if (rec === undefined && !(await git($, root, ['rev-parse', '--verify', '--quiet', `refs/heads/${pr.headRefName}`])).isOk) return undefined
   if (rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true) return undefined
-  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid) return undefined
+  // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
+  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) return undefined
   const short = pr.headRefOid.slice(0, 7)
   const missing =
     rec === undefined
       ? 'no lifecycle record for this branch'
-      : rec.phase === 'ready'
+      : rec.phase === 'ready' && rec.head !== pr.headRefOid
         ? `${short} was pushed after the review completed at ${rec.head.slice(0, 7)}`
         : owedOf(rec)
   const run = await getRun($)
@@ -435,7 +446,12 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
       ? `Your next step: check out ${pr.headRefName} and run /${COMMAND}, which adopts the open PR into post-PR review; merging is held until it is complete.`
       : isRunning
         ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
-        : rec.phase !== 'ready' && (rec.postStatus === 'exhausted' || rec.postStatus === 'blocked')
+        : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'
+          ? `This needs the person's decision: tell them which findings are deferred and why, then stop. They can type ` +
+            `/${COMMAND} waive <findingId> <reason> for each one, or /${COMMAND} waive post <reason> to let this head merge.`
+          : rec.phase !== 'ready' && rec.postStatus === 'blocked'
+          ? `Your next step: run /${COMMAND} resume on ${pr.headRefName}; it sends you the open items to answer, or has Codex check a rebuttal.`
+          : rec.phase !== 'ready' && rec.postStatus === 'exhausted'
           ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
             `or /${COMMAND} allow 1 <reason> for one more review round.`
           : `Your next step: check out ${pr.headRefName} and run /${COMMAND} resume, which reviews ${short} and says when the PR is ready to merge.`

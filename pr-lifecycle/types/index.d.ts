@@ -134,7 +134,8 @@ export type LifecycleRecord = {
   preStatus?: RunStatus
   preHead?: string
   /** Why the post-PR phase stopped short of ready. */
-  postStatus?: 'exhausted' | 'blocked' | 'error' | 'stopped'
+  /** awaiting-decision: only deferrals hold the merge, and only the person's waiver releases them (R39). */
+  postStatus?: 'exhausted' | 'blocked' | 'awaiting-decision' | 'error' | 'stopped'
   message?: string
   effort?: Effort
   hasTimedOut?: boolean

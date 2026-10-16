@@ -10,6 +10,7 @@ import {
   markHeld,
   markVerified,
   mayStartRound,
+  mergeHolds,
   mergeFindings,
   newRecord,
   remaining,
@@ -363,7 +364,9 @@ test('post-PR: a ready record is ready no longer once its ledger holds a blocker
   expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [finding()] })).kind).not.toBe('ready')
   const owed = [finding({ status: 'reported-fixed', isSecurity: true })]
   expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: owed })).kind).not.toBe('ready')
-  expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [finding({ status: 'rebutted' })] }))).toEqual({ kind: 'ready' })
+  // R39: a rebuttal counts only once Codex accepted it.
+  const accepted = finding({ status: 'rebutted', history: [{ round: 2, status: 'rebutted', by: 'codex', at: 2 }] })
+  expect(decideNext(at(done, { phase: 'ready', head: 'b', findings: [accepted] }))).toEqual({ kind: 'ready' })
 })
 
 // ------------------------------------------------------------- task 12 fix round 1
@@ -379,8 +382,8 @@ test('R32: post-PR, a round that left a blocker open on the same head without a 
   const round = post({ n: 2, startHead: 'b', endHead: 'b', raised: { blocking: 1, advisory: 0 } })
   const rec = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2 })] })
   expect(decideNext(rec)).toMatchObject({ kind: 'blocked', nextStep: 'fix or rebut G2-1, then pr-gate resume' })
-  // A rebuttal in the round: another round may settle it.
-  expect(decideNext({ ...rec, rounds: [rec.rounds[0]!, { ...round, rebutted: 1 }] })).toMatchObject({ kind: 'round', roundKind: 'discretionary' })
+  // R39: Codex already checked the round's rebuttals on this head, so another round would say the same either way.
+  expect(decideNext({ ...rec, rounds: [rec.rounds[0]!, { ...round, rebutted: 1 }] })).toMatchObject({ kind: 'blocked', answer: ['G2-1'] })
 })
 
 test('R34: post-PR, reviewer feedback left unanswered never reaches ready', async () => {
@@ -410,7 +413,8 @@ test('the triage prompt calls new commits unreviewed, not someone else\'s, and l
 test('M1: a deferred security P1 post-PR: the agent tells the person, the waiver is the person\'s option', async () => {
   const rec = at([pre(), post({ n: 2, rebutted: 1 })], { phase: 'post', findings: [finding({ id: 'G2-1', status: 'deferred', isSecurity: true })] })
   const next = decideNext(rec)
-  expect(next).toMatchObject({ kind: 'blocked', nextStep: 'tell the person G2-1 is a deferred security P1 that only their waiver settles' })
+  // R39: every deferral, security or not, awaits the person's decision.
+  expect(next).toMatchObject({ kind: 'awaiting-decision', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
   const text = reportPrompt(rec, next as { why: string; nextStep: string })
   expect(text).toContain('Their options:')
   expect(text).toContain('/pr-gate waive G2-1 <reason>')
@@ -429,4 +433,44 @@ test('M4: the triage prompt names replied feedback by finding id', async () => {
   const text = triagePrompt(runOf({ lifecycle: 'post' }), rec, [{ feedback: fb, cls: 'new-on-reviewed', findingId: 'G2-2' }], [])
   expect(text).toContain('Already replied to: G2-1;')
   expect(text).not.toContain('inline:11')
+})
+
+// ------------------------------------------------------------- task 12 fix round 3 (R39)
+
+test('R39: ready and the merge predicate agree on every kind of finding, from either phase', async () => {
+  const accepted = finding({
+    status: 'rebutted',
+    history: [{ round: 2, status: 'rebutted', by: 'main', at: 1 }, { round: 2, status: 'rebutted', by: 'codex', at: 2 }],
+  })
+  const cases: [string, Finding[]][] = [
+    ['none', []],
+    ['verified', [finding({ status: 'verified-fixed' })]],
+    ['accepted rebuttal', [accepted]],
+    ['accepted rebuttal, file changed since', [{ ...accepted, needsRecheck: true }]],
+    ['open P3', [finding({ severity: 'P3' })]],
+    ['deferred P3', [finding({ severity: 'P3', status: 'deferred' })]],
+    ['pre-PR deferred advisory', [finding({ round: 1, severity: 'P2', status: 'deferred' })]],
+    ['reported-fixed P2', [finding({ severity: 'P2', status: 'reported-fixed' })]],
+    ['unaccepted rebuttal P2', [finding({ severity: 'P2', status: 'rebutted' })]],
+  ]
+  for (const [name, findings] of cases) {
+    const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings })
+    const isReady = decideNext(rec).kind === 'ready'
+    expect(`${name}: ${isReady}`).toBe(`${name}: ${mergeHolds(rec).length === 0}`)
+  }
+  expect(mergeHolds(at([post()], { findings: [finding({ severity: 'P3', status: 'deferred' })] })).map(one => one.id)).toEqual(['R1-1'])
+})
+
+test('R39: deferrals alone end post-PR review awaiting the person\'s decision, not exhausted or ready', async () => {
+  const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings: [finding({ id: 'G2-1', severity: 'P3', status: 'deferred', note: 'KAN-9' })] })
+  expect(decideNext(rec)).toMatchObject({ kind: 'awaiting-decision' })
+})
+
+test('R39: the post-PR report lists every finding that holds the merge, and offers the waiver of each deferral', async () => {
+  const findings = [finding({ id: 'G2-1', severity: 'P3', status: 'deferred' }), finding({ id: 'G2-2', severity: 'P2', status: 'rebutted' })]
+  const rec = { ...fresh(), pr: 7, phase: 'post' as const, findings }
+  const text = reportPrompt(rec, { why: 'x', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
+  expect(text).toContain('G2-1 [P3]')
+  expect(text).toContain('G2-2 [P2]')
+  expect(text).toContain('/pr-gate waive G2-1 <reason>')
 })

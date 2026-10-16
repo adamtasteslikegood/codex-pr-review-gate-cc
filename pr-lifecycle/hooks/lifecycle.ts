@@ -208,6 +208,22 @@ export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waiver
   return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && one.status === 'reported-fixed')
 }
 
+/** A rebuttal Codex ruled on and accepted, with its file unchanged since. */
+export const isAcceptedRebuttal = (f: Finding): boolean => {
+  const last = f.history.at(-1)
+  return f.status === 'rebutted' && f.needsRecheck !== true && last?.status === 'rebutted' && last.by === 'codex'
+}
+
+/**
+ * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
+ * reported fixed without verification, or rebutted without Codex accepting it, unless the person waived it.
+ * The controller's ready and the merge guard both read this, so they never disagree.
+ */
+export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
+  const waived = waivedIds(rec)
+  return rec.findings.filter(one => !waived.has(one.id) && one.status !== 'verified-fixed' && !isAcceptedRebuttal(one))
+}
+
 // --------------------------------------------------------------- coverage
 
 /** The head the last completed round left behind: what review evidence covers. */
@@ -229,7 +245,9 @@ export type Next =
   | { kind: 'ready' }
   | { kind: 'exhausted'; why: string; nextStep: string }
   /** answer: the findings the agent can settle on the same head (R37); a resume re-opens triage for them. */
-  | { kind: 'blocked'; why: string; nextStep: string; answer?: string[] }
+  | { kind: 'blocked'; why: string; nextStep: string; answer?: string[]; recheck?: string[] }
+  /** Only deferrals stand between the PR and the merge: the person decides (R39). */
+  | { kind: 'awaiting-decision'; why: string; nextStep: string }
 
 const ids = (findings: readonly Finding[]): string => findings.map(one => one.id).join(', ')
 
@@ -295,9 +313,12 @@ function decidePost(rec: LifecycleRecord): Next {
   if (last === undefined) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   const isChanged = last.endHead !== last.startHead
   const unresolved = unresolvedBlockers(rec)
-  const owed = verificationOwed(rec)
-  // Reviewer feedback nobody answered never rides into ready (R34): the agent answers it in its thread.
-  const unanswered = rec.findings.filter(one => one.source === 'github' && one.status === 'open' && !isBlocking(one))
+  // The merge test (R39): every finding of either phase, at any severity, verified fixed or rebutted with Codex accepting.
+  const holding = mergeHolds(rec)
+  const owed = holding.filter(one => one.status === 'reported-fixed')
+  const unchecked = holding.filter(one => one.status === 'rebutted')
+  const open = holding.filter(one => one.status === 'open')
+  const deferred = holding.filter(one => one.status === 'deferred')
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -307,7 +328,8 @@ function decidePost(rec: LifecycleRecord): Next {
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
   }
   if (last.kind === 'final-head-check') {
-    if (!isChanged && unresolved.length === 0 && owed.length === 0 && unanswered.length === 0) return { kind: 'ready' }
+    if (!isChanged && holding.length === 0) return { kind: 'ready' }
+    if (!isChanged && deferred.length === holding.length) return awaiting(deferred)
     return {
       kind: 'exhausted',
       why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
@@ -317,22 +339,26 @@ function decidePost(rec: LifecycleRecord): Next {
           : 'tell the person the final head is not reviewed clean; a new round needs their allowance',
     }
   }
-  // The pre-PR backstop (R32): blockers left open on an unchanged head with nothing rebutted; another round would say the same.
-  const open = unresolved.filter(one => one.status === 'open')
-  if (!isChanged && last.rebutted === 0 && open.length > 0) {
+  // The pre-PR backstop (R32), at any severity (R39): findings left open on an unchanged head; another round would say the same.
+  if (!isChanged && open.length > 0) {
     // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding.
     const rejected = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-1)?.status === 'open')
     const ignored = open.filter(one => !rejected.includes(one))
+    const isFeedbackOnly = open.every(one => one.source === 'github' && !isBlocking(one))
     const said = [
       ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${one.history.at(-1)?.note ?? 'no reason given'}`),
       ...(ignored.length === 0
         ? []
-        : [`${ids(ignored)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`]),
+        : isFeedbackOnly
+          ? [`${ids(ignored)} from reviewers ${ignored.length === 1 ? 'has' : 'have'} no answer`]
+          : [`${ids(ignored)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`]),
     ]
     return {
       kind: 'blocked',
       why: said.join('; '),
-      nextStep: `fix or rebut ${ids(open)}, then pr-gate resume`,
+      nextStep: isFeedbackOnly
+        ? `answer ${ids(open)} in ${open.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer), then pr-gate resume`
+        : `fix or rebut ${ids(open)}, then pr-gate resume`,
       answer: open.map(one => one.id),
     }
   }
@@ -341,36 +367,33 @@ function decidePost(rec: LifecycleRecord): Next {
       ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
       : { kind: 'round', phase: 'post', roundKind: 'final-head-check', isAdvisory: false, scope: 'delta' }
   }
-  if (unresolved.length === 0 && unanswered.length > 0) {
+  // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
+  if (unchecked.length > 0) {
     return {
       kind: 'blocked',
-      why: `${ids(unanswered)} from reviewers ${unanswered.length === 1 ? 'has' : 'have'} no answer`,
-      nextStep: `answer ${ids(unanswered)} in ${unanswered.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer), then pr-gate resume`,
-      answer: unanswered.map(one => one.id),
+      why: `Codex has not checked the rebuttal of ${ids(unchecked)} on ${last.endHead.slice(0, 7)}`,
+      nextStep: 'run pr-gate resume: Codex checks the rebuttal on this head, using no review round',
+      recheck: unchecked.map(one => one.id),
     }
   }
-  if (unresolved.length === 0) return { kind: 'ready' }
-  if (unresolved.some(one => one.status === 'deferred')) {
-    return {
-      kind: 'blocked',
-      why: `${ids(unresolved)} deferred, and a security P1 needs the person's decision`,
-      nextStep: `tell the person ${ids(unresolved.filter(one => one.status === 'deferred'))} is a deferred security P1 that only their waiver settles`,
-    }
+  if (holding.length === 0) return { kind: 'ready' }
+  return awaiting(deferred)
+}
+
+/** Deferrals are honest answers, but only the person's waiver lets them into the merge (R39). */
+function awaiting(deferred: readonly Finding[]): Next {
+  const one = deferred.length === 1
+  return {
+    kind: 'awaiting-decision',
+    why: `${ids(deferred)} ${one ? 'is' : 'are'} deferred, and only the person's waiver lets ${one ? 'it' : 'them'} into the merge`,
+    nextStep: `tell the person ${ids(deferred)} ${one ? 'is' : 'are'} deferred and why, then stop: only their waiver settles ${one ? 'it' : 'them'}`,
   }
-  return mayStartRound(rec, false)
-    ? { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
-    : {
-        kind: 'exhausted',
-        why: `${ids(unresolved)} unresolved and the review allowance is spent`,
-        nextStep: `fix ${ids(unresolved)} and push, then pr-gate resume`,
-      }
 }
 
 /** What the controller does after a round, from the record alone. Exhaustion is never a pass. */
 export function decideNext(rec: LifecycleRecord): Next {
   // Ready holds only for the head it was reached at: a later push continues the lifecycle.
   // It never holds over an unresolved blocker or a fix still owed its check, whatever wrote them after ready.
-  const isSettled = unresolvedBlockers(rec).length === 0 && verificationOwed(rec).length === 0
-  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && isSettled) return { kind: 'ready' }
+  if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && mergeHolds(rec).length === 0) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
 }

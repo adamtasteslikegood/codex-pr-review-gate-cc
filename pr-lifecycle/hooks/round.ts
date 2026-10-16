@@ -34,11 +34,13 @@ import {
   applyAnswer,
   decideNext,
   invalidate,
+  isAcceptedRebuttal,
   isBlocking,
   lastReviewedHead,
   markHeld,
   markVerified,
   mergeFindings,
+  mergeHolds,
   nextIds,
   raisedIn,
   roundOf,
@@ -210,7 +212,7 @@ export function startTicker($: Engine): void {
           await noteAttempt($, run, why)
           await retryLower($, run, why)
         } else if (run.phase === 'verify' && run.lifecycle === 'post') {
-          await holdPost($, run, `the Codex check of a security rebuttal did not finish: ${why}`)
+          await holdPost($, run, `the Codex check of a rebuttal did not finish: ${why}`)
         } else {
           await noteAttempt($, run, why)
           await finish($, run.id, 'error', why, true)
@@ -588,7 +590,8 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   const isCovered = [...evidence, ...rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence)].some(
     each => each.isComplete && each.head === got.prHead,
   )
-  const owesVerification = verificationOwed(rec).length > 0
+  // Any fix only reported, at any severity (R39), needs Codex to verify it before the merge.
+  const owesVerification = mergeHolds(rec).some(one => one.status === 'reported-fixed')
   const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
   const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
   const after = await patch($, run.id, one => ({
@@ -727,9 +730,9 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   }
   // Codex's findings of this round still open (the fallback or the final-head check): answered in the same turn.
   const codex = run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
-  // Blockers still open from earlier rounds come back until they are fixed or rebutted (R32).
+  // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
-  const carried = unresolvedBlockers({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
+  const carried = mergeHolds({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
     one => one.status === 'open' && !raisedIn(one, run.round) && !listedIds.has(one.id),
   )
   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
@@ -741,7 +744,7 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   }
   const asked = [...listedIds, ...carried.map(one => one.id)]
   if (asked.length === 0 && others.length === 0) {
-    const rebuttals = rebuttedSecurity(run, rec)
+    const rebuttals = rebuttalsOwed(run)
     if (rebuttals.length > 0) await checkRebuttals($, run, rebuttals)
     else await endRound($, run, true)
     return
@@ -789,16 +792,10 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
 }
 
 /**
- * Security blockers the main agent rebutted after the PR opened that Codex has not checked: a rebuttal alone never
- * settles one (R36). A check that was held, then resumed, finds them again here.
+ * Rebuttals Codex has not accepted, of any severity and from either phase: after the PR opens, Codex checks every one
+ * on the same head (R36, widened by R39). A check that was held, then resumed, finds them again here.
  */
-const rebuttedSecurity = (run: Run, rec: Pick<LifecycleRecord, 'rounds'>): Finding[] => {
-  const firstPost = Math.min(run.round, ...rec.rounds.filter(one => one.phase === 'post').map(one => one.n))
-  return run.findings.filter(one => {
-    const last = one.history.at(-1)
-    return isBlocking(one) && one.isSecurity === true && one.status === 'rebutted' && last !== undefined && last.round >= firstPost && last.by === 'main'
-  })
-}
+const rebuttalsOwed = (run: Run): Finding[] => run.findings.filter(one => one.status === 'rebutted' && !isAcceptedRebuttal(one))
 
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
@@ -897,7 +894,8 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   const ended = await getRun($)
   if (ended === null || ended.id !== run.id || ended.status !== 'running') return
-  const rebuttals = rebuttedSecurity(ended, rec)
+  // Only on the head the rebuttals were made about; a new head goes to its own round, which checks them there.
+  const rebuttals = endHead === run.roundStartHead ? rebuttalsOwed(ended) : []
   if (rebuttals.length > 0) {
     await checkRebuttals($, { ...ended, headSha: endHead }, rebuttals)
     return
@@ -922,13 +920,13 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
     phaseStartedAt: now,
     pending: [],
     activity: 'starting the rebuttal check…',
-    steps: withStep(one.steps, { id: `r${one.round}-verify`, label: `Round ${one.round} · codex checks the security rebuttals`, state: 'running' }),
+    steps: withStep(one.steps, { id: `r${one.round}-verify`, label: `Round ${one.round} · codex checks the rebuttals`, state: 'running' }),
   }))
   if (opened === null) return
   $.ui.status(`pr-gate r${opened.round}: checking the rebuttals`)
   const { isStarted, agentId } = await spawn($, opened, 'verify', verifyPrompt(opened, opened.roundStartHead, rebuttals))
   if (!isStarted) {
-    await holdPost($, opened, 'the Codex check of a security rebuttal could not be started')
+    await holdPost($, opened, 'the Codex check of a rebuttal could not be started')
     return
   }
   await patch($, run.id, one => ({ ...one, pending: [{ role: 'verify', step: stepOf(one, 'verify'), agentId }], activity: 'waiting on the rebuttal check…' }))
@@ -936,7 +934,7 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
 
 /** Codex could not check a security rebuttal: the merge is held, never ready on the rebuttal alone (R36). */
 async function holdPost($: Engine, run: Run, why: string): Promise<void> {
-  const ids = (run.rechecks ?? []).join(', ') || 'the rebutted security findings'
+  const ids = (run.rechecks ?? []).join(', ') || 'the rebutted findings'
   const nextStep = `run pr-gate resume to have Codex check the rebuttal of ${ids} again, or fix ${ids} and push`
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
@@ -951,7 +949,7 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
   const trailer = readTrailer(answer)
   // Fail closed: no readable verdict is no check.
   if (trailer === undefined || typeof trailer.ok !== 'boolean') {
-    await holdPost($, run, 'Codex gave no readable verdict on a security rebuttal')
+    await holdPost($, run, 'Codex gave no readable verdict on a rebuttal')
     return
   }
   const verdict = readVerify(answer)
@@ -962,11 +960,13 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
     findings: one.findings.map(f => {
       if (!checked.has(f.id)) return f
       if (!verdict.isOk) return markHeld(f, one.round, 'codex', now, verdict.notes ?? 'Codex did not accept the rebuttal')
-      return { ...f, history: [...f.history, { round: one.round, status: 'rebutted' as const, note: 'Codex: the rebuttal holds', by: 'codex', at: now }] }
+      // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
+      const accepted = { round: one.round, status: 'rebutted' as const, note: 'Codex: the rebuttal holds', by: 'codex', at: now }
+      return { ...f, needsRecheck: undefined, history: [...f.history, accepted] }
     }),
     steps: withStep(one.steps, {
       id: `r${one.round}-verify`,
-      label: `Round ${one.round} · codex checks the security rebuttals`,
+      label: `Round ${one.round} · codex checks the rebuttals`,
       state: 'done',
       detail: verdict.isOk ? 'rebuttal holds' : 'not accepted: open again',
     }),
@@ -1067,6 +1067,34 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
 /** Re-opens triage on the same head for findings a post-PR block left to the agent (R37). It records no round. */
 async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string[], why: string): Promise<void> {
   const now = await $.clock.now()
+  const run = answerRun(rec, ids, now)
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  $.ui.status(`pr-gate r${run.round}: answering the open items`)
+  const findings = rec.findings.filter(one => ids.includes(one.id))
+  const intro = `The review was resumed on the same head: ${why}. Answer each item below; this uses no review round.`
+  const heading = 'Still open (fix, rebut or defer each; a security blocker is fixed or rebutted, and it blocks the merge until then):'
+  // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
+  await patch($, run.id, one => ({ ...one, outbox: triagePrompt(run, rec, [], [], { carried: findings, intro, carriedHeading: heading }) }))
+}
+
+/** Codex checks rebuttals it never ruled on, on the same head, as an answer run: no round, no allowance (R39). */
+async function startRecheck($: Engine, rec: LifecycleRecord, ids: readonly string[]): Promise<void> {
+  const now = await $.clock.now()
+  const run = answerRun(rec, ids, now)
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  await checkRebuttals($, run, rec.findings.filter(one => ids.includes(one.id)))
+}
+
+/** A run on the same head that records no round: an answer to a block, or a rebuttal check (R37, R39). */
+function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number): Run {
   const last = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)
   const round = last?.n ?? 1
   const findings = rec.findings.filter(one => ids.includes(one.id))
@@ -1110,16 +1138,7 @@ async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string
     asked: [...ids],
     isAnswer: true,
   }
-  await update($, runAtom, () => run)
-  await update($, tickAtom, () => now)
-  isLive = true
-  startTicker($)
-  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
-  $.ui.status(`pr-gate r${round}: answering the open items`)
-  const intro = `The review was resumed on the same head: ${why}. Answer each item below; this uses no review round.`
-  const heading = 'Still open (fix, rebut or defer each; a security blocker is fixed or rebutted, and it blocks the merge until then):'
-  // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
-  await patch($, run.id, one => ({ ...one, outbox: triagePrompt(run, rec, [], [], { carried: findings, intro, carriedHeading: heading }) }))
+  return run
 }
 
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
@@ -1243,10 +1262,17 @@ export async function advance($: Engine, root: string, branch: string): Promise<
     await startAnswer($, rec, next.answer ?? [], next.why)
     return
   }
+  // A rebuttal Codex never ruled on: Codex checks it on this head, using no round (R39).
+  if (!isPre && id === undefined && next.kind === 'blocked' && (next.recheck ?? []).length > 0) {
+    await startRecheck($, rec, next.recheck ?? [])
+    return
+  }
+  // Only the post-PR side waits on the person's decision; the run itself ends blocked.
+  const runStatus = next.kind === 'awaiting-decision' ? 'blocked' : next.kind
   const saved = await updateRecord($, root, branch, one =>
-    isPre ? { ...one, preStatus: next.kind, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why },
+    isPre ? { ...one, preStatus: runStatus, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why },
   )
-  if (id !== undefined) await finish($, id, next.kind, `${next.why}. Next: ${next.nextStep}`)
+  if (id !== undefined) await finish($, id, runStatus, `${next.why}. Next: ${next.nextStep}`)
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
   if (isPre) {

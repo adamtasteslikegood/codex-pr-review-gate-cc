@@ -1,7 +1,7 @@
 // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isBlocking, raisedIn, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
+import { isBlocking, mergeHolds, raisedIn, unresolvedBlockers, usedRounds, verificationOwed } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, TriageClass } from './lifecycle'
 import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
@@ -402,7 +402,7 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       `You check rebuttals for pr-gate's post-PR review. Round ${run.round}.`,
       where(run),
       '',
-      'The main agent rebutted these security findings instead of fixing them. A rebuttal alone never settles a security blocker:',
+      'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
       listFindings(rebuttals),
       '',
       'For each one: read the code at HEAD and decide whether the rebuttal holds. ok is true only when every rebuttal holds.',
@@ -552,8 +552,8 @@ export function readyPrompt(rec: LifecycleRecord): string {
 
 /** The person's options after the PR opened; a deferred security blocker adds the waiver only the person can give (M1). */
 const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): string => {
-  const deferred = unresolvedBlockers(rec).filter(one => one.status === 'deferred')
-  const waive = deferred.map(one => `/pr-gate waive ${one.id} <reason> settles the deferred security finding ${one.id}`).join(', ')
+  const deferred = mergeHolds(rec).filter(one => one.status === 'deferred')
+  const waive = deferred.map(one => `/pr-gate waive ${one.id} <reason> lets the deferred ${one.id} into the merge`).join(', ')
   return (
     'Their options: /pr-gate waive post <reason> lets this head merge without the review, ' +
     `${waive === '' ? '' : `${waive}, `}and /pr-gate allow 1 <reason> grants one more review round.`
@@ -562,11 +562,10 @@ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): string 
 
 /** Post-PR review stopped short of ready: why, what holds the merge, the agent's next step, and apart from it the person's options. */
 export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep: string }): string {
-  const holding = [...unresolvedBlockers(rec), ...verificationOwed(rec)]
-  const unanswered = rec.findings.filter(one => one.source === 'github' && one.status === 'open' && !holding.includes(one))
+  // Every finding that holds the merge, at any severity (R39): the same list the merge guard names.
+  const holding = mergeHolds(rec)
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
   if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
-  if (unanswered.length > 0) lines.push('', 'Reviewer feedback with no answer yet:', listFindings(unanswered))
   lines.push(
     '',
     `Your next step: ${next.nextStep}.`,

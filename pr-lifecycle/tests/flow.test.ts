@@ -752,6 +752,8 @@ const toTriage = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>,
 }
 
 const triaged = (step: string, dispositions: object[]) => turn(`ok\n${TRAILER}\n${JSON.stringify({ step, dispositions })}`)
+const accept = (step: string, w: ReturnType<typeof world>, ok = true, notes?: string) =>
+  turn(`v\n${TRAILER}\n${JSON.stringify({ step, ok, ...(notes === undefined ? {} : { notes }) })}`, `agent-${w.spawned.length}`)
 
 test('code changes in the first post-PR round require review of the resulting head', async ($, on) => {
   const w = world(on)
@@ -776,6 +778,8 @@ test('a clean first post-PR round does not force a second', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  // R39: Codex checks the rebuttal on the same head first.
+  await $.turn.complete(accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(w.prompts.at(-1)).toContain('ready for the merge decision')
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
@@ -1007,6 +1011,7 @@ test('a ready record that is no longer ready goes back to post', async ($, on) =
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   const open = { ...rec.findings[0], id: 'X-1', severity: 'P1', status: 'open' }
@@ -1064,7 +1069,7 @@ test('R37: resuming a blocked post-PR review re-opens triage; a security rebutta
   expect(rec.rounds.filter(one => one.kind === 'discretionary' && one.isCompleted)).toHaveLength(1)
 })
 
-test('R37: a deferred P2 answered on resume reaches ready with no new round', async ($, on) => {
+test('R37: a deferred P2 answered on resume ends awaiting the person\'s decision, with no new round', async ($, on) => {
   const w = world(on)
   await toBlocked($, w, 'Consider renaming this')
   const before = postRounds(await recordOf(w))
@@ -1072,7 +1077,9 @@ test('R37: a deferred P2 answered on resume reaches ready with no new round', as
   await w.clock.advance(1000)
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
   const rec = await recordOf(w)
-  expect(rec.phase).toBe('ready')
+  // R39: a deferral is an answer, but only the person's waiver lets it into the merge.
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.postStatus).toBe('awaiting-decision')
   expect(rec.processed).toContain('inline:11')
   expect(postRounds(rec)).toBe(before)
 })
@@ -1106,7 +1113,63 @@ test('M3: resuming a post-PR record reports the post-PR status', async ($, on) =
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w))
   const said = await $.command.run(cmd('resume'))
   expect(JSON.stringify(said)).toContain('post-PR review')
   expect(JSON.stringify(said)).not.toContain('pre-PR gate stands')
+})
+
+// ------------------------------------------------------------- task 12 fix round 3 (R39)
+
+test('R39: a deferred P3 after the PR opened is not ready, and the merge is held naming it', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('ready')
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(w.prompts.at(-1)).toContain('G2-1')
+  expect(w.prompts.at(-1)).toContain('Their options:')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('G2-1 [P3] deferred')
+})
+
+test('R39: a rebutted P2 that Codex accepts reaches ready', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  const spawned = w.spawned.length
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  expect(w.spawned).toHaveLength(spawned + 1)
+  await $.turn.complete(accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'fine as is', replyId: '992' }]))
+  await $.turn.complete(accept('r2-verify', w, false, 'G2-1: the name misleads'))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
+  expect(rec.phase).not.toBe('ready')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+})
+
+test('R39: a pre-PR deferred advisory carried into the PR holds the merge', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  await $.turn.complete(turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'out of scope' }] })}`))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  await $.tool.call(createPr)
+  await w.clock.advance(21 * 60_000)
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
+  expect(rec.phase).not.toBe('ready')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('R1-1 [P2] deferred')
 })
