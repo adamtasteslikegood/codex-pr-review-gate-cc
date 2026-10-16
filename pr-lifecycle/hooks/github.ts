@@ -223,18 +223,46 @@ export type PrAction = {
 
 // ------------------------------------------------------------------ Bash
 
-/** Drop heredoc bodies: from `<<WORD`, `<<'WORD'`, `<<"WORD"` or `<<-WORD` to the line equal to WORD (leading tabs trimmed for `<<-`). */
+/** A heredoc opener: `<<` that is not part of a `<<<` here-string and not a shift after a digit or `(`. */
+const HEREDOC = /(?<![<\d(])<<(?!<)(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/
+
+/** Whether `<<` sits inside an open `$((` or `((` arithmetic expression on its line. */
+const isArithmetic = (before: string): boolean => (before.match(/\(\(/g) ?? []).length > (before.match(/\)\)/g) ?? []).length
+
+const SHELLS = ['bash', 'sh', 'zsh']
+const SHELL_FEEDERS = [...SHELLS, 'eval', 'ssh', 'xargs']
+
+/** The command name of a shell segment, past `sudo`, `env` and `VAR=value` prefixes, quotes dropped. */
+function commandName(segment: string): string {
+  const tokens = segment.replace(/['"]/g, '').trim().split(/\s+/)
+  const at = tokens.findIndex((token) => token !== 'sudo' && token !== 'env' && !/^[A-Za-z_]\w*=/.test(token))
+  return (tokens[at] ?? '').split('/').pop() ?? ''
+}
+
+/** A heredoc whose body a shell runs: the command before `<<` is a shell or feeder, or the line pipes into a shell. */
+function isShellFed(line: string, opener: number): boolean {
+  const before = line.slice(0, opener).split(/;|&&|\|\||\||\(/).pop() ?? ''
+  if (SHELL_FEEDERS.includes(commandName(before))) return true
+  return line.slice(opener).split('|').slice(1).some((piped) => SHELLS.includes(commandName(piped)))
+}
+
+/**
+ * Drop heredoc bodies: from `<<WORD`, `<<'WORD'`, `<<"WORD"` or `<<-WORD` to the line equal to WORD (leading tabs trimmed for `<<-`).
+ * A body fed to a shell is kept, so its lines are read as commands.
+ */
 function dropHeredocs(command: string): string {
   const kept: string[] = []
-  let end: { word: string; isDash: boolean } | undefined
+  let end: { word: string; isDash: boolean; isKept: boolean } | undefined
   for (const line of command.split('\n')) {
     if (end !== undefined) {
       if ((end.isDash ? line.replace(/^\t+/, '') : line) === end.word) end = undefined
+      else if (end.isKept) kept.push(line)
       continue
     }
     kept.push(line)
-    const here = line.match(/<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/)
-    if (here !== null) end = { word: here[3] ?? '', isDash: here[1] === '-' }
+    const here = line.match(HEREDOC)
+    if (here === null || isArithmetic(line.slice(0, here.index))) continue
+    end = { word: here[3] ?? '', isDash: here[1] === '-', isKept: isShellFed(line, here.index ?? 0) }
   }
   return kept.join('\n')
 }
@@ -465,7 +493,7 @@ const wordsOf = (text: string): string =>
     .toLowerCase()
 
 const PRIMARY_KEYS = ['action', 'method', 'operation', 'op']
-const SECONDARY_KEYS = ['command', 'type', 'name', 'tool', 'mode']
+const SECONDARY_KEYS = ['command', 'type', 'name', 'tool', 'mode', 'function', 'verb', 'subcommand', 'operationname', 'tool_name']
 
 /** What a call's input structurally says. Free text (titles, bodies, messages, paths to files) is never read, except for mutation names. */
 type Shape = {
@@ -474,9 +502,9 @@ type Shape = {
   keys: string[]
   /** Values under action, method, operation and op. */
   primary: string[]
-  /** Values under command, type, name, tool and mode: they count only when no primary key is present. */
+  /** Values under the other operation keys (command, type, name, tool, verb, ...), at any depth. */
   secondary: string[]
-  /** Values that parse as a REST path to the pulls API. */
+  /** Values that parse as a REST path to the pulls API, such as `path` or `endpoint`. */
   paths: PullsPath[]
   method: string
 }
@@ -492,6 +520,8 @@ function shapeOf(value: unknown, key: string | undefined, shape: Shape, depth: n
       const path = pullsPathIn(value)
       if (path !== undefined) shape.paths.push(path)
       if (lower === 'method' && shape.method === '') shape.method = value.toUpperCase()
+      const leading = value.match(/^(GET|POST|PUT|PATCH|DELETE)\s/i)?.[1]
+      if (path !== undefined && leading !== undefined && shape.method === '') shape.method = leading.toUpperCase()
     }
   } else if (Array.isArray(value)) {
     for (const one of value) shapeOf(one, key, shape, depth + 1)
@@ -508,6 +538,18 @@ const CREATE_WORDS = /\b(create|new|open|submit)\b/
 const PR_WORDS = /\b(pull|pulls|pr|prs|pullrequests?)\b/
 const REVIEW_WORDS = /\b(reviews?|comments?)\b/
 
+/**
+ * The operation words. A primary key (action, method, operation, op) that names a create or merge decides alone. One that names
+ * neither does not hide another operation key's merge or create verb, but `open` and `new` there still yield to it.
+ */
+function operationOf(shape: Shape): string {
+  const primary = wordsOf(shape.primary.join(' '))
+  const secondary = wordsOf(shape.secondary.join(' '))
+  if (shape.primary.length === 0) return secondary
+  if (MERGE_WORDS.test(primary) || CREATE_WORDS.test(primary)) return primary
+  return `${primary} ${secondary.replace(/\b(open|new)\b/g, ' ')}`
+}
+
 function readUnknownTool(tool: string, input: Record<string, unknown>, repo: string | undefined): PrAction | undefined {
   const shape: Shape = { strings: [], keys: [], primary: [], secondary: [], paths: [], method: '' }
   shapeOf(input, undefined, shape, 0)
@@ -519,7 +561,7 @@ function readUnknownTool(tool: string, input: Record<string, unknown>, repo: str
   if (mutation === 'merge') return merge()
 
   const name = wordsOf(tool.split('__').pop() ?? '')
-  const operation = wordsOf((shape.primary.length > 0 ? shape.primary : shape.secondary).join(' '))
+  const operation = operationOf(shape)
   const path = shape.paths[0]
   const isWrite = shape.method === 'POST' || shape.method === 'PUT'
   const hasPr = PR_WORDS.test(name) || PR_WORDS.test(operation) || PR_WORDS.test(wordsOf(shape.keys.join(' '))) || path !== undefined
@@ -559,6 +601,9 @@ function readKnownTool(tool: string, input: Record<string, unknown>, repo: strin
  * - scripts and package-manager scripts that call gh
  * - a segment that starts with `git`, `echo`, `cat` and so on and hides a command (for example `git -c alias.x='!gh pr ...' x`)
  * - REST calls from other tools (`http`, `wget`, language one-liners)
+ * - a heredoc written to a file and run later (`cat > s.sh <<EOF ... EOF; bash s.sh`): only bodies fed straight to a shell are read
+ * - an MCP operation under a key this mod does not list, or an operation spelled only in free text
+ * - an MCP argv array (`args: ['pr', 'merge', '5']`) is free text, not an operation
  */
 export function readPrAction(tool: string, input: Record<string, unknown>): PrAction | undefined {
   if (tool === 'Bash') return typeof input.command === 'string' ? readBash(input.command) : undefined

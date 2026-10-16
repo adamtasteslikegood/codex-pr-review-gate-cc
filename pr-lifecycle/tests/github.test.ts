@@ -273,3 +273,36 @@ test('mcp: reads, reviews and long prose stay free', async () => {
   expect(readPrAction('mcp__claude_ai_github-graphql-mcp__manage_pull_requests', { action: 'list' })).toBeUndefined()
   expect(readPrAction('mcp__acme-github__pulls', { body: 'please merge this later, it will create a pull request when the long prose runs on and on'.padEnd(130, '.') })).toBeUndefined()
 })
+
+// Fix round 4 (R20): here-strings are not heredocs; shell-fed heredocs and nested MCP operations are read.
+
+const mergeCmd = 'gh pr ' + 'merge 5'
+const createCmd = 'gh pr ' + 'create'
+
+test('bash r20: here-strings and arithmetic shifts are not heredocs', async () => {
+  expect(bash('cat <<< "hello"\n' + mergeCmd)).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('cat <<<hello\n' + mergeCmd)).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('echo $((1<<2))\n' + mergeCmd)).toMatchObject({ action: 'merge', number: 5 })
+})
+
+test('bash r20: heredoc bodies fed to a shell are read; bodies written to a file are not', async () => {
+  expect(bash('bash <<EOF\n' + mergeCmd + '\nEOF')).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash("bash -s <<'EOF'\n" + createCmd + '\nEOF')).toMatchObject({ action: 'create' })
+  expect(bash('ssh h <<EOF\n' + mergeCmd + '\nEOF')).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('cat <<EOF | bash\n' + mergeCmd + '\nEOF')).toMatchObject({ action: 'merge', number: 5 })
+  expect(bash('cat > notes.md <<EOF\n' + mergeCmd + '\nEOF')).toBeUndefined()
+  expect(bash("git commit -F - <<'EOF'\nsubject\n\n" + createCmd + ' --base dev\nEOF')).toBeUndefined()
+})
+
+test('mcp r20: operation keys at any depth, more key names, and endpoint paths', async () => {
+  const call = { method: 'tools/call', params: { name: 'merge_pull_request', arguments: { pullNumber: 5 } } }
+  expect(readPrAction('mcp__github__tools', call)).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(readPrAction('mcp__acme-github__run', { action: 'x', command: 'pr create' })).toMatchObject({ action: 'create', isUnknown: true })
+  expect(readPrAction('mcp__github__pulls', { verb: 'merge', pull_number: 3 })).toMatchObject({ action: 'merge' })
+  expect(readPrAction('mcp__github__call', { endpoint: 'PUT /repos/o/r/pulls/2/merge' })).toMatchObject({ action: 'merge' })
+})
+
+test('mcp r20: open and new still yield to a primary key', async () => {
+  expect(readPrAction('mcp__github__pulls', { action: 'list', type: 'open' })).toBeUndefined()
+  expect(readPrAction('mcp__plugin_github_github__list_pull_requests', { state: 'open' })).toBeUndefined()
+})
