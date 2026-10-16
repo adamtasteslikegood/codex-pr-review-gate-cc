@@ -97,7 +97,17 @@ export type RoundRecord = {
   endedAt: number
 }
 
-export type Waiver = { scope: 'pre' | 'post' | 'finding'; findingId?: string; head: string; reason: string; by: string; at: number }
+/** A finding waiver lapses when its finding's file changes after it was given (R55): `lapsedHead` is the head that changed it. */
+export type Waiver = {
+  scope: 'pre' | 'post' | 'finding'
+  findingId?: string
+  head: string
+  reason: string
+  by: string
+  at: number
+  lapsedAt?: number
+  lapsedHead?: string
+}
 
 export type Grant = { n: number; reason: string; head: string; at: number }
 

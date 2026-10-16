@@ -27,7 +27,6 @@ import {
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
-  waivedIds,
 } from './lifecycle'
 import {
   advance,
@@ -38,6 +37,7 @@ import {
   git,
   hasSecurityBlocker,
   heldReason,
+  lapsedAt,
   holdingPrompts,
   isLiveNow,
   isTurnOf,
@@ -214,7 +214,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     const lastHead = lastReviewedHead(prior)
     const since = lastHead === undefined ? undefined : await git($, root, ['diff', '--name-only', lastHead, head])
     const files = since?.isOk === true ? new Set(since.out.split('\n').filter(Boolean)) : ('all' as const)
-    rec = { ...rec, findings: invalidate(rec.findings, files, waivedIds(rec)) }
+    rec = { ...rec, findings: invalidate(rec.findings, files), waivers: await lapsedAt($, rec, head, now) }
   }
   // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
   const adopted = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
@@ -638,18 +638,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (!mergeHolds(rec).some(one => one.id === scope)) {
       return `/${COMMAND}: ${scope} is already settled (${settledAs(rec, finding)}): there is nothing to waive.`
     }
-    // Waived at this head: a waiver that lapsed on a file change (R50) is given again, so the finding's flag is cleared with it.
-    const findings = rec.findings.map(one => (one.id === scope ? { ...one, needsRecheck: undefined } : one))
+    // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
     const waiver = { scope: 'finding' as const, findingId: scope, head: rec.head, reason, by: origin, at: now }
-    await saveRecord($, { ...rec, findings, waivers: [...rec.waivers, waiver] })
-    // A round in flight carries its own copy of the ledger: it is not asked about again, and its flag does not come back at the round's end.
-    if (isOurs) {
-      await patch($, run.id, one => ({
-        ...one,
-        findings: one.findings.map(each => (each.id === scope ? { ...each, needsRecheck: undefined } : each)),
-        ...(one.asked === undefined ? {} : { asked: one.asked.filter(id => id !== scope) }),
-      }))
-    }
+    await saveRecord($, { ...rec, waivers: [...rec.waivers, waiver] })
+    // A round in flight is not asked about it again.
+    if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
     if (!isRunning) await advance($, root, branch)
     const after = await loadRecord($, root, branch)

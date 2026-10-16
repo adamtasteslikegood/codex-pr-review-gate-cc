@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
-import { invalidate, isAcceptedRebuttal, mergeHolds } from '../hooks/lifecycle'
+import { invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
 import type { LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -1849,4 +1849,49 @@ test('a main step whose turn never started times out saying so', { options: { st
   const run = await runOf(w)
   expect(run.status).toBe('error')
   expect(run.message).toContain('turn was never seen')
+})
+
+// ------------------------------------------------------------- task 13 fix round 3 (R55)
+
+test('R55: a lapsed waiver stays lapsed through a clean round, until the person waives again', { options: { allowanceStandard: 4 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  await say($, 'waive R1-1 the redirect target is fixed')
+  expect((await recordOf(w)).preStatus).toBe('passed')
+  w.git.head = 'e'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  await done($, turn(review('r2-review', 'PASS')))
+  // A clean review does not bring the waiver back: R1-1 still holds, and the fixer is asked about it.
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.phase).toBe('fix')
+  expect(w.prompts.at(-1)).toContain('R1-1')
+  const rec = await recordOf(w)
+  expect(rec.waivers.find(one => one.findingId === 'R1-1')?.lapsedHead).toBe('e'.repeat(40))
+  expect(unresolvedBlockers(rec).map(one => one.id)).toContain('R1-1')
+  // Waived again at the new head, by the person: the round ends and the gate passes.
+  await say($, 'waive R1-1 still a fixed target')
+  await done($, turn('Nothing to change.'))
+  expect((await recordOf(w)).preStatus).toBe('passed')
+})
+
+test('R55: after the PR, a lapsed waiver keeps the merge held through a clean post round', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w)
+  await say($, 'waive G2-1 the input is a constant')
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await say($, 'resume')
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.waivers.find(one => one.findingId === 'G2-1')?.lapsedHead).toBe('e'.repeat(40))
+  expect(mergeHolds(rec).map(one => one.id)).toContain('G2-1')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
 })

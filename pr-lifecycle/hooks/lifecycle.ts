@@ -1,7 +1,7 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Tier } from '../types'
+import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Tier, Waiver } from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -191,15 +191,32 @@ export function triage(
   return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
 }
 
+const touches = (one: Finding, changedFiles: ReadonlySet<string> | 'all'): boolean =>
+  changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))
+
 /**
- * The findings the person waived. A waiver lapses when its finding's file changed since (R50): the finding then holds again
- * until the person waives it at the new head, which clears the flag.
+ * The findings the person waived. A waiver lapses when its finding's file changed after it was given (R50, R55): the lapse is
+ * recorded on the waiver itself, so no later round brings it back. The finding holds again until the person waives it anew.
  */
-export const waivedIds = (rec: Pick<LifecycleRecord, 'waivers' | 'findings'>): Set<string> => {
-  const lapsed = new Set(rec.findings.filter(one => one.needsRecheck === true).map(one => one.id))
-  return new Set(
-    rec.waivers.flatMap(one => (one.scope === 'finding' && one.findingId !== undefined && !lapsed.has(one.findingId) ? [one.findingId] : [])),
-  )
+export const waivedIds = (rec: Pick<LifecycleRecord, 'waivers'>): Set<string> =>
+  new Set(rec.waivers.flatMap(one => (one.scope === 'finding' && one.findingId !== undefined && one.lapsedAt === undefined ? [one.findingId] : [])))
+
+/**
+ * Finding waivers whose finding's file changed between the waiver's head and `head` are marked lapsed (R55). `changedSince` gives
+ * the files changed from a waiver's head, or 'all' when git could not say.
+ */
+export function lapseWaivers(
+  waivers: readonly Waiver[],
+  findings: readonly Finding[],
+  changedSince: (from: string) => ReadonlySet<string> | 'all',
+  head: string,
+  at: number,
+): Waiver[] {
+  return waivers.map(one => {
+    if (one.scope !== 'finding' || one.lapsedAt !== undefined || one.head === head) return one
+    const finding = findings.find(each => each.id === one.findingId)
+    return finding !== undefined && touches(finding, changedSince(one.head)) ? { ...one, lapsedAt: at, lapsedHead: head } : one
+  })
 }
 
 /** Blocking findings deferred and not waived: before the PR, a deferral past the branch waits on the person's waiver of it. */
@@ -269,20 +286,10 @@ export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>
 export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
   rec.rounds.filter(one => one.isCompleted).at(-1)?.endHead
 
-const touches = (one: Finding, changedFiles: ReadonlySet<string> | 'all'): boolean =>
-  changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))
-
-/**
- * Answered findings whose file changed: their evidence must be checked again. History stays. A waived finding is flagged at
- * any status, open included, so its waiver lapses (R53): `waived` is the record's `waivedIds`.
- */
-export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all', waived: ReadonlySet<string> = new Set()): Finding[] {
-  return findings.map(one => ((one.status !== 'open' || waived.has(one.id)) && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
+/** Answered findings whose file changed: their evidence must be checked again. History stays. (A waiver's lapse is `lapseWaivers`.) */
+export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
+  return findings.map(one => (one.status !== 'open' && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 }
-
-/** Only the waivers lapse: waived findings whose file changed (R52, R53). Other findings are left for the next review to judge. */
-export const lapseWaivers = (findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all', waived: ReadonlySet<string>): Finding[] =>
-  findings.map(one => (waived.has(one.id) && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 
 // --------------------------------------------------------------- the next step
 

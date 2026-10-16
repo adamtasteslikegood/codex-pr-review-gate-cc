@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { Effort, Evidence, Finding, LifecycleRecord, Pending, Role, RoundRecord, Run, RunStatus, Step } from '../types'
+import type { Effort, Evidence, Finding, LifecycleRecord, Pending, Role, RoundRecord, Run, RunStatus, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -214,6 +214,17 @@ export async function markPr($: Engine, state: Step['state'], detail: string | u
 export async function git($: Engine, cwd: string | undefined, args: string[], timeoutMs = 30_000): Promise<{ isOk: boolean; out: string; err: string }> {
   const ran = await $.process.run(['git', ...args], { cwd, timeoutMs })
   return { isOk: ran.exitCode === 0, out: ran.stdout.trim(), err: ran.stderr.trim() }
+}
+
+/** The record's waivers at `head`, with each finding waiver whose finding's file changed since it was given marked lapsed (R55). */
+export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'waivers' | 'findings'>, head: string, now: number): Promise<Waiver[]> {
+  const froms = [...new Set(rec.waivers.filter(one => one.scope === 'finding' && one.lapsedAt === undefined && one.head !== head).map(one => one.head))]
+  const changed = new Map<string, ReadonlySet<string> | 'all'>()
+  for (const from of froms) {
+    const diff = await git($, rec.root, ['diff', '--name-only', from, head])
+    changed.set(from, diff.isOk ? new Set(diff.out.split('\n').filter(Boolean)) : 'all')
+  }
+  return lapseWaivers(rec.waivers, rec.findings, from => changed.get(from) ?? 'all', head, now)
 }
 
 const stopTicker = (): void => {
@@ -927,10 +938,12 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     // The answers given in this run are about the new head already, except a fix only reported: its file changed, so it is checked
     // again (R33). Nothing else is exempt: an answer run reuses its round's number, and its push can touch an accepted rebuttal's file.
     const answeredNow = new Set(said.map(each => each.id))
-    const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [], findings: [] })
+    const held = await loadRecord($, run.root, run.branch)
+    const waivers = held === undefined ? undefined : await lapsedAt($, { ...held, findings: run.findings }, endHead, await $.clock.now())
+    if (waivers !== undefined) await updateRecord($, run.root, run.branch, rec => ({ ...rec, waivers }))
     await patch($, run.id, one => ({
       ...one,
-      findings: invalidate(one.findings, files, waived).map(f =>
+      findings: invalidate(one.findings, files).map(f =>
         one.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f,
       ),
     }))
@@ -1225,15 +1238,16 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     startedAt: run.roundStartedAt,
     endedAt: now,
   }
-  // Before the PR, a waiver lapses on a commit of this round that touches its finding's file (R52); post-PR, the head check does it.
-  const isMoved = run.lifecycle === 'pre' && endHead !== run.roundStartHead
-  const changed = isMoved ? await git($, run.root, ['diff', '--name-only', run.roundStartHead, endHead]) : undefined
-  const files = changed === undefined ? undefined : changed.isOk ? new Set(changed.out.split('\n').filter(Boolean)) : ('all' as const)
-  await updateRecord($, run.root, run.branch, rec => {
-    const findings = mergeFindings(rec.findings, run.findings)
-    const lapsed = files === undefined ? findings : lapseWaivers(findings, files, waivedIds(rec))
-    return { ...withRound(rec, round), head: endHead, findings: lapsed, effort: run.effort }
-  })
+  // Before the PR, a waiver lapses on a commit of this round that touches its finding's file (R52, R55); post-PR, the head check does it.
+  const held = run.lifecycle === 'pre' && endHead !== run.roundStartHead ? await loadRecord($, run.root, run.branch) : undefined
+  const waivers = held === undefined ? undefined : await lapsedAt($, { ...held, findings: mergeFindings(held.findings, run.findings) }, endHead, now)
+  await updateRecord($, run.root, run.branch, rec => ({
+    ...withRound(rec, round),
+    head: endHead,
+    findings: mergeFindings(rec.findings, run.findings),
+    ...(waivers === undefined ? {} : { waivers }),
+    effort: run.effort,
+  }))
   if (isCompleted) await advance($, run.root, run.branch)
 }
 
@@ -1503,7 +1517,7 @@ async function afterFix($: Engine, run: Run): Promise<void> {
   if (after === null) return
   // A finding of this round left without an answer gets the fix step once more (no round consumed); then it stays open.
   // One the person waived while the round ran is not asked about again.
-  const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [], findings: [] })
+  const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [] })
   const unanswered = after.findings.filter(
     one => raisedIn(one, after.round) && one.status === 'open' && !said.some(each => each.id === one.id) && !waived.has(one.id),
   )
