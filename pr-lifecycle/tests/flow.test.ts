@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { createPr, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import { invalidate, isAcceptedRebuttal, mergeHolds } from '../hooks/lifecycle'
 import type { LifecycleRecord } from '../types'
 
@@ -13,8 +13,8 @@ test('several reviewers in one cycle consume one round', async ($, on) => {
   w.git.numstat = '10\t2\tsrc/auth/login.ts' // high: review and challenge run in parallel
   await $.tool.call(createPr)
   expect(w.spawned).toHaveLength(2)
-  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-1'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  await done($, turn(review('r1-review', 'PASS'), 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(1)
   expect(rec.rounds[0]?.evidence.map(one => one.reviewer)).toEqual(['codex', 'codex-challenge'])
@@ -23,13 +23,13 @@ test('several reviewers in one cycle consume one round', async ($, on) => {
 test('omitted findings are not marked fixed', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   // R1-2 had no answer: the fix step is asked once more, and says nothing again.
-  await $.turn.complete(turn('Nothing more.'))
+  await done($, turn('Nothing more.'))
   // Round 2: Codex raises nothing and confirms nothing.
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(review('r2-review', 'PASS')))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'R1-1')?.status).toBe('reported-fixed')
   expect(rec.findings.find(one => one.id === 'R1-2')?.status).toBe('open')
@@ -38,11 +38,11 @@ test('omitted findings are not marked fixed', async ($, on) => {
 test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
   expect(w.spawned.at(-1)?.prompt).toContain('R1-2 [P1] Second')
-  await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], held: ['R1-2'] })))
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], held: ['R1-2'] })))
   const rec = await recordOf(w)
   expect(rec.findings.map(one => [one.id, one.status])).toEqual([
     ['R1-1', 'verified-fixed'],
@@ -53,10 +53,10 @@ test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', a
 test('a held blocker goes back to the fixer instead of letting the PR open', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'guarded at :10' }] })}`))
-  await $.turn.complete(turn(review('r2-review', 'PASS', [], { held: ['R1-1'] })))
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'guarded at :10' }] })}`))
+  await done($, turn(review('r2-review', 'PASS', [], { held: ['R1-1'] })))
   const run = await runOf(w)
   expect(run.status).toBe('running')
   expect(run.phase).toBe('fix')
@@ -67,9 +67,9 @@ test('a held blocker goes back to the fixer instead of letting the PR open', asy
 test('a security P1 only reported fixed does not let an exhausted gate open the PR', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   const rec = await recordOf(w)
   expect(rec.findings[0]?.isSecurity).toBe(true)
   expect(rec.preStatus).toBe('exhausted')
@@ -80,12 +80,12 @@ test('a security P1 only reported fixed does not let an exhausted gate open the 
 test('new scope invalidates only the affected evidence', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, { ...P2, file: 'src/other.ts' }])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, { ...P2, file: 'src/other.ts' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(
+  await done($, 
     turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'fine as is' }] })}`),
   )
-  await $.turn.complete(turn(review('r2-review', 'PASS'), 'agent-2'))
+  await done($, turn(review('r2-review', 'PASS'), 'agent-2'))
   // A new commit touches src/app.ts only, and the person runs the gate again.
   w.git.head = 'f'.repeat(40)
   w.git.changed = 'src/app.ts'
@@ -101,8 +101,8 @@ test('new scope invalidates only the affected evidence', async ($, on) => {
 test('timeout retries record effort without recording a completed round', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(`${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'timeout' })}`))
-  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-2'))
+  await done($, turn(`${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'timeout' })}`))
+  await done($, turn(review('r1-review', 'PASS'), 'agent-2'))
   const rec = await recordOf(w)
   expect(rec.attempts).toBe(1)
   expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(1)
@@ -112,13 +112,13 @@ test('timeout retries record effort without recording a completed round', async 
 test('advisories are fixed even when the reserve rule leaves no Codex round for them', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
   const run = await runOf(w)
   expect(run.phase).toBe('fix')
   expect(run.fixKind).toBe('advisory')
   expect(w.prompts.at(-1)).toContain('R1-1 [P2] Rename this')
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1', 'renamed')))
+  await done($, turn(fixed('R1-1', 'renamed')))
   expect(w.prompts.at(-1)).toContain('open the pull request to dev')
   expect(w.spawned).toHaveLength(1)
   expect((await runOf(w)).status).toBe('passed')
@@ -127,17 +127,17 @@ test('advisories are fixed even when the reserve rule leaves no Codex round for 
 test('a finding left without an answer is asked about once more, then stays open', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   // The re-prompt names the finding that had no answer, and uses no round.
   expect(w.prompts.at(-1)).toContain('These findings have no answer yet: R1-2')
   expect(w.spawned).toHaveLength(1)
   expect((await recordOf(w)).rounds).toHaveLength(0)
-  await $.turn.complete(turn(fixed('R1-1', 'still done')))
+  await done($, turn(fixed('R1-1', 'still done')))
   // The round ends; Codex looks at the fix and passes it, and the PR opens with R1-2 still open.
   expect(w.spawned).toHaveLength(2)
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(review('r2-review', 'PASS')))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'R1-2')?.status).toBe('open')
   expect(rec.preStatus).toBe('passed')
@@ -153,11 +153,11 @@ const run$ = (args: string) => ({ command: 'pr-gate', args, origin: { kind: 'com
 test('an open security blocker that a later review leaves out never lets the gate pass', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn('Tried.'))
-  await $.turn.complete(turn('Tried.'))
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  await done($, turn(review('r2-review', 'PASS')))
   const rec = await recordOf(w)
   expect(rec.preStatus).not.toBe('passed')
   expect(rec.findings.find(one => one.id === 'R1-1')?.status).toBe('open')
@@ -171,16 +171,16 @@ test('an open security blocker that a later review leaves out never lets the gat
 test('a rerun after uncommitted fixer changes numbers its findings after the ones already raised', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
   w.git.dirty = ' M src/app.ts'
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   expect((await runOf(w)).status).toBe('error')
   w.git.dirty = ''
   w.git.head = 'e'.repeat(40)
   await $.command.run(run$('resume'))
   const run = await runOf(w)
-  await $.turn.complete(turn(review(`r${run.round}-review`, 'FAIL', [{ ...P1, title: 'Another thing', line: 80 }]), `agent-${w.spawned.length}`))
+  await done($, turn(review(`r${run.round}-review`, 'FAIL', [{ ...P1, title: 'Another thing', line: 80 }]), `agent-${w.spawned.length}`))
   const rec = await recordOf(w)
   expect(rec.findings.map(one => [one.id, one.title])).toEqual([
     ['R1-1', 'Unvalidated redirect'],
@@ -192,12 +192,12 @@ test('a rerun after uncommitted fixer changes numbers its findings after the one
 test('a stop and resume keeps the earlier findings under their ids, and records the attempt', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   await $.command.run(run$('stop'))
   expect((await recordOf(w)).attempts).toBe(1)
   await $.command.run(run$('resume'))
   const run = await runOf(w)
-  await $.turn.complete(turn(review(`r${run.round}-review`, 'PASS', [{ ...P1, severity: 'P2', title: 'Other nit', line: 90 }]), `agent-${w.spawned.length}`))
+  await done($, turn(review(`r${run.round}-review`, 'PASS', [{ ...P1, severity: 'P2', title: 'Other nit', line: 90 }]), `agent-${w.spawned.length}`))
   const rec = await recordOf(w)
   expect(rec.findings.map(one => [one.id, one.severity, one.title])).toEqual([
     ['R1-1', 'P1', 'Unvalidated redirect'],
@@ -208,7 +208,7 @@ test('a stop and resume keeps the earlier findings under their ids, and records 
 test('a fix step that times out records an attempt', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   await w.clock?.advance(62_000)
   expect((await runOf(w)).status).toBe('error')
   expect((await recordOf(w)).attempts).toBe(1)
@@ -217,9 +217,9 @@ test('a fix step that times out records an attempt', { options: { stepTimeoutMin
 test('an exhausted gate that holds the PR says why, with the findings and the next steps', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   const run = await runOf(w)
   // The count is the same set the security check reads: unresolved and unverified.
   expect(run.message).toContain('1 high/critical finding')
@@ -241,10 +241,10 @@ test('an exhausted gate that holds the PR says why, with the findings and the ne
 test('with onExhausted stop, a spent allowance holds the PR and says so', { options: { allowanceStandard: 1, onExhausted: 'stop' } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn('Tried.'))
-  await $.turn.complete(turn('Tried.'))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
   expect((await recordOf(w)).preStatus).toBe('exhausted')
   expect(w.prompts.at(-1)).toContain('held')
   expect(w.prompts.at(-1)).not.toContain('open the pull request')
@@ -253,10 +253,10 @@ test('with onExhausted stop, a spent allowance holds the PR and says so', { opti
 test('a pre-PR block is explained without a PR number or merge advice', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   // No commit and no rebuttal: another round would say the same.
-  await $.turn.complete(turn('Tried.'))
-  await $.turn.complete(turn('Tried.'))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
   expect((await recordOf(w)).preStatus).toBe('blocked')
   const text = w.prompts.at(-1) ?? ''
   expect(text).toContain('R1-1')
@@ -269,11 +269,11 @@ test('a pre-PR block is explained without a PR number or merge advice', async ($
 test('a security fix Codex does not confirm is not a pass', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   // Round 2: Codex passes but does not list R1-1 under verified.
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(review('r2-review', 'PASS')))
   expect((await recordOf(w)).preStatus).not.toBe('passed')
   expect(w.prompts.some(one => one.includes('open the pull request'))).toBe(false)
   // Another round asks Codex to verify it.
@@ -284,10 +284,10 @@ test('a security fix Codex does not confirm is not a pass', async ($, on) => {
 test('a security fix still unverified when the allowance is spent holds the PR and says why', { options: { allowanceStandard: 2 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(fixed('R1-1')))
+  await done($, turn(review('r2-review', 'PASS')))
   expect((await recordOf(w)).preStatus).toBe('exhausted')
   const held = w.prompts.at(-1) ?? ''
   expect(held).toContain('security fix not yet verified')
@@ -303,7 +303,7 @@ const merge = { tool: 'Bash' as const, command: 'gh pr merge 1 --squash' }
 test('a clean pre-PR result still enters post-PR review, and merging stays held', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   const rec = await recordOf(w)
   expect(rec.phase).toBe('post')
@@ -346,7 +346,7 @@ test('a merge to an ungated base, or of a promotion, is not held', async ($, on)
 test('a ready lifecycle lets its own head merge; a later push holds it again', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   w.store.set('lifecycle:/repo:feat/x', { ...(await recordOf(w)), phase: 'ready' })
   expect(isHeld(await $.tool.call(merge))).toBe(false)
@@ -367,7 +367,7 @@ test('a merge gh cannot resolve is held, and the agent is told what to check', a
 test('a merge while post-PR review runs tells the agent to wait, not the person to waive', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('End your turn')
@@ -378,7 +378,7 @@ test('a merge while post-PR review runs tells the agent to wait, not the person 
 test('a PR opened for another branch does not move this branch into post-PR review', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head dev --title release' }))).toBe(false)
   expect((await recordOf(w)).phase).toBe('pre')
 })
@@ -390,7 +390,7 @@ const cmd = (args: string) => ({ command: 'pr-gate', args, origin: { kind: 'comp
 test('a create gh cannot confirm leaves the branch before its PR', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   w.gh.isAuthed = false
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   expect((await recordOf(w)).phase).toBe('pre')
@@ -400,7 +400,7 @@ test('a create gh cannot confirm leaves the branch before its PR', async ($, on)
 test('a graphql create whose PR comes from another branch does not move this one into post-PR', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   w.gh.headRef = 'dev'
   const create = "gh api graphql -f query='mutation { createPullRequest(input: {}) { pullRequest { number } } }'"
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: create }))).toBe(false)
@@ -442,7 +442,7 @@ test('a merge with no record of a branch not checked out here is not intercepted
 test('an exhausted post-PR review says so when a merge is held', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   await $.command.run(cmd('stop'))
   w.store.set('lifecycle:/repo:feat/x', { ...(await recordOf(w)), postStatus: 'exhausted', message: 'R1-1 unresolved and the review allowance is spent' })
@@ -454,7 +454,7 @@ test('an exhausted post-PR review says so when a merge is held', async ($, on) =
 test('a stopped post-PR review tells the agent which branch to resume', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   await $.command.run(cmd('stop'))
   const held = (await $.tool.call(merge)).deny ?? ''
@@ -481,7 +481,7 @@ test('a merge whose guard fails is held, and the person is offered waive post', 
 /** Pre-PR passes clean and the PR opens: the lifecycle is collecting post-PR round 1. */
 const toPost = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
 }
 
@@ -692,7 +692,7 @@ test('when Codex also runs, the round keeps the GitHub evidence', async ($, on) 
   w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('review')
-  await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] }), `agent-${w.spawned.length}`))
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] }), `agent-${w.spawned.length}`))
   // Nothing left to triage: the round is recorded with both.
   const round = (await recordOf(w)).rounds.find(one => one.phase === 'post' && one.isCompleted)
   const sources = (round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)
@@ -765,7 +765,7 @@ test('code changes in the first post-PR round require review of the resulting he
   expect(w.prompts.at(-1)).toContain('reply to thread 11')
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
   const rec = await recordOf(w)
   expect(rec.replies['inline:11']).toBe('991')
   expect(rec.processed).toContain('inline:11')
@@ -780,9 +780,9 @@ test('code changes in the first post-PR round require review of the resulting he
 test('a clean first post-PR round does not force a second', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
   // R39: Codex checks the rebuttal on the same head first.
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(w.prompts.at(-1)).toContain('ready for the merge decision')
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
@@ -793,7 +793,7 @@ test('another agent pushing during triage makes the PR head the round\'s end hea
   await toTriage($, w, 'nit: rename this')
   w.gh.prHead = '7'.repeat(40) // pushed by someone else; local HEAD unchanged
   w.git.isAncestor = true
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.phase === 'post').at(-1)?.endHead).toBe('7'.repeat(40))
   expect((await runOf(w)).roundKind).toBe('baseline')
@@ -802,7 +802,7 @@ test('another agent pushing during triage makes the PR head the round\'s end hea
 test('duplicate comments and polling consume no new round', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
   const before = await recordOf(w)
   await w.clock.advance(10 * 60_000) // ready: nothing polls, nothing counts
   const after = await recordOf(w)
@@ -832,7 +832,7 @@ test('commits the PR does not have end triage as an attempt, keeping the replies
   const w = world(on)
   await toTriage($, w)
   w.git.head = 'e'.repeat(40) // committed here, never pushed
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   const run = await runOf(w)
   expect(run.status).toBe('error')
   expect(run.message).toContain('commits on feat/x are not on the PR: pull or push, then /pr-gate resume')
@@ -847,7 +847,7 @@ test('uncommitted changes after triage still record the replies, so none is post
   const w = world(on)
   await toTriage($, w)
   w.git.dirty = ' M src/app.ts'
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   expect((await runOf(w)).status).toBe('error')
   const rec = await recordOf(w)
   expect(rec.replies['inline:11']).toBe('991')
@@ -861,30 +861,30 @@ test('GitHub findings in a final-head check enter the ledger and are never ready
   // Round 2: the P1 is fixed and pushed.
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   // Round 3, the protected one: Codex verifies the fix, a nit is fixed and pushed.
   w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, 'nit: rename this', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('review')
-  await $.turn.complete(turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  await done($, turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
   expect((await runOf(w)).phase).toBe('triage')
   await w.clock.advance(1000) // the triage prompt enters the main agent's queue
   w.git.head = 'f'.repeat(40)
   w.gh.prHead = 'f'.repeat(40)
-  await $.turn.complete(triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
   // The allowance is spent: round 4 is the final-head check, and a reviewer raises a P1 on it.
   expect((await runOf(w)).roundKind).toBe('final-head-check')
   w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  await $.turn.complete(turn(review('r4-review', 'PASS'), `agent-${w.spawned.length}`))
+  await done($, turn(review('r4-review', 'PASS'), `agent-${w.spawned.length}`))
   expect(w.prompts.at(-1)).toContain('G4-1')
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r4-triage', []))
+  await done($, triaged('r4-triage', []))
   // Asked once more (R34), and left unanswered again.
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r4-triage', []))
+  await done($, triaged('r4-triage', []))
   const rec = await recordOf(w)
   const raised = rec.findings.find(one => one.externalId === 'inline:13')
   expect(raised?.severity).toBe('P1')
@@ -901,9 +901,9 @@ test('GitHub findings in a final-head check enter the ledger and are never ready
 test('R32: an open blocker left unanswered on an unchanged head blocks with the agent\'s next step, spending nothing', async ($, on) => {
   const w = world(on)
   await toTriage($, w)
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
   expect(rec.rounds.filter(one => one.kind === 'discretionary' && one.isCompleted)).toHaveLength(1) // the pre-PR round only
@@ -937,11 +937,11 @@ test('R33: in the protected round, a comment on the lines just fixed is not call
   await toTriage($, w)
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
   w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, '**P1** SQL injection still here', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  await $.turn.complete(turn(review('r3-review', 'PASS'), `agent-${w.spawned.length}`))
+  await done($, turn(review('r3-review', 'PASS'), `agent-${w.spawned.length}`))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('G3-1')
   expect(said).not.toContain('duplicate of an answered finding')
@@ -950,10 +950,10 @@ test('R33: in the protected round, a comment on the lines just fixed is not call
 test('R34: an item left without an answer is asked about once more, and does not reach ready silently', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   const rec = await recordOf(w)
   expect(rec.phase).not.toBe('ready')
   expect(rec.processed).not.toContain('inline:11')
@@ -979,11 +979,11 @@ test('R36: a rebutted security blocker is not ready until Codex checks the rebut
   const w = world(on)
   await toTriage($, w)
   const spawned = w.spawned.length
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the query is parameterised at src/db.ts:4', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the query is parameterised at src/db.ts:4', replyId: '991' }]))
   expect((await recordOf(w)).phase).not.toBe('ready')
   expect(w.spawned).toHaveLength(spawned + 1)
   expect(w.spawned.at(-1)?.prompt).toContain('rebutted')
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
   expect(rec.phase).toBe('ready')
@@ -992,8 +992,8 @@ test('R36: a rebutted security blocker is not ready until Codex checks the rebut
 test('R36: a rebuttal Codex does not accept reopens the security blocker and goes back to the agent', async ($, on) => {
   const w = world(on)
   await toTriage($, w)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'G2-1: reachable from /search' }))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'G2-1: reachable from /search' }))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
   expect(rec.phase).not.toBe('ready')
@@ -1003,7 +1003,7 @@ test('R36: a rebuttal Codex does not accept reopens the security blocker and goe
 test('R36: a rebuttal check that cannot finish holds the PR', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await toTriage($, w)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
   await w.clock.advance(2 * 60_000)
   const rec = await recordOf(w)
   expect(rec.phase).not.toBe('ready')
@@ -1014,8 +1014,8 @@ test('R36: a rebuttal check that cannot finish holds the PR', { options: { stepT
 test('a ready record that is no longer ready goes back to post', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   const open = { ...rec.findings[0], id: 'X-1', severity: 'P1', status: 'open' }
@@ -1027,7 +1027,7 @@ test('a ready record that is no longer ready goes back to post', async ($, on) =
 test('R36: after a held rebuttal check, a resumed round checks the rebuttal again before ready', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await toTriage($, w)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
   await w.clock.advance(2 * 60_000)
   expect((await recordOf(w)).postStatus).toBe('blocked')
   const spawned = w.spawned.length
@@ -1045,9 +1045,9 @@ const postRounds = (rec: LifecycleRecord) => rec.rounds.filter(one => one.phase 
 /** Probe A: the P1 is left unanswered twice, so the post-PR review blocks on the same head. */
 const toBlocked = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = '**P1** SQL injection') => {
   await toTriage($, w, body)
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
   expect((await recordOf(w)).postStatus).toBe('blocked')
 }
 
@@ -1062,11 +1062,11 @@ test('R37: resuming a blocked post-PR review re-opens triage; a security rebutta
   // The ticker sends the prompt once the command has returned.
   expect(w.prompts.at(-1)).toContain('resumed on the same head')
   expect(w.prompts.at(-1)).toContain('G2-1 in thread 11')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
   expect((await recordOf(w)).replies['inline:11']).toBe('995')
   expect((await runOf(w)).phase).toBe('verify')
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   expect(postRounds(rec)).toBe(before)
@@ -1079,7 +1079,7 @@ test('R37: a deferred P2 answered on resume ends awaiting the person\'s decision
   const before = postRounds(await recordOf(w))
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
   const rec = await recordOf(w)
   // R39: a deferral is an answer, but only the person's waiver lets it into the merge.
   expect(rec.phase).not.toBe('ready')
@@ -1091,8 +1091,8 @@ test('R37: a deferred P2 answered on resume ends awaiting the person\'s decision
 test('M2: a rebuttal Codex rejects is reported as rejected, not as unanswered', async ($, on) => {
   const w = world(on)
   await toTriage($, w)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'reachable from /search' }))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'reachable from /search' }))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('Codex did not accept the rebuttal of G2-1: reachable from /search')
   expect(said).not.toContain('with no fix or rebuttal')
@@ -1115,8 +1115,8 @@ test('R38: one reply of this machine answers one reviewer comment in its thread'
 test('M3: resuming a post-PR record reports the post-PR status', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
   const said = await $.command.run(cmd('resume'))
   expect(JSON.stringify(said)).toContain('post-PR review')
   expect(JSON.stringify(said)).not.toContain('pre-PR gate stands')
@@ -1127,7 +1127,7 @@ test('M3: resuming a post-PR record reports the post-PR status', async ($, on) =
 test('R39: a deferred P3 after the PR opened is not ready, and the merge is held naming it', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
   const rec = await recordOf(w)
   expect(rec.phase).not.toBe('ready')
   expect(rec.postStatus).toBe('awaiting-decision')
@@ -1142,10 +1142,10 @@ test('R39: a rebutted P2 that Codex accepts reaches ready', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   const spawned = w.spawned.length
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
   expect((await recordOf(w)).phase).not.toBe('ready')
   expect(w.spawned).toHaveLength(spawned + 1)
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
@@ -1153,8 +1153,8 @@ test('R39: a rebutted P2 that Codex accepts reaches ready', async ($, on) => {
 test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'fine as is', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'G2-1: the name misleads' }))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'fine as is', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'G2-1: the name misleads' }))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
   expect(rec.phase).not.toBe('ready')
@@ -1164,8 +1164,8 @@ test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
 test('R39: a pre-PR deferred advisory carried into the PR holds the merge', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
-  await $.turn.complete(turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'out of scope' }] })}`))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'out of scope' }] })}`))
   expect((await recordOf(w)).preStatus).toBe('passed')
   await $.tool.call(createPr)
   await w.clock.advance(21 * 60_000)
@@ -1196,9 +1196,9 @@ const bothRebutted = triaged('r2-triage', [
 test('R41: two rebuttals get one verdict each, and are settled independently', async ($, on) => {
   const w = world(on)
   await toTwo($, w)
-  await $.turn.complete(bothRebutted)
+  await done($, bothRebutted)
   expect(w.spawned.at(-1)?.prompt).toContain('"verdicts"')
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': true, 'G2-2': 'G2-2: no guard on /search' }))
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': 'G2-2: no guard on /search' }))
   const rec = await recordOf(w)
   const one = rec.findings.find(f => f.id === 'G2-1')
   const two = rec.findings.find(f => f.id === 'G2-2')
@@ -1215,8 +1215,8 @@ test('R41: two rebuttals get one verdict each, and are settled independently', a
 test('R41: a verdict missing for one id holds that id only', async ($, on) => {
   const w = world(on)
   await toTwo($, w)
-  await $.turn.complete(bothRebutted)
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': true }))
+  await done($, bothRebutted)
+  await done($, accept('r2-verify', w, { 'G2-1': true }))
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'G2-1')?.history.at(-1)?.by).toBe('codex')
   const two = rec.findings.find(f => f.id === 'G2-2')
@@ -1230,15 +1230,15 @@ test('R40: rebut, reject, rebut again costs one Codex check, and the dispute goe
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   const spawned = w.spawned.length
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
   // After one rejection, the agent's step offers only fix or defer.
   expect(w.prompts.at(-1)).toContain('fix or defer G2-1')
   expect(w.prompts.at(-1)).not.toContain('fix or rebut G2-1')
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
   expect(w.prompts.at(-1)).toContain('fix it or defer it')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
   expect(w.spawned).toHaveLength(spawned + 1)
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('rebutted')
@@ -1256,8 +1256,8 @@ test('R40: rebut, reject, rebut again costs one Codex check, and the dispute goe
 test('a re-check flag is cleared only for this run\'s answers: an accepted rebuttal whose file a later fix touched is checked again', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'the name is the API\'s', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
   const ready = await recordOf(w)
   expect(ready.phase).toBe('ready')
   const g1 = ready.findings[0]!
@@ -1270,7 +1270,7 @@ test('a re-check flag is cleared only for this run\'s answers: an accepted rebut
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
   w.git.changed = 'src/app.ts'
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-2', action: 'fixed', note: 'guarded' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-2', action: 'fixed', note: 'guarded' }]))
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'G2-1')?.needsRecheck).toBe(true)
   expect(mergeHolds(rec).map(f => f.id)).toContain('G2-1')
@@ -1282,8 +1282,8 @@ test('a record that goes ready keeps no stale message', async ($, on) => {
   expect((await recordOf(w)).message).toBeDefined()
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   expect(rec.message).toBeUndefined()
@@ -1292,9 +1292,9 @@ test('a record that goes ready keeps no stale message', async ($, on) => {
 test('R44: before the PR, a rebuttal Codex accepts stays rebutted with Codex\'s entry, settles the gate, and lapses on a file change', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'validated at :10' }] })}`))
-  await $.turn.complete(turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'rebutted', note: 'validated at :10' }] })}`))
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
   const rec = await recordOf(w)
   const one = rec.findings.find(f => f.id === 'R1-1')!
   expect(one.status).toBe('rebutted')
@@ -1307,11 +1307,11 @@ test('R44: before the PR, a rebuttal Codex accepts stays rebutted with Codex\'s 
 test('R40: a dispute a later Codex review rules on stays the person\'s', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // Someone pushes; no reviewer covers the new head, so Codex reviews it and holds G2-1 again.
   w.git.head = 'e'.repeat(40)
@@ -1320,7 +1320,7 @@ test('R40: a dispute a later Codex review rules on stays the person\'s', async (
   await w.clock.advance(21 * 60_000)
   expect((await runOf(w)).phase).toBe('review')
   expect(w.spawned.at(-1)?.prompt).not.toContain('G2-1')
-  await $.turn.complete(turn(review('r3-review', 'PASS', [], { held: ['G2-1'] }), `agent-${w.spawned.length}`))
+  await done($, turn(review('r3-review', 'PASS', [], { held: ['G2-1'] }), `agent-${w.spawned.length}`))
   const one = (await recordOf(w)).findings.find(f => f.id === 'G2-1')
   expect(one?.status).toBe('rebutted')
   expect(one?.history.at(-1)?.by).toBe('main')
@@ -1329,7 +1329,7 @@ test('R40: a dispute a later Codex review rules on stays the person\'s', async (
 test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // Someone pushes; no reviewer covers the new head, so Codex reviews it and calls G2-1 verified.
   w.git.head = 'e'.repeat(40)
@@ -1338,7 +1338,7 @@ test('R45: a deferral a later Codex review calls verified stays deferred, and th
   await w.clock.advance(21 * 60_000)
   expect((await runOf(w)).phase).toBe('review')
   expect(w.spawned.at(-1)?.prompt).not.toContain('G2-1')
-  await $.turn.complete(turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  await done($, turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('deferred')
   expect(rec.phase).not.toBe('ready')
@@ -1348,8 +1348,8 @@ test('R45: a deferral a later Codex review calls verified stays deferred, and th
 test('R46: a P2 rebuttal with an unreadable verdict gives the agent /pr-gate resume, not the person', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
-  await $.turn.complete(turn(`v\n${TRAILER}\n{"step":"r2-verify","verdicts":"maybe"}`, `agent-${w.spawned.length}`))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  await done($, turn(`v\n${TRAILER}\n{"step":"r2-verify","verdicts":"maybe"}`, `agent-${w.spawned.length}`))
   expect((await recordOf(w)).postStatus).toBe('blocked')
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('is held')
@@ -1392,9 +1392,9 @@ test('only the person waives, allows or resets', async ($, on) => {
 test('exhaustion is distinct from passing, and the person can allow one more round', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   expect((await recordOf(w)).preStatus).toBe('exhausted')
   expect((await runOf(w)).status).toBe('exhausted')
   const before = w.spawned.length
@@ -1404,14 +1404,12 @@ test('exhaustion is distinct from passing, and the person can allow one more rou
 })
 
 test('fix commits and a session restart keep the budget and the history', async ($, on) => {
-  const w = world(on, { canRestart: true })
+  const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  // This world reads the run through a hook (it can restart): the fix prompt is armed a moment after it is sent.
-  await w.clock.advance(1000)
-  await $.turn.complete(turn(fixed('R1-1')))
-  await $.turn.complete(turn(review('r2-review', 'PASS'), 'agent-2'))
+  await done($, turn(fixed('R1-1')))
+  await done($, turn(review('r2-review', 'PASS'), 'agent-2'))
   await $.tool.call(createPr)
   const before = await recordOf(w)
   // A new session: the session state is gone, the store is not.
@@ -1424,9 +1422,9 @@ test('fix commits and a session restart keep the budget and the history', async 
 })
 
 test('a restart during triage neither re-triages nor replies twice', async ($, on) => {
-  const w = world(on, { canRestart: true })
+  const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-triage', dispositions: [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }] })}`))
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-triage', dispositions: [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }] })}`))
   w.clearState()
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
   // The new session goes on collecting the PR's reviews.
@@ -1436,11 +1434,11 @@ test('a restart during triage neither re-triages nor replies twice', async ($, o
 })
 
 test('a session start leaves a ready, held or awaiting record alone', async ($, on) => {
-  const w = world(on, { canRestart: true })
+  const w = world(on)
   await toBlocked($, w, 'Consider renaming this')
   await say($, 'resume')
   await w.clock.advance(1000)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   const prompts = w.prompts.length
   const spawned = w.spawned.length
@@ -1455,7 +1453,7 @@ test('a session start leaves a ready, held or awaiting record alone', async ($, 
 /** Probe: a deferred finding after the PR opened leaves the record awaiting the person's decision. */
 const toAwaiting = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = 'Consider renaming this', extra: object = {}) => {
   await toTriage($, w, body)
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', ...extra }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', ...extra }]))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
 }
 
@@ -1490,8 +1488,8 @@ test('waiving the last deferral makes the record ready, delivers the ready promp
 test('a finding waiver for an id that does not exist, or one already settled, is refused', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect((await say($, 'waive G9-9 because')).text).toContain('no finding G9-9')
   expect((await say($, 'waive G2-1 because')).text).toContain('G2-1 is already settled')
@@ -1529,8 +1527,8 @@ test('a deferred security P1 is released only by a waiver naming it, not by waiv
 test('before the PR, waiving a deferred blocker lets the gate pass', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
-  await $.turn.complete(turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'needs the auth service' }] })}`))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'needs the auth service' }] })}`))
   expect((await recordOf(w)).preStatus).toBe('blocked')
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   expect((await say($, 'waive R1-1 tracked in KAN-7')).text).toBe('/pr-gate waived R1-1 for feat/x: tracked in KAN-7.')
@@ -1541,7 +1539,7 @@ test('before the PR, waiving a deferred blocker lets the gate pass', async ($, o
 test('reset archives the record, and an archived record lets nothing through', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   expect((await recordOf(w)).preStatus).toBe('passed')
   expect((await say($, 'reset')).text).toContain('archived')
   expect((await recordOf(w)).phase).toBe('archived')
@@ -1568,9 +1566,9 @@ test('status names the phase, the budget, the baseline and what is open', async 
 test('the pre-PR held texts name the waiver the parser takes', { options: { allowanceStandard: 1, onExhausted: 'stop' } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   expect(w.prompts.at(-1)).toContain('/pr-gate waive pre <reason>')
   const held = (await $.tool.call(createPr)).deny ?? ''
   expect(held).toContain('/pr-gate waive pre <reason>')
@@ -1580,9 +1578,9 @@ test('the pre-PR held texts name the waiver the parser takes', { options: { allo
 test('R49: a security P1 on a spent allowance offers its own waiver, not a pre waiver', { options: { allowanceStandard: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, title: 'SQL injection in search' }])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('/pr-gate waive R1-1 <reason>')
   expect(said).toContain('/pr-gate allow 1 <reason>')
@@ -1596,8 +1594,8 @@ test('R49: a security P1 on a spent allowance offers its own waiver, not a pre w
 test('R47: reset keeps the old record under its own key, and the fresh lifecycle answers no old feedback again', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
-  await $.turn.complete(accept('r2-verify', w))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
   const before = await recordOf(w)
   const triages = w.prompts.filter(one => one.includes('New review feedback')).length
   await say($, 'reset')
@@ -1618,9 +1616,9 @@ test('R47: reset keeps the old record under its own key, and the fresh lifecycle
 test('R48: waiving the only hold of a held pre-PR gate sends the agent to open the PR', { options: { allowanceStandard: 1, onExhausted: 'stop' } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   expect((await recordOf(w)).preStatus).toBe('exhausted')
   const opens = () => w.prompts.filter(one => one.includes('Now open the pull request')).length
   expect(opens()).toBe(0)
@@ -1644,8 +1642,8 @@ test('R48: a pre waiver sends the agent to open the PR', async ($, on) => {
 test('R49: a deferred blocker before the PR names the person with its own waiver, and offers no allow', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
-  await $.turn.complete(turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'needs the auth service' }] })}`))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(`Deferred.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'deferred', note: 'needs the auth service' }] })}`))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('/pr-gate waive R1-1 <reason>')
   expect(said).not.toContain('allow')
@@ -1661,9 +1659,9 @@ test('R49: a deferred blocker before the PR names the person with its own waiver
 test('R49: a plain blocked round before the PR gives the agent its step and does not name the person', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
-  await $.turn.complete(turn('Tried.'))
-  await $.turn.complete(turn('Tried.'))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('Your next step: fix or rebut R1-1, then /pr-gate resume')
   expect(said).not.toContain('person')
@@ -1693,16 +1691,16 @@ test('R50: a finding waiver lapses when the finding\'s file changes', async ($, 
 test('a finding waived while its round runs is not asked about again', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
   await say($, 'waive R1-2 out of scope')
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('R1-1')))
+  await done($, turn(fixed('R1-1')))
   expect(w.prompts.some(one => one.includes('have no answer yet'))).toBe(false)
   expect((await runOf(w)).phase).not.toBe('fix')
 })
 
 test('a new session resumes a post-PR review that stopped on an error, and leaves a stopped one alone', async ($, on) => {
-  const w = world(on, { canRestart: true })
+  const w = world(on)
   await toPost($, w)
   w.gh.isAuthed = false
   await w.clock.advance(30_000)
@@ -1717,4 +1715,33 @@ test('a new session resumes a post-PR review that stopped on an error, and leave
   w.clearState()
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
   expect(w.run).toBeUndefined()
+})
+
+// ------------------------------------------------------------- task 13 fix round 1 (R51)
+
+test('R51: a main turn that ends before the triage turn starts is not the answer, and asks nothing again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const asked = w.prompts.length
+  // A turn already running when the prompt was sent: its text is someone else's, and it ends first.
+  await $.turn.start({ text: 'refactor the parser', turnId: 'turn-before' })
+  await $.turn.complete({ ...triaged('r2-triage', []), turnId: 'turn-before' })
+  expect((await runOf(w)).phase).toBe('triage')
+  expect(w.prompts).toHaveLength(asked)
+  // The step's own turn starts with its prompt, and its answer counts.
+  await $.turn.start({ text: w.prompts.at(-1) ?? '', turnId: 'turn-triage' })
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', note: 'parameterised', replyId: '991' }]), turnId: 'turn-triage' })
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('reported-fixed')
+})
+
+test('R51: a main turn that ends before the fix turn starts is not the fix', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await $.turn.start({ text: 'something else', turnId: 'turn-before' })
+  await $.turn.complete({ ...turn(fixed('R1-1')), turnId: 'turn-before' })
+  const run = await runOf(w)
+  expect(run.phase).toBe('fix')
+  expect(run.findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  expect(w.prompts.some(one => one.includes('have no answer yet'))).toBe(false)
 })

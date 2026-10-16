@@ -395,19 +395,14 @@ async function beginFix($: Engine, id: string, notes: string | undefined, kind: 
     await patch($, id, run => ({ ...run, pending: [{ role: 'fix', step: stepOf(run, 'fix'), agentId }], activity: 'waiting on the fixer…' }))
     return
   }
-  // The prompt waits for the session to go idle; it is armed once its turn starts,
-  // so a turn already running when the findings came in is never read as the fix.
+  // The prompt waits for the session to go idle. The step is armed by the main-loop turn that starts with this prompt
+  // (`onTurnStart`, R51), so a turn already running when the findings came in is never read as the fix.
   void $.prompt
     .submit({ text: prompt })
     .then(async entered => {
       if ('drop' in entered && typeof entered.drop === 'string') {
         await finish($, id, 'error', `The findings could not be sent to the main agent: ${entered.drop}`)
-        return
       }
-      await patch($, id, run => (run.phase === 'fix' ? { ...run, pending: run.pending.map(one => ({ ...one, isArmed: true })) } : run))
-      // The step's clock starts with the turn, not with the wait for the session to go idle.
-      const startedAt = await $.clock.now()
-      await patch($, id, run => (run.phase === 'fix' ? { ...run, phaseStartedAt: startedAt } : run))
     })
     .catch(() => undefined)
 }
@@ -810,19 +805,17 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   await askTriage($, id, triagePrompt(opened, rec, listed, others, { carried, codex, codexRange }))
 }
 
-/** Sends the triage prompt; it is armed once its turn starts, so a turn already running is never read as the answer. */
+/**
+ * Sends the triage prompt. The step is armed by the main-loop turn that starts with it (`onTurnStart`, R51), so a turn
+ * already running is never read as the answer.
+ */
 async function askTriage($: Engine, id: string, text: string): Promise<void> {
   void $.prompt
     .submit({ text })
     .then(async entered => {
       if ('drop' in entered && typeof entered.drop === 'string') {
         await finish($, id, 'error', `The reviews could not be sent to the main agent: ${entered.drop}`)
-        return
       }
-      const startedAt = await $.clock.now()
-      await patch($, id, one =>
-        one.phase === 'triage' ? { ...one, phaseStartedAt: startedAt, pending: one.pending.map(each => ({ ...each, isArmed: true })) } : one,
-      )
     })
     .catch(() => undefined)
 }
@@ -1556,18 +1549,41 @@ async function afterVerify($: Engine, run: Run): Promise<void> {
   else await beginFix($, run.id, verdict.notes ?? 'The fix does not settle the findings.')
 }
 
+// The main loop's turn in progress, from its `turn.start` to its `turn.complete`: what a main-agent tool call belongs to.
+let mainTurn: string | undefined
+
+/** Whether a pending step is the one this event's loop and turn answer: a sub-agent by its id, the main agent by its own turn (R51). */
+export const isTurnOf = (one: Pending, agentId: string | undefined, turnId: string | undefined = mainTurn): boolean =>
+  one.isMain === true ? agentId === undefined && one.turnId !== undefined && one.turnId === turnId : one.agentId !== undefined && one.agentId === agentId
+
+/**
+ * A main-loop turn started. When its text carries the step marker of a main-agent step still waiting (the `"step":"…"` every
+ * step prompt embeds), that turn is the step's own: only its completion is the answer, and the step's clock starts now (R51).
+ */
+export async function onTurnStart($: Engine, agentId: string | undefined, turnId: string, text: string): Promise<void> {
+  if (agentId !== undefined) return
+  mainTurn = turnId
+  const run = await getRun($)
+  if (run === null || run.status !== 'running') return
+  const isStep = (one: Pending): boolean => one.isMain === true && one.answer === undefined && text.includes(`"step":"${one.step}"`)
+  if (!run.pending.some(isStep)) return
+  const now = await $.clock.now()
+  await patch($, run.id, one => ({ ...one, phaseStartedAt: now, pending: one.pending.map(each => (isStep(each) ? { ...each, turnId } : each)) }))
+}
+
 /** One agent's turn ended: record its answer, and move on once the step's agents are all in. */
-export async function onAnswer($: Engine, agentId: string | undefined, answer: string, reason: string): Promise<void> {
+export async function onAnswer($: Engine, agentId: string | undefined, answer: string, reason: string, turnId?: string): Promise<void> {
+  if (agentId === undefined && turnId === mainTurn) mainTurn = undefined
   const run = await getRun($)
   if (run === null || run.status !== 'running') {
     isLive = false
     return
   }
   // A sub-agent is known by the id the engine gave it, or by the step it names in its
-  // trailer; the main agent by the turn that began once its prompt had entered.
+  // trailer; the main agent by the turn that began with its step's prompt (R51).
   const named = readTrailer(answer)?.step
   const isMine = (one: Pending): boolean =>
-    one.isMain === true ? agentId === undefined && one.isArmed === true : one.agentId !== undefined ? one.agentId === agentId : named === one.step
+    one.isMain === true ? isTurnOf(one, agentId, turnId) : one.agentId !== undefined ? one.agentId === agentId : named === one.step
   if (!run.pending.some(isMine)) return
   if (reason === 'aborted') {
     await finish($, run.id, 'stopped', `The ${run.phase} step was interrupted.`)

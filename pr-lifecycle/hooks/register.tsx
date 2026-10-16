@@ -39,8 +39,10 @@ import {
   heldReason,
   holdingPrompts,
   isLiveNow,
+  isTurnOf,
   markPr,
   onAnswer,
+  onTurnStart,
   PANE,
   patch,
   say,
@@ -713,9 +715,8 @@ export const register: Register = (on, options) => {
           setLive(false)
           return
         }
-        const who = run.pending.find(one =>
-          one.isMain === true ? e.agentId === undefined && one.isArmed === true : one.agentId !== undefined && one.agentId === e.agentId,
-        )
+        // The main agent's call belongs to its step's own turn (R51); a sub-agent's to its id.
+        const who = run.pending.find(one => isTurnOf(one, e.agentId))
         if (who === undefined) return
         const activity = activityOf(who.role, String(e.tool), e as unknown as Record<string, unknown>)
         if (activity !== run.activity) await patch($, run.id, one => ({ ...one, activity }))
@@ -747,11 +748,18 @@ export const register: Register = (on, options) => {
     }
   })
 
+  // A main-loop turn that starts with a step's prompt is that step's own turn (R51).
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (isLiveNow()) await onTurnStart($, e.agentId, e.turnId, e.text).catch(() => undefined)
+    return started
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (isLiveNow()) {
       try {
-        await onAnswer($, e.agentId, e.answer, e.reason)
+        await onAnswer($, e.agentId, e.answer, e.reason, e.turnId)
       } catch (error) {
         const run = await getRun($)
         if (run !== null && run.status === 'running') {

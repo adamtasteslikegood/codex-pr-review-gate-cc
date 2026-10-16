@@ -1,4 +1,5 @@
 import { mock } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Run } from '../types'
@@ -66,8 +67,27 @@ export type World = {
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
 
+// The world a test made last: the host starts the main agent's turn with the prompt that was sent last.
+let latest: World | undefined
+let turns = 0
+
+type Dispatch = Parameters<TestBody>[0]
+type Ended = Parameters<Dispatch['turn']['complete']>[0]
+
+/**
+ * A turn of an agent's loop ends with `t`. The main agent's turn starts first, with the last prompt the mod sent as its
+ * text, as the host runs a submitted prompt; each gets its own id. A sub-agent's turn only ends.
+ */
+export async function done($: Dispatch, t: Ended): Promise<unknown> {
+  if (t.agentId !== undefined) return $.turn.complete(t)
+  turns += 1
+  const turnId = `${t.turnId}-${turns}`
+  await $.turn.start({ text: latest?.prompts.at(-1) ?? '', turnId })
+  return $.turn.complete({ ...t, turnId })
+}
+
 /** Everything beneath the mod: git, the agents, the main agent's prompt queue. */
-export function world(on: On, { canRestart = false } = {}): World {
+export function world(on: On): World {
   const clock = mock.clock(on, { now: 1_000 })
   const w: World = {
     spawned: [],
@@ -107,14 +127,16 @@ export function world(on: On, { canRestart = false } = {}): World {
     stored: (key: string) => w.store.get(key),
     clock,
     clearState: () => {
-      if (!canRestart) throw new Error('clearState needs world(on, { canRestart: true })')
       isCleared = true
       w.run = undefined
     },
   }
   let isCleared = false
-  // Only where a test restarts the session: a read hook on the run adds a hop to every read of it, which the other tests' timing does not expect.
-  if (canRestart) on('state.get', RUN, (_$, e, next) => (isCleared ? next(e).then(read => (read.value === undefined ? read : { value: { ...read.value, value: null } })) : next(e)))
+  latest = w
+  // A new session reads no run until the mod writes one. Since steps are armed by their own turn (R51), the hop this adds to each read is harmless.
+  on('state.get', RUN, (_$, e, next) =>
+    isCleared ? next(e).then(read => (read.value === undefined ? read : { value: { ...read.value, value: null } })) : next(e),
+  )
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
   on('store.set', (_$, e) => {
     w.store.set(e.key, e.value)
@@ -189,6 +211,7 @@ export function world(on: On, { canRestart = false } = {}): World {
     return { result: { stdout: 'https://github.com/me/repo/pull/1', stderr: '', interrupted: false } as never }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))

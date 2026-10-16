@@ -47,8 +47,8 @@ export type Pending = {
   agentId?: string
   /** True for the main agent, which has no id. */
   isMain?: true
-  /** Main agent only: true once its turn has started. */
-  isArmed?: boolean
+  /** Main agent only: the main-loop turn that began with this step's prompt (its step marker in the turn's text, R51). */
+  turnId?: string
   answer?: string
 }
 

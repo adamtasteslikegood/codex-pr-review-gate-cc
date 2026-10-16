@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { createPr, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import type { LifecycleRecord } from '../types'
 
@@ -17,7 +17,7 @@ test('a PR to a gated base is held and starts the gate; a clean review opens it'
   expect(w.spawned[0]?.prompt).toContain('args "review --effort medium"')
   expect(w.spawned[0]?.prompt).toContain('GSTACK_CODEX_EFFORT=medium')
 
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   const run = await runOf(w)
   expect(run.status).toBe('passed')
   expect(w.prompts.at(-1)).toContain('open the pull request to dev')
@@ -35,7 +35,7 @@ test('a PR to a gated base is held and starts the gate; a clean review opens it'
 test('a blocking finding goes to the main agent, then Codex reviews again', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
 
   let run = await runOf(w)
   expect(run.phase).toBe('fix')
@@ -43,7 +43,7 @@ test('a blocking finding goes to the main agent, then Codex reviews again', asyn
   expect(w.prompts[0]).toContain('R1-1 [P1] Unvalidated redirect')
 
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(
+  await done($, 
     turn(
       `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed', note: 'allow-list' }, { id: 'R1-2', action: 'rebutted', note: 'the name is the API' }] })}`,
     ),
@@ -54,7 +54,7 @@ test('a blocking finding goes to the main agent, then Codex reviews again', asyn
   expect(run.findings[0]?.status).toBe('reported-fixed')
   expect(w.spawned).toHaveLength(2)
 
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(review('r2-review', 'PASS')))
   run = await runOf(w)
   expect(run.status).toBe('passed')
   expect(run.headSha).toBe('d'.repeat(40))
@@ -64,11 +64,11 @@ test('the shared allowance (4) without agreement ends the pre-PR gate as exhaust
   const w = world(on)
   await $.tool.call(createPr)
   for (let round = 1; round <= 4; round++) {
-    await $.turn.complete(turn(review(`r${round}-review`, 'FAIL', [P1])))
+    await done($, turn(review(`r${round}-review`, 'FAIL', [P1])))
     w.git.head = String(round).repeat(40)
     // No answer, then none to the one re-prompt: the finding stays open and the round ends.
-    await $.turn.complete(turn('Tried.'))
-    await $.turn.complete(turn('Tried.'))
+    await done($, turn('Tried.'))
+    await done($, turn('Tried.'))
   }
   const run = await runOf(w)
   expect(run.status).toBe('exhausted')
@@ -86,7 +86,7 @@ const fixed = (step: string, dispositions: object[]) => `Done.\n${TRAILER}\n${JS
 test('advisory findings go to the main agent once nothing blocks, then Codex looks again', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
   let run = await runOf(w)
   expect(run.status).toBe('running')
   expect(run.phase).toBe('fix')
@@ -95,12 +95,12 @@ test('advisory findings go to the main agent once nothing blocks, then Codex loo
   expect(w.prompts[0]).toContain('R1-1 [P2] Rename this')
 
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed', note: 'renamed' }])))
+  await done($, turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed', note: 'renamed' }])))
   run = await runOf(w)
   expect(run.round).toBe(2)
   expect(run.phase).toBe('review')
 
-  await $.turn.complete(turn(review('r2-review', 'PASS')))
+  await done($, turn(review('r2-review', 'PASS')))
   run = await runOf(w)
   expect(run.status).toBe('passed')
   expect(recordOf(w).rounds.filter(one => one.isCompleted)).toHaveLength(2)
@@ -113,11 +113,11 @@ test('advisory re-reviews stop when the reserve rule would leave no round; the l
   const w = world(on)
   await $.tool.call(createPr)
   for (let round = 1; round <= 3; round++) {
-    await $.turn.complete(turn(review(`r${round}-review`, 'PASS', [P2])))
+    await done($, turn(review(`r${round}-review`, 'PASS', [P2])))
     // Every round's advisories go to the fixer, the last one's included.
     expect((await runOf(w)).phase).toBe('fix')
     w.git.head = String(round).repeat(40)
-    await $.turn.complete(turn(fixed(`r${round}-fix`, [{ id: `R${round}-1`, action: 'fixed' }])))
+    await done($, turn(fixed(`r${round}-fix`, [{ id: `R${round}-1`, action: 'fixed' }])))
   }
   // Three rounds used, one left: an advisory round would leave none in reserve, so Codex does not look again.
   const run = await runOf(w)
@@ -130,8 +130,8 @@ test('advisory re-reviews stop when the reserve rule would leave no round; the l
 test('an advisory rebuttal with no new commit opens the PR without another round', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
-  await $.turn.complete(turn(fixed('r1-fix', [{ id: 'R1-1', action: 'rebutted', note: 'the name is the API' }])))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(fixed('r1-fix', [{ id: 'R1-1', action: 'rebutted', note: 'the name is the API' }])))
   const run = await runOf(w)
   expect(run.status).toBe('passed')
   expect(recordOf(w).rounds.filter(one => one.isCompleted)).toHaveLength(1)
@@ -142,10 +142,10 @@ test('an advisory rebuttal with no new commit opens the PR without another round
 test('an advisory fix that adds a blocking finding goes back to the blocking rounds', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }])))
-  await $.turn.complete(turn(review('r2-review', 'FAIL', [P1])))
+  await done($, turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }])))
+  await done($, turn(review('r2-review', 'FAIL', [P1])))
   const run = await runOf(w)
   expect(run.phase).toBe('fix')
   expect(run.fixKind).toBe('blocking')
@@ -155,7 +155,7 @@ test('an advisory fix that adds a blocking finding goes back to the blocking rou
 test('a Codex timeout reruns the round one effort lower, and fails closed below low', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(`Codex stalled.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"timeout"}`, 'agent-1'))
+  await done($, turn(`Codex stalled.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"timeout"}`, 'agent-1'))
   let run = await runOf(w)
   expect(run.status).toBe('running')
   expect(run.round).toBe(1)
@@ -163,7 +163,7 @@ test('a Codex timeout reruns the round one effort lower, and fails closed below 
   expect(w.spawned).toHaveLength(2)
   expect(w.spawned[1]?.prompt).toContain('args "review --effort low"')
 
-  await $.turn.complete(turn(`Timed out again.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR"}`, 'agent-2'))
+  await done($, turn(`Timed out again.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR"}`, 'agent-2'))
   run = await runOf(w)
   expect(run.status).toBe('error')
   expect(run.message).toContain('lowest')
@@ -175,13 +175,13 @@ test('the next run on a branch that timed out at low effort stays at low', async
   await $.tool.call(createPr)
   expect(w.spawned[0]?.prompt).toContain('args "review --effort high"')
   const timeout = (step: string, id: string) => turn(`${TRAILER}\n{"step":"${step}","gate":"ERROR","error":"timeout"}`, id)
-  await $.turn.complete(timeout('r1-review', 'agent-1'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  await done($, timeout('r1-review', 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
   expect((await runOf(w)).effort).toBe('medium')
-  await $.turn.complete(timeout('r1-review', 'agent-3'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-4'))
-  await $.turn.complete(timeout('r1-review', 'agent-5'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-6'))
+  await done($, timeout('r1-review', 'agent-3'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-4'))
+  await done($, timeout('r1-review', 'agent-5'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-6'))
   expect((await runOf(w)).status).toBe('error')
 
   await $.command.run({
@@ -200,10 +200,10 @@ test('a branch keeps the effort a review last completed at after a timeout', asy
   const rerun = () =>
     $.command.run({ command: 'pr-gate', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
   await $.tool.call(createPr)
-  await $.turn.complete(turn(`${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"timeout"}`, 'agent-1'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-2'))
-  await $.turn.complete(turn(review('r1-review', 'PASS'), 'agent-3'))
-  await $.turn.complete(turn(review('r1-challenge', 'PASS'), 'agent-4'))
+  await done($, turn(`${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"timeout"}`, 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  await done($, turn(review('r1-review', 'PASS'), 'agent-3'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-4'))
   expect((await runOf(w)).status).toBe('passed')
 
   // Passed at medium after a timeout at high: the next round, on a new commit, starts at medium.
@@ -211,8 +211,8 @@ test('a branch keeps the effort a review last completed at after a timeout', asy
   await rerun()
   expect(w.spawned).toHaveLength(6)
   expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
-  await $.turn.complete(turn(review('r2-review', 'PASS'), `agent-${w.spawned.length - 1}`))
-  await $.turn.complete(turn(review('r2-challenge', 'PASS'), `agent-${w.spawned.length}`))
+  await done($, turn(review('r2-review', 'PASS'), `agent-${w.spawned.length - 1}`))
+  await done($, turn(review('r2-challenge', 'PASS'), `agent-${w.spawned.length}`))
   expect((await runOf(w)).status).toBe('passed')
   // And keeps it on the round after that.
   w.git.head = 'f'.repeat(40)
@@ -225,7 +225,7 @@ test('a branch that passed at its default effort starts at high once it grows in
   const w = world(on)
   await $.tool.call(createPr)
   expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   expect((await runOf(w)).status).toBe('passed')
   // The branch grows: a new commit touches a high blast-radius path.
   w.git.head = 'e'.repeat(40)
@@ -237,7 +237,7 @@ test('a branch that passed at its default effort starts at high once it grows in
 test('a review that did not complete fails closed', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(`Codex could not authenticate.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"other"}`))
+  await done($, turn(`Codex could not authenticate.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR","error":"other"}`))
   const run = await runOf(w)
   expect(run.status).toBe('error')
   expect(w.prompts).toHaveLength(0)
@@ -252,13 +252,13 @@ test('a high blast-radius change runs review and challenge in parallel and revie
   expect(w.spawned.every(one => !/args "\w+ --(xhigh|effort xhigh)/.test(one.prompt))).toBe(true)
   expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(["--effort high", "--effort high"])
 
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   expect((await runOf(w)).phase).toBe('review')
-  await $.turn.complete(turn(review('r1-challenge', 'FAIL', [P1])))
+  await done($, turn(review('r1-challenge', 'FAIL', [P1])))
   expect((await runOf(w)).phase).toBe('fix')
 
   w.git.head = 'e'.repeat(40)
-  await $.turn.complete(turn(`Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }] })}`))
+  await done($, turn(`Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }] })}`))
   const run = await runOf(w)
   expect(run.phase).toBe('verify')
   expect(w.spawned.at(-1)?.description).toBe('codex-gate r1 verify')
@@ -285,12 +285,12 @@ test('a chore/ branch gets one Codex round at low effort; its fix is reviewed af
   w.git.branch = 'chore/tidy-KAN-9'
   await $.tool.call(createPr)
   expect(w.spawned[0]?.prompt).toContain('args "review --effort low"')
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
   // A blocker is always fixed inside its round.
   expect((await runOf(w)).phase).toBe('fix')
   expect(w.prompts.at(-1)).toContain('R1-1 [P1] Unvalidated redirect')
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'fixed' }])))
+  await done($, turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'fixed' }])))
   expect((w.stored('lifecycle:/repo:chore/tidy-KAN-9') as LifecycleRecord).preStatus).toBe('exhausted')
   expect(w.prompts.at(-1)).toContain('open the pull request to dev')
   const run = await runOf(w)
@@ -305,11 +305,11 @@ test('a chore/ branch with only advisories opens the PR without an advisory roun
   const w = world(on)
   w.git.branch = 'chore/tidy-KAN-9'
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS', [P2])))
+  await done($, turn(review('r1-review', 'PASS', [P2])))
   // The advisory is fixed inside the round; the light lane has no round left for Codex to look again.
   expect((await runOf(w)).phase).toBe('fix')
   w.git.head = 'd'.repeat(40)
-  await $.turn.complete(turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }])))
+  await done($, turn(fixed('r1-fix', [{ id: 'R1-1', action: 'fixed' }])))
   expect((await runOf(w)).status).toBe('passed')
   expect(w.spawned).toHaveLength(1)
   expect(w.prompts).toHaveLength(2)
@@ -357,7 +357,7 @@ test('a promotion between gated bases is not gated', async ($, on) => {
 test('a docs-only commit after the pass rides on it; a code commit does not', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await done($, turn(review('r1-review', 'PASS')))
   w.git.head = 'f'.repeat(40)
   w.git.since = '1\t0\tCHANGELOG.md'
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
@@ -382,7 +382,7 @@ test('only the person waives the pre-PR review, and a waiver lets that commit op
 test('the pane lists the to-dos and the findings on each surface', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
-  await $.turn.complete(turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({
       plugin: 'pr-lifecycle',
