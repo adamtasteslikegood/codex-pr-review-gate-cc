@@ -15,10 +15,12 @@ nudging each one.
 
 1. An agent runs `gh pr create` (or the GitHub MCP create-PR tool) against a
    gated base (`dev`, `main`). The mod holds the call and starts the gate.
-   `/pr-gate [base]` starts it by hand. A create that names no base is
-   checked against the base GitHub will use, the repository's default branch
-   (`gh repo view`); if gh cannot read it, the create is held and the agent
-   is told to name `--base`.
+   `/pr-gate [base]` starts it by hand. A `gh pr create` that names no base
+   is checked against the base GitHub will use, the repository's default
+   branch (`gh repo view`); if gh cannot read it, the create is held and the
+   agent is told to name `--base`. REST, GraphQL and MCP creates require a
+   base, so one whose base the mod cannot read is held against the first
+   gated base.
 2. **Scope.** The diff against `origin/<base>` is sized: `trivial` (docs
    or already-reviewed changes only, Codex skipped; see below), `standard`, or
    `high` (a path matching `highRiskPaths`, over 400 changed lines, or over 25
@@ -411,7 +413,7 @@ Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
 | --- | --- | --- |
 | `allowanceStandard` | 4 | rounds for a standard change (capped at 10) |
 | `allowanceHigh` | 6 | rounds for a high blast-radius change (capped at 12) |
-| `bases` | `dev,main` | gated base branches. A base nobody named is the repository's default branch, not the first of these |
+| `bases` | `dev,main` | gated base branches. A base nobody named is the repository's default branch, not the first of these; a REST, GraphQL or MCP create whose base cannot be read is held against the first |
 | `enforce` | true | hold `gh pr create` and the GitHub MCP create-PR tool |
 | `enforceMerge` | true | hold merges until the lifecycle is done |
 | `fixer` | `main` | `main` or `subagent` |

@@ -2715,19 +2715,18 @@ test('R1-5: a create with no base is refused when the default branch cannot be r
   expect(held).toContain('--base')
   expect(held).toContain('HTTP 502')
   expect(w.spawned).toHaveLength(0)
-  const mcp = await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', owner: 'me', repo: 'repo', head: 'feat/x', title: 'x' } as never)
-  expect(mcp.deny).toContain('base')
   // With a base named, the create is gated as before.
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   expect(w.spawned).toHaveLength(1)
 })
 
-test('R1-5: an MCP create with no base is gated against the default branch', async ($, on) => {
+test('F1: an MCP create with no base is held against the first gated base: the tool requires one, so it was not read', async ($, on) => {
   const w = world(on)
   w.gh.defaultBranch = 'main'
   const held = await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', owner: 'me', repo: 'repo', head: 'feat/x', title: 'x' } as never)
   expect(isHeld(held)).toBe(true)
-  expect((await recordOf(w)).base).toBe('main')
+  expect((await recordOf(w)).base).toBe('dev')
+  expect(w.gh.calls.some(one => one.startsWith('repo view'))).toBe(false)
 })
 
 test('R1-5: a bare /pr-gate and a pre waiver with no record use the default branch', async ($, on) => {
@@ -2838,4 +2837,15 @@ test('R1-8: feedback from an author without write access is dropped; a rostered 
   expect(prompt).toContain('<reviewer-comment from="dave">')
   expect(prompt).toContain('<reviewer-comment from="claude[bot]">')
   expect((await runOf(w)).findings.some(one => one.reviewer === 'drive-by' || one.reviewer === 'carol')).toBe(false)
+})
+
+test('F1: a GraphQL or REST create whose base cannot be read is held against the first gated base, whatever the default branch', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = 'release'
+  const graphql = "gh api graphql -f query='mutation { createPullRequest(input: {baseRefName: \"dev\"}) { pullRequest { number } } }'"
+  const held = (await $.tool.call({ tool: 'Bash', command: graphql })).deny ?? ''
+  expect(held).toContain('waits for the pre-PR review')
+  expect((await recordOf(w)).base).toBe('dev')
+  expect(w.gh.calls.some(one => one.startsWith('repo view'))).toBe(false)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh api repos/me/repo/pulls --input body.json' }))).toBe(true)
 })

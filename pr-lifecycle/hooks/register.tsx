@@ -429,6 +429,9 @@ const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outsid
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
   if (config.bases.includes(branch)) return undefined
   if (action.base !== undefined) return { root, branch, base: action.base }
+  // Only gh pr create may leave the base out: REST, GraphQL and the MCP tools require one, so there a missing base is one this mod
+  // could not read, and the create is held against the first gated base, as before R1-5.
+  if (action.via !== 'gh pr create') return { root, branch, base: config.bases[0] ?? 'dev' }
   // No base named: GitHub opens it against the default branch, so that is the base the gate checks (R1-5).
   const found = await defaultBranchOf($, root, action.repo)
   if (found.name === undefined) return { noBase: found.err }
