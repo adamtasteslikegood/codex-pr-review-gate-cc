@@ -97,8 +97,11 @@ type RoundResult = {
 
 - **Pre-PR round**: Codex review (plus challenge in parallel on `high`),
   fixer answers each finding, optional verify of the fix (`fixReview`).
-  Completed when every reviewer returned a verdict and every finding of the
-  round has a disposition. A Codex timeout or missing verdict is an
+  Completed when every reviewer returned a verdict and the fix step (when
+  one ran) ended with an answer; a finding the fixer gave no disposition
+  stays `open` and is reported as unresolved. A blocker is always fixed
+  inside its round; an advisory fix runs only while the reserve rule leaves
+  a round to review it. A Codex timeout or missing verdict is an
   incomplete attempt: effort recorded, no round consumed. Timeout step-down
   and retry behave as in 0.3.1.
 - **Post-PR round**:
@@ -271,6 +274,25 @@ Guards:
   owed on a1b2c3d", "R3-2 [P1] unresolved"). A refusal never starts work.
 - Not intercepted: PRs from a branch not checked out here, other repos
   (`--repo`), promotions between gated bases.
+- Every route that opens or merges a PR goes through one pure classifier,
+  `readPrAction(tool, input)` in `github.ts`, returning `create` or `merge`
+  (merge includes merge-queue enqueue and auto-merge) or nothing:
+  - Bash: `gh pr create`, `gh pr merge` (with or without `--auto`), `gh api`
+    REST calls (`POST .../pulls`, `PUT .../pulls/{n}/merge`), and `gh api
+    graphql` with a `createPullRequest`, `mergePullRequest`,
+    `enqueuePullRequest` or `enablePullRequestAutoMerge` mutation;
+  - `mcp__plugin_github_github__create_pull_request` and `__merge_pull_request`;
+  - `mcp__claude_ai_github-graphql-mcp__manage_pull_requests` with `action`
+    `create`, `merge` or `enqueue`;
+  - fail-closed fallback: any other MCP tool whose name contains `github`
+    and whose name or `action`/`method` input reads as creating, merging or
+    enqueuing a pull request is held with a message naming the tool,
+    waivable like any hold.
+  A merge names a PR number, not a base, so the guard reads base, head
+  branch and head SHA with `gh pr view <n> --json baseRefName,headRefName,headRefOid`.
+  (Added 2026-10-16 after review found the github-graphql connector could
+  bypass both holds. `codex-gate` 0.3.1 has the same gap on create; it stays
+  frozen unless Adam asks for a fix.)
 
 Commands:
 
