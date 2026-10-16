@@ -219,10 +219,13 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (run === null || run.status !== 'running') {
     const after = (await loadRecord($, root, branch)) ?? rec
     const said = after.message === undefined ? '' : ` (${after.message})`
-    return (
-      `Nothing to review for ${branch} at ${head.slice(0, 7)}: the pre-PR gate stands at ${after.preStatus ?? 'not run'}${said}, ` +
-      `${remaining(after)} of ${after.allowance} review rounds left.`
-    )
+    // After the PR opened, the post-PR review's standing is the one that counts (M3).
+    const stands =
+      after.phase === 'pre'
+        ? `the pre-PR gate stands at ${after.preStatus ?? 'not run'}${said}`
+        : `the post-PR review of PR #${after.pr ?? '?'} stands at ${after.phase === 'ready' ? 'ready' : (after.postStatus ?? 'in progress')}` +
+          `${after.phase === 'ready' ? '' : said}`
+    return `Nothing to review for ${branch} at ${head.slice(0, 7)}: ${stands}, ${remaining(after)} of ${after.allowance} review rounds left.`
   }
   const tierNote = rec.tier === 'high' ? ' Review and challenge run in parallel, and fixes are reviewed before each new round.' : ''
   const lightNote = rec.lane === 'light' ? ` Light lane: ${branch} matches lightBranches.` : ''

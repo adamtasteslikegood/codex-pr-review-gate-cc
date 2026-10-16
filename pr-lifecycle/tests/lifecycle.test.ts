@@ -404,3 +404,29 @@ test('the triage prompt calls new commits unreviewed, not someone else\'s, and l
   expect(text).not.toContain('someone else')
   expect(text).not.toContain('New review feedback:')
 })
+
+// ------------------------------------------------------------- task 12 fix round 2
+
+test('M1: a deferred security P1 post-PR: the agent tells the person, the waiver is the person\'s option', async () => {
+  const rec = at([pre(), post({ n: 2, rebutted: 1 })], { phase: 'post', findings: [finding({ id: 'G2-1', status: 'deferred', isSecurity: true })] })
+  const next = decideNext(rec)
+  expect(next).toMatchObject({ kind: 'blocked', nextStep: 'tell the person G2-1 is a deferred security P1 that only their waiver settles' })
+  const text = reportPrompt(rec, next as { why: string; nextStep: string })
+  expect(text).toContain('Their options:')
+  expect(text).toContain('/pr-gate waive G2-1 <reason>')
+  expect(text.split('Your next step:')[1]?.split('\n')[0]).not.toContain('/pr-gate')
+})
+
+test('R37: the post-PR blocks an agent can answer say which findings to answer', async () => {
+  const round = post({ n: 2, startHead: 'b', endHead: 'b', raised: { blocking: 1, advisory: 0 } })
+  const rec = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [finding({ id: 'G2-1', round: 2 })] })
+  expect(decideNext(rec)).toMatchObject({ kind: 'blocked', answer: ['G2-1'] })
+})
+
+test('M4: the triage prompt names replied feedback by finding id', async () => {
+  const rec = { ...fresh(), pr: 7, slug: 'me/repo', replies: { 'inline:11': '991' }, findings: [finding({ id: 'G2-1', externalId: 'inline:11' })] }
+  const fb: any = { id: 'comment:1', kind: 'comment', reviewer: 'bot', body: 'x', at: 1, isFinding: true }
+  const text = triagePrompt(runOf({ lifecycle: 'post' }), rec, [{ feedback: fb, cls: 'new-on-reviewed', findingId: 'G2-2' }], [])
+  expect(text).toContain('Already replied to: G2-1;')
+  expect(text).not.toContain('inline:11')
+})

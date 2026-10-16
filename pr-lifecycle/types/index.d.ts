@@ -178,6 +178,10 @@ export type Run = {
   asked?: string[]
   /** Post-PR: the security rebuttals Codex is checking (R36). */
   rechecks?: string[]
+  /** Post-PR: a triage re-opened on resume for a block the agent can answer on the same head (R37); it records no round. */
+  isAnswer?: true
+  /** A prompt the ticker submits once the command that queued it has returned. */
+  outbox?: string
   hasRefixed: boolean
   /** The fix step was asked once more about findings it left without an answer (it costs no round). */
   hasReprompted?: boolean

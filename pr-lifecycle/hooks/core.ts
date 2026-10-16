@@ -430,7 +430,7 @@ export function triagePrompt(
   rec: LifecycleRecord,
   items: readonly { feedback: Feedback; cls: TriageClass; matchId?: string; findingId: string }[],
   others: readonly string[],
-  more: { carried?: readonly Finding[]; codex?: readonly Finding[]; codexRange?: string } = {},
+  more: { carried?: readonly Finding[]; codex?: readonly Finding[]; codexRange?: string; intro?: string; carriedHeading?: string } = {},
 ): string {
   const cls = { duplicate: 'duplicate of an answered finding', 'new-on-reviewed': 'new claim about code already reviewed', 'new-on-changed': 'about code changed since the last review' } as const
   const lines = [
@@ -445,23 +445,37 @@ export function triagePrompt(
       '',
     )
   }
+  if (more.intro !== undefined) lines.push(more.intro, '')
   if (items.length > 0) lines.push('New review feedback:')
   for (const one of items) {
     const at = one.feedback.file === undefined ? '' : ` (${one.feedback.file}${one.feedback.line === undefined ? '' : `:${one.feedback.line}`})`
     const earlier = one.matchId === undefined ? '' : `\n    earlier answer: ${listFindings(rec.findings.filter(each => each.id === one.matchId)).replace(/\n/g, '\n    ')}`
     const replied = rec.replies[one.feedback.id]
     const where = one.feedback.kind === 'inline' ? `thread ${one.feedback.threadId}` : 'the PR conversation'
-    const reply = replied === undefined ? `reply to ${where}` : `already replied (${replied}): do not reply again`
+    const reply = replied === undefined ? `reply to ${where}` : `you replied (${replied}) in ${where}: if your reply there does not address this comment, reply`
     const body = one.feedback.body.slice(0, 1500).replace(/\n/g, '\n    ')
     lines.push(`- ${one.findingId} from ${one.feedback.reviewer}${at}, ${cls[one.cls]}; ${reply}:\n    ${body}${earlier}`)
   }
   if ((more.codex ?? []).length > 0) lines.push('', `Codex reviewed ${more.codexRange ?? 'the round'} and raised:`, listFindings(more.codex ?? []))
   if ((more.carried ?? []).length > 0) {
-    lines.push('', 'Carried from earlier rounds, still open (fix or rebut each; it blocks the merge):', listFindings(more.carried ?? []))
+    const heading = more.carriedHeading ?? 'Carried from earlier rounds, still open (fix or rebut each; it blocks the merge):'
+    lines.push('', heading, listFindings(more.carried ?? []))
+    // Reviewer feedback among them is answered in its own thread.
+    const threads = (more.carried ?? []).filter(one => one.source === 'github' && one.externalId !== undefined)
+    if (threads.length > 0) {
+      const at = (one: Finding): string => {
+        const thread = one.threadId ?? one.externalId?.slice('inline:'.length)
+        const where = one.externalId?.startsWith('inline:') === true ? `thread ${thread}` : 'the PR conversation'
+        const replied = rec.replies[one.externalId ?? '']
+        return replied === undefined ? `${one.id} in ${where}` : `${one.id} in ${where} (you replied ${replied}: if it does not address this comment, reply)`
+      }
+      lines.push(`Where to reply: ${threads.map(at).join('; ')}.`)
+    }
   }
   const owed = rec.findings.filter(one => isBlocking(one) && one.status === 'reported-fixed')
   if (owed.length > 0) lines.push('', 'Reported fixed, verification still owed:', listFindings(owed))
-  const already = Object.keys(rec.replies)
+  // Replied feedback by its finding id (M4), not the internal key.
+  const already = Object.keys(rec.replies).map(key => rec.findings.find(one => one.externalId === key)?.id ?? key)
   lines.push(
     '',
     'What to do:',
@@ -536,8 +550,15 @@ export function readyPrompt(rec: LifecycleRecord): string {
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }
 
-const PERSON_POST =
-  'Their options: /pr-gate waive post <reason> lets this head merge without the review, and /pr-gate allow 1 <reason> grants one more review round.'
+/** The person's options after the PR opened; a deferred security blocker adds the waiver only the person can give (M1). */
+const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): string => {
+  const deferred = unresolvedBlockers(rec).filter(one => one.status === 'deferred')
+  const waive = deferred.map(one => `/pr-gate waive ${one.id} <reason> settles the deferred security finding ${one.id}`).join(', ')
+  return (
+    'Their options: /pr-gate waive post <reason> lets this head merge without the review, ' +
+    `${waive === '' ? '' : `${waive}, `}and /pr-gate allow 1 <reason> grants one more review round.`
+  )
+}
 
 /** Post-PR review stopped short of ready: why, what holds the merge, the agent's next step, and apart from it the person's options. */
 export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep: string }): string {
@@ -552,7 +573,7 @@ export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep
     'Verify each finding against the code first: fix a real one with the smallest change, commit and push it,',
     'or rebut a false one with file:line evidence in its thread.',
     'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
-    `Tell the person why it stopped. ${PERSON_POST}`,
+    `Tell the person why it stopped. ${personPost(rec)}`,
   )
   return lines.join('\n')
 }
@@ -568,7 +589,7 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string):
       '',
       `Your next step: ${nextStep}.`,
       'Do not merge, and do not merge another way: the guard holds the merge until the review is complete or the person decides.',
-      `Tell the person why it is held. ${PERSON_POST}`,
+      `Tell the person why it is held. ${personPost(rec)}`,
     )
     return post.join('\n')
   }

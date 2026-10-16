@@ -1028,3 +1028,85 @@ test('R36: after a held rebuttal check, a resumed round checks the rebuttal agai
   expect(w.spawned).toHaveLength(spawned + 1)
   expect((await runOf(w)).phase).toBe('verify')
 })
+
+// ------------------------------------------------------------- task 12 fix round 2
+
+const postRounds = (rec: LifecycleRecord) => rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).length
+
+/** Probe A: the P1 is left unanswered twice, so the post-PR review blocks on the same head. */
+const toBlocked = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = '**P1** SQL injection') => {
+  await toTriage($, w, body)
+  await $.turn.complete(triaged('r2-triage', []))
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', []))
+  expect((await recordOf(w)).postStatus).toBe('blocked')
+}
+
+test('R37: resuming a blocked post-PR review re-opens triage; a security rebuttal goes to Codex, then ready, with no round', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w)
+  const before = postRounds(await recordOf(w))
+  await $.command.run(cmd('resume'))
+  const run = await runOf(w)
+  expect(run.phase).toBe('triage')
+  await w.clock.advance(1000)
+  // The ticker sends the prompt once the command has returned.
+  expect(w.prompts.at(-1)).toContain('resumed on the same head')
+  expect(w.prompts.at(-1)).toContain('G2-1 in thread 11')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+  expect((await recordOf(w)).replies['inline:11']).toBe('995')
+  expect((await runOf(w)).phase).toBe('verify')
+  await $.turn.complete(turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', ok: true })}`, `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(postRounds(rec)).toBe(before)
+  expect(rec.rounds.filter(one => one.kind === 'discretionary' && one.isCompleted)).toHaveLength(1)
+})
+
+test('R37: a deferred P2 answered on resume reaches ready with no new round', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  const before = postRounds(await recordOf(w))
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.processed).toContain('inline:11')
+  expect(postRounds(rec)).toBe(before)
+})
+
+test('M2: a rebuttal Codex rejects is reported as rejected, not as unanswered', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  const verdict = JSON.stringify({ step: 'r2-verify', ok: false, notes: 'reachable from /search' })
+  await $.turn.complete(turn(`no\n${TRAILER}\n${verdict}`, `agent-${w.spawned.length}`))
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('Codex did not accept the rebuttal of G2-1: reachable from /search')
+  expect(said).not.toContain('with no fix or rebuttal')
+})
+
+test('R38: one reply of this machine answers one reviewer comment in its thread', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const later = { ...inline(13, '**P1** and the second query too', w.gh.prHead), in_reply_to_id: 11, created_at: '1970-01-01T00:01:30Z' }
+  const mine = { ...inline(12, 'Fixed in 1234567.', w.gh.prHead), user: { login: 'me' }, in_reply_to_id: 11, created_at: '1970-01-01T00:02:00Z' }
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead), later, mine]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const replies = (await recordOf(w)).replies
+  expect(Object.keys(replies)).toEqual(['inline:13'])
+  expect(w.prompts.at(-1)).toContain('if your reply there does not address this comment, reply')
+})
+
+test('M3: resuming a post-PR record reports the post-PR status', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await $.turn.complete(triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  const said = await $.command.run(cmd('resume'))
+  expect(JSON.stringify(said)).toContain('post-PR review')
+  expect(JSON.stringify(said)).not.toContain('pre-PR gate stands')
+})

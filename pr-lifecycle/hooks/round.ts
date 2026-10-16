@@ -194,6 +194,12 @@ export function startTicker($: Engine): void {
         return
       }
       await update($, tickAtom, () => now)
+      if (run.outbox !== undefined) {
+        const text = run.outbox
+        await patch($, run.id, one => ({ ...one, outbox: undefined }))
+        await askTriage($, run.id, text)
+        return
+      }
       if (run.phase === 'collect') {
         await poll($, run)
         return // waiting on reviewers is not a step: no step timeout while collecting
@@ -477,12 +483,15 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     // This machine's own comments are never feedback; its inline ones are its replies, which no turn may post twice (R35).
     const feedback = all.filter(one => one.reviewer !== self)
     const own = all.filter(one => one.reviewer === self && one.kind === 'inline')
-    const ownReplies = Object.fromEntries(
-      feedback.flatMap(one => {
-        const mine = one.kind === 'inline' ? own.find(each => each.threadId === one.threadId && each.at >= one.at) : undefined
-        return mine === undefined ? [] : [[one.id, mine.id.slice('inline:'.length)]]
-      }),
-    )
+    // One to one (R38): each own reply answers the latest reviewer comment in its thread posted before it that no reply answered yet.
+    const ownReplies: Record<string, string> = {}
+    for (const mine of [...own].sort((a, b) => a.at - b.at)) {
+      const answered = feedback
+        .filter(one => one.kind === 'inline' && one.threadId === mine.threadId && one.at <= mine.at && ownReplies[one.id] === undefined)
+        .sort((a, b) => a.at - b.at)
+        .at(-1)
+      if (answered !== undefined) ownReplies[answered.id] = mine.id.slice('inline:'.length)
+    }
     return { isOk: true, feedback, checks: readCheckRuns(checks.out), prHead, ownReplies }
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
@@ -1055,12 +1064,76 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
   else await beginCollect($, run.id)
 }
 
+/** Re-opens triage on the same head for findings a post-PR block left to the agent (R37). It records no round. */
+async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string[], why: string): Promise<void> {
+  const now = await $.clock.now()
+  const last = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)
+  const round = last?.n ?? 1
+  const findings = rec.findings.filter(one => ids.includes(one.id))
+  const run: Run = {
+    id: `${now}`,
+    cwd: rec.root,
+    root: rec.root,
+    branch: rec.branch,
+    base: rec.base,
+    headSha: rec.head,
+    tier: rec.tier,
+    tierWhy: rec.tierWhy,
+    lane: rec.lane,
+    effort: rec.effort ?? config.effort,
+    startEffort: defaultEffort(rec),
+    round,
+    status: 'running',
+    phase: 'triage',
+    hasRefixed: false,
+    hasReprompted: false,
+    fixKind: 'blocking',
+    steps: [
+      { id: 'scope', label: 'Scope & blast radius', state: 'done', detail: `${rec.tier}${rec.lane === 'light' ? ', light lane' : ''}: ${rec.tierWhy}` },
+      { id: `r${round}-triage`, label: `Round ${round} · answer ${ids.length} open item${ids.length === 1 ? '' : 's'} (main agent)`, state: 'running' },
+      { id: 'pr', label: `Open PR → ${rec.base}`, state: 'done' },
+    ],
+    findings: rec.findings,
+    pending: [{ role: 'triage', step: `r${round}-triage`, isMain: true }],
+    activity: 'waiting on the main agent to answer the open items…',
+    startedAt: now,
+    phaseStartedAt: now,
+    lifecycle: 'post',
+    roundKind: last?.kind ?? 'baseline',
+    roundStartHead: rec.head,
+    roundStartedAt: now,
+    diffBase: rec.head,
+    evidence: [],
+    activeMs: 0,
+    waitMs: 0,
+    triaged: findings.flatMap(one => (one.source === 'github' && one.externalId !== undefined ? [one.externalId] : [])),
+    asked: [...ids],
+    isAnswer: true,
+  }
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  $.ui.status(`pr-gate r${round}: answering the open items`)
+  const intro = `The review was resumed on the same head: ${why}. Answer each item below; this uses no review round.`
+  const heading = 'Still open (fix, rebut or defer each; a security blocker is fixed or rebutted, and it blocks the merge until then):'
+  // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
+  await patch($, run.id, one => ({ ...one, outbox: triagePrompt(run, rec, [], [], { carried: findings, intro, carriedHeading: heading }) }))
+}
+
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
 async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?: string): Promise<void> {
   const now = await $.clock.now()
   // After the PR: the head GitHub last reported for it, whatever is checked out here (an adopted PR, a push from elsewhere).
   const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
   const endHead = head?.isOk === true ? head.out : run.headSha
+  if (run.isAnswer === true) {
+    // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
+    await updateRecord($, run.root, run.branch, rec => ({ ...rec, head: endHead, findings: mergeFindings(rec.findings, run.findings), effort: run.effort }))
+    if (isCompleted) await advance($, run.root, run.branch)
+    return
+  }
   const current = run.findings.filter(one => raisedIn(one, run.round))
   const round: RoundRecord = {
     n: run.round,
@@ -1165,6 +1238,11 @@ export async function advance($: Engine, root: string, branch: string): Promise<
     return
   }
   const isPre = rec.phase === 'pre'
+  // A resume of a post-PR block the agent can answer on the same head re-opens triage for it: no round, no allowance (R37).
+  if (!isPre && id === undefined && next.kind === 'blocked' && (next.answer ?? []).length > 0) {
+    await startAnswer($, rec, next.answer ?? [], next.why)
+    return
+  }
   const saved = await updateRecord($, root, branch, one =>
     isPre ? { ...one, preStatus: next.kind, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why },
   )

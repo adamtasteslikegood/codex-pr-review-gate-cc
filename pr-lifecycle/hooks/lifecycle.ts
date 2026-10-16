@@ -228,7 +228,8 @@ export type Next =
   | { kind: 'open-pr'; status: 'passed' | 'exhausted' }
   | { kind: 'ready' }
   | { kind: 'exhausted'; why: string; nextStep: string }
-  | { kind: 'blocked'; why: string; nextStep: string }
+  /** answer: the findings the agent can settle on the same head (R37); a resume re-opens triage for them. */
+  | { kind: 'blocked'; why: string; nextStep: string; answer?: string[] }
 
 const ids = (findings: readonly Finding[]): string => findings.map(one => one.id).join(', ')
 
@@ -319,10 +320,20 @@ function decidePost(rec: LifecycleRecord): Next {
   // The pre-PR backstop (R32): blockers left open on an unchanged head with nothing rebutted; another round would say the same.
   const open = unresolved.filter(one => one.status === 'open')
   if (!isChanged && last.rebutted === 0 && open.length > 0) {
+    // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding.
+    const rejected = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-1)?.status === 'open')
+    const ignored = open.filter(one => !rejected.includes(one))
+    const said = [
+      ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${one.history.at(-1)?.note ?? 'no reason given'}`),
+      ...(ignored.length === 0
+        ? []
+        : [`${ids(ignored)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`]),
+    ]
     return {
       kind: 'blocked',
-      why: `${ids(open)} left open at ${last.endHead.slice(0, 7)} with no fix or rebuttal, so another round would say the same`,
+      why: said.join('; '),
       nextStep: `fix or rebut ${ids(open)}, then pr-gate resume`,
+      answer: open.map(one => one.id),
     }
   }
   if (isChanged || owed.length > 0) {
@@ -335,14 +346,15 @@ function decidePost(rec: LifecycleRecord): Next {
       kind: 'blocked',
       why: `${ids(unanswered)} from reviewers ${unanswered.length === 1 ? 'has' : 'have'} no answer`,
       nextStep: `answer ${ids(unanswered)} in ${unanswered.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer), then pr-gate resume`,
+      answer: unanswered.map(one => one.id),
     }
   }
   if (unresolved.length === 0) return { kind: 'ready' }
   if (unresolved.some(one => one.status === 'deferred')) {
     return {
       kind: 'blocked',
-      why: `${ids(unresolved)} deferred, and a security P1 needs your decision`,
-      nextStep: `/pr-gate waive ${unresolved[0]?.id} <reason>`,
+      why: `${ids(unresolved)} deferred, and a security P1 needs the person's decision`,
+      nextStep: `tell the person ${ids(unresolved.filter(one => one.status === 'deferred'))} is a deferred security P1 that only their waiver settles`,
     }
   }
   return mayStartRound(rec, false)
