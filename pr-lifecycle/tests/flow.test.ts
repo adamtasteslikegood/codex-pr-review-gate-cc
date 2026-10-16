@@ -2849,3 +2849,60 @@ test('F1: a GraphQL or REST create whose base cannot be read is held against the
   expect(w.gh.calls.some(one => one.startsWith('repo view'))).toBe(false)
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh api repos/me/repo/pulls --input body.json' }))).toBe(true)
 })
+
+/** Once `when` holds for a read of the branch's record, `change` is applied to the stored record: the next read sees it. */
+const changeAfterRead = (w: ReturnType<typeof world>, when: (rec: LifecycleRecord) => boolean, change: (rec: LifecycleRecord) => LifecycleRecord) => {
+  w.afterRead = key => {
+    const rec = w.store.get(KEY) as LifecycleRecord | undefined
+    if (key !== KEY || rec === undefined || !when(rec)) return
+    w.afterRead = undefined
+    w.store.set(KEY, change(rec))
+  }
+}
+
+test('F5: a finding settled between the command\'s read and its write is not waived', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  const settle = (rec: LifecycleRecord) => ({
+    ...rec,
+    findings: rec.findings.map(one => (one.id === 'R1-2' ? { ...one, status: 'verified-fixed' as const } : one)),
+  })
+  changeAfterRead(w, () => true, settle)
+  const said = JSON.stringify(await $.command.run(cmd('waive R1-2 cosmetic')))
+  expect(said).toContain('already settled')
+  expect((await recordOf(w)).waivers.some(one => one.findingId === 'R1-2')).toBe(false)
+})
+
+test('F5: a security P1 raised between the command\'s read and its write blocks a pre waiver', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  changeAfterRead(w, () => true, rec => ({ ...rec, findings: rec.findings.map(one => ({ ...one, isSecurity: true })) }))
+  const said = JSON.stringify(await $.command.run(cmd('waive pre hotfix')))
+  expect(said).toContain('security P1')
+  expect((await recordOf(w)).waivers.some(one => one.scope === 'pre')).toBe(false)
+  expect((await recordOf(w)).preStatus).not.toBe('waived')
+})
+
+test('F5: the controller does not write ready from a read a finding has since changed', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+  // The waiver is written; on the controller's next read, a blocker lands that its own read did not see.
+  const late = { ...P1, id: 'G2-9', round: 2, source: 'codex-review', reviewer: 'codex', headSeen: 'a', status: 'open', history: [] }
+  changeAfterRead(
+    w,
+    rec => rec.waivers.some(one => one.findingId === 'G2-1'),
+    rec => ({ ...rec, findings: [...rec.findings, late as Finding] }),
+  )
+  await $.command.run(cmd('waive G2-1 follow-up is filed'))
+  const rec = await recordOf(w)
+  expect(rec.findings.some(one => one.id === 'G2-9')).toBe(true)
+  expect(rec.phase).not.toBe('ready')
+})

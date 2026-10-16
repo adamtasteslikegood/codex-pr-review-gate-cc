@@ -47,7 +47,7 @@ export async function lockRecord<T>(root: string, branch: string, work: () => Pr
   }
 }
 
-/** Reads, changes and writes the record under its lock; undefined when there is none. */
+/** Reads, changes and writes the record under its lock; undefined when there is none. A change that returns the record it was given writes nothing. */
 export async function updateRecord(
   $: Engine,
   root: string,
@@ -58,21 +58,24 @@ export async function updateRecord(
     const rec = await loadRecord($, root, branch)
     if (rec === undefined) return undefined
     const next = await change(rec)
-    await saveRecord($, next)
+    if (next !== rec) await saveRecord($, next)
     return next
   })
 }
 
-/** As `updateRecord`, for a change that may start the record: `change` sees undefined when there is none, and returns what to write. */
+/**
+ * As `updateRecord`, for a change that may start the record: `change` sees undefined when there is none, and returns what to write,
+ * or undefined to write nothing (a check on the locked read refused it).
+ */
 export async function upsertRecord(
   $: Engine,
   root: string,
   branch: string,
-  change: (rec: LifecycleRecord | undefined) => LifecycleRecord | Promise<LifecycleRecord>,
-): Promise<LifecycleRecord> {
+  change: (rec: LifecycleRecord | undefined) => LifecycleRecord | undefined | Promise<LifecycleRecord | undefined>,
+): Promise<LifecycleRecord | undefined> {
   return lockRecord(root, branch, async () => {
     const next = await change(await loadRecord($, root, branch))
-    await saveRecord($, next)
+    if (next !== undefined) await saveRecord($, next)
     return next
   })
 }

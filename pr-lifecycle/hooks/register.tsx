@@ -792,50 +792,68 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const isFinding = /^[RG]\d+-\d+$/.test(scope)
   if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|<findingId> <reason>`
   if (isFinding) {
-    const finding = rec?.findings.find(one => one.id === scope)
-    if (rec === undefined || finding === undefined) return `/${COMMAND}: there is no finding ${scope} in the lifecycle of ${branch}.`
-    if (!mergeHolds(rec).some(one => one.id === scope)) {
-      return `/${COMMAND}: ${scope} is already settled (${settledAs(rec, finding)}): there is nothing to waive.`
+    // Decided on the read taken under the record's lock (F5): a finding settled meanwhile is not waived.
+    const refusalOf = (one: LifecycleRecord | undefined): string | undefined => {
+      const finding = one?.phase === 'archived' ? undefined : one?.findings.find(each => each.id === scope)
+      if (one === undefined || finding === undefined) return `/${COMMAND}: there is no finding ${scope} in the lifecycle of ${branch}.`
+      if (!mergeHolds(one).some(each => each.id === scope)) {
+        return `/${COMMAND}: ${scope} is already settled (${settledAs(one, finding)}): there is nothing to waive.`
+      }
+      return undefined
     }
-    // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
-    const waiver = { scope: 'finding' as const, findingId: scope, head: rec.head, reason, by: origin, at: now }
-    await updateRecord($, root, branch, one => ({ ...one, waivers: [...one.waivers, waiver] }))
+    let refusal = refusalOf(rec)
+    if (refusal !== undefined || rec === undefined) return refusal ?? `/${COMMAND}: there is no finding ${scope} in the lifecycle of ${branch}.`
+    let before: LifecycleRecord = rec
+    await updateRecord($, root, branch, one => {
+      before = one
+      refusal = refusalOf(one)
+      if (refusal !== undefined) return one
+      // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
+      return { ...one, waivers: [...one.waivers, { scope: 'finding' as const, findingId: scope, head: one.head, reason, by: origin, at: now }] }
+    })
+    if (refusal !== undefined) return refusal
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
     if (!isRunning) await advance($, root, branch)
     const after = await loadRecord($, root, branch)
-    const wasPassed = rec.preStatus === 'passed' && rec.preHead === after?.preHead
+    const wasPassed = before.preStatus === 'passed' && before.preHead === after?.preHead
     if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {
       sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
     }
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
   if (scope === 'pre') {
-    if (rec !== undefined && rec.phase !== 'pre') {
+    // Checked on the command's read, and again on the read taken under the record's lock (F5).
+    const refusalOf = (one: LifecycleRecord | undefined): string | undefined => {
+      if (one === undefined || one.phase === 'archived') return undefined
+      if (one.phase !== 'pre') {
+        return (
+          `/${COMMAND}: PR #${one.pr ?? '?'} from ${branch} is already open, so there is no pre-PR review to waive. ` +
+          `/${COMMAND} waive post <reason> lets this head merge.`
+        )
+      }
+      // A security blocker is released only by a waiver naming it, never by waiving the whole review (R54).
+      const security = [...unresolvedBlockers(one), ...verificationOwed(one)].filter(each => each.isSecurity === true)
+      if (security.length === 0) return undefined
+      const isOne = security.length === 1
       return (
-        `/${COMMAND}: PR #${rec.pr ?? '?'} from ${branch} is already open, so there is no pre-PR review to waive. ` +
-        `/${COMMAND} waive post <reason> lets this head merge.`
-      )
-    }
-    // A security blocker is released only by a waiver naming it, never by waiving the whole review (R54).
-    const security = rec === undefined ? [] : [...unresolvedBlockers(rec), ...verificationOwed(rec)].filter(one => one.isSecurity === true)
-    if (security.length > 0) {
-      const one = security.length === 1
-      return (
-        `/${COMMAND}: ${ids(security)} ${one ? 'is a security P1' : 'are security P1s'} holding the pull request for ${branch}, and only a waiver naming ` +
-        `${one ? 'it' : 'each'} releases ${one ? 'it' : 'them'}: ${security.map(each => `/${COMMAND} waive ${each.id} <reason>`).join(', ')}. ` +
+        `/${COMMAND}: ${ids(security)} ${isOne ? 'is a security P1' : 'are security P1s'} holding the pull request for ${branch}, and only a waiver naming ` +
+        `${isOne ? 'it' : 'each'} releases ${isOne ? 'it' : 'them'}: ${security.map(each => `/${COMMAND} waive ${each.id} <reason>`).join(', ')}. ` +
         'No pre waiver was recorded.'
       )
     }
+    let refusal = refusalOf(rec)
+    if (refusal !== undefined) return refusal
     // With no record, the waiver covers the base a PR with no base opens against: the repository's default branch (R1-5).
     const found = rec === undefined ? await defaultBranchOf($, root) : undefined
     if (found !== undefined && found.name === undefined) {
       return `/${COMMAND}: gh could not read the repository's default branch (${found.err}), so the waiver has no base to cover. No pre waiver was recorded.`
     }
-    if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     // A waiver covers this commit for the record's base at this moment, and is kept in the record's history.
     const waived = await upsertRecord($, root, branch, one => {
+      refusal = refusalOf(one)
+      if (refusal !== undefined) return undefined
       const base =
         one?.phase === 'archived' || one === undefined
           ? newRecord({
@@ -853,6 +871,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
     })
+    if (refusal !== undefined || waived === undefined) return refusal ?? `/${COMMAND}: no pre waiver was recorded.`
+    if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     sayOpenPr($, waived, 'waived', now)
     return (
       `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +

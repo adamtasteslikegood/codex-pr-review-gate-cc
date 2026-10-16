@@ -1509,8 +1509,19 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   const rec = await loadRecord($, root, branch)
   if (rec === undefined) return
   const next = decideNext(rec)
+  // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
+  // decided afresh instead of written from a stale decision.
+  const isStill = (one: LifecycleRecord): boolean => JSON.stringify(decideNext(one)) === JSON.stringify(next)
+  let isStale = false
+  const ifStill = (write: (one: LifecycleRecord) => LifecycleRecord) => (one: LifecycleRecord): LifecycleRecord => {
+    if (isStill(one)) return write(one)
+    isStale = true
+    return one
+  }
   // A ready record the controller no longer finds ready is back in post-PR review.
-  if (next.kind !== 'ready' && rec.phase === 'ready') await updateRecord($, root, branch, one => ({ ...one, phase: 'post' }))
+  if (next.kind !== 'ready' && rec.phase === 'ready') {
+    await updateRecord($, root, branch, one => (one.phase === 'ready' && decideNext(one).kind !== 'ready' ? { ...one, phase: 'post' } : one))
+  }
   const run = await getRun($)
   const id = run !== null && run.status === 'running' ? run.id : undefined
   if (next.kind === 'round') {
@@ -1518,16 +1529,18 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   if (next.kind === 'open-pr') {
-    const hasSecurity = hasSecurityBlocker(rec)
+    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, preStatus: next.status, preHead: one.head })))
+    if (isStale) return advance($, root, branch, isResume)
+    const seen = saved ?? rec
+    const hasSecurity = hasSecurityBlocker(seen)
     const opens = next.status === 'passed' || (config.onExhausted === 'open-pr' && !hasSecurity)
-    const saved = await updateRecord($, root, branch, one => ({ ...one, preStatus: next.status, preHead: one.head }))
-    const used = usedRounds(rec)
+    const used = usedRounds(seen)
     const message =
       next.status === 'passed'
-        ? rec.passThrough !== undefined
-          ? `Codex skipped: ${rec.passThrough}.`
+        ? seen.passThrough !== undefined
+          ? `Codex skipped: ${seen.passThrough}.`
           : `No high/critical finding after ${used} round${used === 1 ? '' : 's'}.`
-        : `${heldFindings(rec).length} high/critical finding(s) unresolved or unverified with the allowance spent` +
+        : `${heldFindings(seen).length} high/critical finding(s) unresolved or unverified with the allowance spent` +
           `${hasSecurity ? ', one of them security: the PR stays held' : ''}.`
     const ended = id === undefined ? null : await finish($, id, next.status, message)
     if (ended === null || saved === undefined) return
@@ -1545,8 +1558,10 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   if (next.kind === 'ready') {
-    const saved = await updateRecord($, root, branch, one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined }))
-    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${rec.head.slice(0, 7)}: ready for the merge decision.`)
+    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
+    if (isStale) return advance($, root, branch, isResume)
+    const at = (saved ?? rec).head.slice(0, 7)
+    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: ready for the merge decision.`)
     if (saved !== undefined) say($, readyPrompt(saved))
     return
   }
@@ -1568,9 +1583,13 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   }
   // Only the post-PR side waits on the person's decision; the run itself ends blocked.
   const runStatus = next.kind === 'awaiting-decision' ? 'blocked' : next.kind
-  const saved = await updateRecord($, root, branch, one =>
-    isPre ? { ...one, preStatus: runStatus, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why },
+  const saved = await updateRecord(
+    $,
+    root,
+    branch,
+    ifStill(one => (isPre ? { ...one, preStatus: runStatus, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why })),
   )
+  if (isStale) return advance($, root, branch, isResume)
   if (id !== undefined) await finish($, id, runStatus, `${next.why}. Next: ${next.nextStep}`)
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.

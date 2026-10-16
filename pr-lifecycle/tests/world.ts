@@ -80,6 +80,8 @@ export type World = {
   clock: { advance: (ms: number) => Promise<void> }
   /** A new session: the run state reads as empty until the mod writes it again; the store stays. */
   clearState: () => void
+  /** Called after each store read, with the key and how many reads of it came before: a test changes the store between two reads. */
+  afterRead?: (key: string, n: number) => void
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
@@ -162,7 +164,14 @@ export function world(on: On): World {
   on('state.get', RUN, (_$, e, next) =>
     isCleared ? next(e).then(read => (read.value === undefined ? read : { value: { ...read.value, value: null } })) : next(e),
   )
-  on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
+  const reads = new Map<string, number>()
+  on('store.get', (_$, e) => {
+    const value = w.store.get(e.key)
+    const n = reads.get(e.key) ?? 0
+    reads.set(e.key, n + 1)
+    w.afterRead?.(e.key, n)
+    return { value }
+  })
   on('store.set', (_$, e) => {
     w.store.set(e.key, e.value)
     return { value: undefined }
