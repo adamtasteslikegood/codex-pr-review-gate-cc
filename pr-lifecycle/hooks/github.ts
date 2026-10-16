@@ -20,6 +20,8 @@ export type Feedback = {
   at: number
   /** False for an empty approval or comment: it covers a head but raises nothing. */
   isFinding: boolean
+  /** The author's GitHub author association (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ...), when the row says. */
+  association?: string
 }
 
 export type Check = { name: string; status: string; conclusion: string | null }
@@ -31,6 +33,7 @@ type Row = Record<string, unknown>
 const str = (value: unknown): string | undefined => (typeof value === 'string' && value !== '' ? value : undefined)
 const num = (value: unknown): number | undefined => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
 const login = (row: Row): string => str((row.user as Row | undefined)?.login) ?? 'unknown'
+const associationOf = (row: Row): string | undefined => str(row.author_association) ?? str(row.authorAssociation)
 const when = (value: unknown): number => {
   const parsed = Date.parse(String(value ?? ''))
   return Number.isFinite(parsed) ? parsed : 0
@@ -98,6 +101,7 @@ export const readReviews = (text: string): Feedback[] =>
       state: str(row.state),
       at: when(row.submitted_at),
       isFinding: body.trim() !== '' || row.state === 'CHANGES_REQUESTED',
+      association: associationOf(row),
     }
   })
 
@@ -114,6 +118,7 @@ export const readInlineComments = (text: string): Feedback[] =>
     url: str(row.html_url),
     at: when(row.created_at),
     isFinding: (str(row.body) ?? '').trim() !== '',
+    association: associationOf(row),
   }))
 
 export const readIssueComments = (text: string): Feedback[] =>
@@ -125,6 +130,7 @@ export const readIssueComments = (text: string): Feedback[] =>
     url: str(row.html_url),
     at: when(row.created_at),
     isFinding: (str(row.body) ?? '').trim() !== '',
+    association: associationOf(row),
   }))
 
 /** Each page is `{ total_count, check_runs: [...] }`; an unpaginated single object reads the same way. */
@@ -155,6 +161,19 @@ export function readRoster(text: string): Roster | undefined {
     return undefined
   }
 }
+
+/** Author associations with write access to the repository. */
+const WRITERS = ['OWNER', 'MEMBER', 'COLLABORATOR']
+
+/**
+ * Whether a piece of feedback is triaged at all (R1-8): its author has write access, or is on the roster (a review bot), or the row
+ * does not say (kept, and fenced like the rest). Anyone else's comment is dropped before it reaches a prompt or covers a head.
+ */
+export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
+  one.association === undefined ||
+  WRITERS.includes(one.association) ||
+  roster?.reviewers.includes(one.reviewer) === true ||
+  roster?.requestReview.includes(one.reviewer) === true
 
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 

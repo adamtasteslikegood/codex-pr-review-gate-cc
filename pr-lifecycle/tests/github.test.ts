@@ -1,6 +1,18 @@
 import { expect, test } from 'claude-code/testing'
 
-import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readJsonList, readPrAction, readReviews, readRoster, severityHint } from '../hooks/github'
+import {
+  collectionDone,
+  isTrusted,
+  readCheckRuns,
+  readInlineComments,
+  readIssueComments,
+  readJsonList,
+  readPrAction,
+  readReviews,
+  readRoster,
+  severityHint,
+} from '../hooks/github'
+import type { Feedback } from '../hooks/github'
 
 const at = (iso: string) => Date.parse(iso)
 
@@ -318,4 +330,22 @@ test('mcp r20: operation keys at any depth, more key names, and endpoint paths',
 test('mcp r20: open and new still yield to a primary key', async () => {
   expect(readPrAction('mcp__github__pulls', { action: 'list', type: 'open' })).toBeUndefined()
   expect(readPrAction('mcp__plugin_github_github__list_pull_requests', { state: 'open' })).toBeUndefined()
+})
+
+test('R1-8: the author association is read from either spelling, and only write access or the roster is kept', async () => {
+  const [review] = readReviews(JSON.stringify([{ id: 1, user: { login: 'a' }, body: 'x', state: 'COMMENTED', author_association: 'MEMBER' }]))
+  const [inline] = readInlineComments(JSON.stringify([{ id: 2, user: { login: 'b' }, body: 'x', authorAssociation: 'NONE' }]))
+  const [comment] = readIssueComments(JSON.stringify([{ id: 3, user: { login: 'c' }, body: 'x' }]))
+  expect(review?.association).toBe('MEMBER')
+  expect(inline?.association).toBe('NONE')
+  expect(comment?.association).toBeUndefined()
+  const roster = { reviewers: ['b'], checks: [], requestReview: ['copilot'] }
+  const one = (reviewer: string, association?: string) => ({ ...(comment as Feedback), reviewer, ...(association === undefined ? {} : { association }) })
+  expect(['OWNER', 'MEMBER', 'COLLABORATOR'].every(each => isTrusted(one('x', each), undefined))).toBe(true)
+  expect(isTrusted(one('x', 'CONTRIBUTOR'), undefined)).toBe(false)
+  expect(isTrusted(one('x', 'NONE'), roster)).toBe(false)
+  expect(isTrusted(one('b', 'NONE'), roster)).toBe(true)
+  expect(isTrusted(one('copilot', 'NONE'), roster)).toBe(true)
+  // A row without an association is kept: its text is still fenced.
+  expect(isTrusted(one('x'), undefined)).toBe(true)
 })

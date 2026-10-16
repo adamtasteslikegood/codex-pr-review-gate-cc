@@ -30,7 +30,7 @@ import {
   triagePrompt,
   verifyPrompt,
 } from './core'
-import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
+import { collectionDone, isTrusted, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
 import type { Check, Feedback, Roster } from './github'
 import {
   acceptRebuttal,
@@ -639,7 +639,11 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   if (bad !== undefined) return fail(`gh api failed (${bad.err.slice(0, 160)}); check gh auth login, rate limits and the network`)
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
-    const all = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)]
+    // Only feedback from someone with write access, or on the roster, is read (R1-8); this machine's own rows are sorted out below.
+    const roster = await rosterOf($, rec.root)
+    const all = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)].filter(
+      one => one.reviewer === self || isTrusted(one, roster),
+    )
     // Of this machine's own comments, only the mod's replies are not feedback (R64): an inline reply in a thread, or a comment
     // whose id is a recorded reply. The person's other top-level and review comments reach triage. Its inline replies are
     // its replies, which no turn may post twice (R35).

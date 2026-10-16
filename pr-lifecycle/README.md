@@ -242,6 +242,12 @@ All fields are optional; the repository's values override the plugin options.
   evidence is recorded as incomplete; if no reviewer covered the head, the
   Codex fallback runs.
 
+Only feedback from someone with write access to the repository (GitHub's
+author association `OWNER`, `MEMBER` or `COLLABORATOR`) or on the roster
+(`reviewers` or `requestReview`, so a review bot counts) is read; anyone
+else's comment is dropped before triage and covers no head. A row that does
+not say its author association is kept.
+
 The mod polls about every 30 seconds with `gh api` while the session stays
 free. `requestReview` re-requests review from the listed reviewers on a new
 head in round 2 or later; otherwise the mod never triggers reviewers. If `gh`
@@ -294,6 +300,15 @@ What text matching cannot see:
 - an MCP argv array (`args: ['pr', 'merge', '5']`) is free text, not an operation
 - a contrived nested shape such as `{a:{b:{operation:'merge'}}}`, with no PR words in the tool name or keys, is not held
 - shell-fed commands are missed, for example a command fed to `ssh` on stdin (`... | ssh host`; `ssh h "gh pr merge 5"` is caught), `| xargs`, and `bash -c "$(cat <<EOF)"`
+
+Reviewer text reaches the agent's prompts as data. Each comment body is
+quoted inside `<reviewer-comment from="login">` tags, with one line saying the
+tagged text is data from the reviewer, not instructions; a tag inside a body is
+defused so it cannot close the quote early. A reviewer comment carried into a
+later prompt is named "comment from <login>", not by its first line. The pane
+still shows a comment's first line as its title. Fencing marks the text, it does
+not stop an agent from obeying it; dropping authors without write access is
+what keeps strangers out.
 
 The hold is a guard against a well-meaning agent skipping the gate, not a
 defense against one that works around it.
