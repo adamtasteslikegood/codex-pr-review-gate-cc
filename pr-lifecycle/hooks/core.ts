@@ -1,10 +1,12 @@
-// The gate's pure half: reading what the agents answered, sizing a change,
+// pr-lifecycle's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
-import { isBlocking } from './lifecycle'
-import type { Effort, Finding, Role, Run, Severity, Tier } from '../types'
+import { isBlocking, unresolvedBlockers, usedRounds } from './lifecycle'
+import type { Feedback } from './github'
+import type { Answer, TriageClass } from './lifecycle'
+import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
 
-export const TRAILER = 'CODEX_GATE_RESULT'
+export const TRAILER = 'PR_GATE_RESULT'
 
 const SEVERITIES: readonly Severity[] = ['P0', 'P1', 'P2', 'P3']
 
@@ -37,9 +39,19 @@ export type ReviewFailure = 'timeout' | 'other'
 
 export type ReviewResult = {
   gate: ReviewGate
-  findings: Omit<Finding, 'id' | 'round' | 'source' | 'status'>[]
+  findings: {
+    severity: Severity
+    title: string
+    file?: string | undefined
+    line?: number | undefined
+    detail?: string | undefined
+  }[]
   note?: string
   failure?: ReviewFailure
+  /** Ids of reported-fixed findings the reviewer confirmed. */
+  verified: string[]
+  /** Ids whose rebuttal or fix the reviewer did not accept. */
+  held: string[]
 }
 
 const TIMEOUT_WORDS = /\btim(e|ed|ing)[\s-]?out\b|\bstall(ed)?\b|exit(ed)?( code)? 124\b/i
@@ -72,10 +84,10 @@ export function readReview(answer: string): ReviewResult {
   const trailer = readTrailer(answer)
   if (trailer === undefined) {
     const said = answer.match(/\bGATE:\s*(PASS|FAIL|UNVERIFIED)\b/)?.[1]
-    if (said === 'PASS' || said === 'UNVERIFIED') return { gate: said, findings: [] }
+    if (said === 'PASS' || said === 'UNVERIFIED') return { gate: said, findings: [], verified: [], held: [] }
     const note =
       said === 'FAIL' ? 'The reviewer reported GATE: FAIL without listing its findings.' : 'The reviewer ended without a verdict.'
-    return { gate: 'ERROR', findings: [], note, failure: failureOf(undefined, answer) }
+    return { gate: 'ERROR', findings: [], note, failure: failureOf(undefined, answer), verified: [], held: [] }
   }
   const gate = String(trailer.gate ?? '').toUpperCase()
   const listed = Array.isArray(trailer.findings) ? trailer.findings : []
@@ -95,8 +107,11 @@ export function readReview(answer: string): ReviewResult {
     })
   }
   const note = text(trailer.note)
+  const idList = (value: unknown): string[] => (Array.isArray(value) ? value.map(text).filter((one): one is string => one !== undefined) : [])
+  const verified = idList(trailer.verified)
+  const held = idList(trailer.held)
   if (gate !== 'PASS' && gate !== 'FAIL' && gate !== 'UNVERIFIED') {
-    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer) }
+    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer), verified, held }
   }
   const hasBlocking = findings.some(isBlocking)
   if (gate === 'FAIL' && !hasBlocking) {
@@ -105,30 +120,44 @@ export function readReview(answer: string): ReviewResult {
       findings,
       note: note ?? 'FAIL with no P0/P1 finding listed: the review did not complete.',
       failure: 'other',
+      verified,
+      held,
     }
   }
   // A blocking finding outranks whatever word the agent put on the gate.
-  return { gate: hasBlocking ? 'FAIL' : gate, findings, note }
+  return { gate: hasBlocking ? 'FAIL' : gate, findings, note, verified, held }
 }
 
-export type Disposition = { id: string; action: 'fixed' | 'rebutted' | 'deferred'; note?: string }
+export type TriageAnswer = Answer & { replyId?: string; duplicateOf?: string }
 
-/** What the fixer said it did with each finding; empty when it said nothing. */
-export function readDispositions(answer: string): Disposition[] {
+/** What the fixer said it did with each finding, as the fix and triage steps both report it; empty when it said nothing. */
+export function readTriage(answer: string): TriageAnswer[] {
   const listed = readTrailer(answer)?.dispositions
   if (!Array.isArray(listed)) return []
-  const out: Disposition[] = []
+  const out: TriageAnswer[] = []
   for (const one of listed) {
     if (typeof one !== 'object' || one === null) continue
     const row = one as Record<string, unknown>
     const id = text(row.id)
     const action = String(row.action ?? '').toLowerCase()
-    if (id === undefined) continue
-    if (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred') continue
-    out.push({ id, action, note: text(row.note)?.slice(0, 2000) })
+    if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
+    const severity = String(row.severity ?? '').toUpperCase() as Severity
+    out.push({
+      id,
+      action,
+      ...(text(row.note) === undefined ? {} : { note: text(row.note)?.slice(0, 2000) }),
+      ...(text(row.evidence) === undefined ? {} : { evidence: text(row.evidence)?.slice(0, 2000) }),
+      ...(SEVERITIES.includes(severity) ? { severity } : {}),
+      ...(typeof row.isSecurity === 'boolean' ? { isSecurity: row.isSecurity } : {}),
+      ...(row.replyId === undefined || row.replyId === null ? {} : { replyId: String(row.replyId) }),
+      ...(text(row.duplicateOf) === undefined ? {} : { duplicateOf: text(row.duplicateOf) }),
+    })
   }
   return out
 }
+
+/** What the fixer said it did with each finding. */
+export const readDispositions = (answer: string): Answer[] => readTriage(answer)
 
 /** The fix reviewer's verdict; an unreadable one counts as fine (Codex decides next). */
 export function readVerify(answer: string): { isOk: boolean; notes?: string } {
@@ -251,25 +280,35 @@ const listFindings = (findings: readonly Finding[]): string =>
     .map(one => {
       const at = one.file === undefined ? '' : ` (${one.file}${one.line === undefined ? '' : `:${one.line}`})`
       const detail = one.detail === undefined ? '' : `\n    ${one.detail.replace(/\n/g, '\n    ')}`
-      const note = one.note === undefined ? '' : `\n    ${one.status}${one.note === '' ? '' : `: ${one.note}`}`
+      const said = one.status === 'reported-fixed' ? 'reported-fixed, verification owed' : one.status
+      const note = one.status === 'open' && one.note === undefined ? '' : `\n    ${said}${one.note === undefined || one.note === '' ? '' : `: ${one.note}`}`
       return `- ${one.id} [${one.severity}] ${one.title}${at}${detail}${note}`
     })
     .join('\n')
 
-export function reviewPrompt(run: Run, role: 'review' | 'challenge'): string {
+/** Earlier findings that still apply to the files under review, so a round checks their answers instead of re-arguing them. */
+export function priorRounds(findings: readonly Finding[], files?: ReadonlySet<string>): string {
+  const applies = findings.filter(
+    one => one.status !== 'open' && one.status !== 'verified-fixed' && (files === undefined || one.file === undefined || files.has(one.file)),
+  )
+  const recheck = findings.filter(one => one.needsRecheck === true && !applies.includes(one))
+  const all = [...applies, ...recheck]
+  return all.length === 0 ? '' : listFindings(all)
+}
+
+export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: readonly Finding[]): string {
   // A run started before effort was tracked (a reload mid-run) keeps the old ceiling.
   run = { ...run, effort: (run.effort as Effort | undefined) ?? 'high' }
-  const rebutted = run.findings.filter(one => one.round === run.round - 1 && one.status === 'rebutted')
   const mode =
     role === 'review'
       ? 'Review mode (Step 2A), including the gate verdict it computes'
       : 'Challenge mode (Step 2B)'
   const lines = [
-    `You are the Codex ${role} step of codex-gate, a pre-PR gate. Round ${run.round}.`,
+    `You are the Codex ${role} step of /pr-gate (pr-lifecycle). Round ${run.round}, ${run.lifecycle === 'pre' ? 'before the pull request opens' : 'after it opened'}.`,
     where(run),
     '',
     `1. Invoke the Skill tool with skill "codex" and args "${role} --effort ${run.effort}", and follow that skill's instructions exactly as written: its preamble, its probes, and its ${mode}.`,
-    `   The base branch is origin/${run.base}: use it wherever the skill says <base>, whatever its own base detection prints.`,
+    `   The base is ${run.diffBase}: use it wherever the skill says <base>, whatever its own base detection prints.`,
     `   Reasoning effort is ${run.effort} for every Codex dispatch in this step, consult included. Never pass --xhigh or a higher --effort, and prefix each Codex dispatch with GSTACK_CODEX_EFFORT=${run.effort} so no setting raises it: higher efforts time out here.`,
     '2. You are read-only. Do not edit files, do not fix anything, do not commit, push or open a pull request.',
     '3. Do not ask the user anything: nobody is watching this step. Where the skill would ask, take its documented default and say so.',
@@ -284,19 +323,20 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge'): string {
       '4. Challenge mode output carries no severity tags. Read the code for each problem Codex raised, then report it as P1 only when it is a concrete, reachable failure or security hole in code this branch changes; report the rest as P2. gate is FAIL when any P1 stands, else PASS. If Codex did not complete, gate is ERROR, and error is timeout when Codex timed out or stalled, other otherwise.',
     )
   }
-  if (rebutted.length > 0 && role === 'review') {
+  const answered = priorRounds(prior)
+  if (answered !== '' && role === 'review') {
     lines.push(
       '',
-      'The fixer rebutted these findings from the previous round instead of changing code:',
-      listFindings(rebutted),
-      "After the review, put each rebuttal to Codex through the same skill's consult mode (one prompt listing them all): does Codex concede it, or hold the finding? Report every finding Codex holds, with its original severity, even when the fresh review did not raise it again. Leave out the ones Codex concedes.",
+      'Earlier rounds on this branch settled these, with the evidence shown. Check the answers; do not re-derive them:',
+      answered,
+      "After the review, put every rebutted or reported-fixed one to Codex through the same skill's consult mode (one prompt listing them all). List the ids Codex confirms fixed under verified, and the ids whose rebuttal or fix Codex does not accept under held. Do not list a held one again under findings.",
     )
   }
   lines.push(
     '',
     trailerRule(
       stepOf(run, role),
-      '{"gate":"PASS|FAIL|UNVERIFIED|ERROR","findings":[{"severity":"P1","title":"...","file":"path","line":1,"detail":"one or two sentences"}],"error":"only with ERROR: timeout|other","note":"optional"}',
+      '{"gate":"PASS|FAIL|UNVERIFIED|ERROR","findings":[{"severity":"P1","title":"...","file":"path","line":1,"detail":"one or two sentences"}],"error":"only with ERROR: timeout|other","note":"optional","verified":["R1-1"],"held":["R1-2"]}',
     ),
   )
   return lines.join('\n')
@@ -306,7 +346,7 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge'): string {
 function advisoryPrompt(run: Run, isMain: boolean): string {
   const advisory = run.findings.filter(one => one.round === run.round && !isBlocking(one))
   const lines = [
-    `codex-gate, advisory round ${run.advisoryRound} of ${run.advisoryMax}: Codex left no high/critical finding on ${run.branch} against origin/${run.base}, and raised ${advisory.length} advisory finding${advisory.length === 1 ? '' : 's'} (P2/P3). They do not block the PR; address each one before it opens.`,
+    `pr-gate, round ${run.round}, advisories: Codex left no high/critical finding on ${run.branch} against origin/${run.base}, and raised ${advisory.length} advisory finding${advisory.length === 1 ? '' : 's'} (P2/P3). They do not block the PR; address each one before it opens.`,
     where(run),
     '',
     'Advisory (P2/P3):',
@@ -314,6 +354,7 @@ function advisoryPrompt(run: Run, isMain: boolean): string {
     '',
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every finding against the code before acting on it.',
+    '   A finding marked reported-fixed or rebutted in an earlier round is listed with that answer: do not answer it again unless its file changed.',
     '2. Give every finding one answer. Fix it when it is real and the fix is small and inside this branch. Rebut it with file:line evidence when it is wrong. Defer it, with the reason, when it is real but belongs in other work.',
     '3. Run the checks that cover what you touched, then commit your fixes on this branch. Codex reviews the new commits, so keep them small: a fix that adds a high/critical finding costs a blocking round.',
     '4. Do not push and do not open a pull request: the gate does that when the rounds are over.',
@@ -335,7 +376,7 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
   const blocking = current.filter(isBlocking)
   const advisory = current.filter(one => !isBlocking(one))
   const lines = [
-    `codex-gate, round ${run.round}: Codex found ${blocking.length} high/critical finding${blocking.length === 1 ? '' : 's'} on ${run.branch} against origin/${run.base}. The PR stays unopened until they are settled.`,
+    `pr-gate, round ${run.round}: Codex found ${blocking.length} high/critical finding${blocking.length === 1 ? '' : 's'} on ${run.branch} against origin/${run.base}. The PR stays unopened until they are settled.`,
     where(run),
     '',
     'Blocking (P0/P1):',
@@ -349,6 +390,7 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
     '',
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every finding against the code before acting on it.',
+    '   A finding marked reported-fixed or rebutted in an earlier round is listed with that answer: do not answer it again unless its file changed.',
     '2. A real finding: fix it with the smallest change that settles it, with a test where one fits. A false positive: rebut it with file:line evidence, and change nothing for it.',
     "3. Weigh the blast radius. If the honest fix reaches past this branch's scope (a schema change, a public contract, another service), mark the finding deferred and say what decision it needs; do not widen the change on your own.",
     '4. Run the checks that cover what you touched, then commit your fixes on this branch. The next Codex round reads committed code only.',
@@ -380,31 +422,73 @@ export function verifyPrompt(run: Run, fromSha: string): string {
   ].join('\n')
 }
 
-export function prPrompt(run: Run, hasConverged: boolean): string {
-  const blocking = run.findings.filter(one => one.round === run.round && isBlocking(one)).length
-  const total = run.findings.length
-  const left = run.findings.filter(one => one.round === run.round && !isBlocking(one) && one.status !== 'fixed').length
-  const advisory =
-    run.advisoryRound === 0 ? '' : ` ${run.advisoryRound} advisory round${run.advisoryRound === 1 ? '' : 's'} run, ${left} advisory finding${left === 1 ? '' : 's'} not fixed.`
+export function triagePrompt(
+  run: Run,
+  rec: LifecycleRecord,
+  items: readonly { feedback: Feedback; cls: TriageClass; matchId?: string; findingId: string }[],
+  others: readonly string[],
+): string {
+  const cls = { duplicate: 'duplicate of an answered finding', 'new-on-reviewed': 'new claim about code already reviewed', 'new-on-changed': 'about code changed since the last review' } as const
+  const lines = [
+    `pr-gate, post-PR round ${run.round} (${run.roundKind}) for PR #${rec.pr} on ${rec.branch} → ${rec.base}, head ${run.roundStartHead.slice(0, 7)}.`,
+    where(run),
+    '',
+  ]
+  if (others.length > 0) {
+    lines.push(`Commits were pushed by someone else since ${rec.head.slice(0, 7)}: ${others.join(', ')}. Pull them (git pull --ff-only), read each, and verify it like a review finding before anything else.`, '')
+  }
+  lines.push('New review feedback:')
+  for (const one of items) {
+    const at = one.feedback.file === undefined ? '' : ` (${one.feedback.file}${one.feedback.line === undefined ? '' : `:${one.feedback.line}`})`
+    const earlier = one.matchId === undefined ? '' : `\n    earlier answer: ${listFindings(rec.findings.filter(each => each.id === one.matchId)).replace(/\n/g, '\n    ')}`
+    lines.push(`- ${one.findingId} from ${one.feedback.reviewer}${at}, ${cls[one.cls]}; reply to ${one.feedback.kind === 'inline' ? `thread ${one.feedback.threadId}` : 'the PR conversation'}:\n    ${one.feedback.body.slice(0, 1500).replace(/\n/g, '\n    ')}${earlier}`)
+  }
+  const owed = rec.findings.filter(one => isBlocking(one) && one.status === 'reported-fixed')
+  if (owed.length > 0) lines.push('', 'Reported fixed, verification still owed:', listFindings(owed))
+  const already = Object.keys(rec.replies)
+  lines.push(
+    '',
+    'What to do:',
+    '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
+    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, or defer it with the reason. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
+    `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies -f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). Put the reply id in replyId.${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
+    '5. Run the checks that cover what you touched, commit, and push to the PR branch.',
+    '',
+    trailerRule(
+      stepOf(run, 'triage'),
+      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one"}]}',
+    ),
+    '',
+    'Then end your turn. /pr-gate collects the next reviews by itself.',
+  )
+  return lines.join('\n')
+}
+
+export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exhausted' | 'waived'): string {
+  const hasConverged = status !== 'exhausted'
+  const blocking = unresolvedBlockers(rec).length
+  const total = rec.findings.length
+  const left = rec.findings.filter(one => !isBlocking(one) && one.status !== 'verified-fixed').length
+  const budget = `${usedRounds(rec)} of ${rec.allowance} review rounds used`
+  const advisory = left === 0 ? '' : ` ${left} advisory finding${left === 1 ? '' : 's'} not fixed.`
   const summary =
-    run.tier === 'trivial'
-      ? `codex-gate skipped Codex for ${run.branch}: ${run.tierWhy}.`
-      : hasConverged
-        ? `codex-gate passed for ${run.branch} at ${run.headSha.slice(0, 7)}: no high/critical finding left after ${run.round} round${run.round === 1 ? '' : 's'} (${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
-        : `codex-gate did not converge for ${run.branch}: ${blocking} high/critical finding${blocking === 1 ? '' : 's'} still open after ${run.round} rounds.`
+    status === 'waived'
+      ? `pr-gate was waived for ${run.branch} at ${run.headSha.slice(0, 7)}.`
+      : run.tier === 'trivial'
+        ? `/pr-gate skipped Codex for ${run.branch}: ${run.tierWhy}.`
+        : hasConverged
+          ? `pr-gate passed for ${run.branch} at ${run.headSha.slice(0, 7)}: no high/critical finding left after ${run.round} round${run.round === 1 ? '' : 's'} (${budget}; ${total} finding${total === 1 ? '' : 's'} raised in all).${advisory}`
+          : `pr-gate did not converge for ${run.branch}: ${blocking} high/critical finding${blocking === 1 ? '' : 's'} still open after ${run.round} rounds (${budget}).`
   const lines = [
     summary,
     '',
     `Now open the pull request to ${run.base}, following this repository's own rules for one (its pre-PR checks and preflight, the title and body conventions, the push).`,
-    'Add one line to the body under a "Pre-PR Codex gate" heading: the rounds run and the counts above.',
+    `Add one line to the body under a "Pre-PR Codex gate" heading: the rounds run and the counts above.`,
     `The gate's verdict is for commit ${run.headSha.slice(0, 7)}. A docs-only commit on top (a CHANGELOG line) still rides on it; any other new commit, or a rebase, holds the pull request until the gate has run again, so do not add one unless a check requires it.`,
-  ]
-  lines.push(
     '',
-    hasConverged
-      ? 'This gate is one early review, not the last one. Once the pull request is open, run the whole pull-request lifecycle as this repository does it: wait for every reviewer and every check, the ones that are not required included, read each review in full, and fix or answer what they raise. A clean gate is no reason to skip, shorten or dismiss any of them.'
-      : 'The rounds ran out, so the review is not finished: it carries on in the pull request. Once it is open, run the whole pull-request lifecycle as this repository does it: wait for every reviewer and every check, the ones that are not required included, read each review in full, and keep fixing, starting with the findings still open below.',
-  )
+    "/pr-gate stays with this pull request: once it is open it collects the repository's reviews itself and sends you what needs an answer. Do not wait or poll for reviewers yourself, and do not merge: merging is held until the lifecycle review is complete.",
+  ]
   if (run.findings.length > 0) {
     lines.push(
       '',
@@ -414,8 +498,28 @@ export function prPrompt(run: Run, hasConverged: boolean): string {
       'Tell the user about these here in the conversation, the ones still open first, each with why it is open. The pull request gets the counts only: do not paste a finding into it.',
     )
   }
-  if (!hasConverged) {
+  if (status === 'exhausted') {
     lines.push('In the pull request say only that the gate did not converge, with the count.')
   }
   return lines.join('\n')
+}
+
+export function readyPrompt(rec: LifecycleRecord): string {
+  const done = rec.rounds.filter(one => one.isCompleted)
+  const pre = done.filter(one => one.phase === 'pre').length
+  const post = done.filter(one => one.phase === 'post').length
+  const count = (status: Finding['status']): number => rec.findings.filter(one => one.status === status).length
+  const deferred = rec.findings.filter(one => one.status === 'deferred')
+  const summary = [
+    `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
+    `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
+    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${one.title}`).join('; ')}`,
+  ].join('; ')
+  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
+}
+
+export function reportPrompt(rec: LifecycleRecord, next: { why: string; nextStep: string }): string {
+  const open = unresolvedBlockers(rec)
+  const head = `pr-gate stopped short of ready on PR #${rec.pr}: ${next.why}. Tell the person, with each open finding and its evidence, and the smallest next step: ${next.nextStep}. Do not merge.`
+  return open.length === 0 ? head : `${head}\n\n${listFindings(open)}`
 }

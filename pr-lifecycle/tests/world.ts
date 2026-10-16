@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 import type { Run } from '../types'
 
 export const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
-export const TRAILER = 'CODEX_GATE_RESULT'
+export const TRAILER = 'PR_GATE_RESULT'
 
 export type World = {
   spawned: { prompt: string; description?: string }[]

@@ -21,6 +21,7 @@ import {
   verificationOwed,
   withRound,
 } from '../hooks/lifecycle'
+import { priorRounds, readReview, readTriage, TRAILER } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
 const fresh = () =>
@@ -234,4 +235,35 @@ test('coverage: a change touching a file flags only the answered findings in it'
   // A rebase that lost the reviewed commit: every answered finding is rechecked.
   expect(invalidate(findings, 'all').map(one => one.needsRecheck === true)).toEqual([true, true, false])
   expect(lastReviewedHead({ rounds: [pre({ endHead: 'b' }), pre({ isCompleted: false, endHead: 'z' })] })).toBe('b')
+})
+
+test('a review answer can confirm fixes and hold rebuttals by id', async () => {
+  const answer = `ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-review', gate: 'PASS', findings: [], verified: ['R1-1'], held: ['R1-2'] })}`
+  expect(readReview(answer)).toMatchObject({ gate: 'PASS', verified: ['R1-1'], held: ['R1-2'] })
+})
+
+test('the triage answer carries dispositions, severities, reply ids and duplicates', async () => {
+  const answer = `${TRAILER}\n${JSON.stringify({
+    step: 'r3-triage',
+    dispositions: [
+      { id: 'G3-1', action: 'fixed', note: 'parameterised', severity: 'P1', isSecurity: true, replyId: '991' },
+      { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
+    ],
+  })}`
+  expect(readTriage(answer)).toEqual([
+    { id: 'G3-1', action: 'fixed', note: 'parameterised', severity: 'P1', isSecurity: true, replyId: '991' },
+    { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
+  ])
+})
+
+test('prior rounds list the answered findings that still apply, with their evidence and what is owed', async () => {
+  const text = priorRounds([
+    finding({ status: 'rebutted', note: 'checked at src/app.ts:9' }),
+    finding({ id: 'R1-2', status: 'reported-fixed', note: 'allow-list' }),
+    finding({ id: 'R1-3', file: 'src/other.ts', status: 'verified-fixed' }),
+  ], new Set(['src/app.ts']))
+  expect(text).toContain('R1-1 [P1] Unvalidated redirect in login (src/app.ts:12)\n    rebutted: checked at src/app.ts:9')
+  expect(text).toContain('R1-2 [P1] Unvalidated redirect in login (src/app.ts:12)\n    reported-fixed, verification owed: allow-list')
+  expect(text).not.toContain('R1-3')
+  expect(priorRounds([])).toBe('')
 })

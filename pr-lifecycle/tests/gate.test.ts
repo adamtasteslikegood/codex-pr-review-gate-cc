@@ -17,7 +17,7 @@ test('a PR to a gated base is held and starts the gate; a clean review opens it'
   const run = await runOf(w)
   expect(run.status).toBe('passed')
   expect(w.prompts.at(-1)).toContain('open the pull request to dev')
-  expect(w.prompts.at(-1)).toContain('the ones that are not required included')
+  expect(w.prompts.at(-1)).toContain('collects the repository\'s reviews itself')
 
   const opened = await $.tool.call(createPr)
   expect(isHeld(opened)).toBe(false)
@@ -69,7 +69,7 @@ test('five rounds without agreement end the gate as exhausted', async ($, on) =>
   expect(run.round).toBe(5)
   expect(w.spawned).toHaveLength(5)
   expect(w.prompts.at(-1)).toContain('did not converge')
-  expect(w.prompts.at(-1)).toContain('it carries on in the pull request')
+  expect(w.prompts.at(-1)).toContain('did not converge for feat/x')
   // The findings reach the main agent for the conversation; the pull request gets counts only.
   expect(w.prompts.at(-1)).toContain('do not paste a finding into it')
 })
@@ -84,7 +84,7 @@ test('advisory findings go to the main agent once nothing blocks, then Codex loo
   expect(run.status).toBe('running')
   expect(run.phase).toBe('fix')
   expect(run.fixKind).toBe('advisory')
-  expect(w.prompts[0]).toContain('advisory round 1 of 3')
+  expect(w.prompts[0]).toContain('round 1, advisories')
   expect(w.prompts[0]).toContain('R1-1 [P2] Rename this')
 
   w.git.head = 'd'.repeat(40)
