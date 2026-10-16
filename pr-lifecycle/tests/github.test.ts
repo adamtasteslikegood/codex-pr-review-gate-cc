@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readJsonList, readReviews, readRoster, severityHint } from '../hooks/github'
+import { collectionDone, readCheckRuns, readInlineComments, readIssueComments, readJsonList, readPrAction, readReviews, readRoster, severityHint } from '../hooks/github'
 
 const at = (iso: string) => Date.parse(iso)
 
@@ -103,4 +103,49 @@ test('without a roster, collection ends when checks are done and feedback has go
 test('the wait cap ends collection with what arrived, marked incomplete', async () => {
   const roster = { reviewers: ['copilot'], checks: [], requestReview: [] }
   expect(collectionDone({ ...base, roster, feedback: [], checks: [], now: 1_200_000 })).toEqual({ isDone: true, isComplete: false, missing: ['copilot'], covered: [] })
+})
+
+const bash = (command: string) => readPrAction('Bash', { command })
+
+test('gh pr create and gh pr merge, with and without a number or --auto', async () => {
+  expect(bash('gh pr create --base dev --title x')).toMatchObject({ action: 'create', base: 'dev', via: 'gh pr create' })
+  expect(bash('cd /repo && gh pr merge 12 --squash')).toMatchObject({ action: 'merge', number: 12, cwd: '/repo' })
+  expect(bash('gh pr merge --auto --squash')).toMatchObject({ action: 'merge', number: undefined })
+  expect(bash('gh pr merge https://github.com/me/repo/pull/9')).toMatchObject({ action: 'merge', number: 9 })
+  expect(bash('gh pr view 12')).toBeUndefined()
+})
+
+test('gh api REST and GraphQL calls that open or merge a PR', async () => {
+  expect(bash('gh api repos/me/repo/pulls -f base=dev -f head=feat/x -f title=t')).toMatchObject({ action: 'create', base: 'dev', head: 'feat/x', repo: 'me/repo' })
+  expect(bash('gh api -X PUT repos/me/repo/pulls/12/merge')).toMatchObject({ action: 'merge', number: 12, repo: 'me/repo' })
+  expect(bash("gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"X\"}) { clientMutationId } }'")).toMatchObject({ action: 'merge' })
+  expect(bash("gh api graphql -f query='mutation { enqueuePullRequest(input: {pullRequestId: \"X\"}) { clientMutationId } }'")).toMatchObject({ action: 'merge' })
+  expect(bash("gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"X\"}) { clientMutationId } }'")).toMatchObject({ action: 'merge' })
+  expect(bash("gh api graphql -f query='mutation { createPullRequest(input: {}) { clientMutationId } }'")).toMatchObject({ action: 'create' })
+  // Reading pulls is not opening one.
+  expect(bash('gh api repos/me/repo/pulls')).toBeUndefined()
+  expect(bash('gh api repos/me/repo/pulls/12/comments')).toBeUndefined()
+})
+
+test('both GitHub MCP connectors', async () => {
+  expect(readPrAction('mcp__plugin_github_github__create_pull_request', { owner: 'me', repo: 'repo', base: 'dev', head: 'feat/x' })).toMatchObject({
+    action: 'create',
+    base: 'dev',
+    head: 'feat/x',
+    repo: 'me/repo',
+  })
+  expect(readPrAction('mcp__plugin_github_github__merge_pull_request', { owner: 'me', repo: 'repo', pullNumber: 3 })).toMatchObject({ action: 'merge', number: 3 })
+  const graphql = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+  expect(readPrAction(graphql, { action: 'create', repo: 'me/repo', base: 'dev', head: 'feat/x' })).toMatchObject({ action: 'create', base: 'dev' })
+  expect(readPrAction(graphql, { action: 'merge', repo: 'me/repo', number: 4 })).toMatchObject({ action: 'merge', number: 4 })
+  expect(readPrAction(graphql, { action: 'enqueue', repo: 'me/repo', number: 4 })).toMatchObject({ action: 'merge', number: 4 })
+  expect(readPrAction(graphql, { action: 'get', repo: 'me/repo', number: 4 })).toBeUndefined()
+})
+
+test('an unknown GitHub tool that reads as opening or merging a PR is held; others are not', async () => {
+  expect(readPrAction('mcp__someone_github__merge_pr', { n: 1 })).toMatchObject({ action: 'merge', isUnknown: true })
+  expect(readPrAction('mcp__gh_tools__pulls', { method: 'create_pull_request' })).toBeUndefined()
+  expect(readPrAction('mcp__acme-github__pulls', { method: 'create_pull_request' })).toMatchObject({ action: 'create', isUnknown: true })
+  expect(readPrAction('mcp__acme-github__issues', { action: 'create' })).toBeUndefined()
+  expect(readPrAction('Read', { file_path: 'merge.ts' })).toBeUndefined()
 })

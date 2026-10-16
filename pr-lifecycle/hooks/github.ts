@@ -2,6 +2,7 @@
 // per-repo roster; when collection is over; and which calls open or merge a PR.
 
 import type { Severity } from '../types'
+import { readPrCreate } from './core'
 
 export type Feedback = {
   /** `review:<id>`, `inline:<id>` or `comment:<id>`: stable across polls and sessions. */
@@ -198,4 +199,81 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
   if (missing.length === 0 && isQuiet) return { isDone: true, isComplete: true, missing, covered }
   if (input.now - input.startedAt >= input.capMs) return { isDone: true, isComplete: missing.length === 0, missing, covered }
   return { isDone: false, isComplete: false, missing, covered }
+}
+
+// ----------------------------------------------------------- PR actions
+
+export type PrAction = {
+  action: 'create' | 'merge'
+  /** How: a command or a tool name, for the refusal's words. */
+  via: string
+  base?: string
+  head?: string
+  /** owner/repo when the call names one. */
+  repo?: string
+  /** A merge's PR number; undefined means the PR of the checked-out branch. */
+  number?: number
+  cwd?: string
+  /** A GitHub tool this mod does not know, held because it reads as opening or merging a PR. */
+  isUnknown?: boolean
+}
+
+const cdOf = (command: string): string | undefined => command.match(/(?:^|&&|;)\s*cd\s+["']?([^\s"';&]+)/)?.[1]
+const flagOf = (command: string, names: string): string | undefined =>
+  command.match(new RegExp(`(?:^|\\s)(?:${names})(?:=|\\s+)["']?([^\\s"']+)`))?.[1]
+const fieldOf = (command: string, name: string): string | undefined =>
+  command.match(new RegExp(`(?:-f|-F|--field|--raw-field)\\s+["']?${name}=([^\\s"']+)`))?.[1]
+
+function readBash(command: string): PrAction | undefined {
+  const cwd = cdOf(command)
+  const create = readPrCreate(command)
+  if (create !== undefined) {
+    return { action: 'create', via: 'gh pr create', base: create.base, repo: create.repo, cwd: create.cwd, head: flagOf(command, '--head|-H') }
+  }
+  const merge = command.match(/\bgh\s+pr\s+merge\b([^;&|]*)/)
+  if (merge !== null) {
+    const args = merge[1] ?? ''
+    const number = args.match(/\/pull\/(\d+)/)?.[1] ?? args.match(/(?:^|\s)(\d+)(?=\s|$)/)?.[1]
+    return { action: 'merge', via: 'gh pr merge', number: number === undefined ? undefined : Number(number), repo: flagOf(command, '--repo|-R'), cwd }
+  }
+  if (!/\bgh\s+api\b/.test(command)) return undefined
+  if (/\bgraphql\b/.test(command)) {
+    if (/\b(mergePullRequest|enqueuePullRequest|enablePullRequestAutoMerge)\b/.test(command)) return { action: 'merge', via: 'gh api graphql', cwd }
+    if (/\bcreatePullRequest\b/.test(command)) return { action: 'create', via: 'gh api graphql', cwd }
+    return undefined
+  }
+  const merged = command.match(/repos\/([^/\s]+\/[^/\s]+)\/pulls\/(\d+)\/merge\b/)
+  if (merged !== null) return { action: 'merge', via: 'gh api', repo: merged[1], number: Number(merged[2]), cwd }
+  const pulls = command.match(/repos\/([^/\s]+\/[^/\s]+)\/pulls(?=["'\s]|$)/)
+  const method = (flagOf(command, '-X|--method') ?? '').toUpperCase()
+  const hasFields = /(?:^|\s)(-f|-F|--field|--raw-field|--input)\s/.test(command)
+  if (pulls !== null && (method === 'POST' || (method === '' && hasFields))) {
+    return { action: 'create', via: 'gh api', repo: pulls[1], base: fieldOf(command, 'base'), head: fieldOf(command, 'head'), cwd }
+  }
+  return undefined
+}
+
+const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+
+/** Whether a tool call opens or merges a pull request, on any route this mod can see. Unknown GitHub tools fail closed. */
+export function readPrAction(tool: string, input: Record<string, unknown>): PrAction | undefined {
+  if (tool === 'Bash') return typeof input.command === 'string' ? readBash(input.command) : undefined
+  const owner = str(input.owner)
+  const repoName = str(input.repo)
+  const repo = owner !== undefined && repoName !== undefined ? `${owner}/${repoName}` : repoName
+  if (tool === 'mcp__plugin_github_github__create_pull_request') {
+    return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo }
+  }
+  if (tool === 'mcp__plugin_github_github__merge_pull_request') return { action: 'merge', via: tool, number: num(input.pullNumber), repo }
+  if (tool === GRAPHQL_MCP) {
+    const action = String(input.action ?? '')
+    if (action === 'create') return { action: 'create', via: `${tool} (create)`, base: str(input.base), head: str(input.head), repo }
+    if (action === 'merge' || action === 'enqueue') return { action: 'merge', via: `${tool} (${action})`, number: num(input.number), repo }
+    return undefined
+  }
+  if (!tool.startsWith('mcp__') || !/github/i.test(tool)) return undefined
+  const said = `${tool} ${String(input.action ?? input.method ?? input.operation ?? '')}`.toLowerCase()
+  if (/merge|enqueue|auto[_\s-]?merge/.test(said)) return { action: 'merge', via: tool, number: num(input.number ?? input.pullNumber ?? input.pull_number), repo, isUnknown: true }
+  if (/(create|open)[_\s-]*(pull|pr\b)/.test(said)) return { action: 'create', via: tool, base: str(input.base), head: str(input.head), repo, isUnknown: true }
+  return undefined
 }
