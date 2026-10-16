@@ -381,6 +381,16 @@ function decidePre(rec: LifecycleRecord): Next {
   const isRebutted = rec.findings.some(one => raisedIn(one, last.n) && one.status === 'rebutted' && !isAcceptedRebuttal(one))
   if (!isChanged && last.rebutted === 0 && !isRebutted) {
     const open = rec.findings.filter(one => isBlocking(one) && one.status === 'open' && !waived.has(one.id))
+    // Only fixes reported with no commit since (an answer run, R63): there is nothing new to review until the fix is committed (R66).
+    const owed = verificationOwed(rec).filter(one => one.status === 'reported-fixed')
+    if (open.length === 0 && owed.length > 0) {
+      const one = owed.length === 1
+      return {
+        kind: 'blocked',
+        why: `${ids(owed)} ${one ? 'is' : 'are'} reported fixed with no commit since the last round, so there is nothing new to review`,
+        nextStep: `commit the fix for ${ids(owed)}, then /pr-gate resume`,
+      }
+    }
     return {
       kind: 'blocked',
       why: 'the fixer changed nothing and rebutted nothing, so another round would say the same',

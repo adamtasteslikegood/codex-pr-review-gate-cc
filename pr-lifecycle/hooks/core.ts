@@ -143,6 +143,15 @@ export function readReview(answer: string): ReviewResult {
 
 export type TriageAnswer = Answer & { replyId?: string; duplicateOf?: string }
 
+/**
+ * A reply id as its comment number (R66): gh prints a URL, so `…#issuecomment-60`, `…#discussion_r77` or a trailing number all
+ * read as the number GitHub gives the comment. Anything else is kept as given.
+ */
+export function replyIdOf(raw: string): string {
+  const said = raw.trim()
+  return said.match(/#issuecomment-(\d+)/)?.[1] ?? said.match(/#discussion_r(\d+)/)?.[1] ?? said.match(/(\d+)\/?$/)?.[1] ?? said
+}
+
 /** What the fixer said it did with each finding, as the fix and triage steps both report it; empty when it said nothing. */
 export function readTriage(answer: string): TriageAnswer[] {
   const listed = readTrailer(answer)?.dispositions
@@ -155,8 +164,9 @@ export function readTriage(answer: string): TriageAnswer[] {
     const action = String(row.action ?? '').toLowerCase()
     if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
     const severity = String(row.severity ?? '').toUpperCase() as Severity
-    const replyId =
+    const given =
       typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
+    const replyId = given === undefined ? undefined : replyIdOf(given)
     out.push({
       id,
       action,
@@ -548,7 +558,10 @@ export function triagePrompt(
     '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, or defer it with the reason. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
-    `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies -f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). Put the reply id in replyId.${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
+    `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
+      `-f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). ` +
+      'Put the reply id in replyId: the number after #issuecomment- (or #discussion_r) in the URL gh prints.' +
+      `${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
     '   Before posting, check the thread for a reply of yours already there: never post a second one.',
     '5. Run the checks that cover what you touched, commit, and push to the PR branch.',
     '',

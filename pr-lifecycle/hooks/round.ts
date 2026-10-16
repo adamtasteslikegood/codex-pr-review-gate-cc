@@ -21,6 +21,7 @@ import {
   readVerdicts,
   readVerify,
   readyPrompt,
+  replyIdOf,
   reportPrompt,
   reviewPrompt,
   stepDown,
@@ -618,7 +619,8 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     // Of this machine's own comments, only the mod's replies are not feedback (R64): an inline reply in a thread, or a comment
     // whose id is a recorded reply. The person's other top-level and review comments reach triage. Its inline replies are
     // its replies, which no turn may post twice (R35).
-    const replied = new Set(Object.values(rec.replies))
+    // A reply recorded as the URL gh printed (before R66) is read as its comment number too.
+    const replied = new Set(Object.values(rec.replies).map(replyIdOf))
     const isReply = (one: Feedback): boolean =>
       one.kind === 'inline' ? one.threadId !== one.id.slice('inline:'.length) : replied.has(one.id.slice(one.id.indexOf(':') + 1))
     const feedback = all.filter(one => one.reviewer !== self || !isReply(one))

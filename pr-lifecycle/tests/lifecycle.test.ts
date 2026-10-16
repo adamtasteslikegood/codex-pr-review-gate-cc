@@ -25,7 +25,7 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
@@ -611,4 +611,23 @@ test('a fix-review answer without a readable verdict confirms nothing', () => {
   expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","notes":"no ok field"}`)).toEqual({ isOk: false, isRead: false })
   expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","ok":true}`).isOk).toBe(true)
   expect(readVerify(`done\n${TRAILER}\n{"step":"r1-verify","ok":false,"notes":"x"}`)).toEqual({ isOk: false, isRead: true, notes: 'x' })
+})
+
+// ------------------------------------------------------------- final fix wave (R66)
+
+test('R66: a reply id given as the URL gh prints is read as its comment number', async () => {
+  expect(replyIdOf('https://github.com/me/repo/pull/1#issuecomment-60')).toBe('60')
+  expect(replyIdOf('https://github.com/me/repo/pull/1#discussion_r77')).toBe('77')
+  expect(replyIdOf('https://github.com/me/repo/pull/1/comments/88')).toBe('88')
+  expect(replyIdOf('991')).toBe('991')
+  const said = `ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'G2-1', action: 'fixed', replyId: 'https://github.com/me/repo/pull/1#issuecomment-60' }] })}`
+  expect(readTriage(said)[0]?.replyId).toBe('60')
+})
+
+test('R66: a pre-PR block that holds only fixes reported without a commit says to commit them, not to fix or rebut', async () => {
+  const owed = finding({ status: 'reported-fixed', history: [{ round: 1, status: 'reported-fixed', by: 'main', at: 2 }] })
+  const next = decideNext(at([pre({ raised: { blocking: 1, advisory: 0 } })], { findings: [owed] }))
+  expect(next).toMatchObject({ kind: 'blocked', nextStep: 'commit the fix for R1-1, then /pr-gate resume' })
+  expect(JSON.stringify(next)).not.toContain('fix or rebut')
+  expect(JSON.stringify(next)).not.toContain('Codex')
 })

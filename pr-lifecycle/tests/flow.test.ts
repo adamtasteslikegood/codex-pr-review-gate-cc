@@ -2602,3 +2602,29 @@ test('R63: a fix committed in a resumed pre-PR fix step is a new head: a waiver 
   expect(rec.head).toBe('d'.repeat(40))
   expect(rec.waivers.find(one => one.findingId === 'R1-2')?.lapsedAt).toBeDefined()
 })
+
+test('R66: a reply reported as the URL gh prints does not come back as feedback in the next round', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Typo in the heading.', created_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(20 * 60_000)
+  expect((await runOf(w)).phase).toBe('triage')
+  // The agent fixes, pushes, replies with gh pr comment, and reports the URL it printed.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  w.gh.issueComments = [
+    ...w.gh.issueComments,
+    { id: 60, user: { login: 'me' }, body: 'Fixed in eeeeeee.', created_at: '1970-01-01T00:02:00Z' },
+  ]
+  const url = 'https://github.com/me/repo/pull/1#issuecomment-60'
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P3', replyId: url }]))
+  expect((await recordOf(w)).replies['comment:31']).toBe('60')
+  // The next round reads the PR again: the mod's own reply is not a finding, and nothing holds the merge for it.
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  if (run.phase === 'review') await done($, turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.some(one => one.externalId === 'comment:60')).toBe(false)
+  expect((await runOf(w)).findings.some(one => one.externalId === 'comment:60')).toBe(false)
+  expect(w.prompts.some(one => one.includes('Fixed in eeeeeee.'))).toBe(false)
+})
