@@ -5,6 +5,7 @@
   "author": {
     "name": "adam schoen"
   },
+  "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
     "maxRounds": {

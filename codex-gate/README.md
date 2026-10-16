@@ -1,5 +1,8 @@
 # codex-gate
 
+Version 0.3.1. Part of [pr-gate](../README.md); MIT licensed, see
+[LICENSE](../LICENSE).
+
 A Claude Code mod that runs rounds of adversarial Codex review on a branch
 **before** its pull request is opened, the way lint and tests run locally
 before a push. Codex is reached through the gstack `/codex` skill; the fixes
