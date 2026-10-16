@@ -338,7 +338,8 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
       '4. Challenge mode output carries no severity tags. Read the code for each problem Codex raised, then report it as P1 only when it is a concrete, reachable failure or security hole in code this branch changes; report the rest as P2. gate is FAIL when any P1 stands, else PASS. If Codex did not complete, gate is ERROR, and error is timeout when Codex timed out or stalled, other otherwise.',
     )
   }
-  const answered = priorRounds(prior)
+  // After the PR opens, a dispute is the person's (R40): Codex is not asked about it again.
+  const answered = priorRounds(run.lifecycle === 'post' ? prior.filter(one => !isDisputed(one)) : prior)
   if (answered !== '' && role === 'review') {
     lines.push(
       '',
@@ -437,7 +438,7 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       '',
       trailerRule(
         stepOf(run, 'verify'),
-        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true,"note":"when holds is false: why"}`).join(',')}]}`,
+        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true|false,"note":"when holds is false: why"}`).join(',')}]}`,
       ),
     ].join('\n')
   }

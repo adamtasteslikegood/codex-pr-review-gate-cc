@@ -46,6 +46,7 @@ import {
   mergeHolds,
   nextIds,
   raisedIn,
+  rejections,
   roundOf,
   triage,
   unresolvedBlockers,
@@ -1092,7 +1093,9 @@ async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string
   $.ui.status(`pr-gate r${run.round}: answering the open items`)
   const findings = rec.findings.filter(one => ids.includes(one.id))
   const intro = `The review was resumed on the same head: ${why}. Answer each item below; this uses no review round.`
-  const heading = 'Still open (fix, rebut or defer each; a security blocker is fixed or rebutted, and it blocks the merge until then):'
+  const rejected = findings.filter(one => rejections(one) > 0).map(one => one.id)
+  const except = rejected.length === 0 ? '' : `; ${rejected.join(', ')}: fix or defer only, Codex already rejected its rebuttal`
+  const heading = `Still open (fix, rebut or defer each; a security blocker is fixed or rebutted, and it blocks the merge until then${except}):`
   // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
   await patch($, run.id, one => ({ ...one, outbox: triagePrompt(run, rec, [], [], { carried: findings, intro, carriedHeading: heading }) }))
 }
@@ -1369,7 +1372,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
       ...one.findings.map(old => {
         // A rebuttal Codex accepts stays rebutted, with Codex's entry (R44); a fix it confirms is verified.
         const confirmed = old.status === 'rebutted' ? acceptRebuttal(old, one.round, now) : markVerified(old, one.round, 'codex', now)
-        const ruled = verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
+        // After the PR opens, a dispute is the person's (R40): a review's ruling does not move it.
+        const isTheirs = one.lifecycle === 'post' && isDisputed(old)
+        const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
         return carried.has(ruled.id) && ruled.status === 'open' && !raisedIn(ruled, one.round) ? markHeld(ruled, one.round, 'pr-gate', now) : ruled
       }),
       ...fresh,

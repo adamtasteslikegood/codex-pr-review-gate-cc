@@ -598,3 +598,10 @@ test('R44: prior rounds leave out a rebuttal Codex accepted, until its file chan
   expect(priorRounds([accepted])).toBe('')
   expect(priorRounds([{ ...accepted, needsRecheck: true }])).toContain('R1-1')
 })
+
+test('R40: after the PR opens, a dispute is not put to Codex again in a review', async () => {
+  const text = reviewPrompt(runOf({ lifecycle: 'post', round: 3 }), 'review', [disputed()])
+  expect(text).not.toContain('G2-1')
+  expect(reviewPrompt(runOf({ lifecycle: 'pre', round: 3 }), 'review', [disputed()])).toContain('G2-1')
+  expect(verifyPrompt(runOf({ lifecycle: 'post', round: 2 }), 'abcdef0', [disputed()])).toContain('"holds":true|false')
+})
