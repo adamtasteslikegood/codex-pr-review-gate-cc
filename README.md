@@ -19,6 +19,13 @@ example in `~/.claude/settings.json`:
 
 Each component's README covers its own setup, options and checks.
 
+## In planning
+
+[LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) describes the next major version of
+`/pr-gate`: one lifecycle, review history and budget across pre-PR and
+post-PR review. It will be built in a separate folder while `codex-gate`
+stays at 0.3.1 as the plugin in use.
+
 ## Versions
 
 A component's version is the `version` field in its
