@@ -21,7 +21,9 @@ import {
   verificationOwed,
   withRound,
 } from '../hooks/lifecycle'
-import { fixPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt } from '../hooks/core'
+import {
+  fixPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readyPrompt, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+} from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
 const fresh = () =>
@@ -269,8 +271,9 @@ test('prior rounds list the answered findings that still apply, with their evide
 })
 
 const runOf = (over: Record<string, unknown> = {}): any => ({
-  id: 'x', cwd: '/repo', root: '/repo', branch: 'feat/x', base: 'dev', headSha: 'abcdef123', tier: 'standard', tierWhy: '10 lines', lane: 'full', effort: 'high',
-  round: 1, lifecycle: 'pre', roundKind: 'discretionary', roundStartHead: 'abcdef123', diffBase: 'origin/dev', fixKind: 'blocking', findings: [finding()], ...over,
+  id: 'x', cwd: '/repo', root: '/repo', branch: 'feat/x', base: 'dev', headSha: 'abcdef123',
+  tier: 'standard', tierWhy: '10 lines', lane: 'full', effort: 'high', round: 1, lifecycle: 'pre', roundKind: 'discretionary',
+  roundStartHead: 'abcdef123', diffBase: 'origin/dev', fixKind: 'blocking', findings: [finding()], ...over,
 })
 
 test('no prompt opens with a slash, which would be read as a command', async () => {
@@ -287,6 +290,9 @@ test('no prompt opens with a slash, which would be read as a command', async () 
     triagePrompt(runOf({ lifecycle: 'post', roundKind: 'baseline' }), rec, items, []),
     readyPrompt(rec),
     reportPrompt(rec, { why: 'budget spent', nextStep: 'ask for more rounds' }),
+    reviewPrompt(runOf(), 'review', []),
+    reviewPrompt(runOf(), 'challenge', []),
+    verifyPrompt(runOf(), 'abcdef0'),
   ]
   for (const one of prompts) expect(one.startsWith('/')).toBe(false)
 })

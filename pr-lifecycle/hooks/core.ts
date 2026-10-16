@@ -142,7 +142,8 @@ export function readTriage(answer: string): TriageAnswer[] {
     const action = String(row.action ?? '').toLowerCase()
     if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
     const severity = String(row.severity ?? '').toUpperCase() as Severity
-    const replyId = typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
+    const replyId =
+      typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
     out.push({
       id,
       action,
@@ -412,7 +413,7 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
 export function verifyPrompt(run: Run, fromSha: string): string {
   const current = run.findings.filter(one => one.round === run.round && isBlocking(one))
   return [
-    `You review a fix for codex-gate, a pre-PR gate. Round ${run.round}.`,
+    `You review a fix for pr-gate, a pre-PR gate. Round ${run.round}.`,
     where(run),
     '',
     `Codex raised these high/critical findings, and the fixer answered each (\`git diff ${fromSha}..HEAD\` is what it changed):`,
