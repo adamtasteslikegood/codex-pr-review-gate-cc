@@ -774,6 +774,7 @@ export const register: Register = (on, options) => {
     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
     return ran
   }).catch(($, e, next) => {
+    // Once the hook called `next`, the tool ran: here `next(e)` replays what it settled to and never runs the tool again (Caught).
     const action = next.called ? undefined : readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
     if (action === undefined) return next(e)
     return {

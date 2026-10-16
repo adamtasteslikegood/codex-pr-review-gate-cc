@@ -348,7 +348,9 @@ test('a ready lifecycle lets its own head merge; a later push holds it again', a
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
-  w.store.set('lifecycle:/repo:feat/x', { ...(await recordOf(w)), phase: 'ready' })
+  // Ready through the controller (R65): nobody posts by the wait cap, and the pre-PR Codex review already covered the head.
+  await w.clock.advance(20 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
   expect(isHeld(await $.tool.call(merge))).toBe(false)
   w.gh.prHead = 'e'.repeat(40)
   const held = await $.tool.call(merge)
