@@ -57,7 +57,8 @@ nudging each one.
 A promotion between gated bases (`dev` into `main`) is not gated, and
 neither is a PR for another repository (`--repo`) or from a branch that is
 not checked out. A PR the gate never saw opened is adopted into post-PR review
-when its merge is attempted from its branch.
+when `/pr-gate` runs on its branch; a merge attempt is held and tells the
+agent to run it.
 
 The gate fails closed: a review that did not complete (timeout, auth, no
 verdict, `gh` failing) is an incomplete attempt. It records its effort, spends
@@ -184,9 +185,11 @@ holds the merge again until the new head is reviewed.
 ### Who decides
 
 The gate settles review itself and gives the agent its own next step: fix this,
-answer that, run `/pr-gate resume`. It names the person only for four things:
-deferrals, security P1s, disputes (a second rebuttal), and exhaustion under
-`onExhausted: stop`. The person's tools there are the waivers and `allow`.
+answer that, run `/pr-gate resume`. It names the person only for deferrals, security P1s, disputes (a second
+rebuttal), and exhaustion. After the PR opens, exhaustion names the person
+whatever `onExhausted` is set to. Before it opens, exhaustion names them only
+under `onExhausted: stop` or when a security P1 is open. The person's tools
+there are the waivers and `allow`.
 
 ## Reviewers per repository
 
@@ -232,12 +235,13 @@ Every route that opens or merges a PR goes through one classifier,
   `mergePullRequest`, `enqueuePullRequest` or `enablePullRequestAutoMerge`
   mutation.
 - **GitHub MCP.** `mcp__plugin_github_github__create_pull_request` and
-  `__merge_pull_request`, and
+  `__merge_pull_request`, and `mcp__plugin_github_github__pull_request_write`
+  with `method` `create` or `merge`, and
   `mcp__claude_ai_github-graphql-mcp__manage_pull_requests` with `action`
   `create`, `merge` or `enqueue`.
 - **Fail-closed fallback.** Any other MCP tool whose name contains `github`
-  and whose name or `action`/`method` input reads as creating, merging or
-  enqueuing a pull request is held, with a message naming the tool. It is
+  and whose name or an operation key (at any depth) reads as creating,
+  merging or enqueuing a pull request is held, with a message naming the tool. It is
   waivable like any hold.
 
 A merge names a PR number, not a base, so the guard reads base, head branch and
@@ -260,8 +264,8 @@ What text matching cannot see:
 - a heredoc written to a file and run later (`cat > s.sh <<EOF ... EOF; bash s.sh`): only bodies fed straight to a shell are read
 - an MCP operation under a key this mod does not list, or an operation spelled only in free text
 - an MCP argv array (`args: ['pr', 'merge', '5']`) is free text, not an operation
-- any-depth operation keys can hold contrived shapes
-- shell-fed commands are missed, for example `| ssh`, `| xargs`, and `bash -c "$(cat <<EOF)"`
+- a contrived nested shape such as `{a:{b:{operation:'merge'}}}`, with no PR words in the tool name or keys, is not held
+- shell-fed commands are missed, for example a command fed to `ssh` on stdin (`... | ssh host`; `ssh h "gh pr merge 5"` is caught), `| xargs`, and `bash -c "$(cat <<EOF)"`
 
 The hold is a guard against a well-meaning agent skipping the gate, not a
 defense against one that works around it.
@@ -329,8 +333,7 @@ counts how many hold the merge, how many blockers are open and how many are
 owed verification, from the same test the merge guard uses. When the person is
 awaited, it says for which finding. Rendering the pane starts nothing and
 writes nothing. The surface decides where it sits: docked beside the
-transcript in a fullscreen terminal from 110 columns, above the prompt
-otherwise.
+transcript or above the prompt, depending on the host.
 
 ## Commands
 
@@ -342,7 +345,7 @@ otherwise.
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review; post-PR review still runs. Refused while a security P1 holds |
 | `/pr-gate waive post <reason>` | let this head merge without the review; a security P1 needs its own waiver first |
-| `/pr-gate waive <findingId> <reason>` | release one finding (deferred, disputed or open) from the merge test, security P1 included |
+| `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test, security P1 included |
 | `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
 | `/pr-gate reset` | archive the record under its own key, history kept, and start fresh |
 
@@ -358,8 +361,8 @@ Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
 
 | Option | Default | |
 | --- | --- | --- |
-| `allowanceStandard` | 4 | rounds for a standard change |
-| `allowanceHigh` | 6 | rounds for a high blast-radius change |
+| `allowanceStandard` | 4 | rounds for a standard change (capped at 10) |
+| `allowanceHigh` | 6 | rounds for a high blast-radius change (capped at 12) |
 | `bases` | `dev,main` | gated base branches; the first is the default |
 | `enforce` | true | hold `gh pr create` and the GitHub MCP create-PR tool |
 | `enforceMerge` | true | hold merges until the lifecycle is done |
