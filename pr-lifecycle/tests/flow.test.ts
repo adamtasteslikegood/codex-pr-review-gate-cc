@@ -2436,3 +2436,26 @@ test('R60: the post-PR Codex fallback reviews from the last head a review covere
   expect(run.diffBase).toBe('a'.repeat(40))
   expect(w.spawned.at(-1)?.prompt).toContain(`The base is ${'a'.repeat(40)}`)
 })
+
+test('R61: a merge naming a PR or a repository outside a checkout is held, and the agent is told where to run it', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  const held = (await $.tool.call({ tool: 'Bash', command: 'cd /tmp && gh pr merge 5 -R me/repo' })).deny ?? ''
+  expect(held).toContain("run it from the repository's checkout so the gate can check it")
+  expect(held.startsWith('/')).toBe(false)
+  expect(w.opened.some(one => one.includes('pr merge'))).toBe(false)
+})
+
+test('R61: a create naming a repository outside a checkout is held', async ($, on) => {
+  const w = world(on)
+  const held = (await $.tool.call({ tool: 'Bash', command: `cd /tmp && ${createPr.command} -R me/repo` })).deny ?? ''
+  expect(held).toContain("run it from the repository's checkout so the gate can check it")
+  expect(w.opened).toHaveLength(0)
+})
+
+test('R61: a GitHub MCP create outside a checkout is held', async ($, on) => {
+  const w = world(on)
+  w.git.isOutside = true
+  const held = (await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', base: 'dev', head: 'feat/x', title: 'x' } as never)).deny ?? ''
+  expect(held).toContain("run it from the repository's checkout so the gate can check it")
+})

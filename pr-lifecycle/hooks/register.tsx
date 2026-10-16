@@ -332,12 +332,24 @@ const isAlreadyOnBase = async ($: Engine, root: string, base: string): Promise<s
 
 // ---------------------------------------------------------- the guards
 
-/** The checked-out branch a create is for, when it is this gate's to review; else undefined. */
-const gatedCreate = async ($: Engine, action: PrAction): Promise<{ root: string; branch: string; base: string } | undefined> => {
+/**
+ * Outside a checkout, an action that names a PR number or a repository, or comes from a GitHub MCP tool, can reach a gated PR the
+ * guard cannot check: it is held, never let through (R61). A plain gh call outside a checkout names no repository gh can act on.
+ */
+const isOutsideHeld = (action: PrAction): boolean => action.number !== undefined || action.repo !== undefined || action.via.startsWith('mcp__')
+
+const outsideText = (action: PrAction): string =>
+  [
+    `pr-gate: ${action.via} is held: it does not run inside a git checkout, so the guard cannot check the pull request's lifecycle review.`,
+    `Your next step: run it from the repository's checkout so the gate can check it. Do not ${action.action === 'merge' ? 'merge' : 'open'} it another way.`,
+  ].join('\n') + unknownNote(action)
+
+/** The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61); else undefined. */
+const gatedCreate = async ($: Engine, action: PrAction): Promise<{ root: string; branch: string; base: string } | 'outside' | undefined> => {
   const base = action.base ?? config.bases[0] ?? 'dev'
   if (!config.bases.includes(base)) return undefined
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
-  if (!top.isOk) return undefined
+  if (!top.isOk) return isOutsideHeld(action) ? 'outside' : undefined
   const root = top.out
   if (action.repo !== undefined) {
     const origin = await git($, root, ['remote', 'get-url', 'origin'])
@@ -439,7 +451,7 @@ const owedOf = (rec: LifecycleRecord): string => {
  */
 const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefined> => {
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
-  if (!top.isOk) return undefined
+  if (!top.isOk) return isOutsideHeld(action) ? outsideText(action) : undefined
   const root = top.out
   if (action.repo !== undefined) {
     const origin = await git($, root, ['remote', 'get-url', 'origin'])
@@ -752,6 +764,7 @@ export const register: Register = (on, options) => {
       return refusal !== undefined ? { deny: refusal } : next(e)
     }
     const gated = await gatedCreate($, action)
+    if (gated === 'outside') return config.enforce ? { deny: outsideText(action) } : next(e)
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
     if (refusal !== undefined) return { deny: refusal }
     const ran = await next(e)

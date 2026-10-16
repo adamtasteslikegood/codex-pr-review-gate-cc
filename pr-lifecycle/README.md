@@ -246,7 +246,9 @@ Every route that opens or merges a PR goes through one classifier,
 
 A merge names a PR number, not a base, so the guard reads base, head branch and
 head SHA with `gh pr view <n> --json baseRefName,headRefName,headRefOid`. A
-merge it cannot resolve is held.
+merge it cannot resolve is held. Outside a git checkout, a create or merge that
+names a PR number or a repository, or comes from a GitHub MCP tool, is held
+too: the agent is told to run it from the repository's checkout.
 
 **Not held:** a PR from a branch not checked out here, a PR for another
 repository (`--repo`), a promotion between gated bases, and anything for a base

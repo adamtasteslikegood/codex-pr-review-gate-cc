@@ -33,6 +33,8 @@ export type World = {
     roster: string
     /** Local branches besides the checked-out one. */
     locals: string[]
+    /** The session is outside any checkout: `rev-parse --show-toplevel` fails wherever it runs. */
+    isOutside: boolean
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -107,6 +109,7 @@ export function world(on: On): World {
       isAncestor: false,
       roster: '',
       locals: [],
+      isOutside: false,
     },
     gh: {
       pr: 1,
@@ -175,7 +178,8 @@ export function world(on: On): World {
       return out('')
     }
     if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
-    if (args.startsWith('rev-parse --show-toplevel')) return out('/repo\n')
+    // Outside a checkout (`cd /tmp && ...`), git finds no repository.
+    if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out('/repo\n')
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)
     if (args.startsWith('rev-parse --verify --quiet refs/heads/')) {
       const name = args.slice('rev-parse --verify --quiet refs/heads/'.length)
