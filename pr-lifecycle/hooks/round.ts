@@ -1291,10 +1291,11 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     held === undefined
       ? undefined
       : await headMoved($, run.root, { ...held, findings: mergeFindings(held.findings, run.findings) }, run.roundStartHead, endHead, now)
-  // A fix the fix reviewer verified in this round was read at the round's end head: its own commits do not owe it a re-verify (R58).
+  // A fix the fix reviewer verified in this round owes no re-verify for the round's own commits only if the reviewer read the end
+  // head: a commit that landed while it ran (`run.headSha` is the head it read, not `endHead`) leaves the fix owed (R58, R59).
   const isVerifiedAtEnd = (one: Finding): boolean => {
     const last = one.history.at(-1)
-    return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer'
+    return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer' && run.headSha === endHead
   }
   const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true && !isVerifiedAtEnd(one)).map(one => one.id) ?? [])
   await updateRecord($, run.root, run.branch, rec => ({

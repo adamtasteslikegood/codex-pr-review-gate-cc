@@ -2122,3 +2122,42 @@ test('R58: before the PR, a flagged verified fix blocks the pass until a Codex r
   expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBeUndefined()
   expect(rec.preStatus).toBe('passed')
 })
+
+// ------------------------------------------------------------- R59
+
+/** A high-tier branch: round 1 fails with R1-1, the fix lands at d, and the fix reviewer is running on d. */
+const toFixReview = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  w.git.numstat = '10\t2\tsrc/auth/login.ts'
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  expect((await runOf(w)).phase).toBe('verify')
+}
+
+test('R59: a fix-review verify exempts only the head it read: a commit that landed while it ran leaves the fix owed', { options: { allowanceStandard: 4 } }, async ($, on) => {
+  const w = world(on)
+  await toFixReview($, w)
+  // The reviewer read d; commit g, on the same file, landed before the round ended.
+  w.git.head = 'g'.repeat(40)
+  w.git.changed = 'src/app.ts'
+  await done($, turn(`The fix holds.\n${TRAILER}\n{"step":"r1-verify","ok":true}`))
+  expect((await recordOf(w)).findings.find(f => f.id === 'R1-1')?.needsRecheck).toBe(true)
+  // Round 2's reviewers say nothing of R1-1: the gate does not pass.
+  await done($, turn(review('r2-review', 'PASS'), `agent-${w.spawned.length - 1}`))
+  await done($, turn(review('r2-challenge', 'PASS'), `agent-${w.spawned.length}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBe(true)
+  expect(rec.preStatus).not.toBe('passed')
+})
+
+test('R59: with no commit after the fix, the fix-review verify stands and R1-1 is not flagged', { options: { allowanceStandard: 4 } }, async ($, on) => {
+  const w = world(on)
+  await toFixReview($, w)
+  w.git.changed = 'src/app.ts'
+  await done($, turn(`The fix holds.\n${TRAILER}\n{"step":"r1-verify","ok":true}`))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.status).toBe('verified-fixed')
+  expect(rec.findings.find(f => f.id === 'R1-1')?.needsRecheck).toBeUndefined()
+})
