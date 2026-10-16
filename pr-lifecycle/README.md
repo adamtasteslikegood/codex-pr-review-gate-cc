@@ -15,7 +15,10 @@ nudging each one.
 
 1. An agent runs `gh pr create` (or the GitHub MCP create-PR tool) against a
    gated base (`dev`, `main`). The mod holds the call and starts the gate.
-   `/pr-gate [base]` starts it by hand.
+   `/pr-gate [base]` starts it by hand. A create that names no base is
+   checked against the base GitHub will use, the repository's default branch
+   (`gh repo view`); if gh cannot read it, the create is held and the agent
+   is told to name `--base`.
 2. **Scope.** The diff against `origin/<base>` is sized: `trivial` (docs
    or already-reviewed changes only, Codex skipped; see below), `standard`, or
    `high` (a path matching `highRiskPaths`, over 400 changed lines, or over 25
@@ -356,11 +359,11 @@ transcript or above the prompt, depending on the host.
 
 | Command | Effect |
 | --- | --- |
-| `/pr-gate [base]`, `/pr-gate start [base]` | start the lifecycle for the current branch, or pick it up from its record |
+| `/pr-gate [base]`, `/pr-gate start [base]` | start the lifecycle for the current branch, or pick it up from its record; with no base and no record, against the repository's default branch |
 | `/pr-gate status` | one line of where it stands (phase, rounds used, baseline, what is open, owed and holding the merge), and open the pane |
 | `/pr-gate stop` | stop the round in flight; the record stays, and opening and merging stay held |
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
-| `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
+| `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now, or with no record the repository's default branch (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
 | `/pr-gate waive post <reason>` | let this head merge without the review, and stop the post-PR review in flight; a security P1 needs its own waiver first |
 | `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test, security P1 included |
 | `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
@@ -385,7 +388,7 @@ Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
 | --- | --- | --- |
 | `allowanceStandard` | 4 | rounds for a standard change (capped at 10) |
 | `allowanceHigh` | 6 | rounds for a high blast-radius change (capped at 12) |
-| `bases` | `dev,main` | gated base branches; the first is the default |
+| `bases` | `dev,main` | gated base branches. A base nobody named is the repository's default branch, not the first of these |
 | `enforce` | true | hold `gh pr create` and the GitHub MCP create-PR tool |
 | `enforceMerge` | true | hold merges until the lifecycle is done |
 | `fixer` | `main` | `main` or `subagent` |
@@ -408,7 +411,8 @@ Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
 | `maxRounds` | `allowanceStandard`, one allowance shared by pre-PR and post-PR rounds. `maxRounds` is still read when `allowanceStandard` is unset, which only happens in a hand-written options file: the manifest fills in its default of 4. |
 | none | `allowanceHigh` (6), `enforceMerge` (true), `routineRoundMinutes` (3), `waitCapMinutes` (20), `quietMinutes` (3) |
 | `advisoryMinRounds`, `advisoryMaxRounds` | Removed. Every finding goes to the fixer inside its round; Codex re-reviews an advisory fix only while another round stays in reserve. |
-| `bases`, `enforce`, `fixer`, `fixReview`, `onExhausted`, `openPr`, `highRiskPaths`, `reviewEffort`, `lightBranches`, `lightEffort`, `stepTimeoutMinutes` | unchanged |
+| `bases` | Same list, but its first entry no longer decides a base nobody named: a create without `--base`, a bare `/pr-gate` and a pre waiver with no record use the repository's default branch. |
+| `enforce`, `fixer`, `fixReview`, `onExhausted`, `openPr`, `highRiskPaths`, `reviewEffort`, `lightBranches`, `lightEffort`, `stepTimeoutMinutes` | unchanged |
 
 - **Options do not carry over by themselves.** The plugin name is now
   `pr-lifecycle`, so options set under `pluginConfigs["codex-gate"]` must be

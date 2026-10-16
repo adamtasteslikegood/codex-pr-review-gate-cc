@@ -2688,3 +2688,64 @@ test('R1-10: a post-PR fetch that fails twice stops the round before triage and 
   expect(w.prompts.at(-1)).toContain('could not fetch origin')
   expect(w.prompts.some(one => one.includes('SQL injection'))).toBe(false)
 })
+
+const noBase = { tool: 'Bash' as const, command: createPr.command.replace('--base dev ', '') }
+
+test('R1-5: a create with no base is gated against the repository default branch', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = 'main'
+  expect(noBase.command).not.toContain('--base')
+  expect(isHeld(await $.tool.call(noBase))).toBe(true)
+  expect(w.gh.calls.some(one => one.startsWith('repo view'))).toBe(true)
+  expect((await recordOf(w)).base).toBe('main')
+  expect(w.spawned).toHaveLength(1)
+})
+
+test('R1-5: a create with no base to an ungated default branch is not held', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = 'release'
+  expect(isHeld(await $.tool.call(noBase))).toBe(false)
+  expect(w.spawned).toHaveLength(0)
+})
+
+test('R1-5: a create with no base is refused when the default branch cannot be read', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = undefined
+  const held = (await $.tool.call(noBase)).deny ?? ''
+  expect(held).toContain('--base')
+  expect(held).toContain('HTTP 502')
+  expect(w.spawned).toHaveLength(0)
+  const mcp = await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', owner: 'me', repo: 'repo', head: 'feat/x', title: 'x' } as never)
+  expect(mcp.deny).toContain('base')
+  // With a base named, the create is gated as before.
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect(w.spawned).toHaveLength(1)
+})
+
+test('R1-5: an MCP create with no base is gated against the default branch', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = 'main'
+  const held = await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', owner: 'me', repo: 'repo', head: 'feat/x', title: 'x' } as never)
+  expect(isHeld(held)).toBe(true)
+  expect((await recordOf(w)).base).toBe('main')
+})
+
+test('R1-5: a bare /pr-gate and a pre waiver with no record use the default branch', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = 'main'
+  const said = JSON.stringify(await $.command.run(cmd('waive pre hotfix')))
+  expect(said).toContain('covers main only')
+  expect((await recordOf(w)).waivers.at(-1)?.base).toBe('main')
+  expect(isHeld(await $.tool.call(noBase))).toBe(false)
+})
+
+test('R1-5: a bare /pr-gate with no record starts against the default branch, and says so when it cannot read it', async ($, on) => {
+  const w = world(on)
+  w.gh.defaultBranch = undefined
+  expect(JSON.stringify(await $.command.run(cmd('')))).toContain('/pr-gate <base>')
+  expect(w.spawned).toHaveLength(0)
+  w.gh.defaultBranch = 'main'
+  await $.command.run(cmd(''))
+  expect((await recordOf(w)).base).toBe('main')
+  expect(w.spawned).toHaveLength(1)
+})

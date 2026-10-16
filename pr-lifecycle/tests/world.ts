@@ -61,6 +61,8 @@ export type World = {
     hasPr: boolean
     /** The PR's state as gh reports it: OPEN, MERGED or CLOSED. */
     state: string
+    /** The repository's default branch, as `gh repo view` reports it; undefined makes the lookup fail. */
+    defaultBranch?: string
     /** Every gh call throws, as a broken runtime would. */
     isBroken: boolean
     /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
@@ -139,6 +141,7 @@ export function world(on: On): World {
       isAuthed: true,
       hasPr: false,
       state: 'OPEN',
+      defaultBranch: 'dev',
       isBroken: false,
       calls: [],
     },
@@ -181,6 +184,10 @@ export function world(on: On): World {
       if (w.gh.isBroken) throw new Error('gh broke')
       if (!w.gh.isAuthed) return out('', 4)
       if (args.startsWith('api user')) return out(`${w.gh.self}\n`)
+      if (args.startsWith('repo view')) {
+        if (w.gh.defaultBranch === undefined) return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        return out(JSON.stringify({ defaultBranchRef: { name: w.gh.defaultBranch } }))
+      }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)

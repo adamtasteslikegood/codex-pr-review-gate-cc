@@ -170,6 +170,24 @@ const notFetched = ($: Engine, what: string, err: string): NotFetched => {
 
 const isNotFetched = (value: unknown): value is NotFetched => typeof value === 'object' && value !== null && 'notFetched' in value
 
+/**
+ * The repository's default branch, which GitHub opens a PR against when the create names no base (R1-5): `gh repo view` in the
+ * checkout, or for the repository the call names. `err` says why when gh cannot tell.
+ */
+const defaultBranchOf = async ($: Engine, root: string, repo?: string): Promise<{ name?: string; err: string }> => {
+  try {
+    const ran = await $.process.run(['gh', 'repo', 'view', ...(repo === undefined ? [] : [repo]), '--json', 'defaultBranchRef'], {
+      cwd: root,
+      timeoutMs: 30_000,
+    })
+    const name = ran.exitCode === 0 ? (JSON.parse(ran.stdout) as { defaultBranchRef?: { name?: unknown } } | null)?.defaultBranchRef?.name : undefined
+    if (typeof name === 'string' && name !== '') return { name, err: '' }
+    return { err: ran.stderr.trim().slice(0, 200) || `gh repo view printed no default branch (exit ${ran.exitCode})` }
+  } catch (error) {
+    return { err: (error instanceof Error ? error.message : String(error)).slice(0, 200) }
+  }
+}
+
 const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldCall?: boolean }): Promise<string> => {
   const existing = await getRun($)
   if (existing !== null && existing.status === 'running') {
@@ -187,7 +205,12 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (state === 'MERGED' || state === 'CLOSED') return `${await closeLifecycle($, root, branch, known?.pr, state)}. Nothing to review.`
   // An open PR's base is fixed: a resume or a bare /pr-gate keeps it. Before the PR, no base named keeps the record's own.
   const isKept = known !== undefined && known.phase !== 'archived' && (known.phase !== 'pre' || want.base === undefined)
-  const base = isKept ? known.base : (want.base ?? config.bases[0] ?? 'dev')
+  // No base named and none kept: the one a PR with no base opens against, the repository's default branch (R1-5).
+  const found = isKept || want.base !== undefined ? undefined : await defaultBranchOf($, root)
+  if (found !== undefined && found.name === undefined) {
+    return `Not started: gh could not read the repository's default branch (${found.err}). Name the base: /${COMMAND} <base>.`
+  }
+  const base = isKept ? known.base : (want.base ?? found?.name ?? '')
   if (branch === base) return `Not started: you are on ${base} itself. Check out the branch the PR will come from.`
   const fetched = await fetchTwice($, root, ['origin', base], 120_000)
   if (!fetched.isOk) return notFetched($, `origin/${base}`, fetched.err).notFetched
@@ -385,10 +408,14 @@ const outsideText = (action: PrAction): string =>
     `Your next step: run it from the repository's checkout so the gate can check it. Do not ${action.action === 'merge' ? 'merge' : 'open'} it another way.`,
   ].join('\n') + unknownNote(action)
 
-/** The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61); else undefined. */
-const gatedCreate = async ($: Engine, action: PrAction): Promise<{ root: string; branch: string; base: string } | 'outside' | undefined> => {
-  const base = action.base ?? config.bases[0] ?? 'dev'
-  if (!config.bases.includes(base)) return undefined
+type Gated = { root: string; branch: string; base: string }
+
+/**
+ * The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61);
+ * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); else undefined.
+ */
+const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outside' | { noBase: string } | undefined> => {
+  if (action.base !== undefined && !config.bases.includes(action.base)) return undefined
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return isOutsideHeld(action) ? 'outside' : undefined
   const root = top.out
@@ -401,8 +428,19 @@ const gatedCreate = async ($: Engine, action: PrAction): Promise<{ root: string;
   if (action.head !== undefined && action.head.replace(/^[^:]+:/, '') !== branch) return undefined
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
   if (config.bases.includes(branch)) return undefined
-  return { root, branch, base }
+  if (action.base !== undefined) return { root, branch, base: action.base }
+  // No base named: GitHub opens it against the default branch, so that is the base the gate checks (R1-5).
+  const found = await defaultBranchOf($, root, action.repo)
+  if (found.name === undefined) return { noBase: found.err }
+  return config.bases.includes(found.name) ? { root, branch, base: found.name } : undefined
 }
+
+const noBaseText = (action: PrAction, err: string): string =>
+  [
+    `pr-gate: ${action.via} is held: it names no base, and gh could not read the repository's default branch (${err}), ` +
+      'so the guard cannot tell which base the pull request would open against.',
+    'Your next step: run it again with the base named (--base <branch>, or the base field of the tool). Do not create the pull request another way.',
+  ].join('\n') + unknownNote(action)
 
 /** Why an unknown tool is held: said after the refusal, so the agent knows it was not misread as something else. */
 const unknownNote = (action: PrAction): string =>
@@ -735,6 +773,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         'No pre waiver was recorded.'
       )
     }
+    // With no record, the waiver covers the base a PR with no base opens against: the repository's default branch (R1-5).
+    const found = rec === undefined ? await defaultBranchOf($, root) : undefined
+    if (found !== undefined && found.name === undefined) {
+      return `/${COMMAND}: gh could not read the repository's default branch (${found.err}), so the waiver has no base to cover. No pre waiver was recorded.`
+    }
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     // A waiver covers this commit for the record's base at this moment, and is kept in the record's history.
     const waived = await upsertRecord($, root, branch, one => {
@@ -743,7 +786,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
           ? newRecord({
               root,
               branch,
-              base: config.bases[0] ?? 'dev',
+              base: found?.name ?? one?.base ?? '',
               head,
               tier: 'standard',
               tierWhy: 'not scoped: waived before the gate ran',
@@ -773,10 +816,22 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   }
   const pr = await openPrOf($, root, branch)
   const at = pr?.headRefOid ?? head
+  // A record started here only carries the waiver: its base is the PR's, else the default branch (R1-5), else the first gated base.
+  const fallback = rec === undefined && pr === undefined ? (await defaultBranchOf($, root)).name : undefined
   await upsertRecord($, root, branch, one => {
     const base =
       one === undefined || one.phase === 'archived'
-        ? newRecord({ root, branch, base: config.bases[0] ?? 'dev', head, tier: 'standard', tierWhy: 'waived before scoping', lane: 'full', allowance: 0, at: now })
+        ? newRecord({
+            root,
+            branch,
+            base: pr?.baseRefName ?? fallback ?? config.bases[0] ?? 'dev',
+            head,
+            tier: 'standard',
+            tierWhy: 'waived before scoping',
+            lane: 'full',
+            allowance: 0,
+            at: now,
+          })
         : one
     return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
   })
@@ -816,8 +871,10 @@ export const register: Register = (on, options) => {
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
       return refusal !== undefined ? { deny: refusal } : next(e)
     }
-    const gated = await gatedCreate($, action)
-    if (gated === 'outside') return config.enforce ? { deny: outsideText(action) } : next(e)
+    const found = await gatedCreate($, action)
+    if (found === 'outside') return config.enforce ? { deny: outsideText(action) } : next(e)
+    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: noBaseText(action, found.noBase) } : next(e)
+    const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
     if (refusal !== undefined) return { deny: refusal }
     const ran = await next(e)
