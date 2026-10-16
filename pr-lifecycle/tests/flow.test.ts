@@ -2568,3 +2568,19 @@ test('R64: the person\'s own approval does not cover a head', async ($, on) => {
   expect((await runOf(w)).phase).toBe('review')
   expect((await runOf(w)).evidence.some(one => one.reviewer === 'me')).toBe(false)
 })
+
+test('R1-1: a pre waiver covers the base it was given for, not a round against another base', async ($, on) => {
+  const w = world(on)
+  const said = await $.command.run(cmd('waive pre hotfix'))
+  expect(JSON.stringify(said)).toContain('covers dev only')
+  expect((await recordOf(w)).waivers.at(-1)?.base).toBe('dev')
+  const toMain = { tool: 'Bash' as const, command: createPr.command.replace('--base dev', '--base main') }
+  expect(isHeld(await $.tool.call(toMain))).toBe(true)
+  expect((await recordOf(w)).base).toBe('main')
+  // The round against main raises a P1, and the fixer answers nothing: the gate holds the PR on its own verdict.
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  expect((await recordOf(w)).preHead).toBe(w.git.head)
+  expect(isHeld(await $.tool.call(toMain))).toBe(true)
+})

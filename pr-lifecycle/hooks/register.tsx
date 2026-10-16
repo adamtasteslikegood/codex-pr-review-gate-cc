@@ -388,7 +388,8 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     // A verdict or waiver is about the base it was given for: a pass against dev opens no PR against main.
     one.base === base &&
     // A pre waiver never releases a security blocker: only a waiver naming it does (R54).
-    ((one.waivers.some(each => each.scope === 'pre' && each.head === head) && !hasSecurityBlocker(one)) ||
+    // A pre waiver covers the commit and the base it was given for, whatever round runs against another base since (R1-1).
+    ((one.waivers.some(each => each.scope === 'pre' && each.head === head && each.base === base) && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'exhausted' && config.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
@@ -694,7 +695,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       )
     }
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
-    // A waiver covers this commit for every gated base, and is kept in the record's history.
+    // A waiver covers this commit for the record's base at this moment, and is kept in the record's history.
     const base =
       rec ??
       newRecord({
@@ -708,11 +709,14 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         allowance: config.allowances.standard,
         at: now,
       })
-    const waiver = { scope: 'pre' as const, head, reason, by: origin, at: now }
+    const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
     const waived: LifecycleRecord = { ...base, preStatus: 'waived', preHead: head, waivers: [...base.waivers, waiver] }
     await saveRecord($, waived)
     sayOpenPr($, waived, 'waived', now)
-    return `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. The PR may open; post-PR review still runs.`
+    return (
+      `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +
+      `The PR may open; this waiver covers ${base.base} only, and post-PR review still runs.`
+    )
   }
   // waive post: the head GitHub reports for the PR, which is what the merge guard checks.
   const security = rec === undefined ? [] : securityHolds(rec)

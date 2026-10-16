@@ -104,6 +104,8 @@ export type Waiver = {
   scope: 'pre' | 'post' | 'finding'
   findingId?: string
   head: string
+  /** A pre waiver's base: it lets a PR open only to that base (R1-1). One without it matches none. */
+  base?: string
   reason: string
   by: string
   at: number

@@ -352,7 +352,7 @@ transcript or above the prompt, depending on the host.
 | `/pr-gate status` | one line of where it stands (phase, rounds used, baseline, what is open, owed and holding the merge), and open the pane |
 | `/pr-gate stop` | stop the round in flight; the record stays, and opening and merging stay held |
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
-| `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review; post-PR review still runs. Refused while a security P1 holds |
+| `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
 | `/pr-gate waive post <reason>` | let this head merge without the review, and stop the post-PR review in flight; a security P1 needs its own waiver first |
 | `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test, security P1 included |
 | `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
