@@ -227,22 +227,6 @@ export function compileRisk(source: string): RegExp | undefined {
   }
 }
 
-// ------------------------------------------------------------ gh pr create
-
-export type PrCreate = { base: string | undefined; cwd: string | undefined; repo: string | undefined }
-
-/** Reads a shell command for `gh pr create`: its base, the directory it first enters, its `--repo`. */
-export function readPrCreate(command: string): PrCreate | undefined {
-  if (!/\bgh\s+pr\s+create\b/.test(command)) return undefined
-  const flag = (names: string): string | undefined =>
-    command.match(new RegExp(`(?:^|\\s)(?:${names})(?:=|\\s+)["']?([^\\s"']+)`))?.[1]
-  return {
-    base: flag('--base|-B'),
-    repo: flag('--repo|-R'),
-    cwd: command.match(/(?:^|&&|;)\s*cd\s+["']?([^\s"';&]+)/)?.[1],
-  }
-}
-
 /** `owner/repo` from a remote URL or a `--repo` value, lowercased. */
 export function slugOf(remote: string): string | undefined {
   return remote

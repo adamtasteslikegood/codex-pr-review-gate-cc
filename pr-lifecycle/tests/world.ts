@@ -26,6 +26,22 @@ export type World = {
     left: string
     /** `git diff --name-only` between two heads: the files a new commit touched. */
     changed: string
+    /** `.github/pr-gate.json` at HEAD; empty means none. */
+    roster: string
+  }
+  /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
+  gh: {
+    pr: number
+    prHead: string
+    base: string
+    headRef: string
+    self: string
+    reviews: object[]
+    comments: object[]
+    issueComments: object[]
+    checks: object[]
+    isAuthed: boolean
+    calls: string[]
   }
   /** The run as the mod last wrote it. */
   run?: Run
@@ -55,7 +71,9 @@ export function world(on: On): World {
       pkgDiff: '',
       left: 'x',
       changed: 'src/app.ts',
+      roster: '',
     },
+    gh: { pr: 1, prHead: 'a'.repeat(40), base: 'dev', headRef: 'feat/x', self: 'me', reviews: [], comments: [], issueComments: [], checks: [], isAuthed: true, calls: [] },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
   }
@@ -79,6 +97,19 @@ export function world(on: On): World {
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
     })
+    if (e.argv[0] === 'gh') {
+      w.gh.calls.push(args)
+      if (!w.gh.isAuthed) return out('', 4)
+      if (args.startsWith('api user')) return out(`${w.gh.self}\n`)
+      if (args.startsWith('pr view')) return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: 'OPEN' }))
+      if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
+      if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))
+      if (/issues\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.issueComments))
+      if (/commits\/[0-9a-f]+\/check-runs/.test(args)) return out(JSON.stringify({ check_runs: w.gh.checks }))
+      if (/requested_reviewers/.test(args)) return out('{}')
+      return out('')
+    }
+    if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
     if (args.startsWith('rev-parse --show-toplevel')) return out('/repo\n')
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)
     if (args.startsWith('rev-parse --verify')) return out('b\n')

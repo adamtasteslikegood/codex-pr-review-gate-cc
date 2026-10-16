@@ -275,7 +275,9 @@ test('a docs-only change passes without Codex, and other bases are not gated', a
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   expect(w.spawned).toHaveLength(0)
   expect(w.prompts).toHaveLength(0)
-  expect((await runOf(w)).status).toBe('passed')
+  expect(recordOf(w).preStatus).toBe('passed')
+  // The PR opened, so the lifecycle went on into post-PR review.
+  expect((await runOf(w)).lifecycle).toBe('post')
 })
 
 test('a chore/ branch gets one Codex round at low effort; its fix is reviewed after the PR opens', async ($, on) => {
@@ -321,8 +323,10 @@ test('a pointer bump to a landed submodule commit passes without Codex; an unlan
   w.git.raw = `:160000 160000 ${'1'.repeat(40)} ${'2'.repeat(40)} M\tBackend`
   w.git.pkgDiff = '--- a/package.json\n+++ b/package.json\n@@ -3 +3 @@\n-  "version": "0.6.0",\n+  "version": "0.6.1",'
   w.git.isLanded = true
-  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  // Run by hand, so no PR opens and the branch stays before its PR.
+  await $.command.run({ command: 'pr-gate', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
   expect(w.spawned).toHaveLength(0)
+  expect((await runOf(w)).status).toBe('passed')
   expect((await runOf(w)).tierWhy).toContain('already reviewed: Backend, package.json, package-lock.json')
 
   w.git.head = 'b'.repeat(40)

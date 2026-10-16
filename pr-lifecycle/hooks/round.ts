@@ -374,9 +374,16 @@ async function beginVerify($: Engine, id: string, fromSha: string): Promise<void
   await patch($, id, run => ({ ...run, pending: [{ role: 'verify', step: stepOf(run, 'verify'), agentId }], activity: 'waiting on the fix reviewer…' }))
 }
 
-/** Post-PR collection is built in Task 11; until then a post-PR round ends at once. */
+/** Post-PR collection waits for the repository's reviews. Task 11 builds the polling; until then the round waits in collect. */
 async function beginCollect($: Engine, id: string): Promise<void> {
-  await finish($, id, 'error', 'post-PR rounds are not built yet')
+  const now = await $.clock.now()
+  await patch($, id, run => ({
+    ...run,
+    phase: 'collect',
+    phaseStartedAt: now,
+    collect: { startedAt: now, lastArrivalAt: now, polledAt: now, headAt: now },
+    activity: 'collecting reviews…',
+  }))
 }
 
 /**

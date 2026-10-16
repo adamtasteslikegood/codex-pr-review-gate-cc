@@ -292,3 +292,89 @@ test('a security fix still unverified when the allowance is spent holds the PR a
   expect(held).not.toContain('open the pull request')
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
 })
+
+// ------------------------------------------------- every route; post-PR; merge hold
+
+const GRAPHQL = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+const merge = { tool: 'Bash' as const, command: 'gh pr merge 1 --squash' }
+
+test('a clean pre-PR result still enters post-PR review, and merging stays held', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('post')
+  expect(rec.pr).toBe(1)
+  expect((await runOf(w)).phase).toBe('collect')
+  const held = await $.tool.call(merge)
+  expect(held.deny).toContain('post-PR round 1 owed')
+})
+
+test('the github-graphql connector cannot open or merge around the gate', async ($, on) => {
+  const w = world(on)
+  const created = await $.tool.call({ tool: GRAPHQL, action: 'create', repo: 'me/repo', base: 'dev', head: 'feat/x', title: 't' } as never)
+  expect(created.deny).toContain('/pr-gate')
+  expect(w.spawned).toHaveLength(1)
+  for (const action of ['merge', 'enqueue']) {
+    const held = await $.tool.call({ tool: GRAPHQL, action, repo: 'me/repo', number: 1 } as never)
+    expect(held.deny).toContain('merge')
+  }
+})
+
+test('gh api merges and unknown GitHub tools are held', async ($, on) => {
+  world(on)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh api -X PUT repos/me/repo/pulls/1/merge' }))).toBe(true)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {}) { clientMutationId } }'" }))).toBe(true)
+  const unknown = await $.tool.call({ tool: 'mcp__acme-github__merge_pr', number: 1 } as never)
+  expect(unknown.deny).toContain('mcp__acme-github__merge_pr')
+})
+
+test('a merge to an ungated base, or of a promotion, is not held', async ($, on) => {
+  const w = world(on)
+  w.gh.base = 'release'
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  w.gh.base = 'main'
+  w.gh.headRef = 'dev'
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('a ready lifecycle lets its own head merge; a later push holds it again', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  w.store.set('lifecycle:/repo:feat/x', { ...(await recordOf(w)), phase: 'ready' })
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  w.gh.prHead = 'e'.repeat(40)
+  const held = await $.tool.call(merge)
+  expect(held.deny).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
+  expect(held.deny?.startsWith('/')).toBe(false)
+})
+
+test('a merge gh cannot resolve is held, and the agent is told what to check', async ($, on) => {
+  const w = world(on)
+  w.gh.isAuthed = false
+  const held = await $.tool.call(merge)
+  expect(held.deny).toContain('gh could not say which pull request')
+  expect(held.deny).toContain('gh auth status')
+})
+
+test('a merge while post-PR review runs tells the agent to wait, not the person to waive', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('End your turn')
+  expect(held).not.toContain('waive')
+  expect(w.opened.some(one => one.includes('gh pr merge'))).toBe(false)
+})
+
+test('a PR opened for another branch does not move this branch into post-PR review', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await $.turn.complete(turn(review('r1-review', 'PASS')))
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head dev --title release' }))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('pre')
+})

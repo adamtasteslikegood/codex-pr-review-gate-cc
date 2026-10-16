@@ -10,9 +10,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Effort, LifecycleRecord, Run, Step } from '../types'
-import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, readPrCreate, slugOf, stepDown } from './core'
-import type { PrCreate } from './core'
-import { allowanceFor, invalidate, lastReviewedHead, newRecord, remaining, rescope } from './lifecycle'
+import { activityOf, classify, isBlocking, isVersionOnly, lowerOf, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+import { readPrAction } from './github'
+import type { PrAction } from './github'
+import { allowanceFor, invalidate, lastReviewedHead, newRecord, remaining, rescope, unresolvedBlockers } from './lifecycle'
 import {
   advance,
   configOf,
@@ -33,13 +34,12 @@ import {
   startTicker,
 } from './round'
 import type { Config } from './round'
-import { loadRecord, saveRecord } from './store'
+import { loadRecord, saveRecord, updateRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
 const runAtom = atom({ plugin: 'pr-lifecycle', key: 'run' } as const, null)
 const tickAtom = atom({ plugin: 'pr-lifecycle', key: 'tick' } as const, 0)
-const GITHUB_CREATE_PR = 'mcp__plugin_github_github__create_pull_request'
 
 type Engine = EngineInterface
 
@@ -236,24 +236,37 @@ const isAlreadyOnBase = async ($: Engine, root: string, base: string): Promise<s
 }
 
 
-// ----------------------------------------------------------- the guard
+// ---------------------------------------------------------- the guards
 
-/** Whether a PR to a gated base may be opened now; a refusal starts the gate. */
-const judge = async ($: Engine, pr: PrCreate & { head?: string }): Promise<string | undefined> => {
-  const base = pr.base ?? config.bases[0] ?? 'dev'
+/** The checked-out branch a create is for, when it is this gate's to review; else undefined. */
+const gatedCreate = async ($: Engine, action: PrAction): Promise<{ root: string; branch: string; base: string } | undefined> => {
+  const base = action.base ?? config.bases[0] ?? 'dev'
   if (!config.bases.includes(base)) return undefined
-  const top = await git($, pr.cwd, ['rev-parse', '--show-toplevel'])
+  const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return undefined
   const root = top.out
-  if (pr.repo !== undefined) {
+  if (action.repo !== undefined) {
     const origin = await git($, root, ['remote', 'get-url', 'origin'])
-    if (origin.isOk && slugOf(origin.out) !== slugOf(pr.repo)) return undefined
+    if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return undefined
   }
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   // A PR from a branch that is not checked out here (a release PR, dev into main) is not this gate's to review.
-  if (pr.head !== undefined && pr.head.replace(/^[^:]+:/, '') !== branch) return undefined
+  if (action.head !== undefined && action.head.replace(/^[^:]+:/, '') !== branch) return undefined
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
   if (config.bases.includes(branch)) return undefined
+  return { root, branch, base }
+}
+
+/** Why an unknown tool is held: said after the refusal, so the agent knows it was not misread as something else. */
+const unknownNote = (action: PrAction): string =>
+  action.isUnknown === true
+    ? `\n(pr-gate does not know ${action.via}; it reads as ${action.action === 'create' ? 'opening' : 'merging'} a pull request, ` +
+      `so it is held like gh pr ${action.action}.)`
+    : ''
+
+/** Whether a PR to a gated base may be opened now; a refusal starts the gate. */
+const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; branch: string; base: string }): Promise<string | undefined> => {
+  const { root, branch, base } = gated
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
   const allows = (one: LifecycleRecord | undefined): one is LifecycleRecord =>
     one !== undefined &&
@@ -279,63 +292,138 @@ const judge = async ($: Engine, pr: PrCreate & { head?: string }): Promise<strin
   if (held !== undefined) {
     // No round started: the PR stays held for a settled reason, and waiting will not change it.
     return [
-      `pr-gate: the pull request to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${held.why}.`,
+      `pr-gate: ${action.via} to ${base} is held for ${branch} at ${head.slice(0, 7)}: ${held.why}.`,
       `Your next step: ${held.nextStep}. Do not create the pull request another way.`,
       `Tell the person: they can type /${COMMAND} waive <reason> to let this commit through, or /${COMMAND} allow 1 <reason> for one more review round.`,
+    ].join('\n') + unknownNote(action)
+  }
+  return (
+    [
+      `pr-gate: ${action.via} to ${base} waits for the pre-PR review of ${branch} at ${head.slice(0, 7)}.`,
+      started,
+      'Do not retry this command and do not open the pull request another way.',
+      'End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
+      `(The person can type /${COMMAND} status, or /${COMMAND} waive <reason> to open it without the gate.)`,
+    ].join('\n') + unknownNote(action)
+  )
+}
+
+/** What still stands between a record and ready, in a few words. */
+const owedOf = (rec: LifecycleRecord): string => {
+  const post = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
+  const open = unresolvedBlockers(rec)
+  if (rec.phase === 'pre') return 'the PR is still in pre-PR review'
+  if (post.length === 0) return `post-PR round 1 owed on ${rec.head.slice(0, 7)}`
+  if (post.length === 1 && post[0]?.endHead !== post[0]?.startHead) return `post-PR round 2 owed on ${rec.head.slice(0, 7)}`
+  if (open.length > 0) return open.map(one => `${one.id} [${one.severity}] unresolved`).join(', ')
+  if (rec.postStatus !== undefined) return `${rec.postStatus}: ${rec.message ?? 'no reason recorded'}`
+  return 'review in progress'
+}
+
+/**
+ * Whether a PR may be merged now (merge, enqueue or auto-merge): its lifecycle must be ready for the PR's current head,
+ * or the person waived post for it. A refusal never starts work, and tells the agent its own next step.
+ */
+const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefined> => {
+  const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.isOk) return undefined
+  const root = top.out
+  if (action.repo !== undefined) {
+    const origin = await git($, root, ['remote', 'get-url', 'origin'])
+    if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return undefined
+  }
+  // Only `gh pr merge` without a target means the checked-out branch's PR; any other unnumbered merge names a PR the guard cannot see.
+  if (action.number === undefined && (action.via !== 'gh pr merge' || action.isUnknown === true)) {
+    return [
+      `pr-gate: ${action.via} is held: it does not name the pull request it merges by number, so the guard cannot check that PR's lifecycle review.`,
+      'Do not merge another way. Once the lifecycle review is complete, merge with gh pr merge <number>, which the guard can check.',
     ].join('\n')
   }
-  return [
-    `pr-gate: a pull request to ${base} waits for the pre-PR review of ${branch} at ${head.slice(0, 7)}.`,
-    started,
-    'Do not retry this command and do not open the pull request another way.',
-    'End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
-    `(The person can type /${COMMAND} status, or /${COMMAND} waive <reason> to open it without the gate.)`,
-  ].join('\n')
+  const view = await $.process.run(
+    ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), '--json', 'number,baseRefName,headRefName,headRefOid'],
+    { cwd: root, timeoutMs: 30_000 },
+  )
+  let pr: { number: number; baseRefName: string; headRefName: string; headRefOid: string } | undefined
+  try {
+    pr = view.exitCode === 0 ? JSON.parse(view.stdout) : undefined
+  } catch {
+    pr = undefined
+  }
+  if (pr === undefined || typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || typeof pr.headRefOid !== 'string') {
+    const said = view.stderr.trim().slice(0, 200)
+    return [
+      `pr-gate: ${action.via} is held: gh could not say which pull request this merges${said === '' ? '' : ` (${said})`}.`,
+      'Do not merge another way. Check gh auth status and the PR number, then try again: the guard checks the PR once gh can read it.',
+    ].join('\n')
+  }
+  if (!config.bases.includes(pr.baseRefName) || config.bases.includes(pr.headRefName)) return undefined
+  const rec = await loadRecord($, root, pr.headRefName)
+  if (rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true) return undefined
+  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid) return undefined
+  const short = pr.headRefOid.slice(0, 7)
+  const missing =
+    rec === undefined
+      ? 'no lifecycle record for this branch'
+      : rec.phase === 'ready'
+        ? `${short} was pushed after the review completed at ${rec.head.slice(0, 7)}`
+        : owedOf(rec)
+  const run = await getRun($)
+  const isRunning = run !== null && run.status === 'running' && rec !== undefined && run.root === rec.root && run.branch === rec.branch
+  // The agent's own next step; the person is named only where the spec leaves the decision to them.
+  const next =
+    rec === undefined
+      ? `Your next step: check out ${pr.headRefName} and run /${COMMAND}; merging is held until its lifecycle review is complete.`
+      : isRunning
+        ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
+        : rec.phase !== 'ready' && (rec.postStatus === 'exhausted' || rec.postStatus === 'blocked')
+          ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
+            `or /${COMMAND} allow 1 <reason> for one more review round.`
+          : `Your next step: run /${COMMAND} resume, which reviews ${short} and says when the PR is ready for the merge decision.`
+  return (
+    [
+      `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held: the lifecycle review is not complete for ${short}: ${missing}.`,
+      'Do not merge another way.',
+      next,
+    ].join('\n') + unknownNote(action)
+  )
 }
 
 const markOpened = async ($: Engine): Promise<void> => {
   await markPr($, 'done', 'opened')
 }
 
+/** The PR opened: the lifecycle crosses into post-PR review instead of ending. */
+const onOpened = async ($: Engine, root: string, branch: string): Promise<void> => {
+  const view = await $.process.run(['gh', 'pr', 'view', '--json', 'number,headRefOid'], { cwd: root, timeoutMs: 30_000 })
+  const self = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: root, timeoutMs: 30_000 })
+  const origin = await git($, root, ['remote', 'get-url', 'origin'])
+  let pr: { number: number; headRefOid: string } | undefined
+  try {
+    const read = view.exitCode === 0 ? (JSON.parse(view.stdout) as { number?: unknown; headRefOid?: unknown }) : undefined
+    pr = typeof read?.number === 'number' && typeof read.headRefOid === 'string' ? { number: read.number, headRefOid: read.headRefOid } : undefined
+  } catch {
+    pr = undefined
+  }
+  const login = self.exitCode === 0 ? self.stdout.trim() : ''
+  const slug = origin.isOk ? slugOf(origin.out) : undefined
+  const saved = await updateRecord($, root, branch, rec => ({
+    ...rec,
+    phase: 'post',
+    ...(pr === undefined ? {} : { pr: pr.number, head: pr.headRefOid }),
+    ...(login === '' ? {} : { self: login }),
+    ...(slug === undefined ? {} : { slug }),
+  }))
+  await markOpened($)
+  if (saved !== undefined) await advance($, root, branch)
+}
+
 export const register: Register = (on, options) => {
   config = configOf(options)
   setup(config)
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const pr = config.enforce ? readPrCreate(e.command) : undefined
-    if (pr === undefined) return next(e)
-    const head = e.command.match(/(?:^|\s)(?:--head|-H)(?:=|\s+)["']?([^\s"']+)/)?.[1]
-    const refusal = await judge($, { ...pr, head })
-    if (refusal !== undefined) return { deny: refusal }
-    const ran = await next(e)
-    if (ran.deny === undefined && ran.isError !== true) await markOpened($)
-    return ran
-  }).catch(($, e, next) =>
-    next.called || readPrCreate(e.command) === undefined
-      ? next(e)
-      : { deny: `pr-gate: its guard failed, so this pull request is held. The person can type /${COMMAND} waive <reason>.` },
-  )
-
-  on('tool.call', { tool: GITHUB_CREATE_PR }, async ($, e, next) => {
-    if (!config.enforce) return next(e)
-    const input = e as unknown as Record<string, unknown>
-    const refusal = await judge($, {
-      base: typeof input.base === 'string' ? input.base : undefined,
-      head: typeof input.head === 'string' ? input.head : undefined,
-      repo: typeof input.owner === 'string' && typeof input.repo === 'string' ? `${input.owner}/${input.repo}` : undefined,
-      cwd: undefined,
-    })
-    if (refusal !== undefined) return { deny: refusal }
-    const ran = await next(e)
-    if (ran.deny === undefined && ran.isError !== true) await markOpened($)
-    return ran
-  }).catch(($, e, next) =>
-    next.called ? next(e) : { deny: `pr-gate: its guard failed, so this pull request is held. The person can type /${COMMAND} waive <reason>.` },
-  )
-
-  // -------------------------------------------- the line that changes in place
-
-  on('tool.call', ($, e, next) => {
+  // One hook for every tool call (the engine takes one without a matcher). It updates the line that changes in place, then guards
+  // every route that opens or merges a PR: Bash, the known GitHub MCP tools, and any GitHub tool that reads as one.
+  on('tool.call', async ($, e, next) => {
     if (isLiveNow()) {
       void (async () => {
         const run = await getRun($)
@@ -351,8 +439,27 @@ export const register: Register = (on, options) => {
         if (activity !== run.activity) await patch($, run.id, one => ({ ...one, activity }))
       })().catch(() => undefined)
     }
-    return next(e)
-  })
+    const action = readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
+    if (action === undefined) return next(e)
+    if (action.action === 'merge') {
+      const refusal = config.enforceMerge ? await judgeMerge($, action) : undefined
+      return refusal !== undefined ? { deny: refusal } : next(e)
+    }
+    const gated = await gatedCreate($, action)
+    const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
+    if (refusal !== undefined) return { deny: refusal }
+    const ran = await next(e)
+    if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
+    return ran
+  }).catch(($, e, next) =>
+    next.called || readPrAction(String(e.tool), e as unknown as Record<string, unknown>) === undefined
+      ? next(e)
+      : {
+          deny:
+            'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
+            `who can type /${COMMAND} waive <reason> to let it through.`,
+        },
+  )
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
