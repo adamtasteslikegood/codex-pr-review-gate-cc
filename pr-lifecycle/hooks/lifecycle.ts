@@ -1,7 +1,7 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Lane, LifecycleRecord, RoundRecord, Tier } from '../types'
+import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundRecord, Severity, Tier } from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -93,3 +93,97 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
   endedAt: 0,
   ...over,
 })
+
+export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
+
+// ----------------------------------------------------------------- ledger
+
+export type Answer = {
+  id: string
+  action: 'fixed' | 'rebutted' | 'deferred'
+  note?: string
+  evidence?: string
+  severity?: Severity
+  isSecurity?: boolean
+}
+
+const moved = (f: Finding, status: FindingStatus, round: number, by: string, at: number, note?: string, evidence?: string): Finding => ({
+  ...f,
+  status,
+  note: note ?? f.note,
+  needsRecheck: undefined,
+  history: [
+    ...f.history,
+    { round, status, ...(note === undefined ? {} : { note }), ...(evidence === undefined ? {} : { evidence }), by, at },
+  ],
+})
+
+/** The fixer's word: fixed is only reported until a check confirms it. */
+export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at: number): Finding {
+  const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action
+  const next = moved(f, status, round, by, at, a.note, a.evidence)
+  return {
+    ...next,
+    ...(a.severity === undefined ? {} : { severity: a.severity }),
+    ...(a.isSecurity === undefined ? {} : { isSecurity: a.isSecurity }),
+  }
+}
+
+/** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
+export const markVerified = (f: Finding, round: number, by: string, at: number, note?: string): Finding =>
+  moved(f, 'verified-fixed', round, by, at, note)
+
+/** A reviewer holds the finding against the fix or rebuttal: it is unresolved again. */
+export const markHeld = (f: Finding, round: number, by: string, at: number, note?: string): Finding => moved(f, 'open', round, by, at, note)
+
+/** The ledger after a round: changed findings replace theirs by id, new ones are appended, nothing else moves. */
+export function mergeFindings(kept: readonly Finding[], changed: readonly Finding[]): Finding[] {
+  const byId = new Map(changed.map(one => [one.id, one]))
+  const out = kept.map(one => byId.get(one.id) ?? one)
+  for (const one of changed) if (!kept.some(each => each.id === one.id)) out.push(one)
+  return out
+}
+
+export type TriageClass = 'duplicate' | 'new-on-reviewed' | 'new-on-changed'
+
+const words = (title: string): Set<string> => new Set(title.toLowerCase().split(/[^a-z0-9]+/).filter(one => one.length > 2))
+
+/** Whether two findings name the same problem: same file, nearby line, mostly the same words. */
+function isSame(a: { file?: string; line?: number; title: string }, b: { file?: string; line?: number; title: string }): boolean {
+  if (a.file !== b.file) return false
+  if (a.line !== undefined && b.line !== undefined && Math.abs(a.line - b.line) > 5) return false
+  const x = words(a.title)
+  const y = words(b.title)
+  const shared = [...x].filter(one => y.has(one)).length
+  return shared / Math.max(1, Math.min(x.size, y.size)) >= 0.5
+}
+
+const ANSWERED: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
+
+/** Where incoming feedback stands against the ledger. Prior review can make it a duplicate, never dismiss a new claim. */
+export function triage(
+  item: { file?: string; line?: number; title: string },
+  findings: readonly Finding[],
+  changedFiles: ReadonlySet<string>,
+): { cls: TriageClass; matchId?: string } {
+  if (item.file !== undefined && changedFiles.has(item.file)) return { cls: 'new-on-changed' }
+  const match = findings.find(one => ANSWERED.includes(one.status) && one.needsRecheck !== true && isSame(one, item))
+  return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
+}
+
+const waivedIds = (rec: Pick<LifecycleRecord, 'waivers'>): Set<string> =>
+  new Set(rec.waivers.filter(one => one.scope === 'finding' && one.findingId !== undefined).map(one => one.findingId as string))
+
+/** Blockers nobody settled: open ones, and a deferred security P1, which only the person's waiver settles. */
+export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
+  const waived = waivedIds(rec)
+  return rec.findings.filter(
+    one => isBlocking(one) && !waived.has(one.id) && (one.status === 'open' || (one.status === 'deferred' && one.isSecurity === true)),
+  )
+}
+
+/** Blockers the fixer reported fixed that no check has confirmed yet. */
+export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
+  const waived = waivedIds(rec)
+  return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && one.status === 'reported-fixed')
+}

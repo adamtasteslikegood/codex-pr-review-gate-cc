@@ -1,14 +1,14 @@
 // The gate's pure half: reading what the agents answered, sizing a change,
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
+import { isBlocking } from './lifecycle'
 import type { Effort, Finding, Role, Run, Severity, Tier } from '../types'
 
 export const TRAILER = 'CODEX_GATE_RESULT'
 
 const SEVERITIES: readonly Severity[] = ['P0', 'P1', 'P2', 'P3']
 
-export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean =>
-  finding.severity === 'P0' || finding.severity === 'P1'
+export { isBlocking } from './lifecycle'
 
 // ---------------------------------------------------------------- answers
 
