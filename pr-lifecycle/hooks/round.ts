@@ -60,7 +60,7 @@ import {
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, loadRecord, saveRecord, updateRecord } from './store'
+import { archiveRecord, loadRecord, lockRecord, saveRecord, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -268,12 +268,20 @@ export async function headMoved(
  */
 export async function onNewHead($: Engine, run: Run, from: string, to: string, now: number): Promise<void> {
   const live = await getRun($)
-  const rec = await loadRecord($, run.root, run.branch)
-  const ledger = mergeFindings(rec?.findings ?? [], live?.id === run.id ? live.findings : run.findings)
-  const moved = await headMoved($, run.root, { findings: ledger, waivers: rec?.waivers ?? [] }, from, to, now)
-  const flagged = new Set(moved.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+  const own = live?.id === run.id ? live.findings : run.findings
+  let flagged = new Set<string>()
   const flag = (findings: readonly Finding[]): Finding[] => findings.map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one))
-  if (rec !== undefined) await updateRecord($, run.root, run.branch, one => ({ ...one, findings: flag(one.findings), waivers: moved.waivers }))
+  const move = async (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Promise<Waiver[]> => {
+    const moved = await headMoved($, run.root, { findings: mergeFindings(rec.findings, own), waivers: rec.waivers }, from, to, now)
+    flagged = new Set(moved.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+    return moved.waivers
+  }
+  // Read and written under the record's lock (R1-6): a waiver the person gives meanwhile is not overwritten.
+  const saved = await updateRecord($, run.root, run.branch, async one => {
+    const waivers = await move(one)
+    return { ...one, findings: flag(one.findings), waivers }
+  })
+  if (saved === undefined) await move({ findings: [], waivers: [] })
   await patch($, run.id, one => ({ ...one, findings: flag(one.findings) }))
 }
 
@@ -385,13 +393,15 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
  * fresh start must not repeat (processed feedback and recorded replies). False when there was no live record.
  */
 export async function archiveLifecycle($: Engine, root: string, branch: string, now: number): Promise<boolean> {
-  const last = await loadRecord($, root, branch)
-  if (last === undefined || last.phase === 'archived') return false
-  await archiveRecord($, last, now)
-  const { base, head, tier, tierWhy, lane, allowance } = last
-  const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-  await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
-  return true
+  return lockRecord(root, branch, async () => {
+    const last = await loadRecord($, root, branch)
+    if (last === undefined || last.phase === 'archived') return false
+    await archiveRecord($, last, now)
+    const { base, head, tier, tierWhy, lane, allowance } = last
+    const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
+    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
+    return true
+  })
 }
 
 export type PrState = 'OPEN' | 'MERGED' | 'CLOSED'
@@ -1434,25 +1444,27 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     endedAt: now,
   }
   // Before the PR, this round's own commits are a new head (R52, R55, R56); after it, `pollOnce` and `afterTriage` see each one.
-  const held = run.lifecycle === 'pre' && endHead !== run.roundStartHead ? await loadRecord($, run.root, run.branch) : undefined
-  const moved =
-    held === undefined
-      ? undefined
-      : await headMoved($, run.root, { ...held, findings: mergeFindings(held.findings, run.findings) }, run.roundStartHead, endHead, now)
+  const isMoved = run.lifecycle === 'pre' && endHead !== run.roundStartHead
   // A fix the fix reviewer verified in this round owes no re-verify for the round's own commits only if the reviewer read the end
   // head: a commit that landed while it ran (`run.headSha` is the head it read, not `endHead`) leaves the fix owed (R58, R59).
   const isVerifiedAtEnd = (one: Finding): boolean => {
     const last = one.history.at(-1)
     return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer' && run.headSha === endHead
   }
-  const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true && !isVerifiedAtEnd(one)).map(one => one.id) ?? [])
-  await updateRecord($, run.root, run.branch, rec => ({
-    ...withRound(rec, round),
-    head: endHead,
-    findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
-    ...(moved === undefined ? {} : { waivers: moved.waivers }),
-    effort: run.effort,
-  }))
+  // The head move is read from the record under its lock (R1-6), so a waiver given meanwhile is lapsed or kept, never lost.
+  await updateRecord($, run.root, run.branch, async rec => {
+    const moved = isMoved
+      ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
+      : undefined
+    const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true && !isVerifiedAtEnd(one)).map(one => one.id) ?? [])
+    return {
+      ...withRound(rec, round),
+      head: endHead,
+      findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
+      ...(moved === undefined ? {} : { waivers: moved.waivers }),
+      effort: run.effort,
+    }
+  })
   if (isCompleted) await advance($, run.root, run.branch)
 }
 

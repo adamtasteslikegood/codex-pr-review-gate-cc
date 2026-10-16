@@ -25,16 +25,54 @@ export async function saveRecord($: Engine, rec: LifecycleRecord): Promise<void>
   await $.store.set(recordKey(rec.root, rec.branch), { ...rec, updatedAt: Math.max(rec.updatedAt, await $.clock.now()) })
 }
 
-/** Reads, changes and writes the record; undefined when there is none. */
+// Each branch's record is changed one read-modify-write at a time (R1-6): a promise chain per root and branch, held in this process.
+const locks = new Map<string, Promise<void>>()
+
+/**
+ * Runs `work` once every earlier holder of the branch's record is done, and releases the record whether `work` returns or throws.
+ * Not re-entrant: `work` must not lock the same record again (no `updateRecord`, `advance` or `finish` inside it).
+ */
+export async function lockRecord<T>(root: string, branch: string, work: () => Promise<T>): Promise<T> {
+  const key = recordKey(root, branch)
+  const held = (locks.get(key) ?? Promise.resolve()).then(work)
+  const tail = held.then(
+    () => undefined,
+    () => undefined,
+  )
+  locks.set(key, tail)
+  try {
+    return await held
+  } finally {
+    if (locks.get(key) === tail) locks.delete(key)
+  }
+}
+
+/** Reads, changes and writes the record under its lock; undefined when there is none. */
 export async function updateRecord(
   $: Engine,
   root: string,
   branch: string,
-  change: (rec: LifecycleRecord) => LifecycleRecord,
+  change: (rec: LifecycleRecord) => LifecycleRecord | Promise<LifecycleRecord>,
 ): Promise<LifecycleRecord | undefined> {
-  const rec = await loadRecord($, root, branch)
-  if (rec === undefined) return undefined
-  const next = change(rec)
-  await saveRecord($, next)
-  return next
+  return lockRecord(root, branch, async () => {
+    const rec = await loadRecord($, root, branch)
+    if (rec === undefined) return undefined
+    const next = await change(rec)
+    await saveRecord($, next)
+    return next
+  })
+}
+
+/** As `updateRecord`, for a change that may start the record: `change` sees undefined when there is none, and returns what to write. */
+export async function upsertRecord(
+  $: Engine,
+  root: string,
+  branch: string,
+  change: (rec: LifecycleRecord | undefined) => LifecycleRecord | Promise<LifecycleRecord>,
+): Promise<LifecycleRecord> {
+  return lockRecord(root, branch, async () => {
+    const next = await change(await loadRecord($, root, branch))
+    await saveRecord($, next)
+    return next
+  })
 }

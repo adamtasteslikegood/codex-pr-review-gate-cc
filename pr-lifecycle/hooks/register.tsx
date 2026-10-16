@@ -57,7 +57,7 @@ import {
 } from './round'
 import type { Config } from './round'
 import { renderPane } from './pane'
-import { loadRecord, saveRecord, updateRecord } from './store'
+import { loadRecord, lockRecord, saveRecord, updateRecord, upsertRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -215,60 +215,69 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const lane = config.light !== undefined && config.light.test(branch) ? ('light' as const) : ('full' as const)
   // High blast radius starts at high; the rest at the configured effort, lower on a light-lane branch.
   const startEffort: Effort = scope.tier === 'high' ? 'high' : lane === 'light' ? config.lightEffort : config.effort
-  const prior = await loadRecord($, root, branch)
-  // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
-  // Otherwise it starts no higher than the effort a review last completed at on this branch.
-  const afterTimeout = prior?.hasTimedOut === true && prior.effort !== undefined ? (stepDown(prior.effort) ?? 'low') : startEffort
-  const effort = lowerOf(lowerOf(startEffort, afterTimeout), prior?.passedEffort ?? startEffort)
   const now = await $.clock.now()
   const allowance = allowanceFor(scope.tier, lane, config.allowances)
-  let rec: LifecycleRecord =
-    prior !== undefined && prior.phase !== 'archived'
-      ? {
-          ...rescope(
-            {
-              ...prior,
-              head,
-              base,
-              ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
-              // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
-              // So was one about another base: a pass against dev does not open a PR against main.
-              ...(prior.phase === 'pre' && (prior.head !== head || prior.base !== base) ? { preStatus: undefined, preHead: undefined } : {}),
-              postStatus: undefined,
-            },
-            scope.tier,
-            scope.why,
-            config.allowances,
-          ),
-          effort,
-          // A pass-through that now needs Codex is one no longer.
-          ...(scope.tier === 'trivial' ? {} : { passThrough: undefined }),
-        }
-      : {
-          ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
-          // After a reset: feedback already processed and replied to stays answered (R47).
-          ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies }),
-          effort,
-          ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
-        }
-  // A new head since the last reviewed one (R56): answered findings on a changed file need a re-check, and their waivers lapse.
-  if (prior !== undefined && prior.head !== head) rec = { ...rec, ...(await headMoved($, root, rec, lastReviewedHead(prior), head, now)) }
-  // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
-  const adopted = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
-  if (adopted !== undefined && config.bases.includes(adopted.baseRefName)) {
-    const adoptedRec: LifecycleRecord = {
-      ...rec,
-      ...(await identityOf($, root)),
-      phase: 'post',
-      base: adopted.baseRefName,
-      pr: adopted.number,
-      passThrough: undefined,
+  // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
+  // run inside it; the controller runs after.
+  const { prior, rec, adopted } = await lockRecord(root, branch, async () => {
+    const prior = await loadRecord($, root, branch)
+    // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
+    // Otherwise it starts no higher than the effort a review last completed at on this branch.
+    const afterTimeout = prior?.hasTimedOut === true && prior.effort !== undefined ? (stepDown(prior.effort) ?? 'low') : startEffort
+    const effort = lowerOf(lowerOf(startEffort, afterTimeout), prior?.passedEffort ?? startEffort)
+    let rec: LifecycleRecord =
+      prior !== undefined && prior.phase !== 'archived'
+        ? {
+            ...rescope(
+              {
+                ...prior,
+                head,
+                base,
+                ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
+                // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
+                // So was one about another base: a pass against dev does not open a PR against main.
+                ...(prior.phase === 'pre' && (prior.head !== head || prior.base !== base) ? { preStatus: undefined, preHead: undefined } : {}),
+                postStatus: undefined,
+              },
+              scope.tier,
+              scope.why,
+              config.allowances,
+            ),
+            effort,
+            // A pass-through that now needs Codex is one no longer.
+            ...(scope.tier === 'trivial' ? {} : { passThrough: undefined }),
+          }
+        : {
+            ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
+            // After a reset: feedback already processed and replied to stays answered (R47).
+            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies }),
+            effort,
+            ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
+          }
+    // A new head since the last reviewed one (R56): answered findings on a changed file need a re-check, and their waivers lapse.
+    if (prior !== undefined && prior.head !== head) rec = { ...rec, ...(await headMoved($, root, rec, lastReviewedHead(prior), head, now)) }
+    // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
+    const open = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
+    if (open !== undefined && config.bases.includes(open.baseRefName)) {
+      const adoptedRec: LifecycleRecord = {
+        ...rec,
+        ...(await identityOf($, root)),
+        phase: 'post',
+        base: open.baseRefName,
+        pr: open.number,
+        passThrough: undefined,
+      }
+      await saveRecord($, adoptedRec)
+      return { prior, rec: adoptedRec, adopted: open }
     }
-    await saveRecord($, adoptedRec)
+    await saveRecord($, rec)
+    return { prior, rec, adopted: undefined }
+  })
+  if (adopted !== undefined) {
     await advance($, root, branch)
     return (
       `PR #${adopted.number} from ${branch} to ${adopted.baseRefName} is already open: adopted into post-PR review, ` +
-      `${remaining(adoptedRec)} of ${adoptedRec.allowance} review rounds left.`
+      `${remaining(rec)} of ${rec.allowance} review rounds left.`
     )
   }
   if (rec.tier === 'trivial') {
@@ -277,7 +286,6 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     await update($, runAtom, () => shown)
     setLive(false)
     void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
-    await saveRecord($, rec)
     await advance($, root, branch)
     const saved = await loadRecord($, root, branch)
     if (want.isHeldCall !== true && config.openPr && saved !== undefined) {
@@ -286,7 +294,6 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     }
     return `Gate passed without Codex: ${scope.why}.`
   }
-  await saveRecord($, rec)
   await advance($, root, branch, want.isHeldCall !== true)
   const run = await getRun($)
   if (run === null || run.status !== 'running') {
@@ -426,7 +433,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
     if (since.isOk && files.length > 0 && classify(files, 0, config.highRisk).tier === 'trivial') {
-      await saveRecord($, { ...rec, preHead: head })
+      await updateRecord($, root, branch, one => ({ ...one, preHead: head }))
       return undefined
     }
   }
@@ -674,7 +681,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     const reason = rest.slice(1).join(' ').trim()
     if (!Number.isInteger(n) || n < 1 || n > 5 || reason === '') return `Say how many and why: /${COMMAND} allow <1-5> <reason>`
     if (rec === undefined) return none
-    await saveRecord($, { ...rec, grants: [...rec.grants, { n, reason, head, at: now }] })
+    await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
     const after = (await loadRecord($, root, branch)) ?? rec
@@ -699,7 +706,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     }
     // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
     const waiver = { scope: 'finding' as const, findingId: scope, head: rec.head, reason, by: origin, at: now }
-    await saveRecord($, { ...rec, waivers: [...rec.waivers, waiver] })
+    await updateRecord($, root, branch, one => ({ ...one, waivers: [...one.waivers, waiver] }))
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
@@ -730,26 +737,28 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     }
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     // A waiver covers this commit for the record's base at this moment, and is kept in the record's history.
-    const base =
-      rec ??
-      newRecord({
-        root,
-        branch,
-        base: config.bases[0] ?? 'dev',
-        head,
-        tier: 'standard',
-        tierWhy: 'not scoped: waived before the gate ran',
-        lane: 'full',
-        allowance: config.allowances.standard,
-        at: now,
-      })
-    const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
-    const waived: LifecycleRecord = { ...base, preStatus: 'waived', preHead: head, waivers: [...base.waivers, waiver] }
-    await saveRecord($, waived)
+    const waived = await upsertRecord($, root, branch, one => {
+      const base =
+        one?.phase === 'archived' || one === undefined
+          ? newRecord({
+              root,
+              branch,
+              base: config.bases[0] ?? 'dev',
+              head,
+              tier: 'standard',
+              tierWhy: 'not scoped: waived before the gate ran',
+              lane: 'full',
+              allowance: config.allowances.standard,
+              at: now,
+            })
+          : one
+      const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
+      return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
+    })
     sayOpenPr($, waived, 'waived', now)
     return (
       `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +
-      `The PR may open; this waiver covers ${base.base} only, and post-PR review still runs.`
+      `The PR may open; this waiver covers ${waived.base} only, and post-PR review still runs.`
     )
   }
   // waive post: the head GitHub reports for the PR, which is what the merge guard checks.
@@ -764,10 +773,13 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   }
   const pr = await openPrOf($, root, branch)
   const at = pr?.headRefOid ?? head
-  const base =
-    rec ??
-    newRecord({ root, branch, base: config.bases[0] ?? 'dev', head, tier: 'standard', tierWhy: 'waived before scoping', lane: 'full', allowance: 0, at: now })
-  await saveRecord($, { ...base, waivers: [...base.waivers, { scope: 'post', head: at, reason, by: origin, at: now }] })
+  await upsertRecord($, root, branch, one => {
+    const base =
+      one === undefined || one.phase === 'archived'
+        ? newRecord({ root, branch, base: config.bases[0] ?? 'dev', head, tier: 'standard', tierWhy: 'waived before scoping', lane: 'full', allowance: 0, at: now })
+        : one
+    return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
+  })
   // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.`
