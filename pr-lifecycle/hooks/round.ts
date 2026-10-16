@@ -425,6 +425,15 @@ type Fetched = { isOk: boolean; why?: string; feedback: Feedback[]; checks: Chec
 async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> {
   const fail = (why: string): Fetched => ({ isOk: false, why, feedback: [], checks: [], prHead: rec.head })
   if (rec.pr === undefined || rec.slug === undefined) return fail('the PR number or repository is not known')
+  // Without this machine's login its own replies would read as reviewer coverage: look it up again, else fail closed.
+  let self = rec.self
+  if (self === undefined || self === '') {
+    const who = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: rec.root, timeoutMs: 30_000 })
+    self = who.exitCode === 0 ? who.stdout.trim() : ''
+    if (self === '') return fail('gh did not say which gh login this machine uses, so its own replies cannot be told from reviews; check gh auth login')
+    const found = self
+    await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }))
+  }
   const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid'], { cwd: rec.root, timeoutMs: 30_000 })
   if (pr.exitCode !== 0) {
     return fail(`gh could not read PR #${rec.pr} (${pr.stderr.trim().slice(0, 160) || `exit ${pr.exitCode}`}); check gh auth login and the network`)
@@ -450,7 +459,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
     const feedback = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)].filter(
-      one => one.reviewer !== rec.self,
+      one => one.reviewer !== self,
     )
     return { isOk: true, feedback, checks: readCheckRuns(checks.out), prHead }
   } catch (error) {
@@ -479,8 +488,17 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   if (now - collect.polledAt < POLL_MS) return
   await patch($, run.id, one => ({ ...one, collect: one.collect === undefined ? one.collect : { ...one.collect, polledAt: now } }))
   const rec = await loadRecord($, run.root, run.branch)
-  if (rec === undefined) return
-  const got = await fetchFeedback($, rec)
+  if (rec === undefined) {
+    await finish($, run.id, 'error', `The lifecycle record of ${run.branch} is gone, so post-PR round ${run.round} cannot go on. Run /pr-gate to start it again.`)
+    return
+  }
+  let got: Fetched
+  try {
+    got = await fetchFeedback($, rec)
+  } catch (error) {
+    const said = error instanceof Error ? error.message : String(error)
+    got = { isOk: false, why: `gh failed (${said.slice(0, 160)}); check gh auth login, rate limits and the network`, feedback: [], checks: [], prHead: rec.head }
+  }
   if (!got.isOk) {
     await noteAttempt($, run, got.why ?? 'gh failed')
     await finish($, run.id, 'error', `Post-PR round ${run.round} could not read GitHub: ${got.why ?? 'gh failed'}. Fix that, then /pr-gate resume.`)
@@ -489,11 +507,14 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   const fresh = got.feedback.filter(one => !rec.processed.includes(one.id))
   const lastArrivalAt = Math.max(collect.lastArrivalAt, ...fresh.map(one => Math.min(one.at, now)))
   // The PR's head, not the local one, is what the round covers (an adopted PR, another agent's push).
-  const headAt = got.prHead === run.roundStartHead ? collect.headAt : now
+  const isNewHead = got.prHead !== run.roundStartHead
+  const headAt = isNewHead ? now : collect.headAt
+  // A new head restarts the quiet period: its checks may not be registered yet.
+  const arrived = isNewHead || fresh.length > (run.triaged?.length ?? 0)
   const after = await patch($, run.id, one => ({
     ...one,
     roundStartHead: got.prHead,
-    collect: { ...collect, polledAt: now, lastArrivalAt: fresh.length > (one.triaged?.length ?? 0) ? now : lastArrivalAt, headAt },
+    collect: { ...collect, polledAt: now, lastArrivalAt: arrived ? now : lastArrivalAt, headAt },
     triaged: fresh.map(each => each.id),
   }))
   if (after === null) return
@@ -524,9 +545,18 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   const rec = await loadRecord($, run.root, run.branch)
   if (rec === undefined) return
   const waitMs = now - (run.collect?.startedAt ?? now)
-  const evidence: Evidence[] = done.covered.map(reviewer => ({ source: 'github', reviewer, head: got.prHead, isComplete: done.isComplete }))
-  // Already covered: an earlier completed round holds evidence for this very head (the pre-PR Codex review of it, say).
-  const isCovered = done.covered.length > 0 || rec.rounds.some(one => one.isCompleted && one.evidence.some(each => each.head === got.prHead))
+  // Each reviewer who covered the head; each roster reviewer who never did, as missing evidence.
+  const roster = await rosterOf($, run.root)
+  const evidence: Evidence[] = [
+    ...done.covered.map(reviewer => ({ source: 'github' as const, reviewer, head: got.prHead, isComplete: true })),
+    ...(roster?.reviewers ?? [])
+      .filter(one => done.missing.includes(one))
+      .map(reviewer => ({ source: 'github' as const, reviewer, head: got.prHead, isComplete: false })),
+  ]
+  // Covered: complete evidence for this very head, now or in an earlier completed round (the pre-PR Codex review of it, say).
+  const isCovered = [...evidence, ...rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence)].some(
+    each => each.isComplete && each.head === got.prHead,
+  )
   const owesVerification = verificationOwed(rec).length > 0
   const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
   const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
@@ -545,6 +575,15 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   }))
   if (after === null) return
   if (run.roundKind === 'final-head-check' || ((!isCovered || owesVerification) && !isPassThroughRound1)) {
+    // Codex reads the local checkout: it must be the PR head, or it would review something else.
+    const local = await git($, run.root, ['rev-parse', 'HEAD'])
+    if (!local.isOk || local.out !== got.prHead) {
+      const here = local.isOk ? local.out.slice(0, 7) : 'unknown'
+      const why = `the local checkout ${here} is not the PR head ${got.prHead.slice(0, 7)}: pull (or push), then run pr-gate resume`
+      await noteAttempt($, after, why)
+      await finish($, run.id, 'error', `Post-PR round ${run.round} needs a Codex review, but ${why}.`)
+      return
+    }
     await beginReview($, run.id) // the Codex fallback: reviewPrompt reads run.diffBase (the last reviewed head)
     return
   }
@@ -662,8 +701,9 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
 async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?: string): Promise<void> {
   const now = await $.clock.now()
-  const head = await git($, run.root, ['rev-parse', 'HEAD'])
-  const endHead = head.isOk ? head.out : run.headSha
+  // After the PR: the head GitHub last reported for it, whatever is checked out here (an adopted PR, a push from elsewhere).
+  const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
+  const endHead = head?.isOk === true ? head.out : run.headSha
   const current = run.findings.filter(one => raisedIn(one, run.round))
   const round: RoundRecord = {
     n: run.round,
@@ -857,9 +897,13 @@ async function afterReview($: Engine, run: Run): Promise<void> {
       }),
       ...fresh,
     ],
-    evidence: results
-      .filter(each => each.result.gate !== 'ERROR')
-      .map(each => ({ source: 'codex' as const, reviewer: each.role === 'challenge' ? 'codex-challenge' : 'codex', head: one.headSha, isComplete: true })),
+    // After the PR, the GitHub evidence collected this round stays beside Codex's.
+    evidence: [
+      ...(one.lifecycle === 'post' ? one.evidence.filter(each => each.source === 'github') : []),
+      ...results
+        .filter(each => each.result.gate !== 'ERROR')
+        .map(each => ({ source: 'codex' as const, reviewer: each.role === 'challenge' ? 'codex-challenge' : 'codex', head: one.headSha, isComplete: true })),
+    ],
     steps: results.reduce(
       (steps, { role, result }) =>
         withStep(steps, {

@@ -105,6 +105,19 @@ test('the wait cap ends collection with what arrived, marked incomplete', async 
   expect(collectionDone({ ...base, roster, feedback: [], checks: [], now: 1_200_000 })).toEqual({ isDone: true, isComplete: false, missing: ['copilot'], covered: [] })
 })
 
+test('with a roster, only its reviewers cover the head', async () => {
+  const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [] }
+  expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b'), fb('netlify[bot]', 'b')], checks: [], now: 60_000 }).covered).toEqual(['claude[bot]'])
+})
+
+test('without a roster, an issue comment (a deploy-preview bot) does not cover the head; a review or inline comment does', async () => {
+  const comment = { id: 'comment:1', kind: 'comment' as const, reviewer: 'netlify[bot]', body: 'Preview ready', at: 10, isFinding: true }
+  const inline = { id: 'inline:2', kind: 'inline' as const, reviewer: 'copilot', body: 'x', head: 'b', at: 10, isFinding: true }
+  const now = 600_000
+  expect(collectionDone({ ...base, feedback: [comment], checks: [], now }).covered).toEqual([])
+  expect(collectionDone({ ...base, feedback: [comment, inline, fb('claude[bot]', 'b')], checks: [], now }).covered).toEqual(['copilot', 'claude[bot]'])
+})
+
 const bash = (command: string) => readPrAction('Bash', { command })
 
 test('gh pr create and gh pr merge, with and without a number or --auto', async () => {

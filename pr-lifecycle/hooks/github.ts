@@ -185,12 +185,14 @@ export type CollectInput = {
 
 /** Whether a post-PR round has collected enough: the roster's list, or settled checks and a quiet spell; always the cap. */
 export function collectionDone(input: CollectInput): { isDone: boolean; isComplete: boolean; missing: string[]; covered: string[] } {
-  const covered = [
-    ...new Set(input.feedback.filter(one => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)).map(one => one.reviewer)),
-  ]
-  const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
   const roster = input.roster
   const hasRoster = roster !== undefined && (roster.reviewers.length > 0 || roster.checks.length > 0)
+  // Who covers the head: with a roster, its reviewers only; without one, reviews and inline comments, never an issue
+  // comment (a deploy-preview bot's note reviews nothing).
+  const counts = (one: Feedback): boolean => (hasRoster && roster !== undefined ? roster.reviewers.includes(one.reviewer) : one.kind !== 'comment')
+  const isOnHead = (one: Feedback): boolean => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)
+  const covered = [...new Set(input.feedback.filter(one => counts(one) && isOnHead(one)).map(one => one.reviewer))]
+  const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
   const missing = hasRoster
     ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))]
     : input.checks.filter(one => one.status !== 'completed').map(one => one.name)
