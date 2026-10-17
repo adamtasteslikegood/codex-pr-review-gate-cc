@@ -551,10 +551,19 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
       `pr-gate: ${action.via} to ${base} waits for the pre-PR review of ${branch} at ${head.slice(0, 7)}.`,
       started,
       'Do not retry this command and do not open the pull request another way.',
-      'End your turn: the gate reviews the branch, sends back any findings to fix, and prompts you to open the pull request when it is done.',
+      'Next: the gate. A Codex round is running on this branch. Leave this branch alone (no commits, no pushes) until the gate sends you ' +
+        'findings to fix or tells you to open the pull request; other work is fine.',
       `(The person can type /${COMMAND} status, or /${COMMAND} waive pre <reason> to open it without the gate.)`,
     ].join('\n') + unknownNote(action)
   )
+}
+
+/**
+ * A refusal reaches the agent as a failed tool call. It says first that it is a hold, not an error (finding 7): agents read a
+ * plain refusal as something broken and work around it.
+ */
+function asHold(text: string): string {
+  return text.startsWith('pr-gate: ') ? `pr-gate HOLD (not an error): ${text.slice('pr-gate: '.length)}` : `pr-gate HOLD (not an error): ${text}`
 }
 
 /** What still stands between a record and ready, in a few words. */
@@ -712,7 +721,8 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
         ? `This needs the person's decision: tell them the PR was retargeted after its review. They can point it back at ${rec.base}, ` +
           `or type /${COMMAND} reset to review it again for ${pr.baseRefName}.`
       : isRunning
-        ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
+        ? `Next: the gate. /${COMMAND} is collecting the reviews now. Leave this branch alone until it sends you what needs an answer, ` +
+          'or says the PR is ready for the merge decision; other work is fine.'
         : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'
           ? `This needs the person's decision: tell them which findings are deferred or disputed and why, then stop. They can type ` +
             `/${COMMAND} waive <findingId> <reason> for each one, or /${COMMAND} waive post <reason> to let this head merge.`
@@ -1002,14 +1012,14 @@ export const register: Register = (on, options) => {
       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
-      return refusal !== undefined ? { deny: refusal } : next(e)
+      return refusal !== undefined ? { deny: asHold(refusal) } : next(e)
     }
     const found = await gatedCreate($, action)
-    if (found === 'outside') return config.enforce ? { deny: outsideText(action) } : next(e)
-    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: noBaseText(action, found.noBase) } : next(e)
+    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) } : next(e)
+    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
-    if (refusal !== undefined) return { deny: refusal }
+    if (refusal !== undefined) return { deny: asHold(refusal) }
     const ran = await next(e)
     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
     return ran
@@ -1018,9 +1028,10 @@ export const register: Register = (on, options) => {
     const action = next.called ? undefined : readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
     if (action === undefined) return next(e)
     return {
-      deny:
+      deny: asHold(
         'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
-        `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
+          `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
+      ),
     }
   })
 

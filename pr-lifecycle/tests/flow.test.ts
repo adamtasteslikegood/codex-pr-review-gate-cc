@@ -388,7 +388,10 @@ test('a merge while post-PR review runs tells the agent to wait, not the person 
   await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   const held = (await $.tool.call(merge)).deny ?? ''
-  expect(held).toContain('End your turn')
+  // A hold, not an error, with the gate as the next actor (finding 7).
+  expect(held.startsWith('pr-gate HOLD (not an error): ')).toBe(true)
+  expect(held).toContain('Next: the gate.')
+  expect(held).toContain('Leave this branch alone')
   expect(held).not.toContain('waive')
   expect(w.opened.some(one => one.includes('gh pr merge'))).toBe(false)
 })
@@ -2681,7 +2684,8 @@ test('R1-10: a base fetch that fails twice starts no round, says why, and the ne
   const held = (await $.tool.call(createPr)).deny ?? ''
   expect(held).toContain('could not fetch origin/dev')
   expect(held).toContain('Could not resolve host')
-  expect(held).not.toContain('End your turn')
+  // No round started, so the hold promises no gate message.
+  expect(held).not.toContain('Next: the gate.')
   expect(w.spawned).toHaveLength(0)
   expect(w.run?.status === 'running').toBe(false)
   w.git.fetchFails = 2
