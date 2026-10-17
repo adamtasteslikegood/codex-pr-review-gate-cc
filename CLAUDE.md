@@ -7,7 +7,8 @@ people; [QUICKSTART.md](QUICKSTART.md) covers setup.
 ## What this repo is
 
 Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
-[README.md](README.md) for the component table.
+[README.md](README.md) for the component table and [VISION.md](VISION.md) for
+the project's goals and their order.
 
 ## Current state (2026-10-17)
 
