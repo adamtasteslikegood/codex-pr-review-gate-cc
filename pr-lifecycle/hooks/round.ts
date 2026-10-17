@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { Effort, Evidence, Finding, LifecycleRecord, Pending, Role, RoundRecord, Run, RunStatus, Step, Waiver } from '../types'
+import type { Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -1661,11 +1661,13 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
   if (isCompleted) await advance($, run.root, run.branch)
 }
 
-/** The effort and Codex model a round ran at (R69), when Codex ran in it. */
-const codexOf = (run: Run): Pick<RoundRecord, 'effort' | 'codexModel'> =>
-  run.phase === 'review' || run.evidence.some(one => one.source === 'codex')
-    ? { effort: run.effort, ...(run.codexModel === undefined ? {} : { codexModel: run.codexModel }) }
-    : {}
+/** The effort and Codex model a round ran at (R69), when Codex ran in it: what the reviewers reported, else what the gate named. */
+const codexOf = (run: Run): Pick<RoundRecord, 'effort' | 'codexModel' | 'ranModels'> => {
+  if (run.phase !== 'review' && !run.evidence.some(one => one.source === 'codex')) return {}
+  const ran = run.ranModels ?? {}
+  const model = ran.review ?? Object.values(ran)[0] ?? run.codexModel
+  return { effort: run.effort, ...(model === undefined ? {} : { codexModel: model }), ...(Object.keys(ran).length === 0 ? {} : { ranModels: ran }) }
+}
 
 /** An attempt that did not complete: its effort is recorded, no round is used. */
 async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
@@ -1843,6 +1845,16 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     await retryLower($, run, `Codex ${failed.role} timed out at ${run.effort}: ${failed.result.note ?? 'no verdict'}.`)
     return
   }
+  // What each role ran (R69). Another model than the one named is never accepted: the attempt is discarded whole, as a timeout's is.
+  const ran: RanModels = Object.fromEntries(results.flatMap(one => (one.result.model === undefined ? [] : [[one.role, one.result.model]])))
+  const named = run.codexModel
+  const stray = named === undefined ? undefined : results.find(one => one.result.model !== undefined && one.result.model !== named)
+  if (stray !== undefined && named !== undefined) {
+    const marked = (await patch($, run.id, one => ({ ...one, ranModels: ran }))) ?? run
+    await noteAttempt($, marked, `Codex ${stray.role} ran ${stray.result.model ?? '?'}, not ${named}`)
+    await finish($, run.id, 'error', await strayModel($, marked, stray.role, stray.result.model ?? '?', named))
+    return
+  }
   const prior = await loadRecord($, run.root, run.branch)
   // A rerun of round N (after a stop, an error or uncommitted changes) numbers after what that round already raised.
   const idOf = nextIds(`R${run.round}-`, [run.findings, prior?.findings ?? []])
@@ -1866,11 +1878,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   }
   const verified = new Set(results.flatMap(one => one.result.verified))
   const held = new Set(results.flatMap(one => one.result.held))
-  // The model that ran, as the reviewer read it off the CODEX_MODEL: line (R69); else the one the gate named stands.
-  const ranModel = results.map(one => one.result.model).find(one => one !== undefined)
   const after = await patch($, run.id, one => ({
     ...one,
-    ...(ranModel === undefined ? {} : { codexModel: ranModel }),
+    ...(Object.keys(ran).length === 0 ? {} : { ranModels: ran }),
     pending: [],
     // A finding this review left out keeps its status: only an explicit verified or held moves it.
     findings: [
@@ -1949,21 +1959,36 @@ const fileSets = (file: string | undefined, key: string): boolean => {
   }
 }
 
-/** gstack stopped on the Codex model (R69): what the person reads, with its repair message and the one setting that names the model. */
-async function unusableModel($: Engine, run: Run, note: string | undefined): Promise<string> {
+/** The setting that names a run's Codex model (R69), and where to change it: the base's file when it sets the key, else the option. */
+async function modelSetting($: Engine, run: Run): Promise<{ key: string; named: string | undefined; fix: string }> {
   const key = run.tier === 'high' ? 'codexModelHigh' : 'codexModel'
   const isFile = fileSets(await baseFileOf($, run.root, run.base), key)
-  // The model the gate named; the run's own is the one the reviewer saw run, which gstack may have picked itself.
   const named = codexModelFor(run.tier, (await configFor($, run.root, run.base)).config)
-  const which = run.codexModel ?? named ?? 'the model gstack picked'
   const fix = isFile
     ? `change ${key} in .github/pr-gate.json on origin/${run.base}`
     : named === undefined
       ? `set the plugin option ${key} to a model this account can use (or fix GSTACK_CODEX_MODEL or Codex config.toml)`
       : `change the plugin option ${key}, or set ${key} in the base's .github/pr-gate.json`
+  return { key, named, fix }
+}
+
+/** gstack stopped on the Codex model (R69): what the person reads, with its repair message and the one setting that names the model. */
+async function unusableModel($: Engine, run: Run, note: string | undefined): Promise<string> {
+  const { named, fix } = await modelSetting($, run)
+  // What the reviewer saw run, else what the gate named; gstack may have picked it itself.
+  const which = Object.values(run.ranModels ?? {})[0] ?? run.codexModel ?? named ?? 'the model gstack picked'
   return (
     `Codex could not use ${which}: ${note ?? 'gstack gave no repair message'}. No other model was tried and no review round was used. ` +
     `Next: ${fix}, then run /pr-gate resume.`
+  )
+}
+
+/** A reviewer ran another model than the gate named (R69): never accepted, as a silent fallback would be. */
+async function strayModel($: Engine, run: Run, role: string, ran: string, named: string): Promise<string> {
+  const { key, fix } = await modelSetting($, run)
+  return (
+    `Codex ${role} ran ${ran}, not ${named}, the model ${key} names: the gate never accepts another model, and no review round was used. ` +
+    `Next: run /pr-gate resume to review on ${named} again, or ${fix}.`
   )
 }
 

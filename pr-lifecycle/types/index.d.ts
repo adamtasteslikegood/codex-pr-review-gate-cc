@@ -74,6 +74,9 @@ export type LifecyclePhase = 'pre' | 'post' | 'ready' | 'archived'
 /** baseline rounds and the final-head check are free; discretionary ones draw on the allowance. */
 export type RoundKind = 'baseline' | 'discretionary' | 'final-head-check'
 
+/** The Codex model each role reported from gstack's `CODEX_MODEL:` line (R69): the review, the challenge, the rebuttal check. */
+export type RanModels = { review?: string; challenge?: string; verify?: string }
+
 export type Evidence = { source: 'codex' | 'github'; reviewer: string; head: string; isComplete: boolean }
 
 export type RoundRecord = {
@@ -92,6 +95,8 @@ export type RoundRecord = {
   effort?: Effort
   /** The Codex model that reviewed it, from the reviewer's `CODEX_MODEL:` line, else the model the gate named (R69). */
   codexModel?: string
+  /** Every role's reported model, kept apart when they differ (R69). */
+  ranModels?: RanModels
   evidence: Evidence[]
   raised: { blocking: number; advisory: number }
   rebutted: number
@@ -180,11 +185,10 @@ export type Run = {
    * is this run's alone and never carries. Absent on a run from before 1.2.0, which carries `effort`.
    */
   carriedEffort?: Effort
-  /**
-   * The Codex model the gate names for this run's tier (codexModel or codexModelHigh, R69); undefined names none, so gstack's own
-   * order picks it. Once a review reports its `CODEX_MODEL:` line, the model that ran.
-   */
+  /** The Codex model the gate names for this run's tier (codexModel or codexModelHigh, R69); undefined names none, so gstack's own order picks it. */
   codexModel?: string
+  /** What each role reported running, from its `CODEX_MODEL:` line. A model other than the named one stops the round (R69). */
+  ranModels?: RanModels
   round: number
   status: RunStatus
   phase: 'scope' | 'review' | 'fix' | 'verify' | 'collect' | 'triage' | 'done'

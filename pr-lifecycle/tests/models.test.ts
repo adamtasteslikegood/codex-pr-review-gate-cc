@@ -236,11 +236,12 @@ test('#11: a repository file standard reviewEffort applies at the start', async 
 
 // ------------------------------------------------------------------ what ran is recorded
 
-test('#11: the model on the CODEX_MODEL: line is recorded on the round, beside its effort, and shown in the pane', async ($, on) => {
+test('#11: the model on the CODEX_MODEL: line is recorded on the round, beside its effort, and shown in the pane', { options: { codexModel: '' } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
+  // No model named: whatever gstack picked is recorded, as the reviewer read it.
   await done($, turn(review('r1-review', 'FAIL', [P1], { model: 'gpt-6-luna-2026-09' })))
-  expect((await runOf(w)).codexModel).toBe('gpt-6-luna-2026-09')
+  expect((await runOf(w)).ranModels).toEqual({ review: 'gpt-6-luna-2026-09' })
   const ui = await $.ui.mount({
     plugin: 'pr-lifecycle',
     surface: 'terminal',
@@ -449,4 +450,45 @@ test('I1: a timeout still carries: a re-review that steps down lowers the branch
   const rec = recordOf(w)
   expect(rec.effort).toBe('low')
   expect(rec.passedEffort).toBe('low')
+})
+
+test('I3: a reviewer that ran another model than the one named stops the round, naming both and the setting', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS', [], { model: 'gpt-5.6-luna' })))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('gpt-5.6-luna')
+  expect(run.message).toContain('gpt-6-luna')
+  expect(run.message).toContain('codexModel')
+  expect(w.spawned).toHaveLength(1)
+  const rec = recordOf(w)
+  expect(rec.preStatus).not.toBe('passed')
+  expect(rec.attempts).toBe(1)
+  expect(rec.rounds.filter(one => one.isCompleted)).toHaveLength(0)
+  expect(rec.rounds[0]?.ranModels).toEqual({ review: 'gpt-5.6-luna' })
+})
+
+test('I3: every role\'s model is recorded; review and challenge that differ are both kept', { options: { codexModelHigh: '' } }, async ($, on) => {
+  const w = world(on)
+  w.git.numstat = HIGH
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS', [], { model: 'gpt-6-astra' }), 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS', [], { model: 'gpt-6.1-sol' }), 'agent-2'))
+  expect((await runOf(w)).status).toBe('passed')
+  const round = recordOf(w).rounds.find(one => one.isCompleted)
+  expect(round?.ranModels).toEqual({ review: 'gpt-6-astra', challenge: 'gpt-6.1-sol' })
+  expect(round?.codexModel).toBe('gpt-6-astra')
+})
+
+test('I3: a high-tier stop on a stray model names codexModelHigh', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = HIGH
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS', [], { model: 'gpt-6-astra' }), 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS', [], { model: 'gpt-5.6-luna' }), 'agent-2'))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('challenge ran gpt-5.6-luna')
+  expect(run.message).toContain('codexModelHigh')
 })
