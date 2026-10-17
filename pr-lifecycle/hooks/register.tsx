@@ -319,6 +319,10 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (rebase !== undefined) return startGate($, { ...want, base: rebase, isRescoped: true })
   if (adopted !== undefined) {
     await advance($, root, branch)
+    // The pane's scope step names what the base's file got wrong, as on any other start (gate R3-1).
+    if (note !== '') {
+      await update($, runAtom, run => (run !== null && run.root === root && run.branch === branch ? withScopeNote(run, note) : run))
+    }
     return (
       `PR #${adopted.number} from ${branch} to ${adopted.baseRefName} is already open: adopted into post-PR review, ` +
       `${remaining(rec)} of ${rec.allowance} review rounds left.${note}`

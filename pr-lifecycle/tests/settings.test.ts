@@ -293,6 +293,15 @@ test('C1: between gated bases, a stricter base lowers the allowance, and the rou
   expect(rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary')).toHaveLength(1)
 })
 
+test('gate R3-1: an adopted PR\'s pane names the base settings it ignored, like any other start', async ($, on) => {
+  const w = world(on)
+  w.git.byBase = { dev: '{"allowanceStandard":"lots"}' }
+  w.gh.hasPr = true
+  await $.command.run(cmd('dev'))
+  expect(recordOf(w).phase).toBe('post')
+  expect(await scopeDetail(w)).toContain('ignored allowanceStandard')
+})
+
 test('C1: an open PR adopted on another base than the one asked for is scoped from its own base\'s file', async ($, on) => {
   const w = world(on)
   w.git.byBase = { dev: '{"lightBranches":"^feat/","allowanceStandard":1}', main: '{"allowanceStandard":2}' }
