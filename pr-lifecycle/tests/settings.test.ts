@@ -322,3 +322,13 @@ test('M2: a create decides from the settings read after its fetch: a stop that j
   expect(isHeld(held)).toBe(true)
   expect(held.deny ?? '').toContain('onExhausted is stop')
 })
+
+// ------------------------------------------------------------------ the remote-tracking ref, by its full name (M4)
+
+test('M4: a local tag named origin/dev cannot stand in for the base\'s file', async ($, on) => {
+  const w = world(on)
+  w.git.shadow = '{"allowanceStandard":1,"lightBranches":"^feat/"}'
+  await $.tool.call(createPr)
+  expect(recordOf(w).lane).toBe('full')
+  expect(recordOf(w).allowance).toBe(4)
+})

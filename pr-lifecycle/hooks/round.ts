@@ -638,13 +638,14 @@ async function beginCollect($: Engine, id: string): Promise<void> {
 }
 
 /**
- * `.github/pr-gate.json` as the base has it (R67), never as the branch's own HEAD has it: a PR must not loosen its own gate, add a bot
- * to the trusted roster (R1-8) or lower its allowance. Read from the ref the last fetch left, with no fetch of its own; a base with no
- * such file, or no fetched ref, has none.
+ * `.github/pr-gate.json` as the base has it (R67, `refs/remotes/origin/<base>`), never as the branch's own HEAD has it: a PR must not
+ * loosen its own gate, add a bot to the trusted roster (R1-8) or lower its allowance. Read from the ref the last fetch left, with no
+ * fetch of its own; a base with no such file, or no fetched ref, has none.
  */
 async function baseFileOf($: Engine, root: string, base: string): Promise<string | undefined> {
   if (base === '') return undefined
-  const file = await git($, root, ['show', `origin/${base}:.github/pr-gate.json`])
+  // The remote-tracking ref by its full name (M4): a local tag or branch called origin/<base> would win over a bare origin/<base>.
+  const file = await git($, root, ['show', `refs/remotes/origin/${base}:.github/pr-gate.json`])
   return file.isOk ? file.out : undefined
 }
 

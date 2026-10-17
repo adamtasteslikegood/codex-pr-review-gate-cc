@@ -29,12 +29,14 @@ export type World = {
     changed: string
     /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
     isAncestor: boolean
-    /** `.github/pr-gate.json` on the base (`git show origin/<base>:...`); empty means none. */
+    /** `.github/pr-gate.json` on the base (`git show refs/remotes/origin/<base>:...`); empty means none. */
     roster: string
     /** When set, only `origin/<rosterOn>` has the file: any other base's read fails as a missing path or ref does. */
     rosterOn?: string
     /** Each base's own file, by base name; a base listed here ignores `roster` and `rosterOn`. */
     byBase: Record<string, string>
+    /** The file under a local tag or branch named `origin/<base>`, which a bare `origin/<base>:` would read instead (M4). */
+    shadow: string
     /** `.github/pr-gate.json` at the branch's own HEAD; empty means none. The mod must never read it (R67). */
     headRoster: string
     /** Local branches besides the checked-out one. */
@@ -135,6 +137,7 @@ export function world(on: On): World {
       roster: '',
       headRoster: '',
       byBase: {},
+      shadow: '',
       locals: [],
       isOutside: false,
       fetchFails: 0,
@@ -257,7 +260,8 @@ export function world(on: On): World {
       return fail(w.git.fetchError)
     }
     if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.headRoster, w.git.headRoster === '' ? 128 : 0)
-    const onBase = args.match(/^show origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
+    if (/^show origin\/\S+:\.github\/pr-gate\.json$/.test(args)) return out(w.git.shadow, w.git.shadow === '' ? 128 : 0)
+    const onBase = args.match(/^show refs\/remotes\/origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
     if (onBase !== undefined) {
       const file = Object.hasOwn(w.git.byBase, onBase) ? (w.git.byBase[onBase] ?? '') : w.git.rosterOn === undefined || w.git.rosterOn === onBase ? w.git.roster : ''
       return out(file, file === '' ? 128 : 0)
