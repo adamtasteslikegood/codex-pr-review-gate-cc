@@ -261,7 +261,9 @@ the match off (`"lightBranches": ""` turns the light lane off).
 - **The lane and allowance are fixed when the lifecycle is scoped, for that
   base.** A change to the file that lands on the base mid-lifecycle does not
   rewrite an existing record's lane or allowance; a new lifecycle (or
-  `/pr-gate reset`) picks it up. A lifecycle that moves to another base (a
+  `/pr-gate reset`) picks it up. One exception: a rise in tier on the same
+  base raises the allowance to the new tier's, from the file as it is then.
+  A lifecycle that moves to another base (a
   create to another base, `/pr-gate <base>`, or an open PR adopted on another
   base) is scoped afresh from that base's file: tier, lane and allowance, up
   or down, with the rounds already used still counted. Nothing carries over
