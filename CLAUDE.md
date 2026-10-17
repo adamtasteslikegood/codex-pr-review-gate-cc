@@ -67,6 +67,15 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 - **Codex's GitHub connector** (`chatgpt-codex-connector`) reviews PRs when
   they open, but only while the Codex account's usage limit allows. When it
   can't, the PR goes ahead without its review if Adam says so.
+- **A scheduled ChatGPT reviewer task** reviews PRs and posts its review
+  and inline comments **as Adam's account** (`adamtasteslikegood`). A PR
+  comment asking for a review triggers it (first used on PR #12); whether a
+  new commit does is not yet confirmed. It does not depend on the Codex
+  connector's usage limit. pr-lifecycle uses the same `gh` login, so it reads
+  the task's findings but never counts them as review coverage of a head
+  (`fetchFeedback`, `cover`): the Codex fallback still runs, and listing
+  that login under `reviewers` would make every round wait for
+  `waitCapMinutes`. Read its review before merging.
 
 ## Code style
 
