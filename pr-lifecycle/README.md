@@ -255,11 +255,12 @@ only spaces, as for the plugin options) turns the match off
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
-- **An invalid value** (a count or a wait in minutes below 1 (a wait over a day is capped at 1,440), an unknown
-  `onExhausted`, a regular expression that does not compile) is ignored, so that key falls back to the
-  plugin option; the others still apply. The gate says which keys it ignored,
-  once, in the pane's scope step and in the start message. A file that is not
-  a JSON object overrides nothing.
+- **An invalid value** (a count or a wait in minutes below 1, an unknown
+  `onExhausted`, a regular expression that does not compile) is ignored, so
+  that key falls back to the plugin option; the others still apply. The gate
+  says which keys it ignored, once, in the pane's scope step and in the start
+  message. A file that is not a JSON object overrides nothing. A wait over a
+  day is capped at 1,440 minutes.
 - **The lane and allowance are fixed when the lifecycle is scoped, for that
   base.** A change to the file that lands on the base mid-lifecycle does not
   rewrite an existing record's lane or allowance; a new lifecycle (or
