@@ -174,6 +174,11 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   const onExhausted =
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
   const highRisk = pattern('highRiskPaths')
+  // The collection waits are the roster's to read (readRoster drops a bad one); they are reported here with the rest.
+  for (const key of ['quietMinutes', 'waitCapMinutes']) {
+    const value = r[key]
+    if (value !== undefined && !(typeof value === 'number' && Number.isFinite(value) && value >= 1)) bad(key, 'not a number of minutes of at least 1')
+  }
   return {
     config: {
       ...c,

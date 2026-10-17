@@ -49,6 +49,10 @@ test('an invalid value is ignored and named: that key keeps the user option, the
   expect(config.light?.test('chore/x')).toBe(true)
   expect(config.onExhausted).toBe('stop')
   expect(config.highRisk).toEqual(user.highRisk)
+  // The collection waits are read by the roster, but a bad one is reported here, with the rest.
+  const waits = overrideConfig(user, '{"quietMinutes":0,"waitCapMinutes":"soon","reviewers":["a"]}')
+  expect(waits.ignored.map(one => one.split(' ')[0])).toEqual(['quietMinutes', 'waitCapMinutes'])
+  expect(overrideConfig(user, '{"quietMinutes":2,"waitCapMinutes":30}').ignored).toEqual([])
   // One bad key does not cost the good ones.
   const mixed = overrideConfig(user, '{"allowanceStandard":"lots","allowanceHigh":3}')
   expect(mixed.config.allowances).toEqual({ standard: 5, high: 3 })
