@@ -80,6 +80,12 @@ const TIMEOUT_WORDS = /\btim(e|ed|ing)[\s-]?out\b|\bstall(ed)?\b|exit(ed)?( code
  */
 const MODEL_WORDS = /\bMODEL_UNUSABLE\b|\bmodel\b[^\n]*\b(is not supported when using Codex|does not exist or you do not have access)\b/i
 
+/** What a step said before its trailer: gstack's markers are read there, never in findings or verdicts that quote them. */
+const proseOf = (answer: string): string => {
+  const at = answer.lastIndexOf(TRAILER)
+  return at < 0 ? answer : answer.slice(0, at)
+}
+
 /** The failure kind a reviewer reported, or read from what it said when it named none or only `other` (R69). */
 function failureOf(said: unknown, note: string | undefined, answer = ''): ReviewFailure {
   const kind = String(said ?? '').toLowerCase()
@@ -156,7 +162,7 @@ export function readReview(answer: string): ReviewResult {
   const verified = idList(trailer.verified)
   const held = idList(trailer.held)
   if (gate !== 'PASS' && gate !== 'FAIL' && gate !== 'UNVERIFIED') {
-    const failure = failureOf(trailer.error, note ?? answer, answer)
+    const failure = failureOf(trailer.error, note ?? proseOf(answer), proseOf(answer))
     return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure, verified, held, ...ran }
   }
   const hasBlocking = findings.some(isBlocking)
@@ -236,8 +242,12 @@ export function readCheck(answer: string): { model?: string; failure?: ReviewFai
   const trailer = readTrailer(answer)
   const model = modelIn(trailer?.model, answer)
   const note = text(trailer?.note)
-  const failure = failureOf(trailer?.error, note, answer)
-  const repair = answer.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
+  // A check that ruled is no failure, whatever its notes quote; one that did not is read from its own words, never the trailer's.
+  const isRuled = Array.isArray(trailer?.verdicts) && trailer.verdicts.length > 0 && text(trailer.error) === undefined
+  if (isRuled) return model === undefined ? {} : { model }
+  const said = proseOf(answer)
+  const failure = failureOf(trailer?.error, note, said)
+  const repair = said.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
   return {
     ...(model === undefined ? {} : { model }),
     ...(failure === 'model' ? { failure, note: (note ?? (repair === '' ? undefined : repair))?.slice(0, 1000) } : {}),

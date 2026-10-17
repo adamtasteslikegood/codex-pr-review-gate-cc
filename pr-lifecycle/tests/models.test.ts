@@ -4,7 +4,7 @@ import type { TestBody } from 'claude-code/testing'
 import { createPr, done, P1, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { configOf, overrideConfig } from '../hooks/round'
-import { readReview } from '../hooks/core'
+import { readCheck, readReview } from '../hooks/core'
 import type { LifecycleRecord } from '../types'
 
 // #10: the Claude model of each sub-agent (R68). #11: the Codex model and effort per tier (R69). Both are plugin options a
@@ -585,4 +585,28 @@ test('I3: an unusable model that reports another model stops with gstack\'s repa
   const run = await runOf(w)
   expect(run.status).toBe('error')
   expect(run.message).toContain('not supported when using Codex')
+})
+
+// ------------------------------------------------------------------ fix round 2
+
+test('N1: a rebuttal check with verdicts is accepted even when its notes quote gstack\'s model markers', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  const quoted = 'the guard handles MODEL_UNUSABLE; the model is not supported when using Codex only on ChatGPT accounts'
+  const answer = `Codex agreed: the rebuttal holds.\n${TRAILER}\n` +
+    JSON.stringify({ step: 'r2-verify', verdicts: [{ id: 'G2-1', holds: true, note: quoted }], note: quoted, model: 'gpt-6-luna' })
+  await done($, turn(answer, `agent-${w.spawned.length}`))
+  expect((await runOf(w)).status).not.toBe('error')
+  expect(recordOf(w).findings.find(f => f.id === 'G2-1')?.history.some(h => h.by === 'codex')).toBe(true)
+})
+
+test('N1: the marker scan reads only the text before the trailer, for the check and the review', async () => {
+  const quoting = { verdicts: [], error: 'other', note: 'Codex exited 1' }
+  const inTrailer = { id: 'G2-1', holds: false, note: 'MODEL_UNUSABLE is mishandled at src/a.ts:4' }
+  expect(readCheck(`v\n${TRAILER}\n${JSON.stringify({ ...quoting, verdicts: [inTrailer] })}`).failure).toBeUndefined()
+  expect(readCheck(`v\n${TRAILER}\n${JSON.stringify(quoting)}`).failure).toBeUndefined()
+  expect(readCheck(`MODEL_UNUSABLE\nHINT: pick another\n${TRAILER}\n${JSON.stringify(quoting)}`).failure).toBe('model')
+  const finding = { severity: 'P1', title: 'MODEL_UNUSABLE is swallowed', file: 'src/a.ts', line: 4, detail: 'the model is not supported when using Codex' }
+  const review = `Codex exited 1.\n${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'other', note: 'Codex exited 1', findings: [finding] })}`
+  expect(readReview(review).failure).toBe('other')
 })
