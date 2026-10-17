@@ -1638,7 +1638,13 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     const live = await getRun($)
     const findings = live !== null && live.id === run.id ? live.findings : run.findings
     // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
-    await updateRecord($, run.root, run.branch, rec => ({ ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.effort }))
+    // The carry, never the check's capped effort: advance may start a round at once, before finish could restore it.
+    await updateRecord($, run.root, run.branch, rec => ({
+      ...rec,
+      head: endHead,
+      findings: mergeFindings(rec.findings, findings),
+      effort: run.carriedEffort ?? run.effort,
+    }))
     if (isCompleted) await advance($, run.root, run.branch)
     return
   }

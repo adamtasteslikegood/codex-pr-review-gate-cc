@@ -692,3 +692,38 @@ test('PR12-1: a review timeout beside a challenge model error stops on the model
   expect(recordOf(w).hasTimedOut).toBeUndefined()
   expect(w.spawned).toHaveLength(spawned)
 })
+
+test('PR12-2: an answer check that moves straight on into another round keeps the carry, not the check\'s capped effort', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  await $.tool.call(createPr)
+  // Pre-PR, an advisory fix is committed and reported; the allowance is spent, so the PR opens with it unverified.
+  await done($, turn(review('r1-review', 'PASS', [{ severity: 'P2', title: 'Rename', file: 'src/app.ts', line: 2, detail: 'd' }])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('r1-fix', 'R1-1')))
+  w.gh.prHead = w.git.head
+  await $.tool.call(createPr)
+  const head = w.gh.prHead
+  w.gh.comments = [{ id: 11, user: { login: 'claude[bot]' }, body: '**P1** SQL injection', path: 'src/app.ts', line: 4, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: 'u11' }]
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  // Round 2's Codex review at low does not verify R1-1, and G2-1 is left unanswered: blocked.
+  await done($, turn(review('r2-review', 'PASS'), `agent-${w.spawned.length}`))
+  const none = `ok\n${TRAILER}\n{"step":"r2-triage","dispositions":[]}`
+  await done($, turn(none))
+  await w.clock.advance(1000)
+  await done($, turn(none))
+  expect(recordOf(w).postStatus).toBe('blocked')
+  expect(recordOf(w).effort).toBe('medium')
+  // Resumed, G2-1 is rebutted; Codex accepts it at low, and R1-1 still owed starts round 3 at once.
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  const rebut = { step: 'r2-triage', dispositions: [{ id: 'G2-1', action: 'rebutted', note: 'parameterised at src/db.ts:4', replyId: '995' }] }
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify(rebut)}`))
+  expect((await runOf(w)).effort).toBe('low')
+  await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [{ id: 'G2-1', holds: true }] })}`, `agent-${w.spawned.length}`))
+  const run = await runOf(w)
+  expect(run.round).toBe(3)
+  expect(recordOf(w).effort).toBe('medium')
+  expect(run.carriedEffort).toBe('medium')
+})
