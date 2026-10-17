@@ -60,6 +60,8 @@ export type World = {
     pr: number
     prHead: string
     base: string
+    /** Bases `gh pr view` answers in turn, one per call, before falling back to `base`: a PR retargeted while the gate scopes. */
+    baseSeq?: string[]
     headRef: string
     self: string
     reviews: object[]
@@ -218,7 +220,8 @@ export function world(on: On): World {
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
-        return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
+        const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
+        return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
       }
       // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
       if (args.startsWith('pr checks')) {

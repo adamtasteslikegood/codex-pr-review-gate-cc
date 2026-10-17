@@ -194,7 +194,7 @@ const defaultBranchOf = async ($: Engine, root: string, repo?: string): Promise<
   }
 }
 
-const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldCall?: boolean }): Promise<string> => {
+const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldCall?: boolean; isRescoped?: boolean }): Promise<string> => {
   const existing = await getRun($)
   if (existing !== null && existing.status === 'running') {
     return `The gate is already running for ${existing.branch} (round ${existing.round}).`
@@ -312,7 +312,11 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     await saveRecord($, rec)
     return { prior, rec, adopted: undefined, rebase: undefined }
   })
-  if (rebase !== undefined) return startGate($, { ...want, base: rebase })
+  // One rescope only: a PR whose base moved again meanwhile is not chased; the next /pr-gate scopes against where it settled.
+  if (rebase !== undefined && want.isRescoped === true) {
+    return `The open PR from ${branch} moved to ${rebase} while the gate was scoping it: nothing was saved; run /pr-gate again.`
+  }
+  if (rebase !== undefined) return startGate($, { ...want, base: rebase, isRescoped: true })
   if (adopted !== undefined) {
     await advance($, root, branch)
     return (

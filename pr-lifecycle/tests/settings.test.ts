@@ -302,6 +302,17 @@ test('C1: an open PR adopted on another base than the one asked for is scoped fr
   expect(rec.allowance).toBe(2)
 })
 
+test('a PR retargeted again while the gate rescopes is not chased: one rescope, then the gate says to run it again', async ($, on) => {
+  const w = world(on)
+  w.gh.hasPr = true
+  w.gh.baseSeq = ['main', 'dev', 'main', 'dev', 'main', 'dev']
+  w.gh.base = 'main'
+  const said = await $.command.run(cmd('dev'))
+  const views = w.gh.calls.filter(one => one.startsWith('pr view')).length
+  expect(views).toBeLessThanOrEqual(2)
+  expect(JSON.stringify(said)).toContain('run /pr-gate again')
+})
+
 // ------------------------------------------------------------------ one read decides a create (M2)
 
 test('M2: a create decides from the settings read after its fetch: a stop that just landed on the base holds an exhausted gate', { options: { allowanceStandard: 1 } }, async ($, on) => {
