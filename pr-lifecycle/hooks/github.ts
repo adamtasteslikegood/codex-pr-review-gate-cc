@@ -150,12 +150,19 @@ export function readRoster(text: string): Roster | undefined {
     const row = JSON.parse(text) as unknown
     if (typeof row !== 'object' || row === null || Array.isArray(row)) return undefined
     const r = row as Row
+    // A wait under a minute would end collection on the first poll: it is ignored, so the plugin option applies.
+    const minutes = (value: unknown): number | undefined => {
+      const n = num(value)
+      return n !== undefined && n >= 1 ? Math.floor(n) : undefined
+    }
+    const quietMinutes = minutes(r.quietMinutes)
+    const waitCapMinutes = minutes(r.waitCapMinutes)
     return {
       reviewers: strings(r.reviewers),
       checks: strings(r.checks),
       requestReview: strings(r.requestReview),
-      ...(num(r.quietMinutes) === undefined ? {} : { quietMinutes: num(r.quietMinutes) }),
-      ...(num(r.waitCapMinutes) === undefined ? {} : { waitCapMinutes: num(r.waitCapMinutes) }),
+      ...(quietMinutes === undefined ? {} : { quietMinutes }),
+      ...(waitCapMinutes === undefined ? {} : { waitCapMinutes }),
     }
   } catch {
     return undefined

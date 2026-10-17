@@ -79,6 +79,9 @@ test('check runs and the roster file are read; a bad roster is ignored', async (
     requestReview: [],
     quietMinutes: 2,
   })
+  // A wait under a minute would end collection on the first poll: it falls back to the plugin option, like the user options.
+  expect(readRoster('{"quietMinutes":0,"waitCapMinutes":-5}')).toEqual({ reviewers: [], checks: [], requestReview: [] })
+  expect(readRoster('{"waitCapMinutes":0.5}')).toEqual({ reviewers: [], checks: [], requestReview: [] })
   expect(readRoster('{')).toBeUndefined()
   expect(readRoster('')).toBeUndefined()
 })
