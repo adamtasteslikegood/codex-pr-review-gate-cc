@@ -440,6 +440,36 @@ export async function fetchTwice($: Engine, cwd: string | undefined, args: strin
   return { isOk: false, err: err === '' ? 'git fetch failed' : err }
 }
 
+/**
+ * Brings a clean local checkout up to the PR head (R71): a fetch, then a merge that only fast-forwards. True when HEAD is the PR
+ * head after it. A dirty checkout, or one with commits the PR lacks, is left as it is: that is the person's to sort out.
+ */
+export async function syncToHead($: Engine, root: string, branch: string, prHead: string): Promise<boolean> {
+  const local = await git($, root, ['rev-parse', 'HEAD'])
+  if (!local.isOk) return false
+  if (local.out === prHead) return true
+  const dirty = await git($, root, ['status', '--porcelain', '--untracked-files=no'])
+  if (!dirty.isOk || dirty.out !== '') return false
+  if (!(await fetchTwice($, root, ['--quiet', 'origin', branch], 60_000)).isOk) return false
+  if (!(await git($, root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk) return false
+  if (!(await git($, root, ['merge', '--ff-only', '--quiet', prHead], 60_000)).isOk) return false
+  const after = await git($, root, ['rev-parse', 'HEAD'])
+  return after.isOk && after.out === prHead
+}
+
+/** gh can report the PR head from before a push that just landed (R71): origin's branch is the truth when it is the local HEAD. */
+export async function isPushed($: Engine, root: string, branch: string, local: string): Promise<boolean> {
+  const remote = await git($, root, ['ls-remote', 'origin', `refs/heads/${branch}`])
+  return remote.isOk && remote.out.split(/\s/)[0] === local
+}
+
+/** Who wrote the local commits no origin branch has, for a stop that names them (R71): "abc1234 by Ann, def5678 by Bob". */
+export async function unpushedBy($: Engine, root: string): Promise<string> {
+  const log = await git($, root, ['log', '--format=%h by %an', 'HEAD', '--not', '--remotes=origin'])
+  const lines = log.isOk ? log.out.split('\n').filter(Boolean) : []
+  return lines.length === 0 ? '' : ` (${lines.slice(0, 5).join(', ')}${lines.length > 5 ? ', ...' : ''})`
+}
+
 /** The record's waivers at `head`, with each finding waiver whose finding's file changed since it was given marked lapsed (R55). */
 export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'waivers' | 'findings'>, head: string, now: number): Promise<Waiver[]> {
   const froms = [...new Set(rec.waivers.filter(one => one.scope === 'finding' && one.lapsedAt === undefined && one.head !== head).map(one => one.head))]
@@ -1025,8 +1055,10 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   if (after === null) return
   if (run.roundKind === 'final-head-check' || ((!isCovered || owesVerification) && !isPassThroughRound1)) {
     // Codex reads the local checkout: it must be the PR head, or it would review something else.
+    // A clean checkout behind the PR head (a reviewer's or a bot's push) catches up on its own (R71).
+    const isSynced = await syncToHead($, run.root, run.branch, got.prHead)
     const local = await git($, run.root, ['rev-parse', 'HEAD'])
-    if (!local.isOk || local.out !== got.prHead) {
+    if (!isSynced || !local.isOk || local.out !== got.prHead) {
       const here = local.isOk ? local.out.slice(0, 7) : 'unknown'
       const why = `the local checkout ${here} is not the PR head ${got.prHead.slice(0, 7)}: pull (or push), then run /pr-gate resume`
       await noteAttempt($, after, why)
@@ -1318,9 +1350,12 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     await failPost($, after, `${what}, then run /pr-gate resume`)
     return
   }
+  // gh may not have seen a push that just landed: origin's branch at the local HEAD is the PR head (R71).
+  if (prHead !== local.out && (await isPushed($, run.root, run.branch, local.out))) prHead = local.out
   const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
   if (!isContained) {
-    await failPost($, after, `commits on ${run.branch} are not on the PR: pull or push, then /pr-gate resume`)
+    const by = await unpushedBy($, run.root)
+    await failPost($, after, `commits on ${run.branch} are not on the PR${by}: pull or push, then /pr-gate resume`)
     return
   }
   const endHead = prHead
@@ -1349,8 +1384,8 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
 async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]): Promise<void> {
   const now = await $.clock.now()
   // Codex reads the checkout: it must be the head the rebuttal is about.
-  const local = await git($, run.root, ['rev-parse', 'HEAD'])
-  if (!local.isOk || local.out !== run.headSha) {
+  // A clean checkout behind the PR head catches up on its own (R71).
+  if (!(await syncToHead($, run.root, run.branch, run.headSha))) {
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }

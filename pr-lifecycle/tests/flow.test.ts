@@ -2987,3 +2987,39 @@ test('#13: a session whose record another session took sends its agent nothing a
   expect(w.prompts).toHaveLength(prompts)
   expect(w.run).toBeNull()
 })
+
+// ------------------------------------------- R71: a moved head no longer stops the round
+
+test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.prHead = 'b'.repeat(40) // a bot pushed its own fix to the branch
+  w.git.isAncestor = true
+  const spawned = w.spawned.length
+  await w.clock.advance(20 * 60_000)
+  expect(w.git.head).toBe('b'.repeat(40))
+  expect(w.spawned.length).toBeGreaterThan(spawned)
+  expect((await runOf(w)).status).toBe('running')
+})
+
+test('R71: a push gh has not seen yet does not stop the round', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40) // committed and pushed; gh still reports the old head
+  w.git.remoteHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const run = await runOf(w)
+  expect(run.message ?? '').not.toContain('are not on the PR')
+  expect(run.headSha).toBe('e'.repeat(40))
+})
+
+test('R71: commits that are truly not on the PR still stop the round, naming who wrote them', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.git.unpushed = 'eeeeeee by claude-child'
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('commits on feat/x are not on the PR (eeeeeee by claude-child): pull or push, then /pr-gate resume')
+})
