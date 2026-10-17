@@ -1497,7 +1497,8 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
       if (again !== null) await checkRebuttals($, again, owed)
       return
     }
-    await noteAttempt($, run, 'Codex gave no readable verdict on the reported fixes, twice; they stay owed')
+    // Logged, not noted as an attempt: the round completes here, and an answer run's note would undo the round it answers.
+    await logEvent($, run.root, run.branch, 'check', `Codex gave no readable verdict on ${owed.map(f => f.id).join(', ') || 'the reported fixes'}, twice; they stay owed`)
     await endRound($, run, true)
     return
   }
@@ -1541,7 +1542,15 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
       ].join(' · '),
     }),
   }))
-  if (after !== null) await endRound($, after, true)
+  if (after === null) return
+  // Reported fixes Codex left out while ruling on others get the same one retry (R72): the verdicts in are kept, only these are asked again.
+  const unruled = after.findings.filter(f => missing.includes(f.id) && f.status === 'reported-fixed' && !isReverifyOwed(f))
+  if (run.hasRetriedCheck !== true && unruled.length > 0) {
+    const again = await patch($, run.id, one => ({ ...one, hasRetriedCheck: true }))
+    if (again !== null) await checkRebuttals($, again, unruled)
+    return
+  }
+  await endRound($, after, true)
 }
 
 /**

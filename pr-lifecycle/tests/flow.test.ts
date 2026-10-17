@@ -3150,6 +3150,33 @@ test('R72: a check with no verdict on reported fixes runs once more; a second mi
   expect((await recordOf(w)).postStatus).not.toBe('blocked')
 })
 
+test('R72: a check that rules on one reported fix and leaves out another asks again for that one only, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead), inline(12, '**P1** Missing auth check', w.gh.prHead, 40)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  const before = (await recordOf(w)).rounds.filter(one => one.isCompleted).length
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' },
+    { id: 'G2-2', action: 'fixed', severity: 'P1', replyId: '992' },
+  ]))
+  const spawned = w.spawned.length
+  await done($, accept('r2-verify', w, { 'G2-1': true }))
+  // Asked again for G2-2 alone; G2-1's verdict stands.
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect(w.spawned.at(-1)?.prompt).toContain('G2-2')
+  expect(w.spawned.at(-1)?.prompt).not.toContain('G2-1 [')
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
+  await done($, accept('r2-verify', w, { 'G2-2': true }))
+  const rec = await recordOf(w)
+  expect(rec.findings.filter(one => one.id.startsWith('G2-')).map(one => one.status)).toEqual(['verified-fixed', 'verified-fixed'])
+  expect(rec.rounds.filter(one => one.isCompleted).length).toBe(before + 1)
+})
+
 test('/pr-gate log counts only the person\'s commands, not an agent\'s refused one', async ($, on) => {
   const w = world(on)
   await toBlocked($, w, 'Consider renaming this')

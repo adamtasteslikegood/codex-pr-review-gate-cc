@@ -726,6 +726,9 @@ test('PR12-2: an answer check that moves straight on into another round keeps th
   await done($, turn(`ok\n${TRAILER}\n${JSON.stringify(rebut)}`))
   expect((await runOf(w)).effort).toBe('low')
   await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [{ id: 'G2-1', holds: true }] })}`, `agent-${w.spawned.length}`))
+  // R1-1 was left out: the check asks again for it alone (R72); a second miss leaves it owed, and round 3 starts at once.
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`))
   const run = await runOf(w)
   expect(run.round).toBe(3)
   expect(recordOf(w).effort).toBe('medium')
