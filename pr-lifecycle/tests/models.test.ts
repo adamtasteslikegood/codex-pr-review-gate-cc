@@ -639,3 +639,56 @@ test('N3: a run outside a round never starts above the tier\'s current start eff
   expect(answerRun(rec, ['G2-1'], 0, configOf({ reviewEffort: 'low' })).effort).toBe('low')
   expect(answerRun(rec, ['G2-1'], 0, configOf({})).effort).toBe('medium')
 })
+
+// ------------------------------------------------------------------ PR #12 review
+
+/** High tier, main fixer: round 1 raises R1-1, the fix is committed, and round 2's review and challenge are both spawned. */
+const toHighRound2 = async ($: Dispatch, w: World): Promise<void> => {
+  w.git.numstat = HIGH
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
+  w.git.head = 'e'.repeat(40)
+  await done($, turn(fixed('r1-fix', 'R1-1')))
+  // The fix reviewer finds the fix not settled; the second fix goes to Codex, so R1-1 stays reported-fixed for it to verify.
+  await done($, turn(`v\n${TRAILER}\n{"step":"r1-verify","ok":false,"notes":"R1-1: no test"}`, `agent-${w.spawned.length}`))
+  await done($, turn(fixed('r1-fix', 'R1-1')))
+  expect(w.spawned.slice(-2).map(one => one.description)).toEqual(['pr-lifecycle r2 review', 'pr-lifecycle r2 challenge'])
+  expect(recordOf(w).findings.find(f => f.id === 'R1-1')?.status).toBe('reported-fixed')
+}
+
+const modelError = (step: string) =>
+  `MODEL_UNUSABLE\n${TRAILER}\n` + JSON.stringify({ step, gate: 'ERROR', error: 'model', note: "HINT: the 'gpt-6-astra' model is not supported when using Codex" })
+
+test('PR12-1: a wrong-model review\'s verification is never kept when the challenge hits a model error', async ($, on) => {
+  const w = world(on)
+  await toHighRound2($, w)
+  const effort = recordOf(w).effort
+  const spawned = w.spawned.length
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], model: 'gpt-5.6-luna' }), `agent-${spawned - 1}`))
+  await done($, turn(modelError('r2-challenge'), `agent-${spawned}`))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('not supported when using Codex')
+  expect(run.findings.find(f => f.id === 'R1-1')?.status).toBe('reported-fixed')
+  const rec = recordOf(w)
+  expect(rec.findings.find(f => f.id === 'R1-1')?.status).toBe('reported-fixed')
+  expect(rec.findings.some(f => f.history.some(h => h.round === 2 && h.by === 'codex'))).toBe(false)
+  expect(rec.effort).toBe(effort)
+  expect(w.spawned).toHaveLength(spawned)
+})
+
+test('PR12-1: a review timeout beside a challenge model error stops on the model error, with no retry', async ($, on) => {
+  const w = world(on)
+  await toHighRound2($, w)
+  const effort = recordOf(w).effort
+  const spawned = w.spawned.length
+  await done($, turn(`${TRAILER}\n{"step":"r2-review","gate":"ERROR","error":"timeout"}`, `agent-${spawned - 1}`))
+  await done($, turn(modelError('r2-challenge'), `agent-${spawned}`))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('codexModelHigh')
+  expect(recordOf(w).effort).toBe(effort)
+  expect(recordOf(w).hasTimedOut).toBeUndefined()
+  expect(w.spawned).toHaveLength(spawned)
+})

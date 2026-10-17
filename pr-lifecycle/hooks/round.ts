@@ -1865,23 +1865,29 @@ export function heldReason(rec: LifecycleRecord, onExhausted: Config['onExhauste
 async function afterReview($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
   const results = run.pending.map(one => ({ role: one.role, result: readReview(one.answer ?? '') }))
+  // What each role ran (R69). A model failure or another model than the one named, in any role, is checked before anything of the
+  // attempt is used: a timeout retry, a finding, a verified or accepted ruling. The attempt is discarded whole, as a timeout's is.
+  const ran: RanModels = Object.fromEntries(results.flatMap(one => (one.result.model === undefined ? [] : [[one.role, one.result.model]])))
+  const named = run.codexModel
+  // An unusable model's own stop, with gstack's repair message, comes first, as in the rebuttal check.
+  const unusable = results.find(one => one.result.failure === 'model')
+  const stray = named === undefined ? undefined : results.find(one => one.result.model !== undefined && one.result.model !== named)
+  if (unusable !== undefined || stray !== undefined) {
+    const marked = (await patch($, run.id, one => ({ ...one, ...(Object.keys(ran).length === 0 ? {} : { ranModels: ran }) }))) ?? run
+    if (unusable !== undefined) {
+      await noteAttempt($, marked, `Codex ${unusable.role} could not use its model`)
+      await finish($, run.id, 'error', await unusableModel($, marked, unusable.result.note))
+    } else if (stray !== undefined && named !== undefined) {
+      await noteAttempt($, marked, `Codex ${stray.role} ran ${stray.result.model ?? '?'}, not ${named}`)
+      await finish($, run.id, 'error', await strayModel($, marked, stray.role, stray.result.model ?? '?', named))
+    }
+    return
+  }
   const failed = results.find(one => one.result.gate === 'ERROR')
   if (failed !== undefined && failed.result.failure === 'timeout') {
     // Nothing of this attempt is kept, a parallel reviewer's findings included: it reruns whole.
     await noteAttempt($, run, `Codex ${failed.role} timed out at ${run.effort}`)
     await retryLower($, run, `Codex ${failed.role} timed out at ${run.effort}: ${failed.result.note ?? 'no verdict'}.`)
-    return
-  }
-  // What each role ran (R69). Another model than the one named is never accepted: the attempt is discarded whole, as a timeout's is.
-  const ran: RanModels = Object.fromEntries(results.flatMap(one => (one.result.model === undefined ? [] : [[one.role, one.result.model]])))
-  const named = run.codexModel
-  // An unusable model's own stop, with gstack's repair message, comes first, as in the rebuttal check.
-  const isUnusable = results.some(one => one.result.failure === 'model')
-  const stray = named === undefined || isUnusable ? undefined : results.find(one => one.result.model !== undefined && one.result.model !== named)
-  if (stray !== undefined && named !== undefined) {
-    const marked = (await patch($, run.id, one => ({ ...one, ranModels: ran }))) ?? run
-    await noteAttempt($, marked, `Codex ${stray.role} ran ${stray.result.model ?? '?'}, not ${named}`)
-    await finish($, run.id, 'error', await strayModel($, marked, stray.role, stray.result.model ?? '?', named))
     return
   }
   const prior = await loadRecord($, run.root, run.branch)
@@ -1948,12 +1954,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   }))
   if (after === null) return
   if (failed !== undefined) {
-    // Fail closed: a review that did not complete is never a pass, and no round is spent on it. An unusable model is not retried
-    // on another one (R69): the stop names the setting to change.
-    const isModel = failed.result.failure === 'model'
-    await noteAttempt($, after, isModel ? `Codex ${failed.role} could not use its model` : `Codex ${failed.role} did not complete`)
-    const why = isModel ? await unusableModel($, after, failed.result.note) : `Codex ${failed.role} did not complete: ${failed.result.note ?? 'no verdict'}`
-    await finish($, run.id, 'error', why)
+    // Fail closed: a review that did not complete is never a pass, and no round is spent on it. A model failure stopped above (R69).
+    await noteAttempt($, after, `Codex ${failed.role} did not complete`)
+    await finish($, run.id, 'error', `Codex ${failed.role} did not complete: ${failed.result.note ?? 'no verdict'}`)
     return
   }
   // Codex's ruling goes into the record's ledger at once, not only when the round ends.
