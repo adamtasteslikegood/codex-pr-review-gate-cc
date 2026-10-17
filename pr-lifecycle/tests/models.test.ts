@@ -707,12 +707,14 @@ test('PR12-2: an answer check that moves straight on into another round keeps th
   w.gh.comments = [{ id: 11, user: { login: 'claude[bot]' }, body: '**P1** SQL injection', path: 'src/app.ts', line: 4, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: 'u11' }]
   w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
   await w.clock.advance(30_000)
-  // Round 2's Codex review at low does not verify R1-1, and G2-1 is left unanswered: blocked.
-  await done($, turn(review('r2-review', 'PASS'), `agent-${w.spawned.length}`))
+  // The reviewer covered round 2's head: no Codex review. G2-1 is left unanswered, and the Codex check gives no verdict on R1-1,
+  // which stays owed (R72): blocked.
   const none = `ok\n${TRAILER}\n{"step":"r2-triage","dispositions":[]}`
   await done($, turn(none))
   await w.clock.advance(1000)
   await done($, turn(none))
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`))
   expect(recordOf(w).postStatus).toBe('blocked')
   expect(recordOf(w).effort).toBe('medium')
   // Resumed, G2-1 is rebutted; Codex accepts it at low, and R1-1 still owed starts round 3 at once.

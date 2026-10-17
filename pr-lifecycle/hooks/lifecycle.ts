@@ -265,6 +265,14 @@ export const rejections = (f: Pick<Finding, 'history'>): number =>
 /** Rebutted again after Codex rejected a rebuttal: a dispute only the person settles; it never goes to Codex again (R40). */
 export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !isAcceptedRebuttal(f) && rejections(f) > 0
 
+/**
+ * What the gate's own Codex check rules on (Adam, decision A; R36, R58, R72): rebuttals Codex has not accepted, short of a dispute
+ * (R40); verified fixes whose file changed since (R58); and fixes only reported, at any severity, advisories included. A deferral is
+ * the person's to release (R45), never Codex's.
+ */
+export const checksOwed = (findings: readonly Finding[]): Finding[] =>
+  findings.filter(one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one) || one.status === 'reported-fixed')
+
 /** The dispute in words: the agent's last argument and Codex's last rejection. */
 const disputeOf = (f: Finding): string => {
   const argued = f.history.filter(one => one.status === 'rebutted' && one.by !== 'codex').at(-1)?.note ?? 'no argument recorded'

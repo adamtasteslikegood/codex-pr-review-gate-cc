@@ -40,6 +40,7 @@ import {
   decideNext,
   invalidate,
   lapseWaivers,
+  checksOwed,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
@@ -1037,8 +1038,6 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   const isCovered = [...evidence, ...rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence)].some(
     each => each.isComplete && each.head === got.prHead,
   )
-  // Any fix only reported, at any severity (R39), needs Codex to verify it before the merge.
-  const owesVerification = mergeHolds(rec).some(one => one.status === 'reported-fixed')
   const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
   const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
   const after = await patch($, run.id, one => ({
@@ -1055,7 +1054,8 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     }),
   }))
   if (after === null) return
-  if (run.roundKind === 'final-head-check' || ((!isCovered || owesVerification) && !isPassThroughRound1)) {
+  // A fix only reported no longer calls for a full Codex review: the round's own Codex check verifies it (R72).
+  if (run.roundKind === 'final-head-check' || (!isCovered && !isPassThroughRound1)) {
     // Codex reads the local checkout: it must be the PR head, or it would review something else.
     // A clean checkout behind the PR head (a reviewer's or a bot's push) catches up on its own (R71).
     const isSynced = await syncToHead($, run.root, run.branch, got.prHead)
@@ -1253,14 +1253,8 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
     .catch(() => undefined)
 }
 
-/**
- * Rebuttals Codex has not accepted, of any severity and from either phase: after the PR opens, Codex checks every one
- * on the same head (R36, widened by R39). A check that was held, then resumed, finds them again here. A rebuttal of a
- * finding Codex already rejected once is a dispute for the person, never sent to Codex again (R40). A verified fix whose
- * file changed since goes to the same check, to be re-verified on this head (R58).
- */
-const rebuttalsOwed = (run: Run): Finding[] =>
-  run.findings.filter(one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one))
+/** What Codex checks at the end of a post-PR round, on the head the round ends on (`checksOwed`; R36, R58, R72). */
+const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
@@ -1373,8 +1367,9 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   const ended = await getRun($)
   if (ended === null || ended.id !== run.id || ended.status !== 'running') return
-  // Only on the head the rebuttals were made about; a new head goes to its own round, which checks them there.
-  const rebuttals = endHead === run.roundStartHead ? rebuttalsOwed(ended) : []
+  // Codex checks the fixes and rebuttals on the head the round ends on (R72): a reported fix is about that head, and syncToHead
+  // brings a clean checkout to it. No round is spent, and no full Codex review is needed only to verify a fix.
+  const rebuttals = rebuttalsOwed(ended)
   if (rebuttals.length > 0) {
     await checkRebuttals($, { ...ended, headSha: endHead }, rebuttals)
     return
@@ -1420,8 +1415,8 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
 
 /** The check step's label: rebuttals, re-verifications (R58), or both. */
 const checkLabel = (round: number, checked: readonly Pick<Finding, 'status' | 'needsRecheck'>[]): string => {
-  const reverify = checked.filter(isReverifyOwed).length
-  const what = reverify === 0 ? 'checks the rebuttals' : reverify === checked.length ? 're-verifies the fixes' : 'checks the rebuttals and fixes'
+  const fixes = checked.filter(one => isReverifyOwed(one) || one.status === 'reported-fixed').length
+  const what = fixes === 0 ? 'checks the rebuttals' : fixes === checked.length ? 'verifies the fixes' : 'checks the rebuttals and fixes'
   return `Round ${round} · codex ${what}`
 }
 
@@ -1460,7 +1455,14 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
     return
   }
   const verdicts = readVerdicts(answer)
-  // Fail closed: no readable verdict at all is no check.
+  // Fail closed: no readable verdict at all is no check. Fixes only reported stay owed, for the next check to rule on (R72): only a
+  // rebuttal or a re-verification, which has no other path, holds the lifecycle for it.
+  const mustRule = run.findings.filter(f => (run.rechecks ?? []).includes(f.id) && f.status !== 'reported-fixed')
+  if (verdicts.size === 0 && mustRule.length === 0) {
+    await noteAttempt($, run, 'Codex gave no readable verdict on the reported fixes; they stay owed')
+    await endRound($, run, true)
+    return
+  }
   if (verdicts.size === 0) {
     await holdPost($, run, 'Codex gave no readable verdict on a rebuttal')
     return
@@ -1480,6 +1482,12 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
         return verdict.holds
           ? markVerified(f, one.round, 'codex', now, 'Codex: the fix still holds after its file changed')
           : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix no longer holds')
+      }
+      // A fix only reported (R72): confirmed, it is verified; refuted, it is open again, with Codex's reason for the agent.
+      if (f.status === 'reported-fixed') {
+        return verdict.holds
+          ? markVerified(f, one.round, 'codex', now, 'Codex: the fix holds')
+          : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix does not hold')
       }
       // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
       return verdict.holds ? acceptRebuttal(f, one.round, now) : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex did not accept the rebuttal')
@@ -2041,7 +2049,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
         // Only a fix or a rebuttal is Codex's to rule on (R45): a deferral is released by the person's waiver alone.
         // A verified fix whose file changed is Codex's to re-verify (R58): verified clears the flag, held reopens it.
         const isTheirs = (one.lifecycle === 'post' && isDisputed(old)) || (old.status !== 'reported-fixed' && old.status !== 'rebutted' && !isReverifyOwed(old))
-        const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
+        // A hold names no reason in a review's trailer: say so, rather than leave the agent's own fix note to read as the open item.
+        const heldNote = `Codex held it in the round ${one.round} review, without a reason`
+        const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now, heldNote) : old
         return carried.has(ruled.id) && ruled.status === 'open' && !raisedIn(ruled, one.round) ? markHeld(ruled, one.round, 'pr-gate', now) : ruled
       }),
       ...fresh,
