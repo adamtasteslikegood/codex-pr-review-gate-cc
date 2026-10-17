@@ -123,7 +123,7 @@
     "rereviewEffort": {
       "type": "string",
       "title": "Codex effort, re-reviews",
-      "description": "The effort of every Codex dispatch after a lifecycle's first review round: later rounds, the consult of earlier rebuttals and fixes, and the post-PR Codex fallback. Never above the tier's starting effort. A repository's .github/pr-gate.json on the base can set its own.",
+      "description": "The effort of every Codex dispatch after the first completed round Codex ran in: later rounds, the consult of earlier rebuttals and fixes, the post-PR rebuttal check, and the post-PR Codex fallback. Never above the tier's starting effort. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "low",
       "options": [
         "low",
@@ -134,7 +134,7 @@
     "codexModel": {
       "type": "string",
       "title": "Codex model, standard and light-lane changes",
-      "description": "The Codex model the gate names to the gstack /codex skill (--model, GSTACK_CODEX_MODEL) on a change that is not high blast radius. Empty names none, so gstack's own order applies (GSTACK_CODEX_MODEL, then Codex config.toml). A model gstack cannot use stops the round; it never falls back to another. A repository's .github/pr-gate.json on the base can set its own.",
+      "description": "The Codex model the gate names to the gstack /codex skill (--model, GSTACK_CODEX_MODEL) on a change that is not high blast radius. Empty names none, so gstack's own order applies (GSTACK_CODEX_MODEL, then Codex config.toml). Every Codex step uses it, the post-PR rebuttal check included. A model gstack cannot use, or a step that reports another model, stops the round; it never falls back to another. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "gpt-6-luna"
     },
     "codexModelHigh": {
