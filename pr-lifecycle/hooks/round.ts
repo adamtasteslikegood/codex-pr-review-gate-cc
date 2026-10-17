@@ -1590,7 +1590,8 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
     tier: rec.tier,
     tierWhy: rec.tierWhy,
     lane: rec.lane,
-    effort: rec.effort ?? defaultEffort(rec, c),
+    // The carried effort, never above the tier's start as the base's settings have it now (a lowered reviewEffort applies at once).
+    effort: lowerOf(rec.effort ?? defaultEffort(rec, c), defaultEffort(rec, c)),
     startEffort: defaultEffort(rec, c),
     ...(codexModelFor(rec.tier, c) === undefined ? {} : { codexModel: codexModelFor(rec.tier, c) }),
     round,

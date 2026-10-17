@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, P1, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
-import { configOf, overrideConfig } from '../hooks/round'
+import { answerRun, configOf, overrideConfig } from '../hooks/round'
 import { readCheck, readReview } from '../hooks/core'
 import type { LifecycleRecord } from '../types'
 
@@ -629,4 +629,13 @@ test('N2: a rebuttal check that is Codex\'s first look in the lifecycle runs at 
   await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ step, dispositions: [{ id, action: 'rebutted', note: 'the link is right', replyId: '991' }] })}`))
   expect(w.spawned.at(-1)?.description).toBe(`pr-lifecycle r${run.round} verify`)
   expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort medium")
+})
+
+test('N3: a run outside a round never starts above the tier\'s current start effort', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  // A record that carries more than the base's start now allows, as a base file lowering reviewEffort leaves it.
+  const rec = { ...recordOf(w), effort: 'high' as const }
+  expect(answerRun(rec, ['G2-1'], 0, configOf({ reviewEffort: 'low' })).effort).toBe('low')
+  expect(answerRun(rec, ['G2-1'], 0, configOf({})).effort).toBe('medium')
 })
