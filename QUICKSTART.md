@@ -22,7 +22,7 @@ Name one component's folder in `CLAUDE_CODE_PLUGIN_DIRS`, for example in
 
 Which one to load, from the [README](README.md):
 
-`codex-gate` 0.3.1 is the plugin in daily use. `pr-lifecycle` 1.0.0 replaces
+`codex-gate` 0.3.1 is the plugin in daily use. `pr-lifecycle` 1.1.0 replaces
 it once Adam switches `CLAUDE_CODE_PLUGIN_DIRS` to its folder. Never load
 both: both register `/pr-gate` and hold PR creation, so two would gate the
 same PR twice. [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) is the spec
