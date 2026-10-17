@@ -82,7 +82,7 @@ test('new scope invalidates only the affected evidence', async ($, on) => {
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1, { ...P2, file: 'src/other.ts' }])))
   w.git.head = 'd'.repeat(40)
-  await done($, 
+  await done($,
     turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'fine as is' }] })}`),
   )
   await done($, turn(review('r2-review', 'PASS'), 'agent-2'))

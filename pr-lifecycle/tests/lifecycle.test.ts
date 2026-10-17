@@ -25,7 +25,8 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt, reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt,
+  reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
 const A = { standard: 4, high: 6 }
