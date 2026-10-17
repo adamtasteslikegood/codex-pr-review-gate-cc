@@ -248,13 +248,14 @@ All fields are optional. The first five shape post-PR collection (below). The
 last five are round settings, with the same meaning and limits as the plugin
 options of the same name (see Options): `allowanceStandard` is capped at 10
 and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
-`lightBranches` and `highRiskPaths` are regular expressions, where `""` turns
-the match off (`"lightBranches": ""` turns the light lane off).
+`lightBranches` and `highRiskPaths` are regular expressions, where `""` (or
+only spaces, as for the plugin options) turns the match off
+(`"lightBranches": ""` turns the light lane off).
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
-- **An invalid value** (a count below 1, an unknown `onExhausted`, a regular
-  expression that does not compile) is ignored, so that key falls back to the
+- **An invalid value** (a count or a wait in minutes below 1, an unknown
+  `onExhausted`, a regular expression that does not compile) is ignored, so that key falls back to the
   plugin option; the others still apply. The gate says which keys it ignored,
   once, in the pane's scope step and in the start message. A file that is not
   a JSON object overrides nothing.
