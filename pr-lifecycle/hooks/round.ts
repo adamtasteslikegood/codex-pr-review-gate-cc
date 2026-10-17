@@ -1399,6 +1399,8 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
 async function retryLower($: Engine, run: Run, why: string): Promise<void> {
   const lower = stepDown(run.effort)
   if (lower === undefined) {
+    // The effort that timed out is the carry, not a higher start a re-review ran under: the next run starts no higher than it.
+    await patch($, run.id, one => ({ ...one, carriedEffort: lowerOf(one.carriedEffort ?? one.effort, run.effort) }))
     await finish($, run.id, 'error', `${why} Codex timed out at low effort, the lowest the gate uses.`, true)
     return
   }

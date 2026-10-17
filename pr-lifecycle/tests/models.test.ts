@@ -727,3 +727,20 @@ test('PR12-2: an answer check that moves straight on into another round keeps th
   expect(recordOf(w).effort).toBe('medium')
   expect(run.carriedEffort).toBe('medium')
 })
+
+test('PR12-3: a re-review that times out at low with a high carry leaves low as the carry', { options: { highEffort: 'high' } }, async ($, on) => {
+  const w = world(on)
+  await toHighRound2($, w)
+  expect(argsOf(w, -2)).toBe("review --model 'gpt-6-astra' --effort low")
+  expect((await runOf(w)).carriedEffort).toBe('high')
+  const spawned = w.spawned.length
+  await done($, turn(`${TRAILER}\n{"step":"r2-review","gate":"ERROR","error":"timeout"}`, `agent-${spawned - 1}`))
+  await done($, turn(review('r2-challenge', 'PASS'), `agent-${spawned}`))
+  expect((await runOf(w)).status).toBe('error')
+  expect(recordOf(w).effort).toBe('low')
+  // The base now asks for deeper re-reviews: the branch still never runs above the effort that timed out.
+  w.git.roster = '{"rereviewEffort":"high"}'
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  expect(argsOf(w, -2)).toBe("review --model 'gpt-6-astra' --effort low")
+})
