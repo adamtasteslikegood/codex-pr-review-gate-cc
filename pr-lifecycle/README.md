@@ -223,7 +223,8 @@ there are the waivers and `allow`.
 
 A repository can set its own reviewers and round settings in an optional
 `.github/pr-gate.json`. The file is **read from the base branch**
-(`origin/<base>`, as the gate last fetched it), **never from the PR branch's
+(`origin/<base>`, as the gate last fetched it; a create that only an exhausted
+gate under `open-pr` would let through fetches the base first), **never from the PR branch's
 own HEAD**: a pull request must not be able to loosen its own gate, by lowering
 its allowance, turning on the light lane, or adding a bot to the trusted roster
 (below). A base without the file, or with no fetched `origin/<base>`, has no

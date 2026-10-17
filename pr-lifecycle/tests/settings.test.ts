@@ -338,6 +338,33 @@ test('M2: a create decides from the settings read after its fetch: a stop that j
   expect(held.deny ?? '').toContain('onExhausted is stop')
 })
 
+test('gate R3-2: an exhausted gate at the same head fetches the base before opening, so a stop that just landed holds it', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  expect(recordOf(w).preStatus).toBe('exhausted')
+  w.git.onFetch = () => {
+    w.git.roster = '{"onExhausted":"stop"}'
+  }
+  const held = await $.tool.call(createPr)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('onExhausted is stop')
+})
+
+test('gate R3-2: an exhausted gate under open-pr still opens at the same head once the fetch confirms it', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  expect(recordOf(w).preStatus).toBe('exhausted')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+})
+
 // ------------------------------------------------------------------ the remote-tracking ref, by its full name (M4)
 
 test('M4: a local tag named origin/dev cannot stand in for the base\'s file', async ($, on) => {

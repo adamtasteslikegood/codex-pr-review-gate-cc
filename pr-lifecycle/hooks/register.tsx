@@ -491,8 +491,17 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'exhausted' && s.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
-  if (allows(rec) && rec.preHead === head) return undefined
-  if (allows(rec) && rec.preHead !== undefined) {
+  // Only open-pr lets an exhausted gate open the PR, and that is the base's to say: before it does, the base is fetched, so a stop
+  // that just landed holds it (gate R3-2). A fetch that fails decides nothing here: the gate below fetches again and holds on failure.
+  const stopped: Config = { ...settings, onExhausted: 'stop' }
+  const onlyExhausted = allows(rec) && !allows(rec, stopped)
+  const now = !onlyExhausted
+    ? settings
+    : (await git($, root, ['fetch', '--quiet', 'origin', base], 60_000)).isOk
+      ? (await configFor($, root, base)).config
+      : stopped
+  if (allows(rec, now) && rec.preHead === head) return undefined
+  if (allows(rec, now) && rec.preHead !== undefined) {
     // Commits since the gate finished: docs alone (a CHANGELOG line) ride on its verdict; code does not.
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
