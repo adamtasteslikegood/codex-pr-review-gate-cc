@@ -64,7 +64,7 @@ import {
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, isHeldByOther, loadRecord, lockRecord, ownerOf, saveRecord, setOwner, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -326,9 +326,13 @@ export async function sessionIdOf($: Engine): Promise<string> {
 export async function claimRecord($: Engine, root: string, branch: string): Promise<boolean> {
   const now = await $.clock.now()
   const id = await sessionIdOf($)
-  if (!isInteractive && isHeldByOther(await ownerOf($, root, branch), id, now)) return false
+  const before = await ownerOf($, root, branch)
+  if (!isInteractive && isHeldByOther(before, id, now)) return false
   await setOwner($, root, branch, { sessionId: id, beatAt: now })
   beatAt = now
+  if (before !== undefined && before.sessionId !== id) {
+    await logEvent($, root, branch, 'session', `session ${id.slice(0, 8)} took the record over from ${before.sessionId.slice(0, 8)}`)
+  }
   return true
 }
 
@@ -348,11 +352,12 @@ async function beat($: Engine, run: Run, now: number): Promise<boolean> {
 }
 
 /** Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. */
-async function standDown($: Engine): Promise<void> {
+async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<void> {
   stopTicker()
   isLive = false
   await update($, runAtom, () => null)
   $.ui.status('pr-gate: another session runs this lifecycle')
+  await logEvent($, run.root, run.branch, 'session', `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`)
 }
 
 export const isLiveNow = (): boolean => isLive
@@ -458,7 +463,9 @@ export async function syncToHead($: Engine, root: string, branch: string, prHead
   if (!(await git($, root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk) return false
   if (!(await git($, root, ['merge', '--ff-only', '--quiet', prHead], 60_000)).isOk) return false
   const after = await git($, root, ['rev-parse', 'HEAD'])
-  return after.isOk && after.out === prHead
+  if (!after.isOk || after.out !== prHead) return false
+  await logEvent($, root, branch, 'head', `caught the checkout up from ${local.out.slice(0, 7)} to the PR head ${prHead.slice(0, 7)}`)
+  return true
 }
 
 /** gh can report the PR head from before a push that just landed (R71): origin's branch is the truth when it is the local HEAD. */
@@ -546,7 +553,7 @@ export function startTicker($: Engine): void {
         return
       }
       if (!(await beat($, run, now))) {
-        await standDown($)
+        await standDown($, run)
         return
       }
       await update($, tickAtom, () => now)
@@ -617,6 +624,8 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
   isLive = false
   if (!isEnded || run === null) return null
   const ended: Run = run
+  const isDone = status === 'passed' || status === 'waived'
+  await logEvent($, ended.root, ended.branch, isDone ? 'end' : 'stop', `${ended.lifecycle}-PR round ${ended.round} ${status}: ${message}`)
   // A review that completed below the branch's default sets where the next run starts; a run that never completed one keeps the last.
   const hasReviewed = status === 'passed' || status === 'exhausted' || status === 'blocked'
   // What carries is the start lowered by timeouts, never a re-review's own capped effort.
@@ -769,7 +778,7 @@ async function beginFix($: Engine, id: string, notes: string | undefined, kind: 
   }
   // Another session runs this record (#13): this one sends its agent nothing.
   if (await isOwnedElsewhere($, opened.root, opened.branch)) {
-    await standDown($)
+    await standDown($, opened)
     return
   }
   // The prompt waits for the session to go idle. The step is armed by the main-loop turn that starts with this prompt
@@ -1242,7 +1251,7 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
   // Another session runs this record (#13): this one sends its agent nothing.
   const run = await getRun($)
   if (run !== null && run.id === id && (await isOwnedElsewhere($, run.root, run.branch))) {
-    await standDown($)
+    await standDown($, run)
     return
   }
   void $.prompt
@@ -1349,7 +1358,10 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     return
   }
   // gh may not have seen a push that just landed: origin's branch at the local HEAD is the PR head (R71).
-  if (prHead !== local.out && (await isPushed($, run.root, run.branch, local.out))) prHead = local.out
+  if (prHead !== local.out && (await isPushed($, run.root, run.branch, local.out))) {
+    await logEvent($, run.root, run.branch, 'head', `gh still reported ${prHead.slice(0, 7)}; origin has the push ${local.out.slice(0, 7)}`)
+    prHead = local.out
+  }
   const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
   if (!isContained) {
     const by = await unpushedBy($, run.root)
@@ -1914,6 +1926,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (isStale) return advance($, root, branch, isResume)
     const at = (saved ?? rec).head.slice(0, 7)
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: ready for the merge decision.`)
+    else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready for the merge decision at ${at}`)
     if (saved !== undefined) say($, readyPrompt(saved))
     return
   }

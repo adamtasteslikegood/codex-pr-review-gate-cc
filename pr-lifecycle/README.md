@@ -537,6 +537,7 @@ transcript or above the prompt, depending on the host.
 | --- | --- |
 | `/pr-gate [base]`, `/pr-gate start [base]` | start the lifecycle for the current branch, or pick it up from its record; with no base and no record, against the repository's default branch |
 | `/pr-gate status` | one line of where it stands (phase, rounds used, baseline, what is open, owed and holding the merge), and open the pane |
+| `/pr-gate log` | how the lifecycle went: rounds completed, active and waiting time, how often the person stepped in and with what, the stops and their reasons, and the last events. After a merge or reset it reads the newest archive |
 | `/pr-gate stop` | stop the round in flight; the record stays, and opening and merging stay held |
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now, or with no record the repository's default branch (it covers that base only); post-PR review still runs. Refused while a security P1 holds |

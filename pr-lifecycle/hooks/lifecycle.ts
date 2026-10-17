@@ -588,3 +588,35 @@ export function decideNext(rec: LifecycleRecord): Next {
   if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && mergeHolds(rec).length === 0) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
 }
+
+// -------------------------------------------------------------------- log
+
+const clockOf = (at: number): string => `${new Date(at).toISOString().slice(11, 16)}Z`
+const minutesOf = (ms: number): string => `${Math.round(ms / 60_000)}m`
+const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
+
+/** `/pr-gate log`: how a lifecycle went, in a few lines: its rounds and time, the person's steps, the stops, the last events. */
+export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15): string {
+  const log = rec.log ?? []
+  const done = rec.rounds.filter(one => one.isCompleted)
+  const pre = done.filter(one => one.phase === 'pre').length
+  const person = log.filter(one => one.kind === 'person')
+  const verbs = new Map<string, number>()
+  for (const one of person) {
+    const verb = one.text.split(/\s+/)[1] ?? '?'
+    verbs.set(verb, (verbs.get(verb) ?? 0) + 1)
+  }
+  const stops = log.filter(one => one.kind === 'stop')
+  const lines = [
+    `${rec.branch}${rec.pr === undefined ? '' : ` (PR #${rec.pr})`} → ${rec.base}: ${isArchived ? 'archived' : rec.phase}.`,
+    `Rounds: ${done.length} completed (${pre} pre-PR, ${done.length - pre} post-PR), ${plural(rec.attempts, 'incomplete attempt')}. ` +
+      `Active ${minutesOf(rec.activeMs)}, waiting ${minutesOf(rec.waitMs)}.`,
+    person.length === 0
+      ? 'The person stepped in 0 times.'
+      : `The person stepped in ${plural(person.length, 'time')}: ${[...verbs].map(([verb, n]) => `${verb} ${n}`).join(', ')}.`,
+    `Stops: ${stops.length}${stops.length === 0 ? '' : `; the last: ${stops.at(-1)?.text ?? ''}`}.`,
+  ]
+  if (log.length === 0) lines.push('No events logged: the record is from before 1.3.0.')
+  else lines.push('Last events:', ...log.slice(-last).map(one => `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.text}`))
+  return lines.join('\n')
+}

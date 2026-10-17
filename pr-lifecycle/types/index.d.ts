@@ -124,6 +124,13 @@ export type Waiver = {
 
 export type Grant = { n: number; reason: string; head: string; at: number }
 
+/**
+ * One line of the run log (`/pr-gate log`): what cost time or needed the person. stop: a run ended short of done (error, blocked,
+ * stopped, exhausted); end: a run ended done; person: a /pr-gate command; head: the gate caught up to a head itself; session: a
+ * session took the record over, or stood down.
+ */
+export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session'; text: string }
+
 export type LifecycleRecord = {
   version: 1
   root: string
@@ -145,6 +152,8 @@ export type LifecycleRecord = {
   attempts: number
   activeMs: number
   waitMs: number
+  /** The run log, oldest first, capped at LOG_CAP entries. Absent on a record from before 1.3.0. */
+  log?: LogEntry[]
   rounds: RoundRecord[]
   findings: Finding[]
   /** Feedback ids already triaged. */

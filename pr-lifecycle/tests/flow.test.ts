@@ -3066,3 +3066,27 @@ test('R72: a reported advisory fix is verified by the same check, at no round', 
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
   expect(rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary').length).toBe(before)
 })
+
+// --------------------------------------------------------------- the run log (/pr-gate log)
+
+test('/pr-gate log sums up the run: rounds and time, the person\'s steps, the stops', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'resume')
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain('feat/x (PR #1) → dev: post.')
+  expect(out).toContain('Rounds: ')
+  expect(out).toContain('The person stepped in 1 time: resume 1.')
+  expect(out).toMatch(/Stops: [1-9]/)
+  expect(out).toContain('Last events:')
+  expect(out).toMatch(/person +\/pr-gate resume → /)
+})
+
+test('/pr-gate log reads the newest archive once the lifecycle was reset', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'reset')
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain(': archived.')
+  expect(out).toMatch(/Stops: [1-9]/)
+})

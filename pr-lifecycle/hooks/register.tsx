@@ -25,6 +25,7 @@ import {
   remaining,
   rescope,
   securityHolds,
+  logSummary,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -63,7 +64,7 @@ import {
 } from './round'
 import type { Config } from './round'
 import { renderPane } from './pane'
-import { loadRecord, lockRecord, saveRecord, updateRecord, upsertRecord } from './store'
+import { latestArchive, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -792,14 +793,46 @@ const settledAs = (rec: LifecycleRecord, one: Finding): string =>
         ? 'verified fixed'
         : one.status
 
+/** The checkout's branch: its toplevel and name, or undefined outside a checkout or on a detached HEAD. */
+async function hereOf($: Engine): Promise<{ root: string; branch: string } | undefined> {
+  const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
+  if (!top.isOk) return undefined
+  const branch = (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  return branch === '' || branch === 'HEAD' ? undefined : { root: top.out, branch }
+}
+
+/** `/pr-gate log`: the branch's run log, summed up; once the lifecycle closed, its newest archive's. */
+async function logText($: Engine): Promise<string> {
+  const here = await hereOf($)
+  if (here === undefined) return `/${COMMAND} log: not on a branch of a git checkout.`
+  const live = await loadRecord($, here.root, here.branch)
+  const rec = live !== undefined && live.phase !== 'archived' ? live : await latestArchive($, here.root, here.branch)
+  if (rec === undefined) return `/${COMMAND} log: there is no lifecycle for ${here.branch}.`
+  return `/${COMMAND} log: ${logSummary(rec, rec !== live)}`
+}
+
+/** The person's commands that change a lifecycle, for its run log. */
+const LOGGED = ['resume', 'stop', 'waive', 'allow', 'reset']
+
+/** Logs a person's command and the first line of its reply on the branch's record (`/pr-gate log`). */
+async function logCommand($: Engine, args: string, reply: string): Promise<void> {
+  const verb = args.trim().split(/\s+/)[0] ?? ''
+  if (!LOGGED.includes(verb)) return
+  const here = await hereOf($)
+  if (here === undefined) return
+  const said = reply.split('\n')[0]?.replace(/^\/pr-gate:?\s*/, '') ?? ''
+  await logEvent($, here.root, here.branch, 'person', `/${COMMAND} ${args.trim()} → ${said}`)
+}
+
 /**
- * `/pr-gate start|<base>`, `status`, `stop`, `resume`, `waive pre|post|<findingId> <reason>`, `allow <n> <reason>`, `reset`.
+ * `/pr-gate start|<base>`, `status`, `log`, `stop`, `resume`, `waive pre|post|<findingId> <reason>`, `allow <n> <reason>`, `reset`.
  * Waivers, `allow` and `reset` are the person's alone. The replies may start with the command; prompts never do (R21).
  */
 const runCommand = async ($: Engine, args: string, origin: string): Promise<string> => {
   const [verb = '', ...rest] = args.trim().split(/\s+/)
   const run = await getRun($)
   if (verb === 'status') return statusText($, run)
+  if (verb === 'log') return logText($)
   if (verb === 'stop') {
     if (run === null || run.status !== 'running') return `/${COMMAND} is not running.`
     await finish($, run.id, 'stopped', 'Stopped by the person.')
@@ -1062,8 +1095,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pr-gate',
-      description: "Run /pr-gate: pre-PR Codex review, then the PR's own reviews, under one budget (start, status, stop, resume, waive, allow, reset)",
-      argumentHint: '[base] | status | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
+      description: "Run /pr-gate: pre-PR Codex review, then the PR's own reviews, under one budget (start, status, log, stop, resume, waive, allow, reset)",
+      argumentHint: '[base] | status | log | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
       immediate: true,
     })
     setSession(e.isInteractive)
@@ -1102,7 +1135,11 @@ export const register: Register = (on, options) => {
   })
 
   // Prompts a command decides wait until it has returned: the host refuses a submit while the command holds the turn.
-  on('command.run', { command: 'pr-gate' }, async ($, e) => ({ text: await holdingPrompts($, () => runCommand($, e.args, e.origin.kind)) }))
+  on('command.run', { command: 'pr-gate' }, async ($, e) => {
+    const text = await holdingPrompts($, () => runCommand($, e.args, e.origin.kind))
+    await logCommand($, e.args, text).catch(() => undefined)
+    return { text }
+  })
 
   // ------------------------------------------------------------ the pane
 
