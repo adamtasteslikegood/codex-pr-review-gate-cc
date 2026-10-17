@@ -610,3 +610,23 @@ test('N1: the marker scan reads only the text before the trailer, for the check 
   const review = `Codex exited 1.\n${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'other', note: 'Codex exited 1', findings: [finding] })}`
   expect(readReview(review).failure).toBe('other')
 })
+
+test('N2: a rebuttal check that is Codex\'s first look in the lifecycle runs at the tier\'s start effort', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  await $.tool.call(createPr)
+  expect(recordOf(w).passThrough).toBeDefined()
+  const head = w.gh.prHead
+  w.gh.comments = [
+    { id: 11, user: { login: 'claude[bot]' }, body: '**P1** wrong link', path: 'docs/guide.md', line: 2, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: 'u11' },
+  ]
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  const run = await runOf(w)
+  const step = `r${run.round}-triage`
+  const id = run.findings.at(-1)?.id ?? ''
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ step, dispositions: [{ id, action: 'rebutted', note: 'the link is right', replyId: '991' }] })}`))
+  expect(w.spawned.at(-1)?.description).toBe(`pr-lifecycle r${run.round} verify`)
+  expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort medium")
+})

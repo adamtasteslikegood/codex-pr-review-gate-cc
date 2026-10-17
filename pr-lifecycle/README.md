@@ -445,8 +445,10 @@ model the gate names wins over the machine's `~/.codex/config.toml`. An empty
 `runnerModel` and invokes the skill as `consult --model '<model>' --effort
 <effort>`, putting every rebutted finding (and every verified fix whose file
 changed since) to Codex in one prompt. The verdicts are Codex's, not the
-sub-agent's. Codex has looked at the branch before, so the check runs at
-`rereviewEffort`, never above the tier's starting effort. The pre-PR side
+sub-agent's. Once Codex has completed a round in the lifecycle, the check is
+a re-review and runs at `rereviewEffort`, never above the tier's starting
+effort. When it is Codex's first look (after a pass-through and rounds
+reviewed only by people), it runs at the tier's starting effort. The pre-PR side
 needs no separate check: an earlier round's rebuttals and fixes go to Codex
 through the consult inside the next review round.
 

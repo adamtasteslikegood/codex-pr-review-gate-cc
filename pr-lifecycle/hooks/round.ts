@@ -1284,11 +1284,14 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }
-  // Codex has looked at this branch before, so its check is a re-review (R69): rereviewEffort, never above where the round started.
+  // Once Codex has looked at the branch, the check is a re-review (R69): rereviewEffort, never above where the round started. Its
+  // first look in the lifecycle starts at the tier's effort (M2), as a round would.
   const c = (await configFor($, run.root, run.base)).config
+  const rec = await loadRecord($, run.root, run.branch)
+  const isRereview = (rec !== undefined && hasCodexLooked(rec)) || run.evidence.some(one => one.source === 'codex')
   const opened = await patch($, run.id, one => ({
     ...one,
-    effort: lowerOf(one.carriedEffort ?? one.effort, c.rereviewEffort),
+    effort: isRereview ? lowerOf(one.carriedEffort ?? one.effort, c.rereviewEffort) : (one.carriedEffort ?? one.effort),
     carriedEffort: one.carriedEffort ?? one.effort,
     headSha: run.headSha,
     rechecks: rebuttals.map(each => each.id),
@@ -1425,6 +1428,9 @@ async function retryLower($: Engine, run: Run, why: string): Promise<void> {
   await beginReview($, run.id)
 }
 
+/** Codex completed a round in this lifecycle: it records its effort, and a pre-PR round from before 1.2.0, which has none, ran Codex too. */
+const hasCodexLooked = (rec: LifecycleRecord): boolean => rec.rounds.some(one => one.isCompleted && (one.effort !== undefined || one.phase === 'pre'))
+
 /** Starts the round the controller chose, on the run in flight or a new one. */
 export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<Next, { kind: 'round' }>): Promise<void> {
   const now = await $.clock.now()
@@ -1440,7 +1446,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
   const carried = lowerOf(rec.effort ?? start, start)
   // After the lifecycle's first completed round Codex ran in, every Codex dispatch is a re-review: rereviewEffort, never above the
   // tier's start. A round Codex ran in records its effort; a pre-PR round from before 1.2.0 has none, but Codex ran in every one.
-  const isRereview = rec.rounds.some(one => one.isCompleted && (one.effort !== undefined || one.phase === 'pre'))
+  const isRereview = hasCodexLooked(rec)
   const codexModel = codexModelFor(rec.tier, c)
   const run: Run = {
     id: isOn ? existing.id : `${now}`,
@@ -1570,7 +1576,7 @@ async function startRecheck($: Engine, rec: LifecycleRecord, ids: readonly strin
 }
 
 /** A run on the same head that records no round: an answer to a block, or a rebuttal check (R37, R39). */
-function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number, c: Config): Run {
+export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number, c: Config): Run {
   const last = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)
   const round = last?.n ?? 1
   const findings = rec.findings.filter(one => ids.includes(one.id))
