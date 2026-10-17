@@ -236,6 +236,7 @@ overrides; the mod never falls back to HEAD.
   "reviewers": ["claude[bot]", "copilot-pull-request-reviewer[bot]"],
   "checks": ["Claude Review", "ci"],
   "requestReview": ["copilot"],
+  "trusted": ["chatgpt-codex-connector[bot]"],
   "quietMinutes": 3,
   "waitCapMinutes": 20,
   "allowanceStandard": 3,
@@ -292,7 +293,9 @@ names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
   settings apply to the PRs after it merges.
 
 - **With a roster**, collection ends when every listed reviewer has posted on
-  the current head and every listed check has completed.
+  the current head and every listed check has completed. A `trusted` reviewer
+  is never waited for: its feedback is triaged when it arrives, in this round
+  or the next, and its review of the current head, when already in, covers it.
 - **Without one**, it ends when every check run has completed and nothing new
   arrived for `quietMinutes`. The mod never guesses a roster.
 - **Always**, it ends at `waitCapMinutes` with whatever arrived. Missing
@@ -301,7 +304,7 @@ names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
 
 Only feedback from someone with write access to the repository (GitHub's
 author association `OWNER`, `MEMBER` or `COLLABORATOR`) or on the roster
-(`reviewers` by exact login, or `requestReview` by name, where a name also
+(`reviewers` or `trusted` by exact login, or `requestReview` by name, where a name also
 matches the `[bot]` login posting for it, so `copilot` keeps
 `copilot-pull-request-reviewer[bot]`) is read; anyone
 else's comment is dropped before triage and covers no head. A row that does
@@ -311,9 +314,10 @@ The mod polls about every 30 seconds with `gh api` while the session stays
 free. `requestReview` re-requests review from the listed reviewers on a new
 head in round 2 or later; otherwise the mod never triggers reviewers. If `gh`
 is unauthenticated or rate-limited, the attempt is recorded incomplete, the
-pane says what to fix, and `/pr-gate resume` retries. A new session picks a
-post-PR collection back up where it was, and nothing already processed is done
-again.
+pane says what to fix, and `/pr-gate resume` retries. A new interactive session picks a
+post-PR collection back up where it was once the session that ran it has been
+quiet for 2 minutes, and nothing already processed is done again. A headless
+session (`claude -p`, the SDK) in the same checkout never takes it over.
 
 ## What is held
 

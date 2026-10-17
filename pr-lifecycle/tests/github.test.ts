@@ -77,14 +77,15 @@ test('check runs and the roster file are read; a bad roster is ignored', async (
     reviewers: ['claude[bot]'],
     checks: ['ci'],
     requestReview: [],
+    trusted: [],
     quietMinutes: 2,
   })
   // A wait under a minute would end collection on the first poll: it falls back to the plugin option, like the user options.
-  expect(readRoster('{"quietMinutes":0,"waitCapMinutes":-5}')).toEqual({ reviewers: [], checks: [], requestReview: [] })
-  expect(readRoster('{"waitCapMinutes":0.5}')).toEqual({ reviewers: [], checks: [], requestReview: [] })
+  expect(readRoster('{"quietMinutes":0,"waitCapMinutes":-5}')).toEqual({ reviewers: [], checks: [], requestReview: [], trusted: [] })
+  expect(readRoster('{"waitCapMinutes":0.5}')).toEqual({ reviewers: [], checks: [], requestReview: [], trusted: [] })
   // A huge wait would never time out: it is capped at a day.
   expect(readRoster('{"quietMinutes":1e308,"waitCapMinutes":100000}')).toEqual({
-    reviewers: [], checks: [], requestReview: [], quietMinutes: 1440, waitCapMinutes: 1440,
+    reviewers: [], checks: [], requestReview: [], trusted: [], quietMinutes: 1440, waitCapMinutes: 1440,
   })
   expect(readRoster('{')).toBeUndefined()
   expect(readRoster('')).toBeUndefined()
@@ -103,12 +104,23 @@ const base = { head: 'b', headAt: 0, startedAt: 0, lastArrivalAt: 0, quietMs: 18
 const fb = (reviewer: string, head?: string, when = 10) => ({ id: `review:${reviewer}`, kind: 'review' as const, reviewer, body: '', head, at: when, isFinding: false })
 
 test('with a roster, collection ends once every listed reviewer covered the head and every listed check finished', async () => {
-  const roster = { reviewers: ['claude[bot]', 'copilot'], checks: ['ci'], requestReview: [] }
+  const roster = { reviewers: ['claude[bot]', 'copilot'], checks: ['ci'], requestReview: [], trusted: [] }
   const checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
   expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b')], checks, now: 60_000 })).toMatchObject({ isDone: false, missing: ['copilot'] })
   expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b'), fb('copilot', 'b')], checks, now: 60_000 })).toMatchObject({ isDone: true, isComplete: true })
   // A review of an older head does not cover this one.
   expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b'), fb('copilot', 'a')], checks, now: 60_000 }).isDone).toBe(false)
+})
+
+test('#14: a trusted reviewer is never waited for, but its review already in covers the head', async () => {
+  const roster = { reviewers: [], checks: ['ci'], requestReview: [], trusted: ['claude[bot]'] }
+  const checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  expect(collectionDone({ ...base, roster, feedback: [], checks, now: 60_000 })).toMatchObject({ isDone: true, isComplete: true, covered: [] })
+  expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b')], checks, now: 60_000 }).covered).toEqual(['claude[bot]'])
+  // Trusted, so its comments are triaged even with no write access (R1-8).
+  const bot = { ...fb('claude[bot]', 'b'), association: 'NONE' }
+  expect(isTrusted(bot, roster)).toBe(true)
+  expect(isTrusted(bot, { ...roster, trusted: [] })).toBe(false)
 })
 
 test('without a roster, collection ends when checks are done and feedback has gone quiet', async () => {
@@ -120,12 +132,12 @@ test('without a roster, collection ends when checks are done and feedback has go
 })
 
 test('the wait cap ends collection with what arrived, marked incomplete', async () => {
-  const roster = { reviewers: ['copilot'], checks: [], requestReview: [] }
+  const roster = { reviewers: ['copilot'], checks: [], requestReview: [], trusted: [] }
   expect(collectionDone({ ...base, roster, feedback: [], checks: [], now: 1_200_000 })).toEqual({ isDone: true, isComplete: false, missing: ['copilot'], covered: [] })
 })
 
 test('with a roster, only its reviewers cover the head', async () => {
-  const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [] }
+  const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [], trusted: [] }
   expect(collectionDone({ ...base, roster, feedback: [fb('claude[bot]', 'b'), fb('netlify[bot]', 'b')], checks: [], now: 60_000 }).covered).toEqual(['claude[bot]'])
 })
 
@@ -346,7 +358,7 @@ test('R1-8: the author association is read from either spelling, and only write 
   expect(review?.association).toBe('MEMBER')
   expect(inline?.association).toBe('NONE')
   expect(comment?.association).toBeUndefined()
-  const roster = { reviewers: ['b'], checks: [], requestReview: ['copilot'] }
+  const roster = { reviewers: ['b'], checks: [], requestReview: ['copilot'], trusted: [] }
   const one = (reviewer: string, association?: string) => ({ ...(comment as Feedback), reviewer, ...(association === undefined ? {} : { association }) })
   expect(['OWNER', 'MEMBER', 'COLLABORATOR'].every(each => isTrusted(one('x', each), undefined))).toBe(true)
   expect(isTrusted(one('x', 'CONTRIBUTOR'), undefined)).toBe(false)
@@ -360,7 +372,7 @@ test('R1-8: the author association is read from either spelling, and only write 
 test('F3: a requestReview name keeps the bot that posts for it, and nothing more', async () => {
   const [base] = readIssueComments(JSON.stringify([{ id: 3, user: { login: 'c' }, body: 'x', author_association: 'NONE' }]))
   const by = (reviewer: string): Feedback => ({ ...(base as Feedback), reviewer })
-  const roster = { reviewers: [], checks: [], requestReview: ['copilot'] }
+  const roster = { reviewers: [], checks: [], requestReview: ['copilot'], trusted: [] }
   expect(isTrusted(by('copilot-pull-request-reviewer[bot]'), roster)).toBe(true)
   expect(isTrusted(by('copilot[bot]'), roster)).toBe(true)
   expect(isTrusted(by('copilot'), roster)).toBe(true)
