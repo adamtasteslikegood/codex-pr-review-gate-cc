@@ -230,6 +230,19 @@ export type Verdict = { holds: boolean; note?: string }
  * Codex's rebuttal check, one verdict per finding id (R41). An entry without an id or a boolean `holds` is dropped, so that id
  * stays unruled. A note that repeats the id in front ("G2-1: ...") is stored without it (R44).
  */
+/** The rebuttal check's own run (R69): the Codex model it reported, and a model failure with gstack's repair message. */
+export function readCheck(answer: string): { model?: string; failure?: ReviewFailure; note?: string } {
+  const trailer = readTrailer(answer)
+  const model = modelIn(trailer?.model, answer)
+  const note = text(trailer?.note)
+  const failure = failureOf(trailer?.error, note, answer)
+  const repair = answer.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
+  return {
+    ...(model === undefined ? {} : { model }),
+    ...(failure === 'model' ? { failure, note: (note ?? (repair === '' ? undefined : repair))?.slice(0, 1000) } : {}),
+  }
+}
+
 export function readVerdicts(answer: string): Map<string, Verdict> {
   const out = new Map<string, Verdict>()
   const listed = readTrailer(answer)?.verdicts
@@ -399,6 +412,27 @@ export function priorRounds(findings: readonly Finding[], files?: ReadonlySet<st
   return all.length === 0 ? '' : listFindings(all)
 }
 
+/** The Codex model and effort as gstack's skill args and dispatch prefix (R69); a run that names no model leaves it to gstack's order. */
+function codexArgs(run: Run): { model: string | undefined; flags: string; prefix: string } {
+  const model = run.codexModel
+  const flags = model === undefined ? `--effort ${run.effort}` : `--model '${model}' --effort ${run.effort}`
+  const prefix = model === undefined ? `GSTACK_CODEX_EFFORT=${run.effort}` : `GSTACK_CODEX_MODEL=${model} GSTACK_CODEX_EFFORT=${run.effort}`
+  return { model, flags, prefix }
+}
+
+/** The effort, model and model-failure rules every Codex step carries, the review's and the rebuttal check's alike (R69). */
+function codexRules(run: Run, onModel: string): string[] {
+  const { model, prefix } = codexArgs(run)
+  return [
+    `   Reasoning effort is ${run.effort} for every Codex dispatch in this step, consult included. Never pass --xhigh or a higher --effort, and prefix each Codex dispatch with ${prefix} so no setting raises it: higher efforts time out here.`,
+    model === undefined
+      ? '   No Codex model is named here: gstack picks it in its own order (GSTACK_CODEX_MODEL, then Codex config.toml).'
+      : `   The Codex model is ${model} for every Codex dispatch in this step, consult included: pass --model '${model}' wherever the skill says to name a model (its select-model, probe-model and role-ready calls). Never switch to another model.`,
+    `   If the skill stops because the model is invalid or the account cannot use it (MODEL_UNUSABLE, a model not supported, or one that does not exist or you have no access to), do not retry with any other model: ${onModel}, and note is gstack's repair message, word for word.`,
+    '   Report the model from the CODEX_MODEL: line the skill prints as model.',
+  ]
+}
+
 export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: readonly Finding[]): string {
   // A run started before effort was tracked (a reload mid-run) keeps the old ceiling.
   run = { ...run, effort: (run.effort as Effort | undefined) ?? 'high' }
@@ -406,22 +440,14 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
     role === 'review'
       ? 'Review mode (Step 2A), including the gate verdict it computes'
       : 'Challenge mode (Step 2B)'
-  // The model is named in the skill's leading flags and in each dispatch's prefix (R69); a run with none leaves it to gstack's order.
-  const model = run.codexModel
-  const flags = model === undefined ? `--effort ${run.effort}` : `--model '${model}' --effort ${run.effort}`
-  const prefix = model === undefined ? `GSTACK_CODEX_EFFORT=${run.effort}` : `GSTACK_CODEX_MODEL=${model} GSTACK_CODEX_EFFORT=${run.effort}`
+  const { model, flags, prefix } = codexArgs(run)
   const lines = [
     `You are the Codex ${role} step of /pr-gate (pr-lifecycle). Round ${run.round}, ${run.lifecycle === 'pre' ? 'before the pull request opens' : 'after it opened'}.`,
     where(run),
     '',
     `1. Invoke the Skill tool with skill "codex" and args "${role} ${flags}", and follow that skill's instructions exactly as written: its preamble, its probes, and its ${mode}.`,
     `   The base is ${run.diffBase}: use it wherever the skill says <base>, whatever its own base detection prints.`,
-    `   Reasoning effort is ${run.effort} for every Codex dispatch in this step, consult included. Never pass --xhigh or a higher --effort, and prefix each Codex dispatch with ${prefix} so no setting raises it: higher efforts time out here.`,
-    model === undefined
-      ? '   No Codex model is named here: gstack picks it in its own order (GSTACK_CODEX_MODEL, then Codex config.toml).'
-      : `   The Codex model is ${model} for every Codex dispatch in this step, consult included: pass --model '${model}' wherever the skill says to name a model (its select-model, probe-model and role-ready calls). Never switch to another model.`,
-    "   If the skill stops because the model is invalid or the account cannot use it (MODEL_UNUSABLE, a model not supported, or one that does not exist or you have no access to), do not retry with any other model: gate is ERROR, error is model, and note is gstack's repair message, word for word.",
-    '   Report the model from the CODEX_MODEL: line the skill prints as model.',
+    ...codexRules(run, 'gate is ERROR, error is model'),
     '2. You are read-only. Do not edit files, do not fix anything, do not commit, push or open a pull request.',
     '3. Do not ask the user anything: nobody is watching this step. Where the skill would ask, take its documented default and say so.',
   ]
@@ -539,13 +565,18 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
       '',
-      'For each one: read the code at HEAD and decide whether the rebuttal, or the fix, still holds. Give one verdict per finding id, each on its own:',
-      'holds is true when it holds, false when it does not, with a note saying why it fails. Leave out no id.',
-      'You are read-only: do not edit, commit or push.',
+      // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
+      `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: its preamble, its probes and its consult mode.`,
+      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, or the fix), and ask Codex to read the code at HEAD and rule on each one: does the rebuttal, or the fix, still hold?',
+      ...codexRules(run, 'give no verdicts, error is model'),
+      '2. Report Codex\'s ruling, not your own: one verdict per finding id, each on its own. holds is true when Codex says it holds, false when it does not, with a note saying why it fails. Leave out no id.',
+      '   If Codex did not complete (non-zero exit, timeout, empty output, auth), give no verdicts: error is timeout when it timed out or stalled, model when its model is unusable (above), other otherwise, and note says why.',
+      '3. You are read-only: do not edit, commit or push. Do not ask the user anything: nobody is watching this step.',
       '',
       trailerRule(
         stepOf(run, 'verify'),
-        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true|false,"note":"when holds is false: why"}`).join(',')}]}`,
+        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true|false,"note":"when holds is false: why"}`).join(',')}],` +
+          '"error":"only when Codex did not complete: timeout|model|other","note":"optional","model":"the model on the CODEX_MODEL: line"}',
       ),
     ].join('\n'))
   }

@@ -19,6 +19,7 @@ import {
   readReview,
   readTrailer,
   readTriage,
+  readCheck,
   readVerdicts,
   readVerify,
   readyPrompt,
@@ -1283,8 +1284,12 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }
+  // Codex has looked at this branch before, so its check is a re-review (R69): rereviewEffort, never above where the round started.
+  const c = (await configFor($, run.root, run.base)).config
   const opened = await patch($, run.id, one => ({
     ...one,
+    effort: lowerOf(one.carriedEffort ?? one.effort, c.rereviewEffort),
+    carriedEffort: one.carriedEffort ?? one.effort,
     headSha: run.headSha,
     rechecks: rebuttals.map(each => each.id),
     phase: 'verify',
@@ -1329,6 +1334,21 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
 async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
   const answer = run.pending[0]?.answer ?? ''
+  // Codex is the judge (R69): an unusable model, or another than the one named, rules on nothing.
+  const said = readCheck(answer)
+  const named = run.codexModel
+  const marked =
+    said.model === undefined ? run : ((await patch($, run.id, one => ({ ...one, ranModels: { ...one.ranModels, verify: said.model } }))) ?? run)
+  if (said.failure === 'model') {
+    await noteAttempt($, marked, `Codex could not use its model in the rebuttal check: ${said.note ?? 'no repair message'}`)
+    await finish($, run.id, 'error', await unusableModel($, marked, said.note))
+    return
+  }
+  if (named !== undefined && said.model !== undefined && said.model !== named) {
+    await noteAttempt($, marked, `Codex rebuttal check ran ${said.model}, not ${named}`)
+    await finish($, run.id, 'error', await strayModel($, marked, 'rebuttal check', said.model, named))
+    return
+  }
   const verdicts = readVerdicts(answer)
   // Fail closed: no readable verdict at all is no check.
   if (verdicts.size === 0) {
@@ -1663,8 +1683,8 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
 
 /** The effort and Codex model a round ran at (R69), when Codex ran in it: what the reviewers reported, else what the gate named. */
 const codexOf = (run: Run): Pick<RoundRecord, 'effort' | 'codexModel' | 'ranModels'> => {
-  if (run.phase !== 'review' && !run.evidence.some(one => one.source === 'codex')) return {}
   const ran = run.ranModels ?? {}
+  if (run.phase !== 'review' && !run.evidence.some(one => one.source === 'codex') && Object.keys(ran).length === 0) return {}
   const model = ran.review ?? Object.values(ran)[0] ?? run.codexModel
   return { effort: run.effort, ...(model === undefined ? {} : { codexModel: model }), ...(Object.keys(ran).length === 0 ? {} : { ranModels: ran }) }
 }

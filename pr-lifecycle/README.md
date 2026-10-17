@@ -430,9 +430,10 @@ The gate names the Codex model for each tier:
 | standard and light lane | `codexModel` | `gpt-6-luna` |
 | high blast radius | `codexModelHigh` | `gpt-6-astra` |
 
-The review step passes it to the gstack `/codex` skill as `--model '<model>'`
-among the skill's leading flags, next to `--effort`, and prefixes every Codex
-dispatch with `GSTACK_CODEX_MODEL=<model>` beside `GSTACK_CODEX_EFFORT`.
+Every Codex step (the review, the challenge, and the post-PR rebuttal check)
+passes it to the gstack `/codex` skill as `--model '<model>'` among the
+skill's leading flags, next to `--effort`, and prefixes every Codex dispatch
+with `GSTACK_CODEX_MODEL=<model>` beside `GSTACK_CODEX_EFFORT`.
 gstack picks the model in this order: a model named for the request
 (`--model`), then `GSTACK_CODEX_MODEL`, then Codex's `config.toml` (`model`,
 or `review_model` first for `codex review`), then `gpt-6-astra`. So the
@@ -440,15 +441,33 @@ model the gate names wins over the machine's `~/.codex/config.toml`. An empty
 `codexModel` or `codexModelHigh` names none, and gstack's order applies from
 `GSTACK_CODEX_MODEL` down, as before 1.2.0.
 
-Each review reports the model on gstack's `CODEX_MODEL:` line. The gate
-records it on the round as `codexModel`, beside the round's `effort`, and
-shows it in the pane's round line (`codex gpt-6-luna medium`). A round
-recorded before 1.2.0 has neither field and still loads.
+**The post-PR rebuttal check is a Codex consult.** Its sub-agent runs on
+`runnerModel` and invokes the skill as `consult --model '<model>' --effort
+<effort>`, putting every rebutted finding (and every verified fix whose file
+changed since) to Codex in one prompt. The verdicts are Codex's, not the
+sub-agent's. Codex has looked at the branch before, so the check runs at
+`rereviewEffort`, never above the tier's starting effort. The pre-PR side
+needs no separate check: an earlier round's rebuttals and fixes go to Codex
+through the consult inside the next review round.
+
+Each Codex step reports the model on gstack's `CODEX_MODEL:` line. The gate
+records every role's model on the round as `ranModels` (`review`,
+`challenge`, `verify`), with the review's as `codexModel` beside the round's
+`effort`, and shows them in the pane's round line (`codex gpt-6-luna
+medium`). A round recorded before 1.2.0 has none of these fields and still
+loads.
+
+**A model other than the one named stops the round.** When a step reports a
+`CODEX_MODEL:` other than the model the gate named, gstack fell back to
+another model. The gate never accepts that: the attempt is discarded, as a
+timeout's is, no round is spent, and the stop names the role, both models
+and the setting.
 
 **A model gstack cannot use stops the round.** When gstack stops because the
 model is invalid or the account cannot use it (`MODEL_UNUSABLE`, a model not
 supported, or one that does not exist or the account has no access to), the
-reviewer reports `"error":"model"`. The round is an incomplete attempt: it
+reviewer, or the rebuttal check, reports `"error":"model"`; the gate also
+reads gstack's markers in what it says, whatever error it names. The round is an incomplete attempt: it
 spends no round and steps no effort down, and the gate never falls back to
 another model. The stop message gives gstack's repair message and names the
 setting to change: `codexModel`, or `codexModelHigh` on a high blast-radius
@@ -465,10 +484,12 @@ Codex starts at the tier's effort:
 | light lane | `lightEffort` | `low` |
 | high blast radius | `highEffort` | `medium` |
 
-Every Codex dispatch after a lifecycle's first completed review round is a
+Every Codex dispatch after the first completed round Codex ran in is a
 re-review and runs at `rereviewEffort` (`low`): later rounds, which read the
 fix commits, the consult that checks earlier rebuttals and fixes inside
-them, and the post-PR Codex fallback. It is never above the tier's starting
+them, the post-PR rebuttal check, and the post-PR Codex fallback. Rounds
+that completed without Codex (a pass-through, a round reviewed only by
+people) do not count: Codex's first look starts at the tier's effort. It is never above the tier's starting
 effort. A rerun of the first round after an incomplete attempt is still the
 first round. Efforts are `low`, `medium` or `high`, never `xhigh`, which
 timed out.
@@ -479,7 +500,9 @@ lower and spends no round: high, then medium, then low. A timeout at `low`
 fails closed. Only the effort steps down, never the model. The next run on
 that branch starts one level below where the timed-out run ended. A run
 that stepped down and then completed its reviews keeps that effort for the
-branch: later runs start no higher than it. A reviewer that was replaced is
+branch: later runs start no higher than it. A re-review's lower effort never
+carries this way, so raising `rereviewEffort` takes effect from the next
+round. A reviewer that was replaced is
 not stopped, since there is no way to; its late answer is ignored.
 
 Time is tracked in two kinds. `activeMs` is agent work, compared with

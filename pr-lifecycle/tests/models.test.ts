@@ -492,3 +492,69 @@ test('I3: a high-tier stop on a stray model names codexModelHigh', async ($, on)
   expect(run.message).toContain('challenge ran gpt-5.6-luna')
   expect(run.message).toContain('codexModelHigh')
 })
+
+// ------------------------------------------------------------------ I2: the rebuttal check is a Codex consult
+
+const verdict = (w: World, step: string, model?: string) =>
+  turn(
+    `${model === undefined ? '' : `CODEX_MODEL: ${model} (gpt; source: request)\n`}v\n${TRAILER}\n` +
+      JSON.stringify({ step, verdicts: [{ id: 'G2-1', holds: true }], ...(model === undefined ? {} : { model }) }),
+    `agent-${w.spawned.length}`,
+  )
+
+test('I2: the post-PR rebuttal check calls Codex consult on the tier model at rereviewEffort; the sub-agent stays on runnerModel', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  const check = w.spawned.at(-1)
+  expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort low")
+  expect(check?.prompt).toContain('GSTACK_CODEX_MODEL=gpt-6-luna GSTACK_CODEX_EFFORT=low')
+  expect(check?.prompt).toContain('CODEX_MODEL:')
+  expect(check?.prompt).toContain('error is model')
+  expect(check?.model).toBe('sonnet')
+  await done($, verdict(w, 'r2-verify', 'gpt-6-luna'))
+  const rec = recordOf(w)
+  expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('rebutted')
+  expect(rec.rounds.at(-1)?.ranModels).toEqual({ verify: 'gpt-6-luna' })
+})
+
+test('I2: the rebuttal check never runs above the tier starting effort', { options: { rereviewEffort: 'high' } }, async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort medium")
+})
+
+test('I2: a recheck after an unreadable verdict also runs at rereviewEffort', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  await done($, turn(`v\n${TRAILER}\n{"step":"r2-verify","verdicts":"maybe"}`, `agent-${w.spawned.length}`))
+  expect(recordOf(w).postStatus).toBe('blocked')
+  const spawned = w.spawned.length
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  expect(w.spawned.length).toBe(spawned + 1)
+  expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort low")
+})
+
+test('I2: an unusable model in the rebuttal check stops it and names the setting; the rebuttal stays unruled', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  const note = "HINT: the 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account"
+  await done($, turn(`MODEL_UNUSABLE\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', error: 'model', note })}`, `agent-${w.spawned.length}`))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('codexModel')
+  expect(run.message).toContain('not supported when using Codex')
+  const g = recordOf(w).findings.find(f => f.id === 'G2-1')
+  expect(g?.history.some(h => h.by === 'codex')).toBe(false)
+})
+
+test('I2: a rebuttal check that ran another model is not accepted', async ($, on) => {
+  const w = world(on)
+  await toRebuttalCheck($, w)
+  await done($, verdict(w, 'r2-verify', 'gpt-5.6-luna'))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('rebuttal check ran gpt-5.6-luna')
+  expect(run.message).toContain('codexModel')
+  expect(recordOf(w).findings.find(f => f.id === 'G2-1')?.history.some(h => h.by === 'codex')).toBe(false)
+})

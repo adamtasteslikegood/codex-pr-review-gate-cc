@@ -22,12 +22,12 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 - `pr-lifecycle/` **1.2.0** is **not loaded** (1.0.0 merged in PR #1).
   It extends `/pr-gate` across pre-PR and post-PR review and implements
   [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). The Claude model of each sub-agent
-  and the Codex model and effort per tier are settings (#10, #11; R68, R69).
+  and the Codex model and effort per tier are settings (#10, #11; R68–R70).
   Per-repo settings live in `.github/pr-gate.json`, read from the base
   branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
   - Every ruling made while building it, R1–R66, Adam's rulings on
-    codex-gate's deferred items R1-5 to R1-10, and R67–R69 after 1.0.0:
+    codex-gate's deferred items R1-5 to R1-10, and R67–R70 after 1.0.0:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
@@ -82,7 +82,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 342)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 379)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four
