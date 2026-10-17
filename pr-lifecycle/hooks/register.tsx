@@ -47,6 +47,7 @@ import {
   holdingPrompts,
   ignoredNote,
   isLiveNow,
+  isOwnedElsewhere,
   isTurnOf,
   markPr,
   onAnswer,
@@ -56,6 +57,7 @@ import {
   prStateOf,
   say,
   setLive,
+  setSession,
   setup,
   startTicker,
 } from './round'
@@ -1052,6 +1054,7 @@ export const register: Register = (on, options) => {
       argumentHint: '[base] | status | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
       immediate: true,
     })
+    setSession(e.isInteractive)
     const run = await getRun($)
     if (run !== null && run.status === 'running') {
       // A reload dropped the module's timer, not the run: the host kept it.
@@ -1066,7 +1069,10 @@ export const register: Register = (on, options) => {
         const branch = top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : ''
         const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
         // A review that stopped on an error (gh down, a step that failed) polls again, as the spec's restart does; a stop is the person's.
-        if (rec !== undefined && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
+        // Only a session a person is at takes a record over, and only once its owner has gone quiet (#13; Adam, decision D): a
+        // headless child in the same checkout (a hook's `claude -p`) never runs the lifecycle or gets its prompts.
+        const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
+        if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
           // A PR merged or closed meanwhile is not collected again: its record is archived (R62).
           const state = rec.pr === undefined ? undefined : await prStateOf($, top.out, rec.pr)
           if (state === 'MERGED' || state === 'CLOSED') {

@@ -2932,3 +2932,58 @@ test('F5: the controller does not write ready from a read a finding has since ch
   expect(rec.findings.some(one => one.id === 'G2-9')).toBe(true)
   expect(rec.phase).not.toBe('ready')
 })
+
+// ------------------------------------------------- #13: one session runs each record
+
+const OWNER = 'lifecycle:/repo:feat/x:owner'
+
+test('#13: a headless session in the same checkout never takes the lifecycle over', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  // A hook's `claude -p` child starts in the PR's checkout while the owner is away.
+  w.clearState()
+  w.sessionId = 'child'
+  await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(300_000)
+  expect(w.prompts).toHaveLength(prompts)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('session-1')
+})
+
+test('#13: another interactive session takes the record over only once its owner has been quiet for 2 minutes', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  w.clearState()
+  w.sessionId = 'second'
+  // The owner beat moments ago: the second session leaves the record alone.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect(w.run).toBeUndefined()
+  // Two quiet minutes later, a new session takes it over and collects.
+  await w.clock.advance(121_000)
+  w.clearState()
+  w.sessionId = 'third'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect((await runOf(w)).lifecycle).toBe('post')
+  await w.clock.advance(1000)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('third')
+})
+
+test('#13: a session whose record another session took sends its agent nothing and stands down', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(60_000)
+  expect(w.prompts).toHaveLength(prompts)
+  expect(w.run).toBeNull()
+})

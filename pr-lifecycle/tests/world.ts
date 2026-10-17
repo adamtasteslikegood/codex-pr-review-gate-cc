@@ -93,6 +93,8 @@ export type World = {
   clock: { advance: (ms: number) => Promise<void> }
   /** A new session: the run state reads as empty until the mod writes it again; the store stays. */
   clearState: () => void
+  /** The session's id, as `$.session.id()` answers it. */
+  sessionId: string
   /** Called after each store read, with the key and how many reads of it came before: a test changes the store between two reads. */
   afterRead?: (key: string, n: number) => void
 }
@@ -173,6 +175,7 @@ export function world(on: On): World {
       isCleared = true
       w.run = undefined
     },
+    sessionId: 'session-1',
   }
   let isCleared = false
   latest = w
@@ -313,6 +316,7 @@ export function world(on: On): World {
   on('ui.toast', () => ({ value: undefined }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: w.sessionId }))
   return w
 }
 

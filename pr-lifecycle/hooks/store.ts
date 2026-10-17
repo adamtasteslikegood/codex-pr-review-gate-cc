@@ -79,3 +79,26 @@ export async function upsertRecord(
     return next
   })
 }
+
+// ----------------------------------------------------------------- owner
+
+/** The session that runs a record's lifecycle (#13), and when it last said so. Kept under its own key, so a beat never rewrites the record. */
+export type Owner = { sessionId: string; beatAt: number }
+
+/** How long an owner's last beat holds the record: after this, an interactive session may take it over (Adam, decision D). */
+export const OWNER_STALE_MS = 120_000
+
+const ownerKey = (root: string, branch: string): string => `${recordKey(root, branch)}:owner`
+
+export async function ownerOf($: Engine, root: string, branch: string): Promise<Owner | undefined> {
+  const value = (await $.store.get(ownerKey(root, branch))) as Owner | undefined | null
+  return value !== null && value !== undefined && typeof value.sessionId === 'string' ? value : undefined
+}
+
+export async function setOwner($: Engine, root: string, branch: string, owner: Owner): Promise<void> {
+  await $.store.set(ownerKey(root, branch), owner)
+}
+
+/** Another session beat for the record within `OWNER_STALE_MS` of `now`: it runs the lifecycle, not `me`. */
+export const isHeldByOther = (owner: Owner | undefined, me: string, now: number): boolean =>
+  owner !== undefined && owner.sessionId !== me && now - owner.beatAt < OWNER_STALE_MS

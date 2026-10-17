@@ -62,7 +62,7 @@ import {
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, loadRecord, lockRecord, saveRecord, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, loadRecord, lockRecord, ownerOf, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -298,6 +298,59 @@ export function setup(c: Config): void {
   queued = []
 }
 
+// This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
+let me: string | undefined
+let isInteractive = true
+// When this session last beat for its run's record; 0 makes the next tick claim it.
+let beatAt = 0
+const BEAT_MS = 30_000
+
+export function setSession(interactive: boolean): void {
+  isInteractive = interactive
+  me = undefined
+}
+
+export async function sessionIdOf($: Engine): Promise<string> {
+  me ??= await $.session.id()
+  return me
+}
+
+/**
+ * Makes this session the record's owner (#13): a run it starts or a person's command takes the record. A headless session
+ * (`-p`, the SDK) never takes one another session holds; false then.
+ */
+export async function claimRecord($: Engine, root: string, branch: string): Promise<boolean> {
+  const now = await $.clock.now()
+  const id = await sessionIdOf($)
+  if (!isInteractive && isHeldByOther(await ownerOf($, root, branch), id, now)) return false
+  await setOwner($, root, branch, { sessionId: id, beatAt: now })
+  beatAt = now
+  return true
+}
+
+/** Whether another session holds the record now: this one then sends its agent nothing and stands down. */
+export async function isOwnedElsewhere($: Engine, root: string, branch: string): Promise<boolean> {
+  return isHeldByOther(await ownerOf($, root, branch), await sessionIdOf($), await $.clock.now())
+}
+
+/** The ticker's beat, every 30 s: false when another session took the record since. */
+async function beat($: Engine, run: Run, now: number): Promise<boolean> {
+  if (beatAt === 0) return claimRecord($, run.root, run.branch)
+  if (now - beatAt < BEAT_MS) return true
+  if (await isOwnedElsewhere($, run.root, run.branch)) return false
+  await setOwner($, run.root, run.branch, { sessionId: await sessionIdOf($), beatAt: now })
+  beatAt = now
+  return true
+}
+
+/** Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. */
+async function standDown($: Engine): Promise<void> {
+  stopTicker()
+  isLive = false
+  await update($, runAtom, () => null)
+  $.ui.status('pr-gate: another session runs this lifecycle')
+}
+
 export const isLiveNow = (): boolean => isLive
 export const setLive = (v: boolean): void => {
   isLive = v
@@ -446,6 +499,8 @@ const stopTicker = (): void => {
 
 export function startTicker($: Engine): void {
   stopTicker()
+  // The first tick claims the record for this session (#13).
+  beatAt = 0
   ticker = $.clock.every(1000, () => {
     void (async () => {
       const now = await $.clock.now()
@@ -453,6 +508,10 @@ export function startTicker($: Engine): void {
       if (run === null || run.status !== 'running') {
         stopTicker()
         isLive = false
+        return
+      }
+      if (!(await beat($, run, now))) {
+        await standDown($)
         return
       }
       await update($, tickAtom, () => now)
@@ -671,6 +730,11 @@ async function beginFix($: Engine, id: string, notes: string | undefined, kind: 
       return
     }
     await patch($, id, run => ({ ...run, pending: [{ role: 'fix', step: stepOf(run, 'fix'), agentId }], activity: 'waiting on the fixer…' }))
+    return
+  }
+  // Another session runs this record (#13): this one sends its agent nothing.
+  if (await isOwnedElsewhere($, opened.root, opened.branch)) {
+    await standDown($)
     return
   }
   // The prompt waits for the session to go idle. The step is armed by the main-loop turn that starts with this prompt
@@ -1139,6 +1203,12 @@ async function beginTriage($: Engine, id: string): Promise<void> {
  * already running is never read as the answer.
  */
 async function askTriage($: Engine, id: string, text: string): Promise<void> {
+  // Another session runs this record (#13): this one sends its agent nothing.
+  const run = await getRun($)
+  if (run !== null && run.id === id && (await isOwnedElsewhere($, run.root, run.branch))) {
+    await standDown($)
+    return
+  }
   void $.prompt
     .submit({ text })
     .then(async entered => {
