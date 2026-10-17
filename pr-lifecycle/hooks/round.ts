@@ -524,13 +524,15 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
   const ended: Run = run
   // A review that completed below the branch's default sets where the next run starts; a run that never completed one keeps the last.
   const hasReviewed = status === 'passed' || status === 'exhausted' || status === 'blocked'
+  // What carries is the start lowered by timeouts, never a re-review's own capped effort.
+  const carries = ended.carriedEffort ?? ended.effort
   await updateRecord($, ended.root, ended.branch, rec => {
-    const passedEffort = hasReviewed ? ended.effort : rec.passedEffort
+    const passedEffort = hasReviewed ? carries : rec.passedEffort
     const start = ended.startEffort ?? 'high'
     const isBelow = passedEffort !== undefined && passedEffort !== start && lowerOf(passedEffort, start) === passedEffort
     return {
       ...rec,
-      effort: ended.effort,
+      effort: carries,
       hasTimedOut: hasTimedOut ? true : undefined,
       passedEffort: isBelow ? passedEffort : undefined,
       ...(ended.lifecycle === 'post' && (status === 'error' || status === 'stopped') ? { postStatus: status } : {}),
@@ -1386,6 +1388,8 @@ async function retryLower($: Engine, run: Run, why: string): Promise<void> {
     return {
       ...one,
       effort: lower,
+      // A timeout at an effort means the branch cannot finish there either: the carry steps down with it.
+      carriedEffort: lowerOf(one.carriedEffort ?? one.effort, lower),
       phaseStartedAt: now,
       pending: [],
       steps: withStep(one.steps, {
@@ -1429,6 +1433,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
     tierWhy: rec.tierWhy,
     lane: rec.lane,
     effort: isRereview ? lowerOf(carried, c.rereviewEffort) : carried,
+    carriedEffort: carried,
     startEffort: start,
     ...(codexModel === undefined ? {} : { codexModel }),
     round,
@@ -1650,7 +1655,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       head: endHead,
       findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
       ...(moved === undefined ? {} : { waivers: moved.waivers }),
-      effort: run.effort,
+      effort: run.carriedEffort ?? run.effort,
     }
   })
   if (isCompleted) await advance($, run.root, run.branch)

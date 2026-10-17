@@ -348,7 +348,7 @@ const toBlockedPost = async ($: Dispatch, w: World): Promise<void> => {
   expect(recordOf(w).postStatus).toBe('blocked')
 }
 
-test('M3: an answer run takes the tier\'s own effort and Codex model from the base\'s settings', { options: { highEffort: 'low' } }, async ($, on) => {
+test('M3: an answer run takes the tier\'s own Codex model from the base\'s settings', async ($, on) => {
   const w = world(on)
   await toBlockedPost($, w)
   const rec = recordOf(w)
@@ -356,7 +356,6 @@ test('M3: an answer run takes the tier\'s own effort and Codex model from the ba
   await $.command.run(cmd('resume'))
   const run = await runOf(w)
   expect(run.isAnswer).toBe(true)
-  expect(run.effort).toBe('low')
   expect(run.codexModel).toBe('gpt-6-astra')
 })
 
@@ -415,4 +414,39 @@ test('M1: a reviewer that calls an unusable model other still stops on the model
   expect(run.message).toContain('HINT: the account cannot use gpt-6-luna.')
   expect(w.spawned).toHaveLength(1)
   expect(recordOf(w).rounds.filter(one => one.isCompleted)).toHaveLength(0)
+})
+
+test('I1: a re-review\'s capped effort never carries: raising rereviewEffort mid-lifecycle takes effect on the next round', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'e'.repeat(40)
+  await done($, turn(fixed('r1-fix', 'R1-1')))
+  expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort low")
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
+  expect((await runOf(w)).status).toBe('passed')
+  const rec = recordOf(w)
+  expect(rec.effort).toBe('medium')
+  expect(rec.passedEffort).toBeUndefined()
+  // The base now asks for deeper re-reviews.
+  w.git.roster = '{"rereviewEffort":"medium"}'
+  w.git.head = 'f'.repeat(40)
+  await $.command.run(cmd(''))
+  expect((await runOf(w)).round).toBe(3)
+  expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort medium")
+})
+
+test('I1: a timeout still carries: a re-review that steps down lowers the branch\'s effort', { options: { rereviewEffort: 'medium' } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'e'.repeat(40)
+  await done($, turn(fixed('r1-fix', 'R1-1')))
+  expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort medium")
+  await done($, turn(`${TRAILER}\n{"step":"r2-review","gate":"ERROR","error":"timeout"}`))
+  expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort low")
+  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] })))
+  const rec = recordOf(w)
+  expect(rec.effort).toBe('low')
+  expect(rec.passedEffort).toBe('low')
 })

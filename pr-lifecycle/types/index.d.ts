@@ -176,6 +176,11 @@ export type Run = {
   /** The effort this branch's tier and lane call for, before any carried or timeout step-down. */
   startEffort?: Effort
   /**
+   * The effort the branch carries into later runs: the start, lowered only by timeouts. A re-review's capped effort (rereviewEffort)
+   * is this run's alone and never carries. Absent on a run from before 1.2.0, which carries `effort`.
+   */
+  carriedEffort?: Effort
+  /**
    * The Codex model the gate names for this run's tier (codexModel or codexModelHigh, R69); undefined names none, so gstack's own
    * order picks it. Once a review reports its `CODEX_MODEL:` line, the model that ran.
    */
