@@ -19,12 +19,13 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.0.0** is merged to `main` (PR #1) but **not loaded**.
+- `pr-lifecycle/` **1.1.0** is **not loaded** (1.0.0 merged in PR #1).
   It extends `/pr-gate` across pre-PR and post-PR review and implements
-  [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md):
+  [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). Per-repo settings live in
+  `.github/pr-gate.json`, read from the base branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
-  - Every ruling made while building it, R1–R66 plus Adam's rulings on
-    codex-gate's deferred items R1-5 to R1-10:
+  - Every ruling made while building it, R1–R66, Adam's rulings on
+    codex-gate's deferred items R1-5 to R1-10, and R67 after 1.0.0:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
@@ -79,7 +80,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 306)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 325)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four
