@@ -1414,8 +1414,9 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
   const { config: c } = await configFor($, rec.root, rec.base)
   const start = defaultEffort(rec, c)
   const carried = lowerOf(rec.effort ?? start, start)
-  // After the lifecycle's first completed round, every Codex dispatch is a re-review: rereviewEffort, never above the tier's start.
-  const isRereview = rec.rounds.some(one => one.isCompleted)
+  // After the lifecycle's first completed round Codex ran in, every Codex dispatch is a re-review: rereviewEffort, never above the
+  // tier's start. A round Codex ran in records its effort; a pre-PR round from before 1.2.0 has none, but Codex ran in every one.
+  const isRereview = rec.rounds.some(one => one.isCompleted && (one.effort !== undefined || one.phase === 'pre'))
   const codexModel = codexModelFor(rec.tier, c)
   const run: Run = {
     id: isOn ? existing.id : `${now}`,

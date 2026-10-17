@@ -367,3 +367,24 @@ test('M3: a pass-through run shows the base\'s effort for its tier', async ($, o
   await $.command.run(cmd(''))
   expect((await runOf(w)).effort).toBe('low')
 })
+
+test('M2: Codex\'s first look in a lifecycle starts at the tier\'s effort, after rounds Codex never ran in', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  await $.tool.call(createPr)
+  expect(recordOf(w).passThrough).toBeDefined()
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  const rec = recordOf(w)
+  expect(rec.rounds.filter(one => one.isCompleted && one.phase === 'post')).toHaveLength(1)
+  expect(rec.rounds.every(one => one.effort === undefined)).toBe(true)
+  // Code lands on the PR: round 2, the first round Codex may look at, is no re-review.
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.numstat = '10\t2\tsrc/app.ts'
+  await $.command.run(cmd(''))
+  const run = await runOf(w)
+  expect(run.round).toBe(2)
+  expect(run.effort).toBe('medium')
+})
