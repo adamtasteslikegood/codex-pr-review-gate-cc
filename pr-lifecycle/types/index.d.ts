@@ -88,6 +88,10 @@ export type RoundRecord = {
   /** The PR base the round reviewed against; a pre-PR round's verdict covers that base only. */
   base?: string
   isCompleted: boolean
+  /** The Codex effort the round, or the attempt, ran at. Absent on a record from before 1.2.0. */
+  effort?: Effort
+  /** The Codex model that reviewed it, from the reviewer's `CODEX_MODEL:` line, else the model the gate named (R69). */
+  codexModel?: string
   evidence: Evidence[]
   raised: { blocking: number; advisory: number }
   rebutted: number
@@ -171,6 +175,11 @@ export type Run = {
   effort: Effort
   /** The effort this branch's tier and lane call for, before any carried or timeout step-down. */
   startEffort?: Effort
+  /**
+   * The Codex model the gate names for this run's tier (codexModel or codexModelHigh, R69); undefined names none, so gstack's own
+   * order picks it. Once a review reports its `CODEX_MODEL:` line, the model that ran.
+   */
+  codexModel?: string
   round: number
   status: RunStatus
   phase: 'scope' | 'review' | 'fix' | 'verify' | 'collect' | 'triage' | 'done'

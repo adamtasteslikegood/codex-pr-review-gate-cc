@@ -146,7 +146,9 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
       {run !== null && (
         <Text dimColor wrap="truncate-end">
           round {run.round}
-          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex {run.effort} ·{' '}
+          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex{' '}
+          {run.codexModel === undefined ? '' : `${run.codexModel} `}
+          {run.effort} ·{' '}
           {elapsed((run.endedAt ?? now) - run.startedAt)}
         </Text>
       )}

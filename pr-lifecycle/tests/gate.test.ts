@@ -12,9 +12,9 @@ test('a PR to a gated base is held and starts the gate; a clean review opens it'
   expect(held.deny ?? held.text).toContain('/pr-gate')
   expect(w.opened).toHaveLength(0)
   expect(w.spawned).toHaveLength(1)
-  expect(w.spawned[0]?.prompt).toContain('skill "codex" and args "review --effort')
-  // A standard change starts at medium effort.
-  expect(w.spawned[0]?.prompt).toContain('args "review --effort medium"')
+  expect(w.spawned[0]?.prompt).toContain('skill "codex" and args "review --model')
+  // A standard change starts at medium effort, on codexModel.
+  expect(w.spawned[0]?.prompt).toContain(`args "review --model 'gpt-6-luna' --effort medium"`)
   expect(w.spawned[0]?.prompt).toContain('GSTACK_CODEX_EFFORT=medium')
 
   await done($, turn(review('r1-review', 'PASS')))
@@ -161,7 +161,7 @@ test('a Codex timeout reruns the round one effort lower, and fails closed below 
   expect(run.round).toBe(1)
   expect(run.effort).toBe('low')
   expect(w.spawned).toHaveLength(2)
-  expect(w.spawned[1]?.prompt).toContain('args "review --effort low"')
+  expect(w.spawned[1]?.prompt).toContain(`args "review --model 'gpt-6-luna' --effort low"`)
 
   await done($, turn(`Timed out again.\n${TRAILER}\n{"step":"r1-review","gate":"ERROR"}`, 'agent-2'))
   run = await runOf(w)
@@ -169,11 +169,11 @@ test('a Codex timeout reruns the round one effort lower, and fails closed below 
   expect(run.message).toContain('lowest')
 })
 
-test('the next run on a branch that timed out at low effort stays at low', async ($, on) => {
+test('the next run on a branch that timed out at low effort stays at low', { options: { highEffort: 'high' } }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '30\t4\tserver/security.ts'
   await $.tool.call(createPr)
-  expect(w.spawned[0]?.prompt).toContain('args "review --effort high"')
+  expect(w.spawned[0]?.prompt).toContain('--effort high"')
   const timeout = (step: string, id: string) => turn(`${TRAILER}\n{"step":"${step}","gate":"ERROR","error":"timeout"}`, id)
   await done($, timeout('r1-review', 'agent-1'))
   await done($, turn(review('r1-challenge', 'PASS'), 'agent-2'))
@@ -190,11 +190,14 @@ test('the next run on a branch that timed out at low effort stays at low', async
     origin: { kind: 'composer' },
     presentation: { isFullscreen: false, columns: 120 },
   })
-  expect(w.spawned.at(-2)?.prompt).toContain('args "review --effort low"')
-  expect(w.spawned.at(-1)?.prompt).toContain('args "challenge --effort low"')
+  expect(w.spawned.at(-2)?.prompt).toContain(`args "review --model 'gpt-6-astra' --effort low"`)
+  expect(w.spawned.at(-1)?.prompt).toContain(`args "challenge --model 'gpt-6-astra' --effort low"`)
 })
 
-test('a branch keeps the effort a review last completed at after a timeout', async ($, on) => {
+// Rereviews at the tier's own effort, so the carried effort alone decides (R69's rereviewEffort is tested in models.test.ts).
+const asBefore = { options: { highEffort: 'high', rereviewEffort: 'high' } }
+
+test('a branch keeps the effort a review last completed at after a timeout', asBefore, async ($, on) => {
   const w = world(on)
   w.git.numstat = '30\t4\tserver/security.ts'
   const rerun = () =>
@@ -221,7 +224,7 @@ test('a branch keeps the effort a review last completed at after a timeout', asy
   expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
 })
 
-test('a branch that passed at its default effort starts at high once it grows into high blast radius', async ($, on) => {
+test('a branch that passed at its default effort starts at high once it grows into high blast radius', asBefore, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   expect(w.spawned.at(-1)?.prompt).toContain('--effort medium')
@@ -250,7 +253,8 @@ test('a high blast-radius change runs review and challenge in parallel and revie
   await $.tool.call(createPr)
   expect(w.spawned.map(one => one.description)).toEqual(['pr-lifecycle r1 review', 'pr-lifecycle r1 challenge'])
   expect(w.spawned.every(one => !/args "\w+ --(xhigh|effort xhigh)/.test(one.prompt))).toBe(true)
-  expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(['--effort high', '--effort high'])
+  // Both start at highEffort (medium by default), not always at high (R69).
+  expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(['--effort medium', '--effort medium'])
 
   await done($, turn(review('r1-review', 'PASS')))
   expect((await runOf(w)).phase).toBe('review')
@@ -284,7 +288,7 @@ test('a chore/ branch gets one Codex round at low effort; its fix is reviewed af
   const w = world(on)
   w.git.branch = 'chore/tidy-KAN-9'
   await $.tool.call(createPr)
-  expect(w.spawned[0]?.prompt).toContain('args "review --effort low"')
+  expect(w.spawned[0]?.prompt).toContain(`args "review --model 'gpt-6-luna' --effort low"`)
   await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
   // A blocker is always fixed inside its round.
   expect((await runOf(w)).phase).toBe('fix')
@@ -335,7 +339,8 @@ test('a pointer bump to a landed submodule commit passes without Codex; an unlan
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   const run = await runOf(w)
   expect(run.tier).toBe('high')
-  expect(run.effort).toBe('high')
+  // highEffort, medium by default (R69).
+  expect(run.effort).toBe('medium')
 })
 
 test('a branch whose every commit is already on another gated base passes without Codex', async ($, on) => {

@@ -13,6 +13,7 @@ import {
   fixPrompt,
   lowerOf,
   heldPrompt,
+  isModelId,
   prPrompt,
   readDispositions,
   readReview,
@@ -84,15 +85,43 @@ export type Config = {
   routineRoundMs: number
   waitCapMs: number
   quietMs: number
-  /** Effort for a standard change; a high blast-radius change always starts at high. */
+  /** Effort for a standard change (reviewEffort). */
   effort: Effort
   /** Effort for a light-lane (chore/) branch that is not high blast radius. */
   lightEffort: Effort
+  /** Effort a high blast-radius change starts at (R69). */
+  highEffort: Effort
+  /** Effort of every Codex dispatch after a lifecycle's first review round, never above the tier's own start (R69). */
+  rereviewEffort: Effort
   light: RegExp | undefined
+  /** The Claude model of the sub-agents that run Codex (R68); undefined inherits the session's model. */
+  runnerModel: string | undefined
+  /** The Claude model of the fix sub-agent and the fix reviewer (R68); undefined inherits the session's model. */
+  fixAgentModel: string | undefined
+  /** The Codex model for standard and light-lane changes (R69); undefined names none, so gstack's own order picks it. */
+  codexModel: string | undefined
+  /** The Codex model for high blast-radius changes (R69); undefined names none. */
+  codexModelHigh: string | undefined
+  /** Plugin options whose value was invalid, each with why: the default applies to them. */
+  badOptions: string[]
 }
 
-const effortOf = (value: unknown, fallback: Effort): Effort =>
-  value === 'high' || value === 'medium' || value === 'low' ? value : fallback
+const isEffort = (value: unknown): value is Effort => value === 'high' || value === 'medium' || value === 'low'
+
+const effortOf = (value: unknown, fallback: Effort): Effort => (isEffort(value) ? value : fallback)
+
+/** What the plugin and a repository's file default each model to. One place, so a model rename is one change. */
+export const MODELS = { runnerModel: 'sonnet', fixAgentModel: 'opus', codexModel: 'gpt-6-luna', codexModelHigh: 'gpt-6-astra' } as const
+
+type ModelKey = keyof typeof MODELS
+
+/** A model setting: { model } when valid (undefined for an empty string, which names none), undefined when invalid. */
+const modelOf = (value: unknown): { model: string | undefined } | undefined => {
+  if (typeof value !== 'string') return undefined
+  const said = value.trim()
+  if (said === '') return { model: undefined }
+  return isModelId(said) ? { model: said } : undefined
+}
 
 /** The most rounds an allowance may be set to, by the options or by a repository's file. */
 const CAPS = { standard: 10, high: 12 } as const
@@ -105,6 +134,19 @@ const countOf = (value: unknown): number | undefined => {
 
 export function configOf(options: PluginOptions): Config {
   const number = (key: string, fallback: number): number => countOf(options[key]) ?? fallback
+  const badOptions: string[] = []
+  // Unset is the default; an empty string names no model; anything else invalid is the default, and reported.
+  const model = (key: ModelKey): string | undefined => {
+    if (options[key] === undefined) return MODELS[key]
+    const read = modelOf(options[key])
+    if (read !== undefined) return read.model
+    badOptions.push(`${key} (not a model id)`)
+    return MODELS[key]
+  }
+  const effort = (key: string, fallback: Effort): Effort => {
+    if (options[key] !== undefined && !isEffort(options[key])) badOptions.push(`${key} (not low, medium or high)`)
+    return effortOf(options[key], fallback)
+  }
   const bases = String(options.bases ?? 'dev,main')
     .split(',')
     .map(one => one.trim())
@@ -127,16 +169,27 @@ export function configOf(options: PluginOptions): Config {
     routineRoundMs: number('routineRoundMinutes', 3) * 60_000,
     waitCapMs: number('waitCapMinutes', 20) * 60_000,
     quietMs: number('quietMinutes', 3) * 60_000,
-    effort: effortOf(options.reviewEffort, 'medium'),
-    lightEffort: effortOf(options.lightEffort, 'low'),
+    effort: effort('reviewEffort', 'medium'),
+    lightEffort: effort('lightEffort', 'low'),
+    highEffort: effort('highEffort', 'medium'),
+    rereviewEffort: effort('rereviewEffort', 'low'),
     light: compileRisk(String(options.lightBranches ?? '^chore/')),
+    runnerModel: model('runnerModel'),
+    fixAgentModel: model('fixAgentModel'),
+    codexModel: model('codexModel'),
+    codexModelHigh: model('codexModelHigh'),
+    badOptions,
   }
 }
 
+/** What the plugin options got wrong, said where the person sees it, as R67 says a repository file's. */
+export const badOptionsNote = (bad: readonly string[]): string => `Plugin options: ignored ${bad.join(', ')}; the defaults apply instead.`
+
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, lightBranches, onExhausted and highRiskPaths, each read as configOf reads the option. A key whose value is invalid
- * is left to the option and named in `ignored`; an empty regular expression turns its match off, as the option does.
+ * allowanceHigh, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
+ * the option. A key whose value is invalid is left to the option and named in `ignored`; an empty regular expression turns its
+ * match off, and an empty model names none, as the option does.
  */
 export function overrideConfig(c: Config, text: string | undefined): { config: Config; ignored: string[] } {
   if (text === undefined || text.trim() === '') return { config: c, ignored: [] }
@@ -174,6 +227,20 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   const onExhausted =
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
   const highRisk = pattern('highRiskPaths')
+  // Set or not, and to what: an empty string sets "no model", which undefined alone cannot tell from unset.
+  const model = (key: ModelKey): { model: string | undefined } | undefined =>
+    r[key] === undefined ? undefined : (modelOf(r[key]) ?? bad(key, 'not a model id'))
+  const models = {
+    runnerModel: model('runnerModel'),
+    fixAgentModel: model('fixAgentModel'),
+    codexModel: model('codexModel'),
+    codexModelHigh: model('codexModelHigh'),
+  }
+  const effort = (key: string): Effort | undefined => {
+    const value = r[key]
+    return value === undefined ? undefined : isEffort(value) ? value : bad(key, 'not low, medium or high')
+  }
+  const efforts = { effort: effort('reviewEffort'), lightEffort: effort('lightEffort'), highEffort: effort('highEffort'), rereviewEffort: effort('rereviewEffort') }
   // The collection waits are the roster's to read (readRoster drops a bad one); they are reported here with the rest.
   for (const key of ['quietMinutes', 'waitCapMinutes']) {
     const value = r[key]
@@ -186,6 +253,14 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
       onExhausted: onExhausted ?? c.onExhausted,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
+      effort: efforts.effort ?? c.effort,
+      lightEffort: efforts.lightEffort ?? c.lightEffort,
+      highEffort: efforts.highEffort ?? c.highEffort,
+      rereviewEffort: efforts.rereviewEffort ?? c.rereviewEffort,
+      runnerModel: models.runnerModel === undefined ? c.runnerModel : models.runnerModel.model,
+      fixAgentModel: models.fixAgentModel === undefined ? c.fixAgentModel : models.fixAgentModel.model,
+      codexModel: models.codexModel === undefined ? c.codexModel : models.codexModel.model,
+      codexModelHigh: models.codexModelHigh === undefined ? c.codexModelHigh : models.codexModelHigh.model,
     },
     ignored,
   }
@@ -227,9 +302,19 @@ export const setLive = (v: boolean): void => {
   isLive = v
 }
 
-/** The effort a branch's tier and lane call for, before any carried or timeout step-down. */
-export const defaultEffort = (rec: Pick<LifecycleRecord, 'tier' | 'lane'>): Effort =>
-  rec.tier === 'high' ? 'high' : rec.lane === 'light' ? config.lightEffort : config.effort
+/** The effort a branch's tier and lane call for, before any carried or timeout step-down: `c` is the base's settings (configFor). */
+export const defaultEffort = (rec: Pick<LifecycleRecord, 'tier' | 'lane'>, c: Config): Effort =>
+  rec.tier === 'high' ? c.highEffort : rec.lane === 'light' ? c.lightEffort : c.effort
+
+/** The Codex model the gate names for a tier (R69); undefined names none, so gstack's own order picks it. */
+export const codexModelFor = (tier: LifecycleRecord['tier'], c: Config): string | undefined => (tier === 'high' ? c.codexModelHigh : c.codexModel)
+
+/**
+ * The Claude model of a sub-agent (R68): the fixer and the pre-PR fix reviewer get fixAgentModel; the Codex runners (review,
+ * challenge, and the post-PR rebuttal check) get runnerModel. Undefined inherits the session's model.
+ */
+export const agentModelFor = (role: Role, lifecycle: Run['lifecycle'], c: Config): string | undefined =>
+  role === 'fix' || (role === 'verify' && lifecycle === 'pre') ? c.fixAgentModel : c.runnerModel
 
 // Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
 let holdDepth = 0
@@ -503,11 +588,14 @@ export async function closeLifecycle($: Engine, root: string, branch: string, pr
 // ----------------------------------------------------------- the steps
 
 async function spawn($: Engine, run: Run, role: Role, prompt: string): Promise<{ isStarted: boolean; agentId?: string }> {
+  // The base's own setting, if it has one (R67, R68); no model inherits the session's.
+  const model = agentModelFor(role, run.lifecycle, (await configFor($, run.root, run.base)).config)
   const started = await $.agent.spawn({
     prompt,
     description: `pr-lifecycle r${run.round} ${role}`,
     subagentType: 'general-purpose',
     cwd: run.root,
+    ...(model === undefined ? {} : { model }),
   })
   return 'deny' in started && typeof started.deny === 'string' ? { isStarted: false } : { isStarted: true, agentId: started.agentId }
 }
@@ -1322,6 +1410,13 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
   const round = rec.rounds.length === 0 ? 1 : Math.max(...rec.rounds.map(one => one.n)) + (rec.rounds.at(-1)?.isCompleted === false ? 0 : 1)
   // A post-PR or delta review starts from the last head a reviewer read in full, never from commits nobody read (R60).
   const lastHead = lastCoveredHead(rec)
+  // The base's own settings (R67): its efforts and Codex models (R69).
+  const { config: c } = await configFor($, rec.root, rec.base)
+  const start = defaultEffort(rec, c)
+  const carried = lowerOf(rec.effort ?? start, start)
+  // After the lifecycle's first completed round, every Codex dispatch is a re-review: rereviewEffort, never above the tier's start.
+  const isRereview = rec.rounds.some(one => one.isCompleted)
+  const codexModel = codexModelFor(rec.tier, c)
   const run: Run = {
     id: isOn ? existing.id : `${now}`,
     cwd: rec.root,
@@ -1332,8 +1427,9 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
     tier: rec.tier,
     tierWhy: rec.tierWhy,
     lane: rec.lane,
-    effort: rec.effort ?? config.effort,
-    startEffort: defaultEffort(rec),
+    effort: isRereview ? lowerOf(carried, c.rereviewEffort) : carried,
+    startEffort: start,
+    ...(codexModel === undefined ? {} : { codexModel }),
     round,
     status: 'running',
     phase: 'scope',
@@ -1372,7 +1468,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
 /** Re-opens triage on the same head for findings a post-PR block left to the agent (R37). It records no round. */
 async function startAnswer($: Engine, rec: LifecycleRecord, ids: readonly string[], why: string): Promise<void> {
   const now = await $.clock.now()
-  const run = answerRun(rec, ids, now)
+  const run = answerRun(rec, ids, now, (await configFor($, rec.root, rec.base)).config)
   await update($, runAtom, () => run)
   await update($, tickAtom, () => now)
   isLive = true
@@ -1399,7 +1495,7 @@ async function startFixAnswer($: Engine, rec: LifecycleRecord, ids: readonly str
   const isMain = config.fixer === 'main'
   const step = `r${round}-fix`
   const run: Run = {
-    ...answerRun(rec, ids, now),
+    ...answerRun(rec, ids, now, (await configFor($, rec.root, rec.base)).config),
     round,
     phase: 'fix',
     lifecycle: 'pre',
@@ -1438,7 +1534,7 @@ async function startFixAnswer($: Engine, rec: LifecycleRecord, ids: readonly str
 /** Codex checks rebuttals it never ruled on, on the same head, as an answer run: no round, no allowance (R39). */
 async function startRecheck($: Engine, rec: LifecycleRecord, ids: readonly string[]): Promise<void> {
   const now = await $.clock.now()
-  const run = answerRun(rec, ids, now)
+  const run = answerRun(rec, ids, now, (await configFor($, rec.root, rec.base)).config)
   await update($, runAtom, () => run)
   await update($, tickAtom, () => now)
   isLive = true
@@ -1448,7 +1544,7 @@ async function startRecheck($: Engine, rec: LifecycleRecord, ids: readonly strin
 }
 
 /** A run on the same head that records no round: an answer to a block, or a rebuttal check (R37, R39). */
-function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number): Run {
+function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number, c: Config): Run {
   const last = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)
   const round = last?.n ?? 1
   const findings = rec.findings.filter(one => ids.includes(one.id))
@@ -1462,8 +1558,8 @@ function answerRun(rec: LifecycleRecord, ids: readonly string[], now: number): R
     tier: rec.tier,
     tierWhy: rec.tierWhy,
     lane: rec.lane,
-    effort: rec.effort ?? config.effort,
-    startEffort: defaultEffort(rec),
+    effort: rec.effort ?? c.effort,
+    startEffort: defaultEffort(rec, c),
     round,
     status: 'running',
     phase: 'triage',
@@ -1522,6 +1618,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     endHead,
     base: run.base,
     isCompleted,
+    ...codexOf(run),
     evidence: run.evidence,
     raised: { blocking: current.filter(isBlocking).length, advisory: current.filter(one => !isBlocking(one)).length },
     rebutted: current.filter(one => one.status === 'rebutted').length,
@@ -1557,6 +1654,12 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
   if (isCompleted) await advance($, run.root, run.branch)
 }
 
+/** The effort and Codex model a round ran at (R69), when Codex ran in it. */
+const codexOf = (run: Run): Pick<RoundRecord, 'effort' | 'codexModel'> =>
+  run.phase === 'review' || run.evidence.some(one => one.source === 'codex')
+    ? { effort: run.effort, ...(run.codexModel === undefined ? {} : { codexModel: run.codexModel }) }
+    : {}
+
 /** An attempt that did not complete: its effort is recorded, no round is used. */
 async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
   const now = await $.clock.now()
@@ -1571,6 +1674,7 @@ async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
         startHead: run.roundStartHead,
         endHead: run.headSha,
         isCompleted: false,
+        ...codexOf(run),
         activeMs: run.phase === 'collect' ? 0 : now - run.phaseStartedAt,
         waitMs: run.waitMs + (run.phase === 'collect' && run.collect !== undefined ? now - run.collect.startedAt : 0),
         outstanding: why,
@@ -1755,8 +1859,11 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   }
   const verified = new Set(results.flatMap(one => one.result.verified))
   const held = new Set(results.flatMap(one => one.result.held))
+  // The model that ran, as the reviewer read it off the CODEX_MODEL: line (R69); else the one the gate named stands.
+  const ranModel = results.map(one => one.result.model).find(one => one !== undefined)
   const after = await patch($, run.id, one => ({
     ...one,
+    ...(ranModel === undefined ? {} : { codexModel: ranModel }),
     pending: [],
     // A finding this review left out keeps its status: only an explicit verified or held moves it.
     findings: [
@@ -1795,9 +1902,12 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   }))
   if (after === null) return
   if (failed !== undefined) {
-    // Fail closed: a review that did not complete is never a pass, and no round is spent on it.
-    await noteAttempt($, after, `Codex ${failed.role} did not complete`)
-    await finish($, run.id, 'error', `Codex ${failed.role} did not complete: ${failed.result.note ?? 'no verdict'}`)
+    // Fail closed: a review that did not complete is never a pass, and no round is spent on it. An unusable model is not retried
+    // on another one (R69): the stop names the setting to change.
+    const isModel = failed.result.failure === 'model'
+    await noteAttempt($, after, isModel ? `Codex ${failed.role} could not use its model` : `Codex ${failed.role} did not complete`)
+    const why = isModel ? await unusableModel($, after, failed.result.note) : `Codex ${failed.role} did not complete: ${failed.result.note ?? 'no verdict'}`
+    await finish($, run.id, 'error', why)
     return
   }
   // Codex's ruling goes into the record's ledger at once, not only when the round ends.
@@ -1820,6 +1930,34 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     return
   }
   await endRound($, after, true)
+}
+
+/** Whether a repository's file sets `key` at all, valid or not: the stop then names the file, not the option. */
+const fileSets = (file: string | undefined, key: string): boolean => {
+  try {
+    const row: unknown = JSON.parse(file ?? '')
+    return typeof row === 'object' && row !== null && !Array.isArray(row) && (row as Record<string, unknown>)[key] !== undefined
+  } catch {
+    return false
+  }
+}
+
+/** gstack stopped on the Codex model (R69): what the person reads, with its repair message and the one setting that names the model. */
+async function unusableModel($: Engine, run: Run, note: string | undefined): Promise<string> {
+  const key = run.tier === 'high' ? 'codexModelHigh' : 'codexModel'
+  const isFile = fileSets(await baseFileOf($, run.root, run.base), key)
+  // The model the gate named; the run's own is the one the reviewer saw run, which gstack may have picked itself.
+  const named = codexModelFor(run.tier, (await configFor($, run.root, run.base)).config)
+  const which = run.codexModel ?? named ?? 'the model gstack picked'
+  const fix = isFile
+    ? `change ${key} in .github/pr-gate.json on origin/${run.base}`
+    : named === undefined
+      ? `set the plugin option ${key} to a model this account can use (or fix GSTACK_CODEX_MODEL or Codex config.toml)`
+      : `change the plugin option ${key}, or set ${key} in the base's .github/pr-gate.json`
+  return (
+    `Codex could not use ${which}: ${note ?? 'gstack gave no repair message'}. No other model was tried and no review round was used. ` +
+    `Next: ${fix}, then run /pr-gate resume.`
+  )
 }
 
 async function afterFix($: Engine, run: Run): Promise<void> {

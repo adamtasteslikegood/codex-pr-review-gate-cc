@@ -32,9 +32,11 @@ import {
 import {
   advance,
   archiveLifecycle,
+  badOptionsNote,
   closeLifecycle,
   configFor,
   configOf,
+  defaultEffort,
   fetchTwice,
   finish,
   getRun,
@@ -239,14 +241,15 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (isNotFetched(landedOn)) return landedOn.notFetched
   // The tier, lane and allowance follow the base's own .github/pr-gate.json, just fetched, never the branch's (R67).
   const { config: settings, ignored } = await configFor($, root, base)
-  const note = ignored.length === 0 ? '' : ` ${ignoredNote(base, ignored)}`
+  const note =
+    (ignored.length === 0 ? '' : ` ${ignoredNote(base, ignored)}`) + (settings.badOptions.length === 0 ? '' : ` ${badOptionsNote(settings.badOptions)}`)
   const scope =
     landedOn !== undefined
       ? { tier: 'trivial' as const, why: `already reviewed: every commit is on ${landedOn}` }
       : classify(files, lines, settings.highRisk, settled)
   const lane = settings.light !== undefined && settings.light.test(branch) ? ('light' as const) : ('full' as const)
-  // High blast radius starts at high; the rest at the configured effort, lower on a light-lane branch.
-  const startEffort: Effort = scope.tier === 'high' ? 'high' : lane === 'light' ? config.lightEffort : config.effort
+  // Each tier starts at its own effort, as the base's settings say (R69): highEffort, lightEffort on a light-lane branch, else reviewEffort.
+  const startEffort: Effort = defaultEffort({ tier: scope.tier, lane }, settings)
   const now = await $.clock.now()
   const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
@@ -359,7 +362,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const lightNote = rec.lane === 'light' ? ` Light lane: ${branch} matches lightBranches.` : ''
   return (
     `Lifecycle ${prior === undefined ? 'started' : 'resumed'} for ${branch} → ${base}: ${rec.tier} blast radius (${rec.tierWhy}), ` +
-    `Codex at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.${tierNote}${lightNote}${note}`
+    `Codex${run.codexModel === undefined ? '' : ` ${run.codexModel}`} at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.` +
+    `${tierNote}${lightNote}${note}`
   )
 }
 
