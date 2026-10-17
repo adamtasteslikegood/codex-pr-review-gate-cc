@@ -74,7 +74,8 @@ type Engine = EngineInterface
 let config: Config = configOf({})
 
 /** The run a pass-through shows in the pane: no round runs, so it is ended from the start. */
-const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number): Run => ({
+/** `c` is the base's settings (configFor), for the tier's own effort (R69). */
+const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number, c: Config): Run => ({
   id: `${now}`,
   cwd,
   root: rec.root,
@@ -84,7 +85,7 @@ const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number): Run => 
   tier: rec.tier,
   tierWhy: rec.tierWhy,
   lane: rec.lane,
-  effort: rec.effort ?? config.effort,
+  effort: rec.effort ?? defaultEffort(rec, c),
   round: 0,
   status: 'passed',
   phase: 'done',
@@ -114,7 +115,7 @@ const passThroughRun = (rec: LifecycleRecord, cwd: string, now: number): Run => 
 
 /** The run an open-PR prompt is written from when no run is live: a waiver let the pre-PR gate pass (R48). */
 const settledRun = (rec: LifecycleRecord, now: number): Run => ({
-  ...passThroughRun(rec, rec.root, now),
+  ...passThroughRun(rec, rec.root, now, config),
   headSha: rec.preHead ?? rec.head,
   round: rec.rounds.filter(one => one.phase === 'pre' && one.isCompleted).length,
   findings: rec.findings,
@@ -333,7 +334,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   }
   if (rec.tier === 'trivial') {
     // A pass-through runs no round: the pane shows it passed, and the held call goes straight through.
-    const shown = withScopeNote(passThroughRun(rec, want.cwd ?? root, now), note)
+    const shown = withScopeNote(passThroughRun(rec, want.cwd ?? root, now, settings), note)
     await update($, runAtom, () => shown)
     setLive(false)
     void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)

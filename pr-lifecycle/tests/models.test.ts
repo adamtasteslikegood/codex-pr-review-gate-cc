@@ -326,3 +326,44 @@ test('#11: on a high blast-radius change, the stop names codexModelHigh, and the
   expect(w.spawned).toHaveLength(2)
   expect(recordOf(w).rounds.filter(one => one.isCompleted)).toHaveLength(0)
 })
+
+// ------------------------------------------------------------------ fix round
+
+/** Post-PR: a reviewer's P1 left unanswered twice, so the review blocks on the same head and a resume answers it (R37). */
+const toBlockedPost = async ($: Dispatch, w: World): Promise<void> => {
+  w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  const head = w.gh.prHead
+  w.gh.comments = [
+    { id: 11, user: { login: 'claude[bot]' }, body: '**P1** SQL injection', path: 'src/app.ts', line: 4, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: 'u11' },
+  ]
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'COMMENTED', commit_id: head, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  const none = turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r2-triage', dispositions: [] })}`)
+  await done($, none)
+  await w.clock.advance(1000)
+  await done($, none)
+  expect(recordOf(w).postStatus).toBe('blocked')
+}
+
+test('M3: an answer run takes the tier\'s own effort and Codex model from the base\'s settings', { options: { highEffort: 'low' } }, async ($, on) => {
+  const w = world(on)
+  await toBlockedPost($, w)
+  const rec = recordOf(w)
+  w.store.set('lifecycle:/repo:feat/x', { ...rec, tier: 'high', effort: undefined })
+  await $.command.run(cmd('resume'))
+  const run = await runOf(w)
+  expect(run.isAnswer).toBe(true)
+  expect(run.effort).toBe('low')
+  expect(run.codexModel).toBe('gpt-6-astra')
+})
+
+test('M3: a pass-through run shows the base\'s effort for its tier', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/README.md'
+  w.git.roster = '{"reviewEffort":"low"}'
+  await $.command.run(cmd(''))
+  expect((await runOf(w)).effort).toBe('low')
+})
