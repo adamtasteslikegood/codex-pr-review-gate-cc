@@ -85,7 +85,12 @@ routine steps.
    - **Also counted:** a trusted author's feedback that arrives after a round
      closes is triaged in the next round.
    - **Unblocks** the cookbook's KAN-420 config change.
-6. **Housekeeping.**
+6. **Hold wording (finding 7, moved up from wave 3: every agent trips on it).**
+   - Lead with "HOLD (not an error)".
+   - Name who acts next, the gate or the person.
+   - Say "leave this branch alone", not "end your turn".
+   - Promise a gate message only when one will come.
+7. **Housekeeping.**
    - Rulings from R71.
    - LIFECYCLE_SPEC updates and tests.
    - Version 1.3.0 in `plugin.json` and both READMEs.
@@ -134,12 +139,7 @@ Serves goal 2. Makes the gate legible and reachable from anywhere.
 4. **The shared account (findings 16, 25).** Adam, Codex and the agent all post
    as `adamtasteslikegood`. The gate skips comments whose ids the session itself
    reported as `replyId`, and doesn't count others' replies as the agent's own.
-5. **Hold wording (finding 7).**
-   - Lead with "HOLD (not an error)".
-   - Name who acts next, the gate or the person.
-   - Say "leave this branch alone", not "end your turn".
-   - Promise a gate message only when one will come.
-6. **Announce background work (finding 23).** The pane names the Codex
+5. **Announce background work (finding 23).** The pane names the Codex
    verification and final-head sub-agents while they run.
 
 ## Wave 4 and later: findings that are never lost, and the exhausted decision
