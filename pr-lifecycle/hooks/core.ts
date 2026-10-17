@@ -74,11 +74,19 @@ export type ReviewResult = {
 
 const TIMEOUT_WORDS = /\btim(e|ed|ing)[\s-]?out\b|\bstall(ed)?\b|exit(ed)?( code)? 124\b/i
 
-/** The failure kind a reviewer reported, or read from its note when it named none. */
-function failureOf(said: unknown, note: string | undefined): ReviewFailure {
+/**
+ * gstack's markers for a Codex model that is invalid or that the account cannot use (SKILL.md: MODEL_UNUSABLE, and the "Model not
+ * supported (HTTP 400 or 404)" errors). MODEL_QUOTA_EXHAUSTED and "requires a newer version of Codex" are not the model's fault.
+ */
+const MODEL_WORDS = /\bMODEL_UNUSABLE\b|\bmodel\b[^\n]*\b(is not supported when using Codex|does not exist or you do not have access)\b/i
+
+/** The failure kind a reviewer reported, or read from what it said when it named none or only `other` (R69). */
+function failureOf(said: unknown, note: string | undefined, answer = ''): ReviewFailure {
   const kind = String(said ?? '').toLowerCase()
   if (kind === 'timeout') return 'timeout'
   if (kind === 'model') return 'model'
+  // An unusable model is caught from gstack's own words, so the stop still names the setting when the reviewer called it other.
+  if ((kind === '' || kind === 'other') && MODEL_WORDS.test(`${note ?? ''}\n${answer}`)) return 'model'
   if (kind !== '') return 'other'
   return note !== undefined && TIMEOUT_WORDS.test(note) ? 'timeout' : 'other'
 }
@@ -115,9 +123,16 @@ export function readReview(answer: string): ReviewResult {
   if (trailer === undefined) {
     const said = answer.match(/\bGATE:\s*(PASS|FAIL|UNVERIFIED)\b/)?.[1]
     if (said === 'PASS' || said === 'UNVERIFIED') return { gate: said, findings: [], verified: [], held: [], ...ran }
+    const failure = failureOf(undefined, answer)
+    // gstack's repair lines are what the person needs from an unusable model, not "no verdict".
+    const repair = answer.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
     const note =
-      said === 'FAIL' ? 'The reviewer reported GATE: FAIL without listing its findings.' : 'The reviewer ended without a verdict.'
-    return { gate: 'ERROR', findings: [], note, failure: failureOf(undefined, answer), verified: [], held: [], ...ran }
+      failure === 'model' && repair !== ''
+        ? repair.slice(0, 1000)
+        : said === 'FAIL'
+          ? 'The reviewer reported GATE: FAIL without listing its findings.'
+          : 'The reviewer ended without a verdict.'
+    return { gate: 'ERROR', findings: [], note, failure, verified: [], held: [], ...ran }
   }
   const gate = String(trailer.gate ?? '').toUpperCase()
   const listed = Array.isArray(trailer.findings) ? trailer.findings : []
@@ -141,7 +156,7 @@ export function readReview(answer: string): ReviewResult {
   const verified = idList(trailer.verified)
   const held = idList(trailer.held)
   if (gate !== 'PASS' && gate !== 'FAIL' && gate !== 'UNVERIFIED') {
-    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer), verified, held, ...ran }
+    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer, answer), verified, held, ...ran }
   }
   const hasBlocking = findings.some(isBlocking)
   if (gate === 'FAIL' && !hasBlocking) {

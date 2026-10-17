@@ -388,3 +388,31 @@ test('M2: Codex\'s first look in a lifecycle starts at the tier\'s effort, after
   expect(run.round).toBe(2)
   expect(run.effort).toBe('medium')
 })
+
+test('M1: gstack\'s model-repair markers in the answer read as a model failure, whatever error the reviewer named', async () => {
+  const bare = `CODEX_MODEL: gpt-6-luna (gpt; source: request)\nMODEL_UNUSABLE\nHINT: pick another model.`
+  expect(readReview(bare).failure).toBe('model')
+  expect(readReview(bare).note).toBe('MODEL_UNUSABLE HINT: pick another model.')
+  const other = (note: string) => readReview(`${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'other', note })}`).failure
+  expect(other("The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account")).toBe('model')
+  expect(other("404 Not Found: The model 'gpt-6-luna' does not exist or you do not have access to it")).toBe('model')
+  // A spent quota or an old CLI is not the model's fault.
+  expect(other('MODEL_QUOTA_EXHAUSTED: usage limit reached, resets at 18:00')).toBe('other')
+  expect(other('this model requires a newer version of Codex')).toBe('other')
+  expect(other('auth failed')).toBe('other')
+  // A timeout the reviewer named stays a timeout.
+  expect(readReview(`${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'timeout', note: 'MODEL_UNUSABLE' })}`).failure).toBe('timeout')
+})
+
+test('M1: a reviewer that calls an unusable model other still stops on the model, naming the setting', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const note = 'MODEL_UNUSABLE. HINT: the account cannot use gpt-6-luna.'
+  await done($, turn(`CODEX_MODEL: gpt-6-luna (gpt; source: request)\n${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'other', note })}`))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('codexModel')
+  expect(run.message).toContain('HINT: the account cannot use gpt-6-luna.')
+  expect(w.spawned).toHaveLength(1)
+  expect(recordOf(w).rounds.filter(one => one.isCompleted)).toHaveLength(0)
+})
