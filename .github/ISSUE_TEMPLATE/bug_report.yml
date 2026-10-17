@@ -1,0 +1,34 @@
+name: Bug report
+description: Something in a pr-gate component does not work as its README says.
+labels: [bug]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - pr-lifecycle
+        - codex-gate
+        - repo tooling or docs
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The component's version (the `version` in its `.claude-plugin/plugin.json`), and your `claude --version`.
+      placeholder: pr-lifecycle 1.0.0, Claude Code 2.1.301
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, the branch and base, and any pane or log output.
