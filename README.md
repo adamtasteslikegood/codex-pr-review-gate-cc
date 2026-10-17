@@ -1,12 +1,13 @@
 # pr-gate
 
-Checks that run on a branch before its pull request is opened, as Claude
-Code mods. Each component lives in its own folder, with its own README and
+Checks that run on a branch before and after its pull request is opened, as
+Claude Code mods. Each component lives in its own folder, with its own README and
 version.
 
 | Component                    | Version | What it does                                                                                                  |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
 | [codex-gate](codex-gate/)    | 0.3.1   | Rounds of adversarial Codex review and agent fixes before a PR to `dev` or `main`. [README](codex-gate/README.md) |
+| [pr-lifecycle](pr-lifecycle/) | 1.0.0   | `/pr-gate` across the PR lifecycle: pre-PR Codex rounds, then the PR's own reviews, under one review budget and record. [README](pr-lifecycle/README.md) |
 
 ## Using a component
 
@@ -19,12 +20,13 @@ example in `~/.claude/settings.json`:
 
 Each component's README covers its own setup, options and checks.
 
-## In planning
+## Which one to load
 
-[LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) describes the next major version of
-`/pr-gate`: one lifecycle, review history and budget across pre-PR and
-post-PR review. It will be built in a separate folder while `codex-gate`
-stays at 0.3.1 as the plugin in use.
+`codex-gate` 0.3.1 is the plugin in daily use. `pr-lifecycle` 1.0.0 replaces
+it once Adam switches `CLAUDE_CODE_PLUGIN_DIRS` to its folder. Never load
+both: both register `/pr-gate` and hold PR creation, so two would gate the
+same PR twice. [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) is the spec
+`pr-lifecycle` implements.
 
 ## Versions
 

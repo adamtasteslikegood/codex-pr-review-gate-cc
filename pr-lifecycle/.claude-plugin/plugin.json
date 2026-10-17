@@ -1,0 +1,137 @@
+{
+  "name": "pr-lifecycle",
+  "version": "1.0.0",
+  "description": "/pr-gate across the PR lifecycle: pre-PR Codex rounds, then the repository's own post-PR reviews, under one review budget and one record, with a live progress pane.",
+  "author": {
+    "name": "adam schoen"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "allowanceStandard": {
+      "type": "number",
+      "title": "Review rounds, standard changes",
+      "description": "Discretionary review rounds one lifecycle may complete on a standard change, before and after the PR opens together, advisory rounds included. The protected post-PR rounds do not count. Replaces maxRounds, which is read when this is unset.",
+      "default": 4
+    },
+    "allowanceHigh": {
+      "type": "number",
+      "title": "Review rounds, high blast-radius changes",
+      "description": "The same allowance for a high blast-radius change.",
+      "default": 6
+    },
+    "bases": {
+      "type": "string",
+      "title": "Gated base branches",
+      "description": "Comma-separated base branches whose PRs must pass the gate first. The first one is the default base.",
+      "default": "dev,main"
+    },
+    "enforce": {
+      "type": "boolean",
+      "title": "Block ungated PRs",
+      "description": "Deny `gh pr create` (and the GitHub MCP create-PR tool) to a gated base until the gate has finished for the current HEAD, and start the gate when one is denied.",
+      "default": true
+    },
+    "enforceMerge": {
+      "type": "boolean",
+      "title": "Hold merges until the lifecycle is done",
+      "description": "Deny merging a PR to a gated base (gh, gh api, GitHub MCP tools) until its lifecycle review is complete for the PR's current head, or the person waived it.",
+      "default": true
+    },
+    "fixer": {
+      "type": "string",
+      "title": "Who fixes findings",
+      "description": "main sends each round's findings back to the main agent; subagent hands them to a fresh sub-agent.",
+      "default": "main",
+      "options": [
+        "main",
+        "subagent"
+      ]
+    },
+    "fixReview": {
+      "type": "string",
+      "title": "Review the fix before the next round",
+      "description": "A separate sub-agent checks the fix commits before Codex sees them again. auto does this only for high blast-radius changes.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "always",
+        "never"
+      ]
+    },
+    "onExhausted": {
+      "type": "string",
+      "title": "After the last round without agreement",
+      "description": "open-pr opens the PR anyway when the pre-PR allowance is spent (never with an open security P1); stop leaves it held for a person's decision. Either way the post-PR lifecycle still runs, and merging stays held.",
+      "default": "open-pr",
+      "options": [
+        "open-pr",
+        "stop"
+      ]
+    },
+    "openPr": {
+      "type": "boolean",
+      "title": "Ask the main agent to open the PR",
+      "description": "When the gate finishes, prompt the main agent to push and open the PR following the repository's own rules.",
+      "default": true
+    },
+    "highRiskPaths": {
+      "type": "string",
+      "title": "High blast-radius paths",
+      "description": "A regular expression over changed file paths. A match raises the tier to high: Codex challenge mode runs in parallel with the review, Codex starts at high effort, and fixes are reviewed before the next round. A submodule pointer to a commit already on that submodule's origin/main or origin/dev is not counted.",
+      "default": "(^|/)(migrations?|auth|security|secrets?)(/|\\.|$)|^server/|^Backend$|^\\.github/workflows/|cloudbuild|Dockerfile|(^|/)(package(-lock)?\\.json|uv\\.lock|pyproject\\.toml)$"
+    },
+    "reviewEffort": {
+      "type": "string",
+      "title": "Codex effort, standard changes",
+      "description": "The reasoning effort Codex starts at on a change that is not high blast radius. A high blast-radius change (highRiskPaths, or a large diff) always starts at high. When Codex times out, the round reruns one level lower, down to low; the next run on that branch starts a level below where the timed-out one ended.",
+      "default": "medium",
+      "options": [
+        "medium",
+        "low",
+        "high"
+      ]
+    },
+    "lightBranches": {
+      "type": "string",
+      "title": "Light-lane branches",
+      "description": "A regular expression over the branch name. A matching branch gets one Codex round and no advisory rounds; whatever Codex raises goes to the pull request's own review. A pointer bump, version-only bump or already-landed commits pass without Codex on any branch. Empty turns the light lane off.",
+      "default": "^chore/"
+    },
+    "lightEffort": {
+      "type": "string",
+      "title": "Codex effort, light-lane branches",
+      "description": "The effort Codex starts at on a light-lane branch that is not high blast radius. A high blast-radius change still starts at high.",
+      "default": "low",
+      "options": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "stepTimeoutMinutes": {
+      "type": "number",
+      "title": "Step timeout (minutes)",
+      "description": "How long one agent step may run before the gate stops with an error.",
+      "default": 30
+    },
+    "routineRoundMinutes": {
+      "type": "number",
+      "title": "Routine round timebox (minutes)",
+      "description": "The active time a routine round should take. Going over is shown and recorded, not failed; stepTimeoutMinutes is the hard limit.",
+      "default": 3
+    },
+    "waitCapMinutes": {
+      "type": "number",
+      "title": "Reviewer wait cap (minutes)",
+      "description": "The longest a post-PR round waits for reviewers before it carries on with what arrived. A repository's .github/pr-gate.json can set its own.",
+      "default": 20
+    },
+    "quietMinutes": {
+      "type": "number",
+      "title": "Quiet period (minutes)",
+      "description": "Without a roster file, collection ends once checks are done and no new feedback arrived for this long.",
+      "default": 3
+    }
+  }
+}
