@@ -251,33 +251,36 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
   // run inside it; the controller runs after.
-  const { prior, rec, adopted } = await lockRecord(root, branch, async () => {
+  const { prior, rec, adopted, rebase } = await lockRecord(root, branch, async () => {
     const prior = await loadRecord($, root, branch)
     // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
     // Otherwise it starts no higher than the effort a review last completed at on this branch.
     const afterTimeout = prior?.hasTimedOut === true && prior.effort !== undefined ? (stepDown(prior.effort) ?? 'low') : startEffort
     const effort = lowerOf(lowerOf(startEffort, afterTimeout), prior?.passedEffort ?? startEffort)
-    let rec: LifecycleRecord =
+    const kept: LifecycleRecord | undefined =
       prior !== undefined && prior.phase !== 'archived'
         ? {
-            ...rescope(
-              {
-                ...prior,
-                head,
-                base,
-                ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
-                // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
-                // So was one about another base: a pass against dev does not open a PR against main.
-                ...(prior.phase === 'pre' && (prior.head !== head || prior.base !== base) ? { preStatus: undefined, preHead: undefined } : {}),
-                postStatus: undefined,
-              },
-              scope.tier,
-              scope.why,
-              settings.allowances,
-            ),
+            ...prior,
+            head,
+            base,
+            ...(prior.phase === 'ready' && prior.head !== head ? { phase: 'post' as const } : {}),
+            // A pre-PR verdict was about the old head: the new run's own outcome replaces it (R57).
+            // So was one about another base: a pass against dev does not open a PR against main.
+            ...(prior.phase === 'pre' && (prior.head !== head || prior.base !== base) ? { preStatus: undefined, preHead: undefined } : {}),
+            postStatus: undefined,
+          }
+        : undefined
+    let rec: LifecycleRecord =
+      kept !== undefined && prior !== undefined
+        ? {
+            // Another base is a new scope (R67, C1): its own file sets tier, lane and allowance, up or down; the rounds used still count.
+            // The same base only rescopes upward.
+            ...(prior.base === base
+              ? rescope(kept, scope.tier, scope.why, settings.allowances)
+              : { ...kept, tier: scope.tier, tierWhy: scope.why, lane, allowance }),
             effort,
-            // A pass-through that now needs Codex is one no longer.
-            ...(scope.tier === 'trivial' ? {} : { passThrough: undefined }),
+            // A pass-through that now needs Codex is one no longer; on a new base, a trivial change is one.
+            ...(scope.tier !== 'trivial' ? { passThrough: undefined } : prior.base === base ? {} : { passThrough: scope.why }),
           }
         : {
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
@@ -290,6 +293,10 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     if (prior !== undefined && prior.head !== head) rec = { ...rec, ...(await headMoved($, root, rec, lastReviewedHead(prior), head, now)) }
     // A PR the gate never saw opened (opened by hand, or before this mod): adopt it straight into post-PR review.
     const open = prior === undefined || prior.phase === 'pre' || prior.phase === 'archived' ? await openPrOf($, root, branch) : undefined
+    // An open PR on another base than this scope's: nothing is saved, and the gate scopes again against the PR's own base (R67, C1).
+    if (open !== undefined && config.bases.includes(open.baseRefName) && open.baseRefName !== base) {
+      return { prior, rec, adopted: undefined, rebase: open.baseRefName }
+    }
     if (open !== undefined && config.bases.includes(open.baseRefName)) {
       const adoptedRec: LifecycleRecord = {
         ...rec,
@@ -300,11 +307,12 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         passThrough: undefined,
       }
       await saveRecord($, adoptedRec)
-      return { prior, rec: adoptedRec, adopted: open }
+      return { prior, rec: adoptedRec, adopted: open, rebase: undefined }
     }
     await saveRecord($, rec)
-    return { prior, rec, adopted: undefined }
+    return { prior, rec, adopted: undefined, rebase: undefined }
   })
+  if (rebase !== undefined) return startGate($, { ...want, base: rebase })
   if (adopted !== undefined) {
     await advance($, root, branch)
     return (

@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { createPr, done, isHeld, P1, review, runOf, turn, world } from './world'
+import { createPr, done, isHeld, P1, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { configOf, overrideConfig } from '../hooks/round'
 import type { LifecycleRecord } from '../types'
@@ -239,4 +239,65 @@ test('a roster on the base is used: collection waits on its reviewer, whose comm
   w.gh.issueComments = [{ id: 31, user: { login: 'junie[bot]' }, body: 'Rename the helper.', created_at: '1970-01-01T00:01:00Z', author_association: 'NONE' }]
   await w.clock.advance(20 * 60_000)
   expect(w.prompts.some(one => one.includes('Rename the helper.'))).toBe(true)
+})
+
+// ------------------------------------------------------------------ a base change scopes afresh (R67 follow-up, C1)
+
+const agentCmd = (args: string) => ({ command: 'pr-gate', args, origin: { kind: 'agent' }, presentation: { isFullscreen: false, columns: 120 } }) as never
+const createTo = (base: string) => ({ ...createPr, command: createPr.command.replace('--base dev', `--base ${base}`) })
+
+test('C1: a lifecycle scoped on a lax base outside bases keeps none of its lane or allowance when the create goes to dev', async ($, on) => {
+  const w = world(on)
+  w.git.byBase = { lax: '{"lightBranches":"^feat/","allowanceStandard":1}' }
+  await $.command.run(agentCmd('lax'))
+  expect(recordOf(w).lane).toBe('light')
+  await $.command.run(cmd('stop'))
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  const rec = recordOf(w)
+  expect(rec.base).toBe('dev')
+  expect(rec.lane).toBe('full')
+  expect(rec.allowance).toBe(4)
+})
+
+test('C1: between gated bases, the lane comes from the new base\'s file', async ($, on) => {
+  const w = world(on)
+  w.git.byBase = { dev: '{"lightBranches":"^feat/","allowanceStandard":1}', main: '{"lightBranches":""}' }
+  await $.tool.call(createPr)
+  expect(recordOf(w).lane).toBe('light')
+  await $.command.run(cmd('stop'))
+  await $.tool.call(createTo('main'))
+  const rec = recordOf(w)
+  expect(rec.base).toBe('main')
+  expect(rec.lane).toBe('full')
+  expect(rec.allowance).toBe(4)
+})
+
+test('C1: between gated bases, a stricter base lowers the allowance, and the rounds already used still count', { options: { allowanceStandard: 3 } }, async ($, on) => {
+  const w = world(on)
+  w.git.byBase = { main: '{"allowanceStandard":2}' }
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  // Round 1 ends with the fix; round 2's review is under way when the create goes to main.
+  await done($, turn(`Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed', note: 'done' }] })}`))
+  await $.command.run(cmd('stop'))
+  expect(recordOf(w).allowance).toBe(3)
+  await $.tool.call(createTo('main'))
+  const rec = recordOf(w)
+  expect(rec.base).toBe('main')
+  expect(rec.allowance).toBe(2)
+  expect(rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary')).toHaveLength(1)
+})
+
+test('C1: an open PR adopted on another base than the one asked for is scoped from its own base\'s file', async ($, on) => {
+  const w = world(on)
+  w.git.byBase = { dev: '{"lightBranches":"^feat/","allowanceStandard":1}', main: '{"allowanceStandard":2}' }
+  w.gh.hasPr = true
+  w.gh.base = 'main'
+  await $.command.run(cmd('dev'))
+  const rec = recordOf(w)
+  expect(rec.phase).toBe('post')
+  expect(rec.base).toBe('main')
+  expect(rec.lane).toBe('full')
+  expect(rec.allowance).toBe(2)
 })

@@ -33,6 +33,8 @@ export type World = {
     roster: string
     /** When set, only `origin/<rosterOn>` has the file: any other base's read fails as a missing path or ref does. */
     rosterOn?: string
+    /** Each base's own file, by base name; a base listed here ignores `roster` and `rosterOn`. */
+    byBase: Record<string, string>
     /** `.github/pr-gate.json` at the branch's own HEAD; empty means none. The mod must never read it (R67). */
     headRoster: string
     /** Local branches besides the checked-out one. */
@@ -130,6 +132,7 @@ export function world(on: On): World {
       isAncestor: false,
       roster: '',
       headRoster: '',
+      byBase: {},
       locals: [],
       isOutside: false,
       fetchFails: 0,
@@ -253,8 +256,8 @@ export function world(on: On): World {
     if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.headRoster, w.git.headRoster === '' ? 128 : 0)
     const onBase = args.match(/^show origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
     if (onBase !== undefined) {
-      const has = w.git.roster !== '' && (w.git.rosterOn === undefined || w.git.rosterOn === onBase)
-      return out(has ? w.git.roster : '', has ? 0 : 128)
+      const file = Object.hasOwn(w.git.byBase, onBase) ? (w.git.byBase[onBase] ?? '') : w.git.rosterOn === undefined || w.git.rosterOn === onBase ? w.git.roster : ''
+      return out(file, file === '' ? 128 : 0)
     }
     // Outside a checkout (`cd /tmp && ...`), git finds no repository.
     if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out('/repo\n')

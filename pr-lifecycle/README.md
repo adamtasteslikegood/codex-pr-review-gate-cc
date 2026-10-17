@@ -258,9 +258,14 @@ the match off (`"lightBranches": ""` turns the light lane off).
   plugin option; the others still apply. The gate says which keys it ignored,
   once, in the pane's scope step and in the start message. A file that is not
   a JSON object overrides nothing.
-- **The allowance is fixed when the lifecycle is scoped.** A change to the
-  file that lands on the base mid-lifecycle does not rewrite an existing
-  record's allowance; a new lifecycle (or `/pr-gate reset`) picks it up. The
+- **The lane and allowance are fixed when the lifecycle is scoped, for that
+  base.** A change to the file that lands on the base mid-lifecycle does not
+  rewrite an existing record's lane or allowance; a new lifecycle (or
+  `/pr-gate reset`) picks it up. A lifecycle that moves to another base (a
+  create to another base, `/pr-gate <base>`, or an open PR adopted on another
+  base) is scoped afresh from that base's file: tier, lane and allowance, up
+  or down, with the rounds already used still counted. Nothing carries over
+  from the base it was scoped on before, which may be one outside `bases`. The
   other settings are read again where they are used: `onExhausted` when a
   pre-PR gate is spent and when a create is judged, the roster on every poll.
 - **A PR that adds or changes `.github/pr-gate.json` is gated by the base's
