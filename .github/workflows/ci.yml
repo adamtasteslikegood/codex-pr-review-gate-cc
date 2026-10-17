@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # A ruleset requires this job by name; keep it stable.
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm i -g @anthropic-ai/claude-code@2.1.301
+      - name: Lint
+        run: npm run lint
+      # test and validate run before typecheck: the harness generates each
+      # component's .claude-plugin/types/, which pr-lifecycle's tsconfig extends.
+      - name: Test
+        run: npm run test
+      - name: Validate
+        run: npm run validate
+      - name: Typecheck
+        run: npm run typecheck
