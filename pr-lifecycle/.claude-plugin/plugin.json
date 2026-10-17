@@ -11,13 +11,13 @@
     "allowanceStandard": {
       "type": "number",
       "title": "Review rounds, standard changes",
-      "description": "Discretionary review rounds one lifecycle may complete on a standard change, before and after the PR opens together, advisory rounds included. The protected post-PR rounds do not count. Replaces maxRounds, which is read when this is unset.",
+      "description": "Discretionary review rounds one lifecycle may complete on a standard change, before and after the PR opens together, advisory rounds included. The protected post-PR rounds do not count. Replaces maxRounds, which is read when this is unset. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 4
     },
     "allowanceHigh": {
       "type": "number",
       "title": "Review rounds, high blast-radius changes",
-      "description": "The same allowance for a high blast-radius change.",
+      "description": "The same allowance for a high blast-radius change. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 6
     },
     "bases": {
@@ -62,7 +62,7 @@
     "onExhausted": {
       "type": "string",
       "title": "After the last round without agreement",
-      "description": "open-pr opens the PR anyway when the pre-PR allowance is spent (never with an open security P1); stop leaves it held for a person's decision. Either way the post-PR lifecycle still runs, and merging stays held.",
+      "description": "open-pr opens the PR anyway when the pre-PR allowance is spent (never with an open security P1); stop leaves it held for a person's decision. Either way the post-PR lifecycle still runs, and merging stays held. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "open-pr",
       "options": [
         "open-pr",
@@ -78,7 +78,7 @@
     "highRiskPaths": {
       "type": "string",
       "title": "High blast-radius paths",
-      "description": "A regular expression over changed file paths. A match raises the tier to high: Codex challenge mode runs in parallel with the review, Codex starts at high effort, and fixes are reviewed before the next round. A submodule pointer to a commit already on that submodule's origin/main or origin/dev is not counted.",
+      "description": "A regular expression over changed file paths. A match raises the tier to high: Codex challenge mode runs in parallel with the review, Codex starts at high effort, and fixes are reviewed before the next round. A submodule pointer to a commit already on that submodule's origin/main or origin/dev is not counted. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "(^|/)(migrations?|auth|security|secrets?)(/|\\.|$)|^server/|^Backend$|^\\.github/workflows/|cloudbuild|Dockerfile|(^|/)(package(-lock)?\\.json|uv\\.lock|pyproject\\.toml)$"
     },
     "reviewEffort": {
@@ -95,7 +95,7 @@
     "lightBranches": {
       "type": "string",
       "title": "Light-lane branches",
-      "description": "A regular expression over the branch name. A matching branch gets one Codex round and no advisory rounds; whatever Codex raises goes to the pull request's own review. A pointer bump, version-only bump or already-landed commits pass without Codex on any branch. Empty turns the light lane off.",
+      "description": "A regular expression over the branch name. A matching branch gets one Codex round and no advisory rounds; whatever Codex raises goes to the pull request's own review. A pointer bump, version-only bump or already-landed commits pass without Codex on any branch. Empty turns the light lane off. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "^chore/"
     },
     "lightEffort": {
@@ -124,13 +124,13 @@
     "waitCapMinutes": {
       "type": "number",
       "title": "Reviewer wait cap (minutes)",
-      "description": "The longest a post-PR round waits for reviewers before it carries on with what arrived. A repository's .github/pr-gate.json can set its own.",
+      "description": "The longest a post-PR round waits for reviewers before it carries on with what arrived. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 20
     },
     "quietMinutes": {
       "type": "number",
       "title": "Quiet period (minutes)",
-      "description": "Without a roster file, collection ends once checks are done and no new feedback arrived for this long.",
+      "description": "Without a roster file, collection ends once checks are done and no new feedback arrived for this long. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 3
     }
   }
