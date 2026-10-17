@@ -188,7 +188,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
 
 /** What a repository's file got wrong, said once where the person sees it (R67). */
 export const ignoredNote = (base: string, ignored: readonly string[]): string =>
-  `.github/pr-gate.json on origin/${base}: ignored ${ignored.join(', ')}; the plugin options apply instead.`
+  `The base's .github/pr-gate.json (origin/${base}): ignored ${ignored.join(', ')}; the plugin options apply instead.`
 
 export const elapsed = (ms: number): string => {
   const seconds = Math.max(0, Math.round(ms / 1000))

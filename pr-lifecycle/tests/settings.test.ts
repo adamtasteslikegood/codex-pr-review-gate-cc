@@ -332,3 +332,16 @@ test('M4: a local tag named origin/dev cannot stand in for the base\'s file', as
   expect(recordOf(w).lane).toBe('full')
   expect(recordOf(w).allowance).toBe(4)
 })
+
+// ------------------------------------------------------------------ the note reads as a sentence (M5)
+
+test('M5: the ignored-keys note follows the scope detail and the start message as a sentence, with no stray ". ."', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"allowanceStandard":"lots"}'
+  const said = JSON.stringify(await $.command.run(cmd('')))
+  const detail = await scopeDetail(w)
+  expect(detail).toContain('allowanceStandard')
+  expect(detail).not.toContain('. .')
+  expect(said).toContain('allowanceStandard')
+  expect(said).not.toContain('. .')
+})
