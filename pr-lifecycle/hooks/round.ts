@@ -451,12 +451,15 @@ export async function fetchTwice($: Engine, cwd: string | undefined, args: strin
 
 /**
  * Brings a clean local checkout up to the PR head (R71): a fetch, then a merge that only fast-forwards. True when HEAD is the PR
- * head after it. A dirty checkout, or one with commits the PR lacks, is left as it is: that is the person's to sort out.
+ * head after it. A dirty checkout, one with commits the PR lacks, or one on another branch is left as it is: that is the person's to sort out.
  */
 export async function syncToHead($: Engine, root: string, branch: string, prHead: string): Promise<boolean> {
   const local = await git($, root, ['rev-parse', 'HEAD'])
   if (!local.isOk) return false
   if (local.out === prHead) return true
+  // Only the PR's own branch is moved: a checkout switched to another branch meanwhile is never fast-forwarded to the PR head.
+  const on = await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  if (!on.isOk || on.out !== branch) return false
   const dirty = await git($, root, ['status', '--porcelain', '--untracked-files=no'])
   if (!dirty.isOk || dirty.out !== '') return false
   if (!(await fetchTwice($, root, ['--quiet', 'origin', branch], 60_000)).isOk) return false

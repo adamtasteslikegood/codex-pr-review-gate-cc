@@ -3019,6 +3019,19 @@ test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fall
   expect((await runOf(w)).status).toBe('running')
 })
 
+test('R71: a checkout switched to another branch is never fast-forwarded; the round stops', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const before = w.git.head
+  // The person switched the clean checkout to an ancestor branch while reviewers were posting.
+  w.git.branch = 'main'
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.isAncestor = true
+  await w.clock.advance(20 * 60_000)
+  expect(w.git.head).toBe(before)
+  expect((await runOf(w)).status).toBe('error')
+})
+
 test('R71: a push gh has not seen yet does not stop the round', async ($, on) => {
   const w = world(on)
   await toTriage($, w)
