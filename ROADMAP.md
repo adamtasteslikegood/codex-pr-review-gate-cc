@@ -90,7 +90,14 @@ routine steps.
    - Name who acts next, the gate or the person.
    - Say "leave this branch alone", not "end your turn".
    - Promise a gate message only when one will come.
-7. **Housekeeping.**
+7. **A run log (`/pr-gate log`).**
+   - **Events on the record:** one line per event (round start and end, a stop
+     and its reason, resume, allow, waive, a moved head, stand-down), capped
+     at about 200.
+   - **`/pr-gate log`** prints a short summary: rounds and time per round,
+     Codex time vs. waiting, how many times the person stepped in and why, and
+     the stop reasons. The next live run uses it to measure this wave.
+8. **Housekeeping.**
    - Rulings from R71.
    - LIFECYCLE_SPEC updates and tests.
    - Version 1.3.0 in `plugin.json` and both READMEs.
