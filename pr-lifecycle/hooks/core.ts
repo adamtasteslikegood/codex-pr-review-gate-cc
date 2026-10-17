@@ -156,7 +156,8 @@ export function readReview(answer: string): ReviewResult {
   const verified = idList(trailer.verified)
   const held = idList(trailer.held)
   if (gate !== 'PASS' && gate !== 'FAIL' && gate !== 'UNVERIFIED') {
-    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer, answer), verified, held, ...ran }
+    const failure = failureOf(trailer.error, note ?? answer, answer)
+    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure, verified, held, ...ran }
   }
   const hasBlocking = findings.some(isBlocking)
   if (gate === 'FAIL' && !hasBlocking) {
@@ -566,11 +567,15 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
       '',
       // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
-      `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: its preamble, its probes and its consult mode.`,
-      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, or the fix), and ask Codex to read the code at HEAD and rule on each one: does the rebuttal, or the fix, still hold?',
+      `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: ` +
+        'its preamble, its probes and its consult mode.',
+      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, or the fix), and ask Codex to read the code at HEAD ' +
+        'and rule on each one: does the rebuttal, or the fix, still hold?',
       ...codexRules(run, 'give no verdicts, error is model'),
-      '2. Report Codex\'s ruling, not your own: one verdict per finding id, each on its own. holds is true when Codex says it holds, false when it does not, with a note saying why it fails. Leave out no id.',
-      '   If Codex did not complete (non-zero exit, timeout, empty output, auth), give no verdicts: error is timeout when it timed out or stalled, model when its model is unusable (above), other otherwise, and note says why.',
+      "2. Report Codex's ruling, not your own: one verdict per finding id, each on its own. holds is true when Codex says it holds, " +
+        'false when it does not, with a note saying why it fails. Leave out no id.',
+      '   If Codex did not complete (non-zero exit, timeout, empty output, auth), give no verdicts: error is timeout when it timed out or stalled, ' +
+        'model when its model is unusable (above), other otherwise, and note says why.',
       '3. You are read-only: do not edit, commit or push. Do not ask the user anything: nobody is watching this step.',
       '',
       trailerRule(
