@@ -28,8 +28,12 @@ both: both register `/pr-gate` and hold PR creation, so two would gate the
 same PR twice. [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) is the spec
 `pr-lifecycle` implements.
 
-Loading a component in a session also writes its generated
-`.claude-plugin/types/`, which `npm run typecheck` needs.
+Loading a component in a session also writes its own generated
+`.claude-plugin/types/`. `npm run typecheck` checks `pr-lifecycle` and needs
+`pr-lifecycle/.claude-plugin/types/`, so loading `codex-gate` alone is not
+enough. Until a session has loaded `pr-lifecycle` (on its own, never beside
+`codex-gate`), `npm run check` stops at typecheck. The other checks run without
+it, and CI skips typecheck for the same reason.
 
 ## 3. Run the checks
 
