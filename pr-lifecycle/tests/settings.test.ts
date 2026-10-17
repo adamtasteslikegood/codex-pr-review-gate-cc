@@ -301,3 +301,24 @@ test('C1: an open PR adopted on another base than the one asked for is scoped fr
   expect(rec.lane).toBe('full')
   expect(rec.allowance).toBe(2)
 })
+
+// ------------------------------------------------------------------ one read decides a create (M2)
+
+test('M2: a create decides from the settings read after its fetch: a stop that just landed on the base holds an exhausted gate', { options: { allowanceStandard: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  w.git.head = 'd'.repeat(40)
+  await done($, turn('Tried.'))
+  await done($, turn('Tried.'))
+  expect(recordOf(w).preStatus).toBe('exhausted')
+  // A code commit since, and the base turns onExhausted to stop: only the create's own fetch brings it.
+  w.git.head = 'e'.repeat(40)
+  w.git.since = '1\t1\tsrc/app.ts'
+  w.git.onFetch = () => {
+    w.git.roster = '{"onExhausted":"stop"}'
+  }
+  const held = await $.tool.call(createPr)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('onExhausted is stop')
+})

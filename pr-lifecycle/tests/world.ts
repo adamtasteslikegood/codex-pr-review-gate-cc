@@ -50,6 +50,8 @@ export type World = {
     missingRefs: string[]
     /** Every `git fetch` call's arguments. */
     fetches: string[]
+    /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
+    onFetch?: () => void
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -246,6 +248,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
+      w.git.onFetch?.()
       const fail = (stderr: string) => ({ value: { exitCode: 128, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
       const missing = w.git.missingRefs.find(ref => e.argv.slice(3).includes(ref))
       if (missing !== undefined) return fail(`fatal: couldn't find remote ref ${missing}`)

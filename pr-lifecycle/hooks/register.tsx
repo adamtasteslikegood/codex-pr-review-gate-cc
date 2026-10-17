@@ -475,7 +475,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
   // The base's own settings (R67), from the ref the last fetch left: a create is no reason to fetch.
   const settings = (await configFor($, root, base)).config
-  const allows = (one: LifecycleRecord | undefined): one is LifecycleRecord =>
+  const allows = (one: LifecycleRecord | undefined, s: Config = settings): one is LifecycleRecord =>
     one !== undefined &&
     // A reset record lets nothing through: the lifecycle starts fresh.
     one.phase !== 'archived' &&
@@ -485,7 +485,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     // A pre waiver covers the commit and the base it was given for, whatever round runs against another base since (R1-1).
     ((one.waivers.some(each => each.scope === 'pre' && each.head === head && each.base === base) && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
-      (one.preStatus === 'exhausted' && settings.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
+      (one.preStatus === 'exhausted' && s.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
   if (allows(rec) && rec.preHead === head) return undefined
   if (allows(rec) && rec.preHead !== undefined) {
@@ -507,10 +507,10 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
   }
   // A change Codex is not needed for passes at once: the held call goes straight through.
   const after = await loadRecord($, root, branch)
-  if (allows(after) && after.preHead === head) return undefined
-  // The gate just fetched the record's base: its file is read afresh, in case the record kept another base than the one asked for.
-  const held =
-    after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after, (await configFor($, root, after.base)).config.onExhausted)
+  // One read decides the rest of this create (M2): the record's base, as the gate just fetched it.
+  const fresh = (await configFor($, root, after?.base ?? base)).config
+  if (allows(after, fresh) && after.preHead === head) return undefined
+  const held = after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after, fresh.onExhausted)
   const person = after === undefined ? undefined : prePerson(after)
   if (held !== undefined) {
     // No round started: the PR stays held for a settled reason, and waiting will not change it.
