@@ -106,7 +106,7 @@ rounds, blocking, advisory and rebuttal rounds alike:
 | Tier | Rounds |
 | --- | --- |
 | trivial | 0 |
-| light lane | 1 |
+| light lane | `allowanceLight` (3); a high blast radius takes the full lane |
 | standard | `allowanceStandard` (4) |
 | high | `allowanceHigh` (6) |
 
@@ -253,8 +253,8 @@ overrides; the mod never falls back to HEAD.
 
 All fields are optional. The first five shape post-PR collection (below). The
 rest are round settings, with the same meaning and limits as the plugin
-options of the same name (see Options): `allowanceStandard` is capped at 10
-and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
+options of the same name (see Options): `allowanceStandard` and
+`allowanceLight` are capped at 10 and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
 `lightBranches` and `highRiskPaths` are regular expressions, where `""` (or
 only spaces, as for the plugin options) turns the match off
 (`"lightBranches": ""` turns the light lane off). The models (`runnerModel`,
@@ -556,7 +556,7 @@ not start again for it.
 
 Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
 repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
-`allowanceHigh`, `onExhausted`, `highRiskPaths`, `lightBranches`,
+`allowanceHigh`, `allowanceLight`, `onExhausted`, `highRiskPaths`, `lightBranches`,
 `waitCapMinutes`, `quietMinutes`, the four models and the four efforts (see
 Settings per repository):
 
@@ -564,6 +564,7 @@ Settings per repository):
 | --- | --- | --- |
 | `allowanceStandard` | 4 | rounds for a standard change (capped at 10) |
 | `allowanceHigh` | 6 | rounds for a high blast-radius change (capped at 12) |
+| `allowanceLight` | 3 | rounds for a branch on the light lane (`lightBranches`), unless its blast radius is high (capped at 10) |
 | `bases` | `dev,main` | gated base branches. A base nobody named is the repository's default branch, not the first of these; a REST, GraphQL or MCP create whose base cannot be read is held against the first |
 | `enforce` | true | hold `gh pr create` and the GitHub MCP create-PR tool |
 | `enforceMerge` | true | hold merges until the lifecycle is done |

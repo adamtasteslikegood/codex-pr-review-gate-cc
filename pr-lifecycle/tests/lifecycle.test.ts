@@ -29,7 +29,7 @@ import {
   reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
-const A = { standard: 4, high: 6 }
+const A = { standard: 4, high: 6, light: 3 }
 const fresh = () =>
   newRecord({ root: '/repo', branch: 'feat/x', base: 'dev', head: 'a', tier: 'standard', tierWhy: '10 lines', lane: 'full', allowance: 4, at: 1 })
 
@@ -37,7 +37,9 @@ test('the allowance follows the tier and the lane', async () => {
   expect(allowanceFor('trivial', 'full', A)).toBe(0)
   expect(allowanceFor('standard', 'full', A)).toBe(4)
   expect(allowanceFor('high', 'full', A)).toBe(6)
-  expect(allowanceFor('high', 'light', A)).toBe(1)
+  // The light lane has its own allowance (decision C); a high blast radius never takes it (finding 4).
+  expect(allowanceFor('standard', 'light', A)).toBe(3)
+  expect(allowanceFor('high', 'light', A)).toBe(6)
 })
 
 test('only completed discretionary rounds use the allowance', async () => {

@@ -125,7 +125,7 @@ const modelOf = (value: unknown): { model: string | undefined } | undefined => {
 }
 
 /** The most rounds an allowance may be set to, by the options or by a repository's file. */
-const CAPS = { standard: 10, high: 12 } as const
+const CAPS = { standard: 10, high: 12, light: 10 } as const
 
 /** A whole count of at least 1, or undefined. */
 const countOf = (value: unknown): number | undefined => {
@@ -157,6 +157,7 @@ export function configOf(options: PluginOptions): Config {
     allowances: {
       standard: Math.min(number('allowanceStandard', number('maxRounds', 4)), CAPS.standard),
       high: Math.min(number('allowanceHigh', 6), CAPS.high),
+      light: Math.min(number('allowanceLight', 3), CAPS.light),
     },
     bases: bases.length > 0 ? bases : ['dev', 'main'],
     enforce: options.enforce !== false,
@@ -188,7 +189,7 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
  * the option. A key whose value is invalid is left to the option and named in `ignored`; an empty regular expression turns its
  * match off, and an empty model names none, as the option does.
  */
@@ -207,7 +208,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
     ignored.push(`${key} (${why})`)
     return undefined
   }
-  const count = (key: 'allowanceStandard' | 'allowanceHigh', cap: number): number | undefined => {
+  const count = (key: 'allowanceStandard' | 'allowanceHigh' | 'allowanceLight', cap: number): number | undefined => {
     const value = r[key]
     if (value === undefined) return undefined
     const n = typeof value === 'number' || typeof value === 'string' ? countOf(value) : undefined
@@ -224,6 +225,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   }
   const standard = count('allowanceStandard', CAPS.standard)
   const high = count('allowanceHigh', CAPS.high)
+  const lightRounds = count('allowanceLight', CAPS.light)
   const light = pattern('lightBranches')
   const onExhausted =
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
@@ -250,7 +252,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   return {
     config: {
       ...c,
-      allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high },
+      allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high, light: lightRounds ?? c.allowances.light },
       onExhausted: onExhausted ?? c.onExhausted,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,

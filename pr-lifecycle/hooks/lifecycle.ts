@@ -5,14 +5,17 @@ import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRec
 
 // ----------------------------------------------------------------- budget
 
-export type Allowances = { standard: number; high: number }
+export type Allowances = { standard: number; high: number; light: number }
 
 const TIERS: readonly Tier[] = ['trivial', 'standard', 'high']
 
-/** Discretionary rounds a lifecycle may complete: by tier, one on the light lane, none for a pass-through. */
+/**
+ * Discretionary rounds a lifecycle may complete: by tier, the light lane's own (Adam, decision C), none for a pass-through. A high
+ * blast radius always gets its own allowance: the branch name never lowers it (finding 4).
+ */
 export function allowanceFor(tier: Tier, lane: Lane, a: Allowances): number {
   if (tier === 'trivial') return 0
-  if (lane === 'light') return 1
+  if (lane === 'light' && tier !== 'high') return a.light
   return tier === 'high' ? a.high : a.standard
 }
 

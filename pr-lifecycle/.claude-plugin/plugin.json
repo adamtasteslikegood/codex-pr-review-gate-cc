@@ -20,6 +20,12 @@
       "description": "The same allowance for a high blast-radius change. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 6
     },
+    "allowanceLight": {
+      "type": "number",
+      "title": "Review rounds, light lane",
+      "description": "The same allowance for a branch on the light lane (lightBranches), unless its blast radius is high: then it takes the full lane and allowanceHigh. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": 3
+    },
     "bases": {
       "type": "string",
       "title": "Gated base branches",

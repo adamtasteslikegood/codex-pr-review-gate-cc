@@ -284,9 +284,10 @@ test('a docs-only change passes without Codex, and other bases are not gated', a
   expect((await runOf(w)).lifecycle).toBe('post')
 })
 
-test('a chore/ branch gets one Codex round at low effort; its fix is reviewed after the PR opens', async ($, on) => {
+test('with allowanceLight 1, a chore/ branch gets one Codex round at low effort; its fix is reviewed after the PR opens', async ($, on) => {
   const w = world(on)
   w.git.branch = 'chore/tidy-KAN-9'
+  w.git.roster = '{"allowanceLight":1}'
   await $.tool.call(createPr)
   expect(w.spawned[0]?.prompt).toContain(`args "review --model 'gpt-6-luna' --effort low"`)
   await done($, turn(review('r1-review', 'FAIL', [P1, P2])))
@@ -305,9 +306,10 @@ test('a chore/ branch gets one Codex round at low effort; its fix is reviewed af
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
 })
 
-test('a chore/ branch with only advisories opens the PR without an advisory round', async ($, on) => {
+test('with allowanceLight 1, a chore/ branch with only advisories opens the PR without an advisory round', async ($, on) => {
   const w = world(on)
   w.git.branch = 'chore/tidy-KAN-9'
+  w.git.roster = '{"allowanceLight":1}'
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS', [P2])))
   // The advisory is fixed inside the round; the light lane has no round left for Codex to look again.

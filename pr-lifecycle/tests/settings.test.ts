@@ -16,18 +16,18 @@ const scopeDetail = async (w: World): Promise<string> => (await runOf(w)).steps.
 // ------------------------------------------------------------------ the merge itself
 
 test('each repository key overrides the user option, with the same clamps', async () => {
-  const user = configOf({ allowanceStandard: 5, allowanceHigh: 7, lightBranches: '^chore/', onExhausted: 'stop', highRiskPaths: '^infra/' })
-  const file = JSON.stringify({ allowanceStandard: 2, allowanceHigh: 9, lightBranches: '^feat/', onExhausted: 'open-pr', highRiskPaths: '^src/' })
+  const user = configOf({ allowanceStandard: 5, allowanceHigh: 7, allowanceLight: 4, lightBranches: '^chore/', onExhausted: 'stop', highRiskPaths: '^infra/' })
+  const file = JSON.stringify({ allowanceStandard: 2, allowanceHigh: 9, allowanceLight: 2, lightBranches: '^feat/', onExhausted: 'open-pr', highRiskPaths: '^src/' })
   const { config, ignored } = overrideConfig(user, file)
   expect(ignored).toEqual([])
-  expect(config.allowances).toEqual({ standard: 2, high: 9 })
+  expect(config.allowances).toEqual({ standard: 2, high: 9, light: 2 })
   expect(config.light?.test('feat/x')).toBe(true)
   expect(config.light?.test('chore/x')).toBe(false)
   expect(config.onExhausted).toBe('open-pr')
   expect(config.highRisk?.test('src/app.ts')).toBe(true)
   expect(config.highRisk?.test('infra/main.tf')).toBe(false)
   // Clamped as configOf clamps the options: 10 and 12 at most, whole rounds.
-  expect(overrideConfig(user, '{"allowanceStandard":50,"allowanceHigh":50}').config.allowances).toEqual({ standard: 10, high: 12 })
+  expect(overrideConfig(user, '{"allowanceStandard":50,"allowanceHigh":50,"allowanceLight":50}').config.allowances).toEqual({ standard: 10, high: 12, light: 10 })
   expect(overrideConfig(user, '{"allowanceStandard":3.9}').config.allowances.standard).toBe(3)
   // The other way round: the repository can also hold harder than the person.
   expect(overrideConfig(configOf({}), '{"onExhausted":"stop"}').config.onExhausted).toBe('stop')
@@ -45,7 +45,7 @@ test('an invalid value is ignored and named: that key keeps the user option, the
   const file = JSON.stringify({ allowanceStandard: 'lots', allowanceHigh: 0, lightBranches: '(', onExhausted: 'never', highRiskPaths: 7 })
   const { config, ignored } = overrideConfig(user, file)
   expect(ignored.map(one => one.split(' ')[0])).toEqual(['allowanceStandard', 'allowanceHigh', 'lightBranches', 'onExhausted', 'highRiskPaths'])
-  expect(config.allowances).toEqual({ standard: 5, high: 7 })
+  expect(config.allowances).toEqual({ standard: 5, high: 7, light: 3 })
   expect(config.light?.test('chore/x')).toBe(true)
   expect(config.onExhausted).toBe('stop')
   expect(config.highRisk).toEqual(user.highRisk)
@@ -55,7 +55,7 @@ test('an invalid value is ignored and named: that key keeps the user option, the
   expect(overrideConfig(user, '{"quietMinutes":2,"waitCapMinutes":30}').ignored).toEqual([])
   // One bad key does not cost the good ones.
   const mixed = overrideConfig(user, '{"allowanceStandard":"lots","allowanceHigh":3}')
-  expect(mixed.config.allowances).toEqual({ standard: 5, high: 3 })
+  expect(mixed.config.allowances).toEqual({ standard: 5, high: 3, light: 3 })
   expect(mixed.ignored).toHaveLength(1)
 })
 
@@ -100,7 +100,17 @@ test('lightBranches from the base file puts a branch on the light lane', async (
   w.git.roster = '{"lightBranches":"^feat/"}'
   await $.tool.call(createPr)
   expect(recordOf(w).lane).toBe('light')
-  expect(recordOf(w).allowance).toBe(1)
+  expect(recordOf(w).allowance).toBe(3)
+})
+
+test('a high blast-radius change on a light-lane branch takes the full lane and allowanceHigh (finding 4)', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"lightBranches":"^feat/"}'
+  w.git.numstat = '10\t2\tsrc/auth/login.ts'
+  await $.tool.call(createPr)
+  expect(recordOf(w).tier).toBe('high')
+  expect(recordOf(w).lane).toBe('full')
+  expect(recordOf(w).allowance).toBe(6)
 })
 
 test('an empty lightBranches on the base turns the light lane off for a chore branch', async ($, on) => {

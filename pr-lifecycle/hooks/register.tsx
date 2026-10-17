@@ -250,7 +250,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     landedOn !== undefined
       ? { tier: 'trivial' as const, why: `already reviewed: every commit is on ${landedOn}` }
       : classify(files, lines, settings.highRisk, settled)
-  const lane = settings.light !== undefined && settings.light.test(branch) ? ('light' as const) : ('full' as const)
+  // A high blast radius takes the full lane whatever the branch is called (finding 4).
+  const lane = scope.tier !== 'high' && settings.light !== undefined && settings.light.test(branch) ? ('light' as const) : ('full' as const)
   // Each tier starts at its own effort, as the base's settings say (R69): highEffort, lightEffort on a light-lane branch, else reviewEffort.
   const startEffort: Effort = defaultEffort({ tier: scope.tier, lane }, settings)
   const now = await $.clock.now()
