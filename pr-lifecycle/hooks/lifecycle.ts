@@ -207,7 +207,16 @@ export const RECHECK_WINDOW = 20
  * is not narrowed. A mode-only change touches no line, so it reopens nothing.
  */
 export function changedLines(diff: string): Map<string, [number, number][]> {
+  return readDiff(diff).lines
+}
+
+/** Per file, each hunk's old start, old length and the lines it adds or removes: what shifts the lines below it (R73). */
+export type LineMoves = ReadonlyMap<string, readonly (readonly [number, number, number])[]>
+
+/** `git diff --unified=0` read once: the lines it touched (`changedLines`) and how it moved the lines it did not touch. */
+export function readDiff(diff: string): { lines: Map<string, [number, number][]>; moves: Map<string, [number, number, number][]> } {
   const out = new Map<string, [number, number][]>()
+  const moves = new Map<string, [number, number, number][]>()
   let file: string | undefined
   let from: string | undefined
   // File headers come between `diff --git` and the first hunk: inside a hunk, a removed `-- comment` line reads as `--- comment`.
@@ -238,8 +247,38 @@ export function changedLines(diff: string): Map<string, [number, number][]> {
       return [a, a + Math.max(n, 1) - 1]
     }
     out.get(file)?.push(span(hunk[1], hunk[2]), span(hunk[3], hunk[4]))
+    const oldCount = hunk[2] === undefined ? 1 : Number(hunk[2])
+    const newCount = hunk[4] === undefined ? 1 : Number(hunk[4])
+    moves.set(file, [...(moves.get(file) ?? []), [Number(hunk[1]), oldCount, newCount - oldCount]])
   }
-  return out
+  return { lines: out, moves }
+}
+
+/** Where an old line is after a change: shifted by every hunk wholly above it. An insertion (`-n,0`) comes after line n. */
+export function moveLine(line: number, moves: readonly (readonly [number, number, number])[]): number {
+  return moves.reduce((at, [start, count, delta]) => ((count === 0 ? start < line : start + count - 1 < line) ? at + delta : at), line)
+}
+
+/**
+ * The head moved to `to` (R73): each finding is read against the head its line was last placed at (`lineHead`, else `from`), so
+ * shifts from earlier commits carry over. A change near it reopens it (`invalidate`); otherwise its line moves with the code, and
+ * `lineHead` becomes `to`. A diff git could not give reopens the finding and leaves its line where it was.
+ */
+export function relocate(
+  findings: readonly Finding[],
+  from: string | undefined,
+  to: string,
+  diffs: ReadonlyMap<string, { lines: ChangedLines; moves: LineMoves } | 'all'>,
+): Finding[] {
+  return findings.map(one => {
+    const base = one.lineHead ?? from
+    if (base === to) return one
+    const diff = base === undefined ? 'all' : (diffs.get(base) ?? 'all')
+    if (diff === 'all') return invalidate([one], 'all')[0] ?? one
+    const flagged = invalidate([one], diff.lines)[0] ?? one
+    const line = flagged.line === undefined || flagged.file === undefined ? undefined : moveLine(flagged.line, diff.moves.get(flagged.file) ?? [])
+    return { ...flagged, ...(line === undefined ? {} : { line }), lineHead: to }
+  })
 }
 
 const touches = (one: Finding, changed: ReadonlySet<string> | ChangedLines | 'all'): boolean => {

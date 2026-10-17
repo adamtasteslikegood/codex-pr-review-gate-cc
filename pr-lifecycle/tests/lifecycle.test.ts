@@ -14,7 +14,10 @@ import {
   isDisputed,
   mergeHolds,
   mergeFindings,
+  moveLine,
   newRecord,
+  readDiff,
+  relocate,
   remaining,
   rejections,
   rescope,
@@ -302,6 +305,23 @@ test('R73: only a change near a finding reopens it; one with no line, or a binar
   const anywhere = finding({ id: 'R1-3', line: undefined, status: 'rebutted' })
   const image = finding({ id: 'R1-4', file: 'img.png', line: 3, status: 'rebutted' })
   expect(invalidate([near, far, anywhere, image], lines).map(one => one.needsRecheck === true)).toEqual([true, false, true, true])
+})
+
+test('R73: a finding\'s line moves with the code, so an edit two commits later is still seen', async () => {
+  const hunk = (header: string): string => ['diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', header].join('\n')
+  const fixed = finding({ line: 100, status: 'verified-fixed' })
+  // Commit 1 inserts 50 lines at the top: far from the finding, which moves down to 150.
+  const [first] = relocate([fixed], 'a', 'b', new Map([['a', readDiff(hunk('@@ -0,0 +1,50 @@'))]]))
+  expect(first?.needsRecheck).toBeUndefined()
+  expect(first?.line).toBe(150)
+  expect(first?.lineHead).toBe('b')
+  // Commit 2 edits line 150: read from b, where the line was placed, not from the older head the caller names.
+  const [second] = relocate([first ?? fixed], 'a', 'c', new Map([['b', readDiff(hunk('@@ -150 +150 @@'))]]))
+  expect(second?.needsRecheck).toBe(true)
+  // A diff git could not give reopens it and leaves its line where it was.
+  const [failed] = relocate([fixed], 'a', 'b', new Map([['a', 'all']]))
+  expect([failed?.needsRecheck, failed?.line, failed?.lineHead]).toEqual([true, 100, undefined])
+  expect([moveLine(100, [[10, 5, -5]]), moveLine(100, [[200, 1, 3]]), moveLine(100, [[100, 0, 2]]), moveLine(100, [[99, 0, 2]])]).toEqual([95, 100, 100, 102])
 })
 
 test('a review answer can confirm fixes and hold rebuttals by id', async () => {

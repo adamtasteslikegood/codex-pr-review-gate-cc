@@ -30,6 +30,8 @@ export type Finding = {
   note?: string
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
+  /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
+  lineHead?: string
   history: FindingEvent[]
 }
 

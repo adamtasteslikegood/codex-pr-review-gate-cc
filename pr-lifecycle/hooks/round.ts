@@ -38,9 +38,7 @@ import {
   acceptRebuttal,
   applyAnswer,
   decideNext,
-  invalidate,
   lapseWaivers,
-  changedLines,
   checksOwed,
   isAcceptedRebuttal,
   isBlocking,
@@ -54,7 +52,9 @@ import {
   newRecord,
   nextIds,
   raisedIn,
+  readDiff,
   rejections,
+  relocate,
   roundOf,
   triage,
   unresolvedBlockers,
@@ -517,10 +517,14 @@ export async function headMoved(
   to: string,
   now: number,
 ): Promise<{ findings: Finding[]; waivers: Waiver[] }> {
-  // Only a change near a finding reopens it (R73); git failing reopens everything.
-  const diff = from === undefined ? undefined : await git($, root, ['diff', '--unified=0', '--no-color', '--no-ext-diff', from, to], 60_000)
-  const lines = diff?.isOk === true ? changedLines(diff.out) : ('all' as const)
-  const findings = invalidate(rec.findings, lines)
+  // Only a change near a finding reopens it, read from the head its line was placed at (R73); git failing reopens everything.
+  const bases = new Set(rec.findings.map(one => one.lineHead ?? from ?? to).filter(base => base !== to))
+  const diffs = new Map<string, ReturnType<typeof readDiff> | 'all'>()
+  for (const base of bases) {
+    const diff = await git($, root, ['diff', '--unified=0', '--no-color', '--no-ext-diff', base, to], 60_000)
+    diffs.set(base, diff.isOk ? readDiff(diff.out) : 'all')
+  }
+  const findings = relocate(rec.findings, from, to, diffs)
   return { findings, waivers: await lapsedAt($, { root, waivers: rec.waivers, findings }, to, now) }
 }
 
@@ -531,11 +535,22 @@ export async function headMoved(
 export async function onNewHead($: Engine, run: Run, from: string, to: string, now: number): Promise<void> {
   const live = await getRun($)
   const own = live?.id === run.id ? live.findings : run.findings
-  let flagged = new Set<string>()
-  const flag = (findings: readonly Finding[]): Finding[] => findings.map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one))
+  // Each finding's flag and its line, placed at the new head (R73), go to both copies.
+  let placed = new Map<string, Finding>()
+  const flag = (findings: readonly Finding[]): Finding[] =>
+    findings.map(one => {
+      const at = placed.get(one.id)
+      if (at === undefined) return one
+      return {
+        ...one,
+        ...(at.needsRecheck === true ? { needsRecheck: true } : {}),
+        ...(at.line === undefined ? {} : { line: at.line }),
+        ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+      }
+    })
   const move = async (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Promise<Waiver[]> => {
     const moved = await headMoved($, run.root, { findings: mergeFindings(rec.findings, own), waivers: rec.waivers }, from, to, now)
-    flagged = new Set(moved.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+    placed = new Map(moved.findings.map(one => [one.id, one]))
     return moved.waivers
   }
   // Read and written under the record's lock (R1-6): a waiver the person gives meanwhile is not overwritten.
