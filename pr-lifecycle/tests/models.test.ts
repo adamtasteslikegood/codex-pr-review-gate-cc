@@ -546,6 +546,12 @@ test('I2: an unusable model in the rebuttal check stops it and names the setting
   expect(run.message).toContain('not supported when using Codex')
   const g = recordOf(w).findings.find(f => f.id === 'G2-1')
   expect(g?.history.some(h => h.by === 'codex')).toBe(false)
+  // The stop says to resume: that runs the check again, on the same head.
+  const spawned = w.spawned.length
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(1000)
+  expect(w.spawned.length).toBe(spawned + 1)
+  expect(argsOf(w)).toBe("consult --model 'gpt-6-luna' --effort low")
 })
 
 test('I2: a rebuttal check that ran another model is not accepted', async ($, on) => {
@@ -557,4 +563,26 @@ test('I2: a rebuttal check that ran another model is not accepted', async ($, on
   expect(run.message).toContain('rebuttal check ran gpt-5.6-luna')
   expect(run.message).toContain('codexModel')
   expect(recordOf(w).findings.find(f => f.id === 'G2-1')?.history.some(h => h.by === 'codex')).toBe(false)
+})
+
+test('I2: pre-PR, a blocking rebuttal with no new commit goes to Codex: the next review round consults it on the tier model', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await done($, turn(fixed('r1-fix', 'R1-1').replace('"fixed"', '"rebutted"')))
+  const next = w.spawned.at(-1)
+  expect(next?.description).toBe('pr-lifecycle r2 review')
+  expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort low")
+  expect(next?.prompt).toContain('R1-1')
+  expect(next?.prompt).toContain('consult mode')
+})
+
+test('I3: an unusable model that reports another model stops with gstack\'s repair message', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const note = "HINT: the 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account"
+  await done($, turn(`MODEL_UNUSABLE\n${TRAILER}\n${JSON.stringify({ step: 'r1-review', gate: 'ERROR', error: 'model', note, model: 'gpt-5.6-luna' })}`))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('not supported when using Codex')
 })

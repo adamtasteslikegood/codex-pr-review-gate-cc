@@ -1868,7 +1868,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
   // What each role ran (R69). Another model than the one named is never accepted: the attempt is discarded whole, as a timeout's is.
   const ran: RanModels = Object.fromEntries(results.flatMap(one => (one.result.model === undefined ? [] : [[one.role, one.result.model]])))
   const named = run.codexModel
-  const stray = named === undefined ? undefined : results.find(one => one.result.model !== undefined && one.result.model !== named)
+  // An unusable model's own stop, with gstack's repair message, comes first, as in the rebuttal check.
+  const isUnusable = results.some(one => one.result.failure === 'model')
+  const stray = named === undefined || isUnusable ? undefined : results.find(one => one.result.model !== undefined && one.result.model !== named)
   if (stray !== undefined && named !== undefined) {
     const marked = (await patch($, run.id, one => ({ ...one, ranModels: ran }))) ?? run
     await noteAttempt($, marked, `Codex ${stray.role} ran ${stray.result.model ?? '?'}, not ${named}`)
