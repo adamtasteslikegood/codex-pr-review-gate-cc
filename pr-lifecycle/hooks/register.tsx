@@ -33,6 +33,7 @@ import {
   advance,
   archiveLifecycle,
   closeLifecycle,
+  configFor,
   configOf,
   fetchTwice,
   finish,
@@ -42,6 +43,7 @@ import {
   headMoved,
   heldReason,
   holdingPrompts,
+  ignoredNote,
   isLiveNow,
   isTurnOf,
   markPr,
@@ -116,6 +118,10 @@ const settledRun = (rec: LifecycleRecord, now: number): Run => ({
   findings: rec.findings,
   message: undefined,
 })
+
+/** A repository file's ignored keys (R67), said once in the pane's scope step, where the person sees them. */
+const withScopeNote = (run: Run, note: string): Run =>
+  note === '' ? run : { ...run, steps: run.steps.map(one => (one.id === 'scope' ? { ...one, detail: `${one.detail ?? ''}.${note}` } : one)) }
 
 /** Sends the agent to open the PR, once the person's waiver let the pre-PR gate pass; through the command's prompt queue. */
 const sayOpenPr = ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number, waivedNote?: string): void => {
@@ -231,15 +237,18 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   if (isNotFetched(settled)) return settled.notFetched
   const landedOn = await isAlreadyOnBase($, root, base)
   if (isNotFetched(landedOn)) return landedOn.notFetched
+  // The tier, lane and allowance follow the base's own .github/pr-gate.json, just fetched, never the branch's (R67).
+  const { config: settings, ignored } = await configFor($, root, base)
+  const note = ignored.length === 0 ? '' : ` ${ignoredNote(base, ignored)}`
   const scope =
     landedOn !== undefined
       ? { tier: 'trivial' as const, why: `already reviewed: every commit is on ${landedOn}` }
-      : classify(files, lines, config.highRisk, settled)
-  const lane = config.light !== undefined && config.light.test(branch) ? ('light' as const) : ('full' as const)
+      : classify(files, lines, settings.highRisk, settled)
+  const lane = settings.light !== undefined && settings.light.test(branch) ? ('light' as const) : ('full' as const)
   // High blast radius starts at high; the rest at the configured effort, lower on a light-lane branch.
   const startEffort: Effort = scope.tier === 'high' ? 'high' : lane === 'light' ? config.lightEffort : config.effort
   const now = await $.clock.now()
-  const allowance = allowanceFor(scope.tier, lane, config.allowances)
+  const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
   // run inside it; the controller runs after.
   const { prior, rec, adopted } = await lockRecord(root, branch, async () => {
@@ -264,7 +273,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
               },
               scope.tier,
               scope.why,
-              config.allowances,
+              settings.allowances,
             ),
             effort,
             // A pass-through that now needs Codex is one no longer.
@@ -300,12 +309,12 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     await advance($, root, branch)
     return (
       `PR #${adopted.number} from ${branch} to ${adopted.baseRefName} is already open: adopted into post-PR review, ` +
-      `${remaining(rec)} of ${rec.allowance} review rounds left.`
+      `${remaining(rec)} of ${rec.allowance} review rounds left.${note}`
     )
   }
   if (rec.tier === 'trivial') {
     // A pass-through runs no round: the pane shows it passed, and the held call goes straight through.
-    const shown = passThroughRun(rec, want.cwd ?? root, now)
+    const shown = withScopeNote(passThroughRun(rec, want.cwd ?? root, now), note)
     await update($, runAtom, () => shown)
     setLive(false)
     void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
@@ -315,10 +324,10 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
       await markPr($, 'running', 'handed to the main agent')
       say($, prPrompt(shown, saved, 'passed'))
     }
-    return `Gate passed without Codex: ${scope.why}.`
+    return `Gate passed without Codex: ${scope.why}.${note}`
   }
   await advance($, root, branch, want.isHeldCall !== true)
-  const run = await getRun($)
+  const run = note === '' ? await getRun($) : await patch($, (await getRun($))?.id ?? '', one => withScopeNote(one, note))
   if (run === null || run.status !== 'running') {
     const after = (await loadRecord($, root, branch)) ?? rec
     const said = after.message === undefined ? '' : ` (${after.message})`
@@ -328,13 +337,13 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         ? `the pre-PR gate stands at ${after.preStatus ?? 'not run'}${said}`
         : `the post-PR review of PR #${after.pr ?? '?'} stands at ${after.phase === 'ready' ? 'ready' : (after.postStatus ?? 'in progress')}` +
           `${after.phase === 'ready' ? '' : said}`
-    return `Nothing to review for ${branch} at ${head.slice(0, 7)}: ${stands}, ${remaining(after)} of ${after.allowance} review rounds left.`
+    return `Nothing to review for ${branch} at ${head.slice(0, 7)}: ${stands}, ${remaining(after)} of ${after.allowance} review rounds left.${note}`
   }
   const tierNote = rec.tier === 'high' ? ' Review and challenge run in parallel, and fixes are reviewed before each new round.' : ''
   const lightNote = rec.lane === 'light' ? ` Light lane: ${branch} matches lightBranches.` : ''
   return (
     `Lifecycle ${prior === undefined ? 'started' : 'resumed'} for ${branch} → ${base}: ${rec.tier} blast radius (${rec.tierWhy}), ` +
-    `Codex at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.${tierNote}${lightNote}`
+    `Codex at ${run.effort} effort, ${remaining(rec)} of ${rec.allowance} review rounds left.${tierNote}${lightNote}${note}`
   )
 }
 
@@ -456,6 +465,8 @@ const unknownNote = (action: PrAction): string =>
 const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; branch: string; base: string }): Promise<string | undefined> => {
   const { root, branch, base } = gated
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
+  // The base's own settings (R67), from the ref the last fetch left: a create is no reason to fetch.
+  const settings = (await configFor($, root, base)).config
   const allows = (one: LifecycleRecord | undefined): one is LifecycleRecord =>
     one !== undefined &&
     // A reset record lets nothing through: the lifecycle starts fresh.
@@ -466,14 +477,14 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     // A pre waiver covers the commit and the base it was given for, whatever round runs against another base since (R1-1).
     ((one.waivers.some(each => each.scope === 'pre' && each.head === head && each.base === base) && !hasSecurityBlocker(one)) ||
       (one.preStatus === 'passed' && !hasSecurityBlocker(one)) ||
-      (one.preStatus === 'exhausted' && config.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
+      (one.preStatus === 'exhausted' && settings.onExhausted === 'open-pr' && !hasSecurityBlocker(one)))
   const rec = await loadRecord($, root, branch)
   if (allows(rec) && rec.preHead === head) return undefined
   if (allows(rec) && rec.preHead !== undefined) {
     // Commits since the gate finished: docs alone (a CHANGELOG line) ride on its verdict; code does not.
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
-    if (since.isOk && files.length > 0 && classify(files, 0, config.highRisk).tier === 'trivial') {
+    if (since.isOk && files.length > 0 && classify(files, 0, settings.highRisk).tier === 'trivial') {
       await updateRecord($, root, branch, one => ({ ...one, preHead: head }))
       return undefined
     }
@@ -489,7 +500,9 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
   // A change Codex is not needed for passes at once: the held call goes straight through.
   const after = await loadRecord($, root, branch)
   if (allows(after) && after.preHead === head) return undefined
-  const held = after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after)
+  // The gate just fetched the record's base: its file is read afresh, in case the record kept another base than the one asked for.
+  const held =
+    after === undefined || (await getRun($))?.status === 'running' ? undefined : heldReason(after, (await configFor($, root, after.base)).config.onExhausted)
   const person = after === undefined ? undefined : prePerson(after)
   if (held !== undefined) {
     // No round started: the PR stays held for a settled reason, and waiting will not change it.
@@ -850,6 +863,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (found !== undefined && found.name === undefined) {
       return `/${COMMAND}: gh could not read the repository's default branch (${found.err}), so the waiver has no base to cover. No pre waiver was recorded.`
     }
+    // A record started by the waiver takes its allowance from the base's own settings (R67), read before the lock.
+    const { allowances } = (await configFor($, root, found?.name ?? rec?.base ?? '')).config
     // A waiver covers this commit for the record's base at this moment, and is kept in the record's history.
     const waived = await upsertRecord($, root, branch, one => {
       refusal = refusalOf(one)
@@ -864,7 +879,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
               tier: 'standard',
               tierWhy: 'not scoped: waived before the gate ran',
               lane: 'full',
-              allowance: config.allowances.standard,
+              allowance: allowances.standard,
               at: now,
             })
           : one

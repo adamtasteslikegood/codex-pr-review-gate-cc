@@ -29,8 +29,12 @@ export type World = {
     changed: string
     /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
     isAncestor: boolean
-    /** `.github/pr-gate.json` at HEAD; empty means none. */
+    /** `.github/pr-gate.json` on the base (`git show origin/<base>:...`); empty means none. */
     roster: string
+    /** When set, only `origin/<rosterOn>` has the file: any other base's read fails as a missing path or ref does. */
+    rosterOn?: string
+    /** `.github/pr-gate.json` at the branch's own HEAD; empty means none. The mod must never read it (R67). */
+    headRoster: string
     /** Local branches besides the checked-out one. */
     locals: string[]
     /** The session is outside any checkout: `rev-parse --show-toplevel` fails wherever it runs. */
@@ -125,6 +129,7 @@ export function world(on: On): World {
       changed: 'src/app.ts',
       isAncestor: false,
       roster: '',
+      headRoster: '',
       locals: [],
       isOutside: false,
       fetchFails: 0,
@@ -245,7 +250,12 @@ export function world(on: On): World {
       w.git.fetchFails -= 1
       return fail(w.git.fetchError)
     }
-    if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
+    if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.headRoster, w.git.headRoster === '' ? 128 : 0)
+    const onBase = args.match(/^show origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
+    if (onBase !== undefined) {
+      const has = w.git.roster !== '' && (w.git.rosterOn === undefined || w.git.rosterOn === onBase)
+      return out(has ? w.git.roster : '', has ? 0 : 128)
+    }
     // Outside a checkout (`cd /tmp && ...`), git finds no repository.
     if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out('/repo\n')
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)
