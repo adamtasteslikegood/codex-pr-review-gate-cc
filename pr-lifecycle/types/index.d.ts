@@ -227,6 +227,8 @@ export type Run = {
   hasRefixed: boolean
   /** The fix step was asked once more about findings it left without an answer (it costs no round). */
   hasReprompted?: boolean
+  /** The Codex check gave no verdict on reported fixes and ran once more (R72); a second miss leaves them owed. */
+  hasRetriedCheck?: boolean
   /** What the fix step in flight (or the last one) was sent: blocking findings, or advisories alone. */
   fixKind: 'blocking' | 'advisory'
   steps: Step[]

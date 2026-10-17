@@ -820,6 +820,8 @@ test('another agent pushing during triage makes the PR head the round\'s end hea
   w.gh.prHead = '7'.repeat(40) // pushed by someone else; local HEAD unchanged
   w.git.isAncestor = true
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  // The PR head someone pushed is fetched before its ancestry is read (R71).
+  expect(w.git.fetches).toContain('fetch --quiet origin feat/x')
   // Codex checks the rebuttal on the PR head the round ends on (R72); the clean checkout catches up to it first (R71).
   await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
@@ -3089,4 +3091,28 @@ test('/pr-gate log reads the newest archive once the lifecycle was reset', async
   const out = String((await say($, 'log')).text ?? '')
   expect(out).toContain(': archived.')
   expect(out).toMatch(/Stops: [1-9]/)
+})
+
+test('R72: a check with no verdict on reported fixes runs once more; a second miss leaves them owed, holding nothing', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const empty = () => turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`)
+  const spawned = w.spawned.length
+  await done($, empty())
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, empty())
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('reported-fixed')
+  expect((await recordOf(w)).postStatus).not.toBe('blocked')
+})
+
+test('/pr-gate log counts only the person\'s commands, not an agent\'s refused one', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'waive post because', { ...asPerson, origin: { kind: 'sdk' } })
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain('The person stepped in 0 times.')
 })

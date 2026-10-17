@@ -815,9 +815,10 @@ async function logText($: Engine): Promise<string> {
 const LOGGED = ['resume', 'stop', 'waive', 'allow', 'reset']
 
 /** Logs a person's command and the first line of its reply on the branch's record (`/pr-gate log`). */
-async function logCommand($: Engine, args: string, reply: string): Promise<void> {
+async function logCommand($: Engine, args: string, reply: string, origin: string): Promise<void> {
   const verb = args.trim().split(/\s+/)[0] ?? ''
-  if (!LOGGED.includes(verb)) return
+  // Only the person's own: an agent's run of a person-only command is refused, and is no step of theirs.
+  if (!LOGGED.includes(verb) || (origin !== 'composer' && origin !== 'bridge')) return
   const here = await hereOf($)
   if (here === undefined) return
   const said = reply.split('\n')[0]?.replace(/^\/pr-gate:?\s*/, '') ?? ''
@@ -1137,7 +1138,7 @@ export const register: Register = (on, options) => {
   // Prompts a command decides wait until it has returned: the host refuses a submit while the command holds the turn.
   on('command.run', { command: 'pr-gate' }, async ($, e) => {
     const text = await holdingPrompts($, () => runCommand($, e.args, e.origin.kind))
-    await logCommand($, e.args, text).catch(() => undefined)
+    await logCommand($, e.args, text, e.origin.kind).catch(() => undefined)
     return { text }
   })
 

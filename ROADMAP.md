@@ -48,8 +48,8 @@ routine steps.
    - **No headless takeover:** a headless session (`$.session.surfaces()` is
      empty) never takes over, starts the ticker or sends a prompt.
    - **Takeover after 2 minutes:** another interactive session takes over only
-     when the heartbeat is more than 2 minutes old (decision D). Until then,
-     the pane says who owns the record.
+     when the heartbeat is more than 2 minutes old (decision D). A session
+     that stands down says so in its status line and in the run log.
    - **One owner check:** all three prompt paths (`round.ts:347`, `679`,
      `1143`) go through it.
    - **Verify first:** that the session id stays the same through compaction

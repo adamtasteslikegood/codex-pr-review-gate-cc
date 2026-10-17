@@ -46,7 +46,9 @@ export function withRound(rec: LifecycleRecord, round: RoundRecord): LifecycleRe
 /** A materially wider change: the tier and allowance only go up, and the rounds already run still count. */
 export function rescope(rec: LifecycleRecord, tier: Tier, why: string, a: Allowances): LifecycleRecord {
   if (TIERS.indexOf(tier) <= TIERS.indexOf(rec.tier)) return rec
-  return { ...rec, tier, tierWhy: why, allowance: Math.max(rec.allowance, allowanceFor(tier, rec.lane, a)) }
+  // A high blast radius takes the full lane whatever the branch is called (R75).
+  const lane = tier === 'high' ? 'full' : rec.lane
+  return { ...rec, tier, tierWhy: why, lane, allowance: Math.max(rec.allowance, allowanceFor(tier, lane, a)) }
 }
 
 export function newRecord(init: {
@@ -201,8 +203,8 @@ export type ChangedLines = ReadonlyMap<string, readonly (readonly [number, numbe
 export const RECHECK_WINDOW = 20
 
 /**
- * `git diff --unified=0` as the lines it touched, per file (R73). A file git names but shows no hunk for (a binary, a mode change)
- * gets the whole file: what cannot be read as lines is not narrowed.
+ * `git diff --unified=0` as the lines it touched, per file (R73). A binary file gets the whole file: what cannot be read as lines
+ * is not narrowed. A mode-only change touches no line, so it reopens nothing.
  */
 export function changedLines(diff: string): Map<string, [number, number][]> {
   const out = new Map<string, [number, number][]>()

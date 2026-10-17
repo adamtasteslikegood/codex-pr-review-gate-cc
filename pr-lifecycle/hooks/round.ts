@@ -1361,6 +1361,10 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   if (prHead !== local.out && (await isPushed($, run.root, run.branch, local.out))) {
     await logEvent($, run.root, run.branch, 'head', `gh still reported ${prHead.slice(0, 7)}; origin has the push ${local.out.slice(0, 7)}`)
     prHead = local.out
+  } else if (prHead !== local.out) {
+    // Someone pushed during the answer: fetch the PR head, so the ancestry check and the unpushed list read it (R71). A failed fetch
+    // leaves the check to fail closed.
+    await fetchTwice($, run.root, ['--quiet', 'origin', run.branch], 60_000)
   }
   const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
   if (!isContained) {
@@ -1473,7 +1477,14 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
   // rebuttal or a re-verification, which has no other path, holds the lifecycle for it.
   const mustRule = run.findings.filter(f => (run.rechecks ?? []).includes(f.id) && f.status !== 'reported-fixed')
   if (verdicts.size === 0 && mustRule.length === 0) {
-    await noteAttempt($, run, 'Codex gave no readable verdict on the reported fixes; they stay owed')
+    // Once more at once (R72): an owed fix left after the check would cost a whole round.
+    const owed = checksOwed(run.findings).filter(f => (run.rechecks ?? []).includes(f.id))
+    if (run.hasRetriedCheck !== true && owed.length > 0) {
+      const again = await patch($, run.id, one => ({ ...one, hasRetriedCheck: true }))
+      if (again !== null) await checkRebuttals($, again, owed)
+      return
+    }
+    await noteAttempt($, run, 'Codex gave no readable verdict on the reported fixes, twice; they stay owed')
     await endRound($, run, true)
     return
   }
@@ -1598,6 +1609,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
     phase: 'scope',
     hasRefixed: false,
     hasReprompted: false,
+    hasRetriedCheck: false,
     fixKind: next.isAdvisory ? 'advisory' : 'blocking',
     steps: isOn
       ? existing.steps
@@ -1730,6 +1742,7 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
     phase: 'triage',
     hasRefixed: false,
     hasReprompted: false,
+    hasRetriedCheck: false,
     fixKind: 'blocking',
     steps: [
       { id: 'scope', label: 'Scope & blast radius', state: 'done', detail: `${rec.tier}${rec.lane === 'light' ? ', light lane' : ''}: ${rec.tierWhy}` },

@@ -69,6 +69,13 @@ test('grants from the person add rounds', async () => {
   expect(remaining(rec)).toBe(2)
 })
 
+test('R75: a light-lane lifecycle rescoped to high takes the full lane', async () => {
+  const light = { ...fresh(), lane: 'light' as const, allowance: 3 }
+  const rec = rescope(light, 'high', 'touches auth/', A)
+  expect(rec.lane).toBe('full')
+  expect(rec.allowance).toBe(6)
+})
+
 test('a rescope raises the allowance to the new tier and keeps history; it never lowers it', async () => {
   let rec = withRound(fresh(), roundOf({ n: 1, kind: 'discretionary', isCompleted: true }))
   rec = rescope(rec, 'high', 'touches auth/', A)

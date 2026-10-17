@@ -714,6 +714,8 @@ test('PR12-2: an answer check that moves straight on into another round keeps th
   await w.clock.advance(1000)
   await done($, turn(none))
   expect((await runOf(w)).phase).toBe('verify')
+  // No verdict twice: the check runs once more, then leaves R1-1 owed.
+  await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`))
   await done($, turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`))
   expect(recordOf(w).postStatus).toBe('blocked')
   expect(recordOf(w).effort).toBe('medium')
