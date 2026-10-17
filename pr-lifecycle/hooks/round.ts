@@ -40,6 +40,7 @@ import {
   decideNext,
   invalidate,
   lapseWaivers,
+  changedLines,
   checksOwed,
   isAcceptedRebuttal,
   isBlocking,
@@ -485,7 +486,7 @@ export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'w
 }
 
 /**
- * The head moved from `from` to `to` (R56): each answered finding whose file changed needs a re-check (`invalidate`), and each
+ * The head moved from `from` to `to` (R56): each answered finding a change came near needs a re-check (`invalidate`, R73), and each
  * finding waiver whose finding's file changed since it was given lapses (R55). Git failing flags and lapses everything.
  */
 export async function headMoved(
@@ -496,9 +497,10 @@ export async function headMoved(
   to: string,
   now: number,
 ): Promise<{ findings: Finding[]; waivers: Waiver[] }> {
-  const diff = from === undefined ? undefined : await git($, root, ['diff', '--name-only', from, to])
-  const files = diff?.isOk === true ? new Set(diff.out.split('\n').filter(Boolean)) : ('all' as const)
-  const findings = invalidate(rec.findings, files)
+  // Only a change near a finding reopens it (R73); git failing reopens everything.
+  const diff = from === undefined ? undefined : await git($, root, ['diff', '--unified=0', '--no-color', '--no-ext-diff', from, to], 60_000)
+  const lines = diff?.isOk === true ? changedLines(diff.out) : ('all' as const)
+  const findings = invalidate(rec.findings, lines)
   return { findings, waivers: await lapsedAt($, { root, waivers: rec.waivers, findings }, to, now) }
 }
 

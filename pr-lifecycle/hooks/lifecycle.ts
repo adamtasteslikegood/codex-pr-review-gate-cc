@@ -194,8 +194,63 @@ export function triage(
   return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
 }
 
-const touches = (one: Finding, changedFiles: ReadonlySet<string> | 'all'): boolean =>
-  changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))
+/** The lines a change touched, per file: each hunk's old and new ranges, both, since a finding's line may predate either side. */
+export type ChangedLines = ReadonlyMap<string, readonly (readonly [number, number])[]>
+
+/** How far from a finding's line a change still reopens it (R58, narrowed by R73): lines drift as a file is edited around them. */
+export const RECHECK_WINDOW = 20
+
+/**
+ * `git diff --unified=0` as the lines it touched, per file (R73). A file git names but shows no hunk for (a binary, a mode change)
+ * gets the whole file: what cannot be read as lines is not narrowed.
+ */
+export function changedLines(diff: string): Map<string, [number, number][]> {
+  const out = new Map<string, [number, number][]>()
+  let file: string | undefined
+  let from: string | undefined
+  // File headers come between `diff --git` and the first hunk: inside a hunk, a removed `-- comment` line reads as `--- comment`.
+  let isHeader = false
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      file = undefined
+      from = undefined
+      isHeader = true
+      continue
+    }
+    if (line.startsWith('@@')) isHeader = false
+    if (isHeader && line.startsWith('--- ')) from = line === '--- /dev/null' ? undefined : line.replace(/^--- (a\/)?/, '')
+    if (isHeader && line.startsWith('+++ ')) {
+      file = line === '+++ /dev/null' ? from : line.replace(/^\+\+\+ (b\/)?/, '')
+      if (file !== undefined && !out.has(file)) out.set(file, [])
+      continue
+    }
+    const hunk = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
+    if (hunk === null || file === undefined) {
+      const binary = line.match(/^Binary files (?:a\/)?(\S+) and (?:b\/)?(\S+) differ$/)
+      if (binary !== null) out.set(binary[2] === '/dev/null' ? (binary[1] ?? '') : (binary[2] ?? ''), [[1, Number.MAX_SAFE_INTEGER]])
+      continue
+    }
+    const span = (start: string | undefined, count: string | undefined): [number, number] => {
+      const a = Number(start)
+      const n = count === undefined ? 1 : Number(count)
+      return [a, a + Math.max(n, 1) - 1]
+    }
+    out.get(file)?.push(span(hunk[1], hunk[2]), span(hunk[3], hunk[4]))
+  }
+  return out
+}
+
+const touches = (one: Finding, changed: ReadonlySet<string> | ChangedLines | 'all'): boolean => {
+  if (changed === 'all') return true
+  if (one.file === undefined) return false
+  if (changed instanceof Set) return changed.has(one.file)
+  const ranges = (changed as ChangedLines).get(one.file)
+  if (ranges === undefined) return false
+  // A finding with no line, or a file git showed no hunk for, is reopened by any change to its file (R58).
+  if (one.line === undefined || ranges.length === 0) return true
+  const line = one.line
+  return ranges.some(([a, b]) => a <= line + RECHECK_WINDOW && b >= line - RECHECK_WINDOW)
+}
 
 /**
  * The findings the person waived. A waiver lapses when its finding's file changed after it was given (R50, R55): the lapse is
@@ -310,8 +365,12 @@ export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string |
 export const lastCoveredHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
   rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence.filter(each => each.isComplete)).at(-1)?.head
 
-/** Answered findings whose file changed: their evidence must be checked again. History stays. (A waiver's lapse is `lapseWaivers`.) */
-export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
+/**
+ * Answered findings a change touched: their evidence must be checked again. With line ranges (R73), only a change within
+ * RECHECK_WINDOW lines of the finding counts; with file names, any change to its file. History stays. (A waiver's lapse is
+ * `lapseWaivers`, by file.)
+ */
+export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | ChangedLines | 'all'): Finding[] {
   return findings.map(one => (one.status !== 'open' && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 }
 

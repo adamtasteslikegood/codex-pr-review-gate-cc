@@ -28,6 +28,8 @@ export type World = {
     left: string
     /** `git diff --name-only` between two heads: the files a new commit touched. */
     changed: string
+    /** `git diff --unified=0` between two heads; undefined makes every file in `changed` changed throughout. */
+    hunks?: string
     /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
     isAncestor: boolean
     /** `.github/pr-gate.json` on the base (`git show refs/remotes/origin/<base>:...`); empty means none. */
@@ -296,6 +298,11 @@ export function world(on: On): World {
     if (args.startsWith('rev-list --no-merges')) return out(w.git.left)
     if (args.startsWith('diff --numstat')) return out(w.git.since)
     if (args.startsWith('diff --name-only')) return out(w.git.changed)
+    // Line ranges (R73): each changed file whole, unless a test gives its own hunks.
+    if (args.startsWith('diff --unified=0')) {
+      const whole = w.git.changed.split('\n').filter(Boolean).map(file => `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,100000 +1,100000 @@`)
+      return out(w.git.hunks ?? whole.join('\n'))
+    }
     if (args.startsWith('ls-remote origin')) return out(w.git.remoteHead === undefined ? '' : `${w.git.remoteHead}\trefs/heads/${w.git.branch}\n`)
     if (args.startsWith('log --format=%h by %an')) return out(w.git.unpushed)
     // A fast-forward to a commit the local head is an ancestor of moves the head there.

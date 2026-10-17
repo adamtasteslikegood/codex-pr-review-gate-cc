@@ -5,6 +5,7 @@ import {
   allowanceFor,
   applyAnswer,
   decideNext,
+  changedLines,
   invalidate,
   lastReviewedHead,
   markHeld,
@@ -269,6 +270,31 @@ test('coverage: a change touching a file flags only the answered findings in it'
   // A rebase that lost the reviewed commit: every answered finding is rechecked.
   expect(invalidate(findings, 'all').map(one => one.needsRecheck === true)).toEqual([true, true, false])
   expect(lastReviewedHead({ rounds: [pre({ endHead: 'b' }), pre({ isCompleted: false, endHead: 'z' })] })).toBe('b')
+})
+
+test('R73: only a change near a finding reopens it; one with no line, or a binary file, reopens on any change', async () => {
+  const diff = [
+    'diff --git a/src/app.ts b/src/app.ts',
+    '--- a/src/app.ts',
+    '+++ b/src/app.ts',
+    '@@ -200,3 +200,4 @@ export function far() {',
+    '+  return 1',
+    '--- a removed SQL comment, not a header',
+    'diff --git a/src/new.ts b/src/new.ts',
+    '--- /dev/null',
+    '+++ b/src/new.ts',
+    '@@ -0,0 +1,5 @@',
+    'diff --git a/img.png b/img.png',
+    'Binary files a/img.png and b/img.png differ',
+  ].join('\n')
+  const lines = changedLines(diff)
+  expect(lines.get('src/app.ts')).toEqual([[200, 202], [200, 203]])
+  expect(lines.get('src/new.ts')).toEqual([[0, 0], [1, 5]])
+  const near = finding({ id: 'R1-1', line: 190, status: 'verified-fixed' })
+  const far = finding({ id: 'R1-2', line: 12, status: 'verified-fixed' })
+  const anywhere = finding({ id: 'R1-3', line: undefined, status: 'rebutted' })
+  const image = finding({ id: 'R1-4', file: 'img.png', line: 3, status: 'rebutted' })
+  expect(invalidate([near, far, anywhere, image], lines).map(one => one.needsRecheck === true)).toEqual([true, false, true, true])
 })
 
 test('a review answer can confirm fixes and hold rebuttals by id', async () => {
