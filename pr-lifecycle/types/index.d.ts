@@ -74,6 +74,9 @@ export type LifecyclePhase = 'pre' | 'post' | 'ready' | 'archived'
 /** baseline rounds and the final-head check are free; discretionary ones draw on the allowance. */
 export type RoundKind = 'baseline' | 'discretionary' | 'final-head-check'
 
+/** The Codex model each role reported from gstack's `CODEX_MODEL:` line (R69): the review, the challenge, the rebuttal check. */
+export type RanModels = { review?: string; challenge?: string; verify?: string }
+
 export type Evidence = { source: 'codex' | 'github'; reviewer: string; head: string; isComplete: boolean }
 
 export type RoundRecord = {
@@ -88,6 +91,12 @@ export type RoundRecord = {
   /** The PR base the round reviewed against; a pre-PR round's verdict covers that base only. */
   base?: string
   isCompleted: boolean
+  /** The Codex effort the round, or the attempt, ran at. Absent on a record from before 1.2.0. */
+  effort?: Effort
+  /** The Codex model that reviewed it, from the reviewer's `CODEX_MODEL:` line, else the model the gate named (R69). */
+  codexModel?: string
+  /** Every role's reported model, kept apart when they differ (R69). */
+  ranModels?: RanModels
   evidence: Evidence[]
   raised: { blocking: number; advisory: number }
   rebutted: number
@@ -171,6 +180,15 @@ export type Run = {
   effort: Effort
   /** The effort this branch's tier and lane call for, before any carried or timeout step-down. */
   startEffort?: Effort
+  /**
+   * The effort the branch carries into later runs: the start, lowered only by timeouts. A re-review's capped effort (rereviewEffort)
+   * is this run's alone and never carries. Absent on a run from before 1.2.0, which carries `effort`.
+   */
+  carriedEffort?: Effort
+  /** The Codex model the gate names for this run's tier (codexModel or codexModelHigh, R69); undefined names none, so gstack's own order picks it. */
+  codexModel?: string
+  /** What each role reported running, from its `CODEX_MODEL:` line. A model other than the named one stops the round (R69). */
+  ranModels?: RanModels
   round: number
   status: RunStatus
   phase: 'scope' | 'review' | 'fix' | 'verify' | 'collect' | 'triage' | 'done'

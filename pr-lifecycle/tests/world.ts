@@ -8,7 +8,8 @@ export const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
 export const TRAILER = 'PR_GATE_RESULT'
 
 export type World = {
-  spawned: { prompt: string; description?: string }[]
+  /** Each sub-agent spawned: its prompt, its description, and the Claude model it was given (absent: the session's own). */
+  spawned: { prompt: string; description?: string; model?: string }[]
   prompts: string[]
   opened: string[]
   git: {
@@ -291,7 +292,7 @@ export function world(on: On): World {
     return out('')
   })
   on('agent.spawn', (_$, e) => {
-    w.spawned.push({ prompt: e.prompt, description: e.description })
+    w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })
     return { model: 'test', agentId: `agent-${w.spawned.length}` }
   })
   on('prompt.submit', (_$, e) => {

@@ -1,6 +1,6 @@
 {
   "name": "pr-lifecycle",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "/pr-gate across the PR lifecycle: pre-PR Codex rounds, then the repository's own post-PR reviews, under one review budget and one record, with a live progress pane.",
   "author": {
     "name": "adam schoen"
@@ -78,13 +78,13 @@
     "highRiskPaths": {
       "type": "string",
       "title": "High blast-radius paths",
-      "description": "A regular expression over changed file paths. A match raises the tier to high: Codex challenge mode runs in parallel with the review, Codex starts at high effort, and fixes are reviewed before the next round. A submodule pointer to a commit already on that submodule's origin/main or origin/dev is not counted. A repository's .github/pr-gate.json on the base can set its own.",
+      "description": "A regular expression over changed file paths. A match raises the tier to high: Codex challenge mode runs in parallel with the review, on codexModelHigh at highEffort, and fixes are reviewed before the next round. A submodule pointer to a commit already on that submodule's origin/main or origin/dev is not counted. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "(^|/)(migrations?|auth|security|secrets?)(/|\\.|$)|^server/|^Backend$|^\\.github/workflows/|cloudbuild|Dockerfile|(^|/)(package(-lock)?\\.json|uv\\.lock|pyproject\\.toml)$"
     },
     "reviewEffort": {
       "type": "string",
       "title": "Codex effort, standard changes",
-      "description": "The reasoning effort Codex starts at on a change that is not high blast radius. A high blast-radius change (highRiskPaths, or a large diff) always starts at high. When Codex times out, the round reruns one level lower, down to low; the next run on that branch starts a level below where the timed-out one ended.",
+      "description": "The reasoning effort Codex starts at on a standard change. A high blast-radius change (highRiskPaths, or a large diff) starts at highEffort, a light-lane branch at lightEffort. When Codex times out, the round reruns one level lower, down to low; the next run on that branch starts a level below where the timed-out one ended. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "medium",
       "options": [
         "medium",
@@ -101,13 +101,59 @@
     "lightEffort": {
       "type": "string",
       "title": "Codex effort, light-lane branches",
-      "description": "The effort Codex starts at on a light-lane branch that is not high blast radius. A high blast-radius change still starts at high.",
+      "description": "The effort Codex starts at on a light-lane branch that is not high blast radius. A high blast-radius change starts at highEffort. A repository's .github/pr-gate.json on the base can set its own.",
       "default": "low",
       "options": [
         "low",
         "medium",
         "high"
       ]
+    },
+    "highEffort": {
+      "type": "string",
+      "title": "Codex effort, high blast-radius changes",
+      "description": "The effort Codex starts at on a high blast-radius change (highRiskPaths, or a large diff), light lane or not. A timeout steps it down as for the other tiers. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "medium",
+      "options": [
+        "medium",
+        "low",
+        "high"
+      ]
+    },
+    "rereviewEffort": {
+      "type": "string",
+      "title": "Codex effort, re-reviews",
+      "description": "The effort of every Codex dispatch after the first completed round Codex ran in: later rounds, the consult of earlier rebuttals and fixes, the post-PR rebuttal check, and the post-PR Codex fallback. Never above the tier's starting effort. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "low",
+      "options": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "codexModel": {
+      "type": "string",
+      "title": "Codex model, standard and light-lane changes",
+      "description": "The Codex model the gate names to the gstack /codex skill (--model, GSTACK_CODEX_MODEL) on a change that is not high blast radius. Empty names none, so gstack's own order applies (GSTACK_CODEX_MODEL, then Codex config.toml). Every Codex step uses it, the post-PR rebuttal check included. A model gstack cannot use, or a step that reports another model, stops the round; it never falls back to another. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "gpt-6-luna"
+    },
+    "codexModelHigh": {
+      "type": "string",
+      "title": "Codex model, high blast-radius changes",
+      "description": "The Codex model the gate names on a high blast-radius change. Empty names none, so gstack's own order applies. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "gpt-6-astra"
+    },
+    "runnerModel": {
+      "type": "string",
+      "title": "Claude model, Codex runners",
+      "description": "The Claude model of the sub-agents that run Codex: the review, the challenge and the post-PR rebuttal check. An alias (sonnet, opus, haiku) or a full id; empty inherits the session's model. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "sonnet"
+    },
+    "fixAgentModel": {
+      "type": "string",
+      "title": "Claude model, fixer and fix reviewer",
+      "description": "The Claude model of the fix sub-agent (fixer: subagent) and the sub-agent that reviews a fix. An alias or a full id; empty inherits the session's model. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": "opus"
     },
     "stepTimeoutMinutes": {
       "type": "number",

@@ -43,6 +43,13 @@ const rowsOf = (run: Run | null, rec: LifecycleRecord | undefined): Finding[] =>
 }
 
 /** The status line's color: the run's outcome, or a warning when only a record is left. */
+/** The Codex models a round ran on, as the reviewers reported them (R69), else the one the gate named; with a trailing space. */
+const modelsOf = (run: Run): string => {
+  const ran = [...new Set(Object.values(run.ranModels ?? {}))]
+  const shown = ran.length > 0 ? ran.join('/') : run.codexModel
+  return shown === undefined ? '' : `${shown} `
+}
+
 const colorOf = (run: Run | null): 'success' | 'claude' | 'warning' | 'error' => {
   if (run === null || run.status === 'waived') return 'warning'
   return run.status === 'passed' ? 'success' : run.status === 'running' ? 'claude' : 'error'
@@ -146,7 +153,9 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
       {run !== null && (
         <Text dimColor wrap="truncate-end">
           round {run.round}
-          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex {run.effort} ·{' '}
+          {run.fixKind === 'advisory' ? ' · advisories' : ''} · {run.tier} blast radius{run.lane === 'light' ? ' · light lane' : ''} · codex{' '}
+          {modelsOf(run)}
+          {run.effort} ·{' '}
           {elapsed((run.endedAt ?? now) - run.startedAt)}
         </Text>
       )}

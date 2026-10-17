@@ -47,8 +47,11 @@ export function readTrailer(answer: string): Record<string, unknown> | undefined
 
 export type ReviewGate = 'PASS' | 'FAIL' | 'UNVERIFIED' | 'ERROR'
 
-/** Why a review did not complete; only a timeout is worth a rerun at lower effort. */
-export type ReviewFailure = 'timeout' | 'other'
+/**
+ * Why a review did not complete; only a timeout is worth a rerun at lower effort. model: gstack stopped because the Codex model is
+ * invalid or the account cannot use it (R69), which no rerun and no other model fixes: the setting does.
+ */
+export type ReviewFailure = 'timeout' | 'model' | 'other'
 
 export type ReviewResult = {
   gate: ReviewGate
@@ -65,14 +68,31 @@ export type ReviewResult = {
   verified: string[]
   /** Ids whose rebuttal or fix the reviewer did not accept. */
   held: string[]
+  /** The Codex model that ran, from the reviewer's trailer or the skill's `CODEX_MODEL:` line (R69). */
+  model?: string
 }
 
 const TIMEOUT_WORDS = /\btim(e|ed|ing)[\s-]?out\b|\bstall(ed)?\b|exit(ed)?( code)? 124\b/i
 
-/** The failure kind a reviewer reported, or read from its note when it named none. */
-function failureOf(said: unknown, note: string | undefined): ReviewFailure {
+/**
+ * gstack's markers for a Codex model that is invalid or that the account cannot use (SKILL.md: MODEL_UNUSABLE, and the "Model not
+ * supported (HTTP 400 or 404)" errors). MODEL_QUOTA_EXHAUSTED and "requires a newer version of Codex" are not the model's fault.
+ */
+const MODEL_WORDS = /\bMODEL_UNUSABLE\b|\bmodel\b[^\n]*\b(is not supported when using Codex|does not exist or you do not have access)\b/i
+
+/** What a step said before its trailer: gstack's markers are read there, never in findings or verdicts that quote them. */
+const proseOf = (answer: string): string => {
+  const at = answer.lastIndexOf(TRAILER)
+  return at < 0 ? answer : answer.slice(0, at)
+}
+
+/** The failure kind a reviewer reported, or read from what it said when it named none or only `other` (R69). */
+function failureOf(said: unknown, note: string | undefined, answer = ''): ReviewFailure {
   const kind = String(said ?? '').toLowerCase()
   if (kind === 'timeout') return 'timeout'
+  if (kind === 'model') return 'model'
+  // An unusable model is caught from gstack's own words, so the stop still names the setting when the reviewer called it other.
+  if ((kind === '' || kind === 'other') && MODEL_WORDS.test(`${note ?? ''}\n${answer}`)) return 'model'
   if (kind !== '') return 'other'
   return note !== undefined && TIMEOUT_WORDS.test(note) ? 'timeout' : 'other'
 }
@@ -88,6 +108,15 @@ export const lowerOf = (a: Effort, b: Effort): Effort => (EFFORTS.indexOf(a) >= 
 const text = (value: unknown): string | undefined =>
   typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
 
+/** A Claude or Codex model: a short alias or id. Nothing else reaches a prompt, a shell prefix, a spawn or a record (R68, R69). */
+export const isModelId = (said: string): boolean => said.length <= 100 && /^[a-z0-9][a-z0-9.-]*$/i.test(said)
+
+/** A model id as a reviewer reported it: the trailer's `model`, else gstack's `CODEX_MODEL:` line; anything not an id is dropped. */
+function modelIn(said: unknown, answer: string): string | undefined {
+  const named = text(said) ?? answer.match(/^\s*CODEX_MODEL:\s*(\S+)/m)?.[1]
+  return named !== undefined && isModelId(named) ? named : undefined
+}
+
 /**
  * A reviewer's answer as a gate verdict. Fails closed: an answer with no
  * readable verdict, or a FAIL that names no blocking finding, is an ERROR,
@@ -95,12 +124,21 @@ const text = (value: unknown): string | undefined =>
  */
 export function readReview(answer: string): ReviewResult {
   const trailer = readTrailer(answer)
+  const model = modelIn(trailer?.model, answer)
+  const ran = model === undefined ? {} : { model }
   if (trailer === undefined) {
     const said = answer.match(/\bGATE:\s*(PASS|FAIL|UNVERIFIED)\b/)?.[1]
-    if (said === 'PASS' || said === 'UNVERIFIED') return { gate: said, findings: [], verified: [], held: [] }
+    if (said === 'PASS' || said === 'UNVERIFIED') return { gate: said, findings: [], verified: [], held: [], ...ran }
+    const failure = failureOf(undefined, answer)
+    // gstack's repair lines are what the person needs from an unusable model, not "no verdict".
+    const repair = answer.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
     const note =
-      said === 'FAIL' ? 'The reviewer reported GATE: FAIL without listing its findings.' : 'The reviewer ended without a verdict.'
-    return { gate: 'ERROR', findings: [], note, failure: failureOf(undefined, answer), verified: [], held: [] }
+      failure === 'model' && repair !== ''
+        ? repair.slice(0, 1000)
+        : said === 'FAIL'
+          ? 'The reviewer reported GATE: FAIL without listing its findings.'
+          : 'The reviewer ended without a verdict.'
+    return { gate: 'ERROR', findings: [], note, failure, verified: [], held: [], ...ran }
   }
   const gate = String(trailer.gate ?? '').toUpperCase()
   const listed = Array.isArray(trailer.findings) ? trailer.findings : []
@@ -124,7 +162,8 @@ export function readReview(answer: string): ReviewResult {
   const verified = idList(trailer.verified)
   const held = idList(trailer.held)
   if (gate !== 'PASS' && gate !== 'FAIL' && gate !== 'UNVERIFIED') {
-    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure: failureOf(trailer.error, note ?? answer), verified, held }
+    const failure = failureOf(trailer.error, note ?? proseOf(answer), proseOf(answer))
+    return { gate: 'ERROR', findings, note: note ?? 'The review did not complete.', failure, verified, held, ...ran }
   }
   const hasBlocking = findings.some(isBlocking)
   if (gate === 'FAIL' && !hasBlocking) {
@@ -135,10 +174,11 @@ export function readReview(answer: string): ReviewResult {
       failure: 'other',
       verified,
       held,
+      ...ran,
     }
   }
   // A blocking finding outranks whatever word the agent put on the gate.
-  return { gate: hasBlocking ? 'FAIL' : gate, findings, note, verified, held }
+  return { gate: hasBlocking ? 'FAIL' : gate, findings, note, verified, held, ...ran }
 }
 
 export type TriageAnswer = Answer & { replyId?: string; duplicateOf?: string }
@@ -197,6 +237,23 @@ export type Verdict = { holds: boolean; note?: string }
  * Codex's rebuttal check, one verdict per finding id (R41). An entry without an id or a boolean `holds` is dropped, so that id
  * stays unruled. A note that repeats the id in front ("G2-1: ...") is stored without it (R44).
  */
+/** The rebuttal check's own run (R69): the Codex model it reported, and a model failure with gstack's repair message. */
+export function readCheck(answer: string): { model?: string; failure?: ReviewFailure; note?: string } {
+  const trailer = readTrailer(answer)
+  const model = modelIn(trailer?.model, answer)
+  const note = text(trailer?.note)
+  // A check that ruled is no failure, whatever its notes quote; one that did not is read from its own words, never the trailer's.
+  const isRuled = Array.isArray(trailer?.verdicts) && trailer.verdicts.length > 0 && text(trailer.error) === undefined
+  if (isRuled) return model === undefined ? {} : { model }
+  const said = proseOf(answer)
+  const failure = failureOf(trailer?.error, note, said)
+  const repair = said.split('\n').filter(line => MODEL_WORDS.test(line) || /^\s*(HINT|Repair)\b/i.test(line)).join(' ').trim()
+  return {
+    ...(model === undefined ? {} : { model }),
+    ...(failure === 'model' ? { failure, note: (note ?? (repair === '' ? undefined : repair))?.slice(0, 1000) } : {}),
+  }
+}
+
 export function readVerdicts(answer: string): Map<string, Verdict> {
   const out = new Map<string, Verdict>()
   const listed = readTrailer(answer)?.verdicts
@@ -366,6 +423,27 @@ export function priorRounds(findings: readonly Finding[], files?: ReadonlySet<st
   return all.length === 0 ? '' : listFindings(all)
 }
 
+/** The Codex model and effort as gstack's skill args and dispatch prefix (R69); a run that names no model leaves it to gstack's order. */
+function codexArgs(run: Run): { model: string | undefined; flags: string; prefix: string } {
+  const model = run.codexModel
+  const flags = model === undefined ? `--effort ${run.effort}` : `--model '${model}' --effort ${run.effort}`
+  const prefix = model === undefined ? `GSTACK_CODEX_EFFORT=${run.effort}` : `GSTACK_CODEX_MODEL=${model} GSTACK_CODEX_EFFORT=${run.effort}`
+  return { model, flags, prefix }
+}
+
+/** The effort, model and model-failure rules every Codex step carries, the review's and the rebuttal check's alike (R69). */
+function codexRules(run: Run, onModel: string): string[] {
+  const { model, prefix } = codexArgs(run)
+  return [
+    `   Reasoning effort is ${run.effort} for every Codex dispatch in this step, consult included. Never pass --xhigh or a higher --effort, and prefix each Codex dispatch with ${prefix} so no setting raises it: higher efforts time out here.`,
+    model === undefined
+      ? '   No Codex model is named here: gstack picks it in its own order (GSTACK_CODEX_MODEL, then Codex config.toml).'
+      : `   The Codex model is ${model} for every Codex dispatch in this step, consult included: pass --model '${model}' wherever the skill says to name a model (its select-model, probe-model and role-ready calls). Never switch to another model.`,
+    `   If the skill stops because the model is invalid or the account cannot use it (MODEL_UNUSABLE, a model not supported, or one that does not exist or you have no access to), do not retry with any other model: ${onModel}, and note is gstack's repair message, word for word.`,
+    '   Report the model from the CODEX_MODEL: line the skill prints as model.',
+  ]
+}
+
 export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: readonly Finding[]): string {
   // A run started before effort was tracked (a reload mid-run) keeps the old ceiling.
   run = { ...run, effort: (run.effort as Effort | undefined) ?? 'high' }
@@ -373,24 +451,25 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
     role === 'review'
       ? 'Review mode (Step 2A), including the gate verdict it computes'
       : 'Challenge mode (Step 2B)'
+  const { model, flags, prefix } = codexArgs(run)
   const lines = [
     `You are the Codex ${role} step of /pr-gate (pr-lifecycle). Round ${run.round}, ${run.lifecycle === 'pre' ? 'before the pull request opens' : 'after it opened'}.`,
     where(run),
     '',
-    `1. Invoke the Skill tool with skill "codex" and args "${role} --effort ${run.effort}", and follow that skill's instructions exactly as written: its preamble, its probes, and its ${mode}.`,
+    `1. Invoke the Skill tool with skill "codex" and args "${role} ${flags}", and follow that skill's instructions exactly as written: its preamble, its probes, and its ${mode}.`,
     `   The base is ${run.diffBase}: use it wherever the skill says <base>, whatever its own base detection prints.`,
-    `   Reasoning effort is ${run.effort} for every Codex dispatch in this step, consult included. Never pass --xhigh or a higher --effort, and prefix each Codex dispatch with GSTACK_CODEX_EFFORT=${run.effort} so no setting raises it: higher efforts time out here.`,
+    ...codexRules(run, 'gate is ERROR, error is model'),
     '2. You are read-only. Do not edit files, do not fix anything, do not commit, push or open a pull request.',
     '3. Do not ask the user anything: nobody is watching this step. Where the skill would ask, take its documented default and say so.',
   ]
   if (role === 'review') {
     lines.push(
       "4. Report every finding Codex tagged [P0] to [P3], with Codex's own severity and title. Do not downgrade, merge or drop a finding.",
-      "   gate is the skill's verdict: PASS, FAIL or UNVERIFIED. If Codex did not complete (non-zero exit, timeout, empty output, auth), gate is ERROR, error is timeout when Codex timed out or stalled and other otherwise, and note says why.",
+      "   gate is the skill's verdict: PASS, FAIL or UNVERIFIED. If Codex did not complete (non-zero exit, timeout, empty output, auth), gate is ERROR, error is timeout when Codex timed out or stalled, model when its model is unusable (above), and other otherwise, and note says why.",
     )
   } else {
     lines.push(
-      '4. Challenge mode output carries no severity tags. Read the code for each problem Codex raised, then report it as P1 only when it is a concrete, reachable failure or security hole in code this branch changes; report the rest as P2. gate is FAIL when any P1 stands, else PASS. If Codex did not complete, gate is ERROR, and error is timeout when Codex timed out or stalled, other otherwise.',
+      '4. Challenge mode output carries no severity tags. Read the code for each problem Codex raised, then report it as P1 only when it is a concrete, reachable failure or security hole in code this branch changes; report the rest as P2. gate is FAIL when any P1 stands, else PASS. If Codex did not complete, gate is ERROR, and error is timeout when Codex timed out or stalled, model when its model is unusable (above), other otherwise.',
     )
   }
   // After the PR opens, a dispute or a deferral is the person's (R40, R45): Codex is not asked about it again.
@@ -407,7 +486,7 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
     '',
     trailerRule(
       stepOf(run, role),
-      '{"gate":"PASS|FAIL|UNVERIFIED|ERROR","findings":[{"severity":"P1","title":"...","file":"path","line":1,"detail":"one or two sentences"}],"error":"only with ERROR: timeout|other","note":"optional","verified":["R1-1"],"held":["R1-2"]}',
+      '{"gate":"PASS|FAIL|UNVERIFIED|ERROR","findings":[{"severity":"P1","title":"...","file":"path","line":1,"detail":"one or two sentences"}],"error":"only with ERROR: timeout|model|other","note":"optional","verified":["R1-1"],"held":["R1-2"],"model":"the model on the CODEX_MODEL: line"}',
     ),
   )
   return noted(lines.join('\n'))
@@ -497,13 +576,22 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
       '',
-      'For each one: read the code at HEAD and decide whether the rebuttal, or the fix, still holds. Give one verdict per finding id, each on its own:',
-      'holds is true when it holds, false when it does not, with a note saying why it fails. Leave out no id.',
-      'You are read-only: do not edit, commit or push.',
+      // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
+      `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: ` +
+        'its preamble, its probes and its consult mode.',
+      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, or the fix), and ask Codex to read the code at HEAD ' +
+        'and rule on each one: does the rebuttal, or the fix, still hold?',
+      ...codexRules(run, 'give no verdicts, error is model'),
+      "2. Report Codex's ruling, not your own: one verdict per finding id, each on its own. holds is true when Codex says it holds, " +
+        'false when it does not, with a note saying why it fails. Leave out no id.',
+      '   If Codex did not complete (non-zero exit, timeout, empty output, auth), give no verdicts: error is timeout when it timed out or stalled, ' +
+        'model when its model is unusable (above), other otherwise, and note says why.',
+      '3. You are read-only: do not edit, commit or push. Do not ask the user anything: nobody is watching this step.',
       '',
       trailerRule(
         stepOf(run, 'verify'),
-        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true|false,"note":"when holds is false: why"}`).join(',')}]}`,
+        `{"verdicts":[${rebuttals.map(one => `{"id":"${one.id}","holds":true|false,"note":"when holds is false: why"}`).join(',')}],` +
+          '"error":"only when Codex did not complete: timeout|model|other","note":"optional","model":"the model on the CODEX_MODEL: line"}',
       ),
     ].join('\n'))
   }

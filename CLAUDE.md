@@ -19,13 +19,15 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.1.0** is **not loaded** (1.0.0 merged in PR #1).
+- `pr-lifecycle/` **1.2.0** is **not loaded** (1.0.0 merged in PR #1).
   It extends `/pr-gate` across pre-PR and post-PR review and implements
-  [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). Per-repo settings live in
-  `.github/pr-gate.json`, read from the base branch, never the PR's HEAD:
+  [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). The Claude model of each sub-agent
+  and the Codex model and effort per tier are settings (#10, #11; R68–R70).
+  Per-repo settings live in `.github/pr-gate.json`, read from the base
+  branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
   - Every ruling made while building it, R1–R66, Adam's rulings on
-    codex-gate's deferred items R1-5 to R1-10, and R67 after 1.0.0:
+    codex-gate's deferred items R1-5 to R1-10, and R67–R70 after 1.0.0:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
@@ -65,6 +67,15 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 - **Codex's GitHub connector** (`chatgpt-codex-connector`) reviews PRs when
   they open, but only while the Codex account's usage limit allows. When it
   can't, the PR goes ahead without its review if Adam says so.
+- **A scheduled ChatGPT reviewer task** reviews PRs and posts its review
+  and inline comments **as Adam's account** (`adamtasteslikegood`). A PR
+  comment asking for a review triggers it (first used on PR #12); whether a
+  new commit does is not yet confirmed. It does not depend on the Codex
+  connector's usage limit. pr-lifecycle uses the same `gh` login, so it reads
+  the task's findings but never counts them as review coverage of a head
+  (`fetchFeedback`, `cover`): the Codex fallback still runs, and listing
+  that login under `reviewers` would make every round wait for
+  `waitCapMinutes`. Read its review before merging.
 
 ## Code style
 
@@ -80,7 +91,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 332)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 389)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four
