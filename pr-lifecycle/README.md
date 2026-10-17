@@ -255,7 +255,7 @@ only spaces, as for the plugin options) turns the match off
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
-- **An invalid value** (a count or a wait in minutes below 1, an unknown
+- **An invalid value** (a count or a wait in minutes below 1 (a wait over a day is capped at 1,440), an unknown
   `onExhausted`, a regular expression that does not compile) is ignored, so that key falls back to the
   plugin option; the others still apply. The gate says which keys it ignored,
   once, in the pane's scope step and in the start message. A file that is not
