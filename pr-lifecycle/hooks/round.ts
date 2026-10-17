@@ -1130,7 +1130,7 @@ async function failPost($: Engine, run: Run, why: string): Promise<void> {
  * Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier
  * rounds (R32) go to the main agent in one turn. Nothing to answer and no unreviewed commits end the round clean (R3).
  */
-async function beginTriage($: Engine, id: string): Promise<void> {
+async function beginTriage($: Engine, id: string, isFromCommand = false): Promise<void> {
   const now = await $.clock.now()
   const run = await getRun($)
   if (run === null || run.id !== id || run.status !== 'running') return
@@ -1268,7 +1268,34 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   if (opened === null) return
   $.ui.status(`pr-gate r${opened.round}: answering the reviews`)
   const codexRange = `${opened.diffBase.slice(0, 7)}..${opened.headSha.slice(0, 7)}`
-  await askTriage($, id, triagePrompt(opened, rec, listed, others, { carried, codex, codexRange }))
+  const text = triagePrompt(opened, rec, listed, others, { carried, codex, codexRange })
+  // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
+  if (isFromCommand) await patch($, id, one => ({ ...one, outbox: text }))
+  else await askTriage($, id, text)
+}
+
+/**
+ * Review feedback on the PR that no round has triaged: a trusted reviewer, never waited for (R76), can post after the lifecycle
+ * was ready. undefined when GitHub could not be read.
+ */
+export async function untriagedFeedback($: Engine, rec: LifecycleRecord): Promise<Feedback[] | undefined> {
+  const got = await fetchFeedback($, rec)
+  if (!got.isOk) return undefined
+  const known = new Set(rec.findings.flatMap(one => (one.externalId === undefined ? [] : [one.externalId])))
+  return got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !known.has(one.id))
+}
+
+/** Triages feedback that arrived after the lifecycle was ready, on the same head, as an answer run: no round, no allowance (R76). */
+async function startLateTriage($: Engine, rec: LifecycleRecord): Promise<void> {
+  const now = await $.clock.now()
+  const run = answerRun(rec, [], now, (await configFor($, rec.root, rec.base)).config)
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  await logEvent($, rec.root, rec.branch, 'head', `review feedback arrived after ready at ${rec.head.slice(0, 7)}: triaged on the same head`)
+  await beginTriage($, run.id, true)
 }
 
 /**
@@ -1974,6 +2001,12 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   if (next.kind === 'ready') {
+    // A resume of a ready lifecycle reads GitHub again: feedback that arrived since is triaged before it is ready again (R76).
+    const late = isResume && id === undefined ? await untriagedFeedback($, rec) : undefined
+    if (late !== undefined && late.length > 0) {
+      await startLateTriage($, rec)
+      return
+    }
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
     if (isStale) return advance($, root, branch, isResume)
     const at = (saved ?? rec).head.slice(0, 7)

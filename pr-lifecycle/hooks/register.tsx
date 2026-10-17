@@ -62,6 +62,7 @@ import {
   setSession,
   setup,
   startTicker,
+  untriagedFeedback,
 } from './round'
 import type { Config } from './round'
 import { renderPane } from './pane'
@@ -704,6 +705,23 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
   if (rec !== undefined && rec.phase === 'ready' && isOnBase && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) {
+    // A trusted reviewer is never waited for (R76): what it posted after ready is triaged before the merge, never merged past.
+    const late = await untriagedFeedback($, rec)
+    if (late === undefined) {
+      return [
+        `pr-gate: ${action.via} is held: gh could not read PR #${pr.number}'s reviews, so the guard cannot tell whether any arrived ` +
+          'after the lifecycle review completed.',
+        'Do not merge another way. Check gh auth status and the network, then try the merge again.',
+      ].join('\n')
+    }
+    if (late.length > 0) {
+      const who = [...new Set(late.map(one => one.reviewer))].join(', ')
+      return [
+        `pr-gate: ${action.via} is held: ${late.length} review comment${late.length === 1 ? '' : 's'} from ${who} arrived after the lifecycle ` +
+          `review completed at ${rec.head.slice(0, 7)}, and no round has triaged ${late.length === 1 ? 'it' : 'them'}.`,
+        `Your next step: run /${COMMAND} resume, which triages ${late.length === 1 ? 'it' : 'them'} on this head and uses no review round. Then try the merge again.`,
+      ].join('\n')
+    }
     return ciHold($, root, action, pr)
   }
   const short = pr.headRefOid.slice(0, 7)

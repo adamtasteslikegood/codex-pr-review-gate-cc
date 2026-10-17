@@ -2816,6 +2816,24 @@ test('R1-9: a ready PR with failing CI is held, the checks are named, and no wai
   expect(w.gh.calls.some(one => one.startsWith('pr checks 1'))).toBe(true)
 })
 
+test('R76: a trusted reviewer\'s P1 posted after ready holds the merge until a resume has triaged it, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
+  await toReady($, w)
+  const rounds = (await recordOf(w)).rounds.length
+  // The trusted bot, never waited for, posts once the lifecycle is ready.
+  w.gh.comments = [inline(21, '**P1** SQL injection', w.gh.prHead)]
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('1 review comment from claude[bot] arrived after the lifecycle review completed')
+  expect(held).toContain('/pr-gate resume')
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('SQL injection')
+  expect((await runOf(w)).phase).toBe('triage')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  expect((await recordOf(w)).rounds.length).toBe(rounds)
+})
+
 test('R1-9: a ready PR with CI still running is held', async ($, on) => {
   const w = world(on)
   await toReady($, w)
