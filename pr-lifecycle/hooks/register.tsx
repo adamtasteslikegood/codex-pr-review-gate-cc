@@ -666,11 +666,17 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a red check.
   if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
-  if (rec !== undefined && rec.phase === 'ready' && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) return ciHold($, root, action, pr)
+  // Ready means ready for the base it was reviewed against: a PR retargeted since holds (its base's settings and roster were not applied).
+  const isOnBase = rec !== undefined && rec.base === pr.baseRefName
+  if (rec !== undefined && rec.phase === 'ready' && isOnBase && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) {
+    return ciHold($, root, action, pr)
+  }
   const short = pr.headRefOid.slice(0, 7)
   const missing =
     rec === undefined
       ? 'no lifecycle record for this branch'
+      : !isOnBase
+        ? `it was reviewed for ${rec.base}, but PR #${pr.number} now targets ${pr.baseRefName}`
       : rec.phase === 'ready' && rec.head !== pr.headRefOid
         ? `${short} was pushed after the review completed at ${rec.head.slice(0, 7)}`
         : owedOf(rec)
@@ -680,6 +686,9 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   const next =
     rec === undefined
       ? `Your next step: check out ${pr.headRefName} and run /${COMMAND}, which adopts the open PR into post-PR review; merging is held until it is complete.`
+      : !isOnBase
+        ? `This needs the person's decision: tell them the PR was retargeted after its review. They can point it back at ${rec.base}, ` +
+          `or type /${COMMAND} reset to review it again for ${pr.baseRefName}.`
       : isRunning
         ? `End your turn: /${COMMAND} collects the reviews itself, sends you what needs an answer, and says when the PR is ready for the merge decision.`
         : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'

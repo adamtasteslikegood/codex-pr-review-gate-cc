@@ -358,6 +358,20 @@ test('a ready lifecycle lets its own head merge; a later push holds it again', a
   expect(held.deny?.startsWith('/')).toBe(false)
 })
 
+test('a PR ready for dev and retargeted to main is held: its review was for dev', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  await w.clock.advance(20 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  w.gh.base = 'main'
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('reviewed for dev, but PR #1 now targets main')
+  expect(held.deny).toContain('/pr-gate reset')
+})
+
 test('a merge gh cannot resolve is held, and the agent is told what to check', async ($, on) => {
   const w = world(on)
   w.gh.isAuthed = false
