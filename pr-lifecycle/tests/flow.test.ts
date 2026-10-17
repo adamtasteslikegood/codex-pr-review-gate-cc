@@ -1398,6 +1398,18 @@ test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
   ])
 })
 
+test('gate R4-1: a post waiver given while the PR targeted dev does not release a merge after it is retargeted to main', async ($, on) => {
+  const w = world(on)
+  await say($, 'waive pre hotfix for the outage')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  await say($, 'waive post reviewed by hand')
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  w.gh.base = 'main'
+  const held = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('reviewed for dev, but PR #1 now targets main')
+})
+
 test('only the person waives, allows or resets', async ($, on) => {
   world(on)
   for (const args of ['waive pre x', 'waive post x', 'allow 1 x', 'reset']) {

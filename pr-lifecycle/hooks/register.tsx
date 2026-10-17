@@ -509,7 +509,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     // Commits since the gate finished: docs alone (a CHANGELOG line) ride on its verdict; code does not.
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
-    if (since.isOk && files.length > 0 && classify(files, 0, settings.highRisk).tier === 'trivial') {
+    if (since.isOk && files.length > 0 && classify(files, 0, now.highRisk).tier === 'trivial') {
       await updateRecord($, root, branch, one => ({ ...one, preHead: head }))
       return undefined
     }
@@ -675,12 +675,13 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // No record and no such branch here: a PR from a branch not checked out here is not this gate's to review.
   if (rec === undefined && !(await git($, root, ['rev-parse', '--verify', '--quiet', `refs/heads/${pr.headRefName}`])).isOk) return undefined
   // The person's post waiver for this head, unless a security P1 holds: only a waiver naming it releases that (spec §3).
-  const isWaived = rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
+  // Ready, or waived, means for the base it was reviewed against: a PR retargeted since holds (its base's settings and roster were
+  // not applied; gate R2-3, R4-1).
+  const isOnBase = rec !== undefined && rec.base === pr.baseRefName
+  const isWaived = isOnBase && rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
   // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a red check.
   if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
-  // Ready means ready for the base it was reviewed against: a PR retargeted since holds (its base's settings and roster were not applied).
-  const isOnBase = rec !== undefined && rec.base === pr.baseRefName
   if (rec !== undefined && rec.phase === 'ready' && isOnBase && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) {
     return ciHold($, root, action, pr)
   }
