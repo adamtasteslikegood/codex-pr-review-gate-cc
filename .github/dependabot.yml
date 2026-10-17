@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-dependencies:
+        dependency-type: development
+        patterns:
+          - '*'
+    ignore:
+      # typescript-eslint pins TypeScript below 6.1; a major bump would fail npm ci on the peer range.
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

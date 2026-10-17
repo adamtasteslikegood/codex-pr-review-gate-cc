@@ -1,0 +1,4 @@
+node_modules/
+.superpowers/
+.gstack/tmp/
+**/.claude-plugin/types/

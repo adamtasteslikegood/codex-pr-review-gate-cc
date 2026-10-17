@@ -1,0 +1,19 @@
+{
+  "name": "pr-gate",
+  "private": true,
+  "description": "Claude Code mods for pre-PR and post-PR review",
+  "license": "MIT",
+  "scripts": {
+    "lint": "eslint pr-lifecycle",
+    "typecheck": "tsc -p pr-lifecycle --noEmit",
+    "test": "claude plugin test codex-gate && claude plugin test pr-lifecycle",
+    "validate": "claude plugin validate codex-gate && claude plugin validate pr-lifecycle",
+    "check": "npm run lint && npm run test && npm run validate && npm run typecheck"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "5.10.0",
+    "eslint": "10.11.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.0"
+  }
+}

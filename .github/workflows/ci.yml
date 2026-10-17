@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # A ruleset requires this job by name; keep it stable.
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm i -g @anthropic-ai/claude-code@2.1.301
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm run test
+      - name: Validate
+        run: npm run validate
+      # pr-lifecycle's tsconfig extends .claude-plugin/types/, which the harness lays only when a
+      # Claude Code session loads the mod. That needs credentials CI does not have, so a clean
+      # checkout has no types and the step is skipped with a warning. When the types are present,
+      # real type errors still fail the job.
+      - name: Typecheck
+        run: |
+          if [ -f pr-lifecycle/.claude-plugin/types/tsconfig.json ]; then
+            npm run typecheck
+          else
+            echo "::warning title=typecheck skipped::pr-lifecycle/.claude-plugin/types/ is absent. The harness lays it only when a Claude Code session loads the mod. Run npm run typecheck locally."
+          fi

@@ -43,7 +43,7 @@ test('a blocking finding goes to the main agent, then Codex reviews again', asyn
   expect(w.prompts[0]).toContain('R1-1 [P1] Unvalidated redirect')
 
   w.git.head = 'd'.repeat(40)
-  await done($, 
+  await done($,
     turn(
       `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed', note: 'allow-list' }, { id: 'R1-2', action: 'rebutted', note: 'the name is the API' }] })}`,
     ),
@@ -250,7 +250,7 @@ test('a high blast-radius change runs review and challenge in parallel and revie
   await $.tool.call(createPr)
   expect(w.spawned.map(one => one.description)).toEqual(['pr-lifecycle r1 review', 'pr-lifecycle r1 challenge'])
   expect(w.spawned.every(one => !/args "\w+ --(xhigh|effort xhigh)/.test(one.prompt))).toBe(true)
-  expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(["--effort high", "--effort high"])
+  expect(w.spawned.map(one => one.prompt.match(/--effort \w+/)?.[0])).toEqual(['--effort high', '--effort high'])
 
   await done($, turn(review('r1-review', 'PASS')))
   expect((await runOf(w)).phase).toBe('review')

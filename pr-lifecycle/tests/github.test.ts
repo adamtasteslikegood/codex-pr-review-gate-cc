@@ -260,7 +260,7 @@ test('bash r19: prose, other subcommands and variables inside literal queries ar
   expect(bash('git commit -m "docs: gating of gh pr ' + 'create"')).toBeUndefined()
   expect(bash('grep -rn "gh pr ' + 'merge" docs')).toBeUndefined()
   expect(bash("git commit -F - <<'EOF'\nsubject\n\ngh pr " + 'create --base dev\nEOF')).toBeUndefined()
-  expect(bash("cat <<-EOF\n\tgh pr " + 'merge 5\n\tEOF\necho done')).toBeUndefined()
+  expect(bash('cat <<-EOF\n\tgh pr ' + 'merge 5\n\tEOF\necho done')).toBeUndefined()
 })
 
 test('mcp r19: a long mutation string under any key, and pullrequest as one word', async () => {

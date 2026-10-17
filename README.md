@@ -34,6 +34,10 @@ A component's version is the `version` field in its
 `.claude-plugin/plugin.json`. Its README and the table above repeat it, so
 bump all three together.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the repo's rules and [QUICKSTART.md](QUICKSTART.md) to get set up.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
