@@ -38,6 +38,7 @@ There is no `VERSION` file.
 - PRs to `main` go through `/pr-gate` first: `gh pr create` is held until the
   pre-PR Codex gate finishes. Fill in the PR template.
 - CI (the `check` job) must pass before merge.
+- CodeQL (`codeql.yml`) scans TypeScript and the workflows on PRs, pushes to `main` and weekly; Dependabot opens weekly update PRs for npm dev dependencies (grouped) and actions.
 
 ## Checks
 
