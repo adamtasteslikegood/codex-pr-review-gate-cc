@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.1.0. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.2.0. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -25,9 +25,10 @@ nudging each one.
    or already-reviewed changes only, Codex skipped; see below), `standard`, or
    `high` (a path matching `highRiskPaths`, over 400 changed lines, or over 25
    files). The tier sets the review allowance.
-3. **Review.** A sub-agent invokes the `codex` skill in review mode and
-   reports Codex's findings. On a `high` change a second sub-agent runs the
-   skill's challenge mode in parallel.
+3. **Review.** A sub-agent invokes the `codex` skill in review mode, naming
+   the tier's Codex model and effort, and reports Codex's findings. On a
+   `high` change a second sub-agent runs the skill's challenge mode in
+   parallel. See Models and effort.
 4. **Fix.** Every finding, blocking or not, goes to the main agent (or a
    sub-agent, per `fixer`), which verifies each against the code and answers
    it: fixed, rebutted with a reason, or deferred with a reason. On a `high`
@@ -66,7 +67,7 @@ when `/pr-gate` runs on its branch; a merge attempt is held and tells the
 agent to run it.
 
 The gate fails closed: a review that did not complete (timeout, auth, no
-verdict, `gh` failing) is an incomplete attempt. It records its effort, spends
+verdict, `gh` failing, a Codex model gstack cannot use) is an incomplete attempt. It records its effort, spends
 no round, and `/pr-gate resume` retries it.
 
 Nothing is reviewed against a stale base. Each fetch the gate makes before a
@@ -241,25 +242,36 @@ overrides; the mod never falls back to HEAD.
   "allowanceHigh": 8,
   "lightBranches": "^(chore|deps)/",
   "onExhausted": "stop",
-  "highRiskPaths": "^(server|infra)/|(^|/)auth/"
+  "highRiskPaths": "^(server|infra)/|(^|/)auth/",
+  "codexModel": "gpt-6-luna",
+  "codexModelHigh": "gpt-6-astra",
+  "highEffort": "medium",
+  "rereviewEffort": "low",
+  "runnerModel": "sonnet"
 }
 ```
 
 All fields are optional. The first five shape post-PR collection (below). The
-last five are round settings, with the same meaning and limits as the plugin
+rest are round settings, with the same meaning and limits as the plugin
 options of the same name (see Options): `allowanceStandard` is capped at 10
 and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
 `lightBranches` and `highRiskPaths` are regular expressions, where `""` (or
 only spaces, as for the plugin options) turns the match off
-(`"lightBranches": ""` turns the light lane off).
+(`"lightBranches": ""` turns the light lane off). The models (`runnerModel`,
+`fixAgentModel`, `codexModel`, `codexModelHigh`) are a short alias or id,
+letters, digits, dots and dashes, starting with a letter or digit, where `""`
+names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
+`rereviewEffort`) are `low`, `medium` or `high` (see Models and effort).
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
 - **An invalid value** (a count or a wait in minutes below 1, an unknown
-  `onExhausted`, a regular expression that does not compile) is ignored, so
+  `onExhausted`, a regular expression that does not compile, a model that is
+  not an id, an effort other than `low`, `medium` or `high`) is ignored, so
   that key falls back to the plugin option; the others still apply. The gate
   says which keys it ignored, once, in the pane's scope step and in the start
-  message. A file that is not a JSON object overrides nothing. A wait over a
+  message. An invalid model or effort in the plugin options is reported the
+  same way, and its default applies. A file that is not a JSON object overrides nothing. A wait over a
   day is capped at 1,440 minutes.
 - **The lane and allowance are fixed when the lifecycle is scoped, for that
   base.** A change to the file that lands on the base mid-lifecycle does not
@@ -272,7 +284,9 @@ only spaces, as for the plugin options) turns the match off
   or down, with the rounds already used still counted. Nothing carries over
   from the base it was scoped on before, which may be one outside `bases`. The
   other settings are read again where they are used: `onExhausted` when a
-  pre-PR gate is spent and when a create is judged, the roster on every poll.
+  pre-PR gate is spent and when a create is judged, the roster on every poll,
+  the Codex model and efforts when each round starts, and the Claude models
+  when each sub-agent is started.
 - **A PR that adds or changes `.github/pr-gate.json` is gated by the base's
   version** (or, without one, by the plugin options), not by its own. Its
   settings apply to the PRs after it merges.
@@ -380,28 +394,93 @@ fallback.
 ## The light lane (`chore/`)
 
 A branch matching `lightBranches` (`^chore/`) that still needs Codex gets one
-round and no advisory rounds. Codex starts at `lightEffort` (`low`), or at
-`high` on a high blast-radius change. With `onExhausted: open-pr` (the
+round and no advisory rounds. Codex starts at `lightEffort` (`low`) on
+`codexModel`, or on a high blast-radius change at `highEffort` on
+`codexModelHigh`. With `onExhausted: open-pr` (the
 default), what it raises does not hold the pull request: the gate ends
 `exhausted` (or `passed`), and the findings go to the main agent for the pull
 request's own review. With `stop`, a P0/P1 still holds it. The prefix is a weak
 signal, since hooks code can be named `chore/` too, so a high blast-radius
-chore still reviews at high effort.
+chore still reviews with the high tier's model and effort.
 
-## Effort
+## Models and effort
 
-Codex starts at `high` on a high blast-radius change (`highRiskPaths`, or a
-large diff) and at `reviewEffort` (`medium`) otherwise. It never runs at
-`xhigh`, which timed out. When a review times out (the reviewer reports
-`"error":"timeout"`, or the review step passes `stepTimeoutMinutes`), the
-same round reruns one level lower and spends no round: high, then medium,
-then low. A timeout at `low` fails closed. The next run on that branch
-starts one level below where the timed-out run ended. A run that stepped down
-and then completed its reviews keeps that effort for the branch: later runs
-start no higher than it. A branch that never stepped down keeps no such
-limit, so it still starts at `high` once it grows into high blast radius. A
-reviewer that was replaced is not stopped, since there is no way to; its late
-answer is ignored.
+### Claude models
+
+Every sub-agent the gate starts is given its Claude model:
+
+| Sub-agent | Option | Default |
+| --- | --- | --- |
+| Codex review, challenge, and the post-PR rebuttal check | `runnerModel` | `sonnet` |
+| the fixer (`fixer: subagent`) and the fix reviewer | `fixAgentModel` | `opus` |
+
+The runners follow skill instructions, run shell commands and turn Codex's
+output into findings; fixing and judging a fix need more judgment. An alias
+such as `sonnet` follows the latest model of that name; a full id pins one.
+An empty value passes no model, so that sub-agent runs on the session's
+model. The main agent is never given one: with `fixer: main`, the session's
+own model fixes.
+
+### Codex model
+
+The gate names the Codex model for each tier:
+
+| Tier | Option | Default |
+| --- | --- | --- |
+| standard and light lane | `codexModel` | `gpt-6-luna` |
+| high blast radius | `codexModelHigh` | `gpt-6-astra` |
+
+The review step passes it to the gstack `/codex` skill as `--model '<model>'`
+among the skill's leading flags, next to `--effort`, and prefixes every Codex
+dispatch with `GSTACK_CODEX_MODEL=<model>` beside `GSTACK_CODEX_EFFORT`.
+gstack picks the model in this order: a model named for the request
+(`--model`), then `GSTACK_CODEX_MODEL`, then Codex's `config.toml` (`model`,
+or `review_model` first for `codex review`), then `gpt-6-astra`. So the
+model the gate names wins over the machine's `~/.codex/config.toml`. An empty
+`codexModel` or `codexModelHigh` names none, and gstack's order applies from
+`GSTACK_CODEX_MODEL` down, as before 1.2.0.
+
+Each review reports the model on gstack's `CODEX_MODEL:` line. The gate
+records it on the round as `codexModel`, beside the round's `effort`, and
+shows it in the pane's round line (`codex gpt-6-luna medium`). A round
+recorded before 1.2.0 has neither field and still loads.
+
+**A model gstack cannot use stops the round.** When gstack stops because the
+model is invalid or the account cannot use it (`MODEL_UNUSABLE`, a model not
+supported, or one that does not exist or the account has no access to), the
+reviewer reports `"error":"model"`. The round is an incomplete attempt: it
+spends no round and steps no effort down, and the gate never falls back to
+another model. The stop message gives gstack's repair message and names the
+setting to change: `codexModel`, or `codexModelHigh` on a high blast-radius
+change, in the plugin options or, when it sets it, the base's
+`.github/pr-gate.json`. Change it, then run `/pr-gate resume`.
+
+### Effort
+
+Codex starts at the tier's effort:
+
+| Tier | Option | Default |
+| --- | --- | --- |
+| standard | `reviewEffort` | `medium` |
+| light lane | `lightEffort` | `low` |
+| high blast radius | `highEffort` | `medium` |
+
+Every Codex dispatch after a lifecycle's first completed review round is a
+re-review and runs at `rereviewEffort` (`low`): later rounds, which read the
+fix commits, the consult that checks earlier rebuttals and fixes inside
+them, and the post-PR Codex fallback. It is never above the tier's starting
+effort. A rerun of the first round after an incomplete attempt is still the
+first round. Efforts are `low`, `medium` or `high`, never `xhigh`, which
+timed out.
+
+When a review times out (the reviewer reports `"error":"timeout"`, or the
+review step passes `stepTimeoutMinutes`), the same round reruns one level
+lower and spends no round: high, then medium, then low. A timeout at `low`
+fails closed. Only the effort steps down, never the model. The next run on
+that branch starts one level below where the timed-out run ended. A run
+that stepped down and then completed its reviews keeps that effort for the
+branch: later runs start no higher than it. A reviewer that was replaced is
+not stopped, since there is no way to; its late answer is ignored.
 
 Time is tracked in two kinds. `activeMs` is agent work, compared with
 `routineRoundMinutes` (3): overrunning is shown and recorded, not failed.
@@ -453,7 +532,8 @@ not start again for it.
 Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
 repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
 `allowanceHigh`, `onExhausted`, `highRiskPaths`, `lightBranches`,
-`waitCapMinutes` and `quietMinutes` (see Settings per repository):
+`waitCapMinutes`, `quietMinutes`, the four models and the four efforts (see
+Settings per repository):
 
 | Option | Default | |
 | --- | --- | --- |
@@ -470,6 +550,12 @@ repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
 | `reviewEffort` | `medium` | Codex's starting effort, standard changes |
 | `lightBranches` | `^chore/` | light-lane branches; empty turns it off |
 | `lightEffort` | `low` | Codex's starting effort on the light lane |
+| `highEffort` | `medium` | Codex's starting effort, high blast-radius changes |
+| `rereviewEffort` | `low` | Codex's effort after the first review round, never above the tier's start |
+| `codexModel` | `gpt-6-luna` | Codex model, standard and light-lane changes; empty names none |
+| `codexModelHigh` | `gpt-6-astra` | Codex model, high blast-radius changes; empty names none |
+| `runnerModel` | `sonnet` | Claude model of the sub-agents that run Codex; empty inherits the session's |
+| `fixAgentModel` | `opus` | Claude model of the fix sub-agent and the fix reviewer; empty inherits the session's |
 | `stepTimeoutMinutes` | 30 | hard cap on one agent step |
 | `routineRoundMinutes` | 3 | soft active-time target for a round |
 | `waitCapMinutes` | 20 | longest a round waits for reviewers |
@@ -483,6 +569,7 @@ repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
 | none | `allowanceHigh` (6), `enforceMerge` (true), `routineRoundMinutes` (3), `waitCapMinutes` (20), `quietMinutes` (3) |
 | `advisoryMinRounds`, `advisoryMaxRounds` | Removed. Every finding goes to the fixer inside its round; Codex re-reviews an advisory fix only while another round stays in reserve. |
 | `bases` | Same list, but its first entry no longer decides a base nobody named: a create without `--base`, a bare `/pr-gate` and a pre waiver with no record use the repository's default branch. |
+| none | `highEffort` (`medium`): a high blast-radius change no longer always starts at `high`. `rereviewEffort` (`low`), `codexModel` (`gpt-6-luna`), `codexModelHigh` (`gpt-6-astra`), `runnerModel` (`sonnet`), `fixAgentModel` (`opus`). |
 | `enforce`, `fixer`, `fixReview`, `onExhausted`, `openPr`, `highRiskPaths`, `reviewEffort`, `lightBranches`, `lightEffort`, `stepTimeoutMinutes` | unchanged |
 
 - **Options do not carry over by themselves.** The plugin name is now
