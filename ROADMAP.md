@@ -30,6 +30,10 @@ later when it is implemented.
 
 ## Wave 1: no errors, no babysitting the basics (pr-lifecycle 1.3.0)
 
+**Status:** built on `wave1/pr-lifecycle-1.3.0` (rulings R71-R78). Not built: a
+pre-PR verification pass (R72 leaves pre-PR as it was, so opening the PR is
+never delayed), and finding 21's approvals, which moves to wave 2 item 2.
+
 Serves goals 1 and 2. Fixes what broke runs or forced the person in for
 routine steps.
 
