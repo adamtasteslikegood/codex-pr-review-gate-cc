@@ -29,8 +29,16 @@ export type World = {
     changed: string
     /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
     isAncestor: boolean
-    /** `.github/pr-gate.json` at HEAD; empty means none. */
+    /** `.github/pr-gate.json` on the base (`git show refs/remotes/origin/<base>:...`); empty means none. */
     roster: string
+    /** When set, only `origin/<rosterOn>` has the file: any other base's read fails as a missing path or ref does. */
+    rosterOn?: string
+    /** Each base's own file, by base name; a base listed here ignores `roster` and `rosterOn`. */
+    byBase: Record<string, string>
+    /** The file under a local tag or branch named `origin/<base>`, which a bare `origin/<base>:` would read instead (M4). */
+    shadow: string
+    /** `.github/pr-gate.json` at the branch's own HEAD; empty means none. The mod must never read it (R67). */
+    headRoster: string
     /** Local branches besides the checked-out one. */
     locals: string[]
     /** The session is outside any checkout: `rev-parse --show-toplevel` fails wherever it runs. */
@@ -44,12 +52,16 @@ export type World = {
     missingRefs: string[]
     /** Every `git fetch` call's arguments. */
     fetches: string[]
+    /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
+    onFetch?: () => void
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
     pr: number
     prHead: string
     base: string
+    /** Bases `gh pr view` answers in turn, one per call, before falling back to `base`: a PR retargeted while the gate scopes. */
+    baseSeq?: string[]
     headRef: string
     self: string
     reviews: object[]
@@ -125,6 +137,9 @@ export function world(on: On): World {
       changed: 'src/app.ts',
       isAncestor: false,
       roster: '',
+      headRoster: '',
+      byBase: {},
+      shadow: '',
       locals: [],
       isOutside: false,
       fetchFails: 0,
@@ -205,7 +220,8 @@ export function world(on: On): World {
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
-        return out(JSON.stringify({ number: w.gh.pr, baseRefName: w.gh.base, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
+        const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
+        return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
       }
       // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
       if (args.startsWith('pr checks')) {
@@ -238,6 +254,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
+      w.git.onFetch?.()
       const fail = (stderr: string) => ({ value: { exitCode: 128, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
       const missing = w.git.missingRefs.find(ref => e.argv.slice(3).includes(ref))
       if (missing !== undefined) return fail(`fatal: couldn't find remote ref ${missing}`)
@@ -245,7 +262,13 @@ export function world(on: On): World {
       w.git.fetchFails -= 1
       return fail(w.git.fetchError)
     }
-    if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.roster, w.git.roster === '' ? 128 : 0)
+    if (args.startsWith('show HEAD:.github/pr-gate.json')) return out(w.git.headRoster, w.git.headRoster === '' ? 128 : 0)
+    if (/^show origin\/\S+:\.github\/pr-gate\.json$/.test(args)) return out(w.git.shadow, w.git.shadow === '' ? 128 : 0)
+    const onBase = args.match(/^show refs\/remotes\/origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
+    if (onBase !== undefined) {
+      const file = Object.hasOwn(w.git.byBase, onBase) ? (w.git.byBase[onBase] ?? '') : w.git.rosterOn === undefined || w.git.rosterOn === onBase ? w.git.roster : ''
+      return out(file, file === '' ? 128 : 0)
+    }
     // Outside a checkout (`cd /tmp && ...`), git finds no repository.
     if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out('/repo\n')
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)

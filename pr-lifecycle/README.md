@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.0.0. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.1.0. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -219,10 +219,16 @@ whatever `onExhausted` is set to. Before it opens, exhaustion names them only
 under `onExhausted: stop` or when a security P1 is open. The person's tools
 there are the waivers and `allow`.
 
-## Reviewers per repository
+## Settings per repository
 
-An optional `.github/pr-gate.json` on the branch, read on every poll from the
-checked-out branch, so each repository waits for its own reviewers:
+A repository can set its own reviewers and round settings in an optional
+`.github/pr-gate.json`. The file is **read from the base branch**
+(`origin/<base>`, as the gate last fetched it; a create that only an exhausted
+gate under `open-pr` would let through fetches the base first), **never from the PR branch's
+own HEAD**: a pull request must not be able to loosen its own gate, by lowering
+its allowance, turning on the light lane, or adding a bot to the trusted roster
+(below). A base without the file, or with no fetched `origin/<base>`, has no
+overrides; the mod never falls back to HEAD.
 
 ```json
 {
@@ -230,11 +236,46 @@ checked-out branch, so each repository waits for its own reviewers:
   "checks": ["Claude Review", "ci"],
   "requestReview": ["copilot"],
   "quietMinutes": 3,
-  "waitCapMinutes": 20
+  "waitCapMinutes": 20,
+  "allowanceStandard": 3,
+  "allowanceHigh": 8,
+  "lightBranches": "^(chore|deps)/",
+  "onExhausted": "stop",
+  "highRiskPaths": "^(server|infra)/|(^|/)auth/"
 }
 ```
 
-All fields are optional; the repository's values override the plugin options.
+All fields are optional. The first five shape post-PR collection (below). The
+last five are round settings, with the same meaning and limits as the plugin
+options of the same name (see Options): `allowanceStandard` is capped at 10
+and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
+`lightBranches` and `highRiskPaths` are regular expressions, where `""` (or
+only spaces, as for the plugin options) turns the match off
+(`"lightBranches": ""` turns the light lane off).
+
+- **Precedence.** The file on the base, then the person's plugin options, then
+  the defaults.
+- **An invalid value** (a count or a wait in minutes below 1, an unknown
+  `onExhausted`, a regular expression that does not compile) is ignored, so
+  that key falls back to the plugin option; the others still apply. The gate
+  says which keys it ignored, once, in the pane's scope step and in the start
+  message. A file that is not a JSON object overrides nothing. A wait over a
+  day is capped at 1,440 minutes.
+- **The lane and allowance are fixed when the lifecycle is scoped, for that
+  base.** A change to the file that lands on the base mid-lifecycle does not
+  rewrite an existing record's lane or allowance; a new lifecycle (or
+  `/pr-gate reset`) picks it up. One exception: a rise in tier on the same
+  base raises the allowance to the new tier's, from the file as it is then.
+  A lifecycle that moves to another base (a
+  create to another base, `/pr-gate <base>`, or an open PR adopted on another
+  base) is scoped afresh from that base's file: tier, lane and allowance, up
+  or down, with the rounds already used still counted. Nothing carries over
+  from the base it was scoped on before, which may be one outside `bases`. The
+  other settings are read again where they are used: `onExhausted` when a
+  pre-PR gate is spent and when a create is judged, the roster on every poll.
+- **A PR that adds or changes `.github/pr-gate.json` is gated by the base's
+  version** (or, without one, by the plugin options), not by its own. Its
+  settings apply to the PRs after it merges.
 
 - **With a roster**, collection ends when every listed reviewer has posted on
   the current head and every listed check has completed.
@@ -409,7 +450,10 @@ not start again for it.
 
 ## Options
 
-Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`:
+Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
+repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
+`allowanceHigh`, `onExhausted`, `highRiskPaths`, `lightBranches`,
+`waitCapMinutes` and `quietMinutes` (see Settings per repository):
 
 | Option | Default | |
 | --- | --- | --- |

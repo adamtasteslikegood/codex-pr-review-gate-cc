@@ -358,6 +358,20 @@ test('a ready lifecycle lets its own head merge; a later push holds it again', a
   expect(held.deny?.startsWith('/')).toBe(false)
 })
 
+test('a PR ready for dev and retargeted to main is held: its review was for dev', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  await $.tool.call(createPr)
+  await w.clock.advance(20 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  w.gh.base = 'main'
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('reviewed for dev, but PR #1 now targets main')
+  expect(held.deny).toContain('/pr-gate reset')
+})
+
 test('a merge gh cannot resolve is held, and the agent is told what to check', async ($, on) => {
   const w = world(on)
   w.gh.isAuthed = false
@@ -1382,6 +1396,18 @@ test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
     ['pre', 'hotfix for the outage', 'composer'],
     ['post', 'reviewed by hand', 'composer'],
   ])
+})
+
+test('gate R4-1: a post waiver given while the PR targeted dev does not release a merge after it is retargeted to main', async ($, on) => {
+  const w = world(on)
+  await say($, 'waive pre hotfix for the outage')
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  await say($, 'waive post reviewed by hand')
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  w.gh.base = 'main'
+  const held = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny).toContain('reviewed for dev, but PR #1 now targets main')
 })
 
 test('only the person waives, allows or resets', async ($, on) => {

@@ -94,11 +94,17 @@ export type Config = {
 const effortOf = (value: unknown, fallback: Effort): Effort =>
   value === 'high' || value === 'medium' || value === 'low' ? value : fallback
 
+/** The most rounds an allowance may be set to, by the options or by a repository's file. */
+const CAPS = { standard: 10, high: 12 } as const
+
+/** A whole count of at least 1, or undefined. */
+const countOf = (value: unknown): number | undefined => {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined
+}
+
 export function configOf(options: PluginOptions): Config {
-  const number = (key: string, fallback: number): number => {
-    const value = Number(options[key])
-    return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback
-  }
+  const number = (key: string, fallback: number): number => countOf(options[key]) ?? fallback
   const bases = String(options.bases ?? 'dev,main')
     .split(',')
     .map(one => one.trim())
@@ -106,8 +112,8 @@ export function configOf(options: PluginOptions): Config {
   return {
     // 0.3.1's maxRounds is read when allowanceStandard is unset (a hand-written options file).
     allowances: {
-      standard: Math.min(number('allowanceStandard', number('maxRounds', 4)), 10),
-      high: Math.min(number('allowanceHigh', 6), 12),
+      standard: Math.min(number('allowanceStandard', number('maxRounds', 4)), CAPS.standard),
+      high: Math.min(number('allowanceHigh', 6), CAPS.high),
     },
     bases: bases.length > 0 ? bases : ['dev', 'main'],
     enforce: options.enforce !== false,
@@ -126,6 +132,68 @@ export function configOf(options: PluginOptions): Config {
     light: compileRisk(String(options.lightBranches ?? '^chore/')),
   }
 }
+
+/**
+ * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
+ * allowanceHigh, lightBranches, onExhausted and highRiskPaths, each read as configOf reads the option. A key whose value is invalid
+ * is left to the option and named in `ignored`; an empty regular expression turns its match off, as the option does.
+ */
+export function overrideConfig(c: Config, text: string | undefined): { config: Config; ignored: string[] } {
+  if (text === undefined || text.trim() === '') return { config: c, ignored: [] }
+  let row: unknown
+  try {
+    row = JSON.parse(text)
+  } catch {
+    return { config: c, ignored: ['the file (not valid JSON)'] }
+  }
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) return { config: c, ignored: ['the file (not a JSON object)'] }
+  const r = row as Record<string, unknown>
+  const ignored: string[] = []
+  const bad = (key: string, why: string): undefined => {
+    ignored.push(`${key} (${why})`)
+    return undefined
+  }
+  const count = (key: 'allowanceStandard' | 'allowanceHigh', cap: number): number | undefined => {
+    const value = r[key]
+    if (value === undefined) return undefined
+    const n = typeof value === 'number' || typeof value === 'string' ? countOf(value) : undefined
+    return n === undefined ? bad(key, 'not a number of at least 1') : Math.min(n, cap)
+  }
+  // Set or not, and what to: an empty string sets "no match", which compileRisk alone cannot tell from an invalid pattern.
+  const pattern = (key: 'lightBranches' | 'highRiskPaths'): { re: RegExp | undefined } | undefined => {
+    const value = r[key]
+    if (value === undefined) return undefined
+    if (typeof value !== 'string') return bad(key, 'not a string')
+    if (value.trim() === '') return { re: undefined }
+    const re = compileRisk(value)
+    return re === undefined ? bad(key, 'not a valid regular expression') : { re }
+  }
+  const standard = count('allowanceStandard', CAPS.standard)
+  const high = count('allowanceHigh', CAPS.high)
+  const light = pattern('lightBranches')
+  const onExhausted =
+    r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
+  const highRisk = pattern('highRiskPaths')
+  // The collection waits are the roster's to read (readRoster drops a bad one); they are reported here with the rest.
+  for (const key of ['quietMinutes', 'waitCapMinutes']) {
+    const value = r[key]
+    if (value !== undefined && !(typeof value === 'number' && Number.isFinite(value) && value >= 1)) bad(key, 'not a number of minutes of at least 1')
+  }
+  return {
+    config: {
+      ...c,
+      allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high },
+      onExhausted: onExhausted ?? c.onExhausted,
+      highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
+      light: light === undefined ? c.light : light.re,
+    },
+    ignored,
+  }
+}
+
+/** What a repository's file got wrong, said once where the person sees it (R67). */
+export const ignoredNote = (base: string, ignored: readonly string[]): string =>
+  `The base's .github/pr-gate.json (origin/${base}): ignored ${ignored.join(', ')}; the plugin options apply instead.`
 
 export const elapsed = (ms: number): string => {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -563,7 +631,7 @@ async function beginCollect($: Engine, id: string): Promise<void> {
   const rec = await loadRecord($, opened.root, opened.branch)
   // A later post-PR round, on a new head: ask the roster's reviewers to look again.
   if (rec !== undefined && rec.rounds.some(one => one.phase === 'post' && one.isCompleted) && rec.pr !== undefined && rec.slug !== undefined) {
-    const roster = await rosterOf($, opened.root)
+    const roster = await rosterOf($, opened.root, opened.base)
     for (const who of roster?.requestReview ?? []) {
       await $.process.run(['gh', 'api', '-X', 'POST', `repos/${rec.slug}/pulls/${rec.pr}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
         cwd: opened.root,
@@ -574,9 +642,26 @@ async function beginCollect($: Engine, id: string): Promise<void> {
   $.ui.status(`pr-gate r${opened.round}: waiting on reviewers`)
 }
 
-async function rosterOf($: Engine, root: string): Promise<Roster | undefined> {
-  const file = await git($, root, ['show', 'HEAD:.github/pr-gate.json'])
-  return file.isOk ? readRoster(file.out) : undefined
+/**
+ * `.github/pr-gate.json` as the base has it (R67, `refs/remotes/origin/<base>`), never as the branch's own HEAD has it: a PR must not
+ * loosen its own gate, add a bot to the trusted roster (R1-8) or lower its allowance. Read from the ref the last fetch left, with no
+ * fetch of its own; a base with no such file, or no fetched ref, has none.
+ */
+async function baseFileOf($: Engine, root: string, base: string): Promise<string | undefined> {
+  if (base === '') return undefined
+  // The remote-tracking ref by its full name (M4): a local tag or branch called origin/<base> would win over a bare origin/<base>.
+  const file = await git($, root, ['show', `refs/remotes/origin/${base}:.github/pr-gate.json`])
+  return file.isOk ? file.out : undefined
+}
+
+/** The round settings for a branch to `base` (R67): the base's file over the plugin options, over the defaults. */
+export async function configFor($: Engine, root: string, base: string): Promise<{ config: Config; ignored: string[] }> {
+  return overrideConfig(config, await baseFileOf($, root, base))
+}
+
+async function rosterOf($: Engine, root: string, base: string): Promise<Roster | undefined> {
+  const file = await baseFileOf($, root, base)
+  return file === undefined ? undefined : readRoster(file)
 }
 
 async function ghJson($: Engine, root: string, path: string): Promise<{ isOk: boolean; out: string; err: string }> {
@@ -640,7 +725,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
     // Only feedback from someone with write access, or on the roster, is read (R1-8); this machine's own rows are sorted out below.
-    const roster = await rosterOf($, rec.root)
+    const roster = await rosterOf($, rec.root, rec.base)
     const all = [...readReviews(reviews.out), ...readInlineComments(inline.out), ...readIssueComments(comments.out)].filter(
       one => one.reviewer === self || isTrusted(one, roster),
     )
@@ -726,7 +811,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     triaged: fresh.map(each => each.id),
   }))
   if (after === null) return
-  const roster = await rosterOf($, run.root)
+  const roster = await rosterOf($, run.root, run.base)
   const done = collectionDone({
     roster,
     feedback: got.cover ?? got.feedback,
@@ -754,7 +839,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   if (rec === undefined) return
   const waitMs = now - (run.collect?.startedAt ?? now)
   // Each reviewer who covered the head; each roster reviewer who never did, as missing evidence.
-  const roster = await rosterOf($, run.root)
+  const roster = await rosterOf($, run.root, run.base)
   const evidence: Evidence[] = [
     ...done.covered.map(reviewer => ({ source: 'github' as const, reviewer, head: got.prHead, isComplete: true })),
     ...(roster?.reviewers ?? [])
@@ -1533,7 +1618,9 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (isStale) return advance($, root, branch, isResume)
     const seen = saved ?? rec
     const hasSecurity = hasSecurityBlocker(seen)
-    const opens = next.status === 'passed' || (config.onExhausted === 'open-pr' && !hasSecurity)
+    // The base's own setting, if it has one (R67).
+    const { onExhausted } = (await configFor($, root, seen.base)).config
+    const opens = next.status === 'passed' || (onExhausted === 'open-pr' && !hasSecurity)
     const used = usedRounds(seen)
     const message =
       next.status === 'passed'
@@ -1546,7 +1633,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (ended === null || saved === undefined) return
     if (!opens) {
       // The round that just ended leaves the PR held: say so once, with why and what can move it.
-      const held = heldReason(saved)
+      const held = heldReason(saved, onExhausted)
       await markPr($, 'skipped', 'held')
       if (held !== undefined) say($, heldPrompt(saved, held.why, held.nextStep))
       return
@@ -1603,8 +1690,11 @@ export async function advance($: Engine, root: string, branch: string, isResume 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
 const heldFindings = (rec: LifecycleRecord): Finding[] => [...unresolvedBlockers(rec), ...verificationOwed(rec)]
 
-/** Why the pre-PR gate holds the PR, and the next step; undefined when it does not hold it for a settled reason. */
-export function heldReason(rec: LifecycleRecord): { why: string; nextStep: string } | undefined {
+/**
+ * Why the pre-PR gate holds the PR, and the next step; undefined when it does not hold it for a settled reason. `onExhausted` is the
+ * effective setting for the record's base (configFor, R67).
+ */
+export function heldReason(rec: LifecycleRecord, onExhausted: Config['onExhausted']): { why: string; nextStep: string } | undefined {
   if (rec.preStatus === 'blocked') {
     // The controller's own next step for this block (R49): a deferral is never "fix or rebut".
     const next = decideNext(rec)
@@ -1614,7 +1704,7 @@ export function heldReason(rec: LifecycleRecord): { why: string; nextStep: strin
   if (rec.preStatus !== 'exhausted') return undefined
   const holding = heldFindings(rec)
   const isSecurity = hasSecurityBlocker(rec)
-  if (!isSecurity && config.onExhausted === 'open-pr') return undefined
+  if (!isSecurity && onExhausted === 'open-pr') return undefined
   const n = holding.length
   const unverified = verificationOwed(rec).filter(one => one.isSecurity === true)
   const security =
