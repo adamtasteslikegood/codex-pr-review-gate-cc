@@ -34,6 +34,7 @@ import {
   advance,
   archiveLifecycle,
   badOptionsNote,
+  claimRecord,
   closeLifecycle,
   configFor,
   configOf,
@@ -210,6 +211,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const root = top.out
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   if (branch === '' || branch === 'HEAD') return 'Not started: HEAD is detached, so there is no branch to open a PR from.'
+  // A start or a resume takes the record for this session (#13); a headless one never takes it from another.
+  if (!(await claimRecord($, root, branch))) return 'Not started: another session runs this lifecycle.'
   const known = await loadRecord($, root, branch)
   // A PR merged or closed since: nothing more to review on it, and its record is archived (R62).
   const isOpened = known !== undefined && (known.phase === 'post' || known.phase === 'ready') && known.pr !== undefined
@@ -854,6 +857,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const stored = await loadRecord($, root, branch)
   const rec = stored?.phase === 'archived' ? undefined : stored
   const now = await $.clock.now()
+  // The person's waive, allow or reset takes the record for this session (#13): what it starts is this session's to run.
+  if (isPersons) await claimRecord($, root, branch)
   const isRunning = run !== null && run.status === 'running'
   const isOurs = isRunning && run.root === root && run.branch === branch
   const none = `/${COMMAND}: there is no lifecycle for ${branch} yet: /${COMMAND} starts one.`

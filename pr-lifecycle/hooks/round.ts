@@ -320,7 +320,7 @@ export async function sessionIdOf($: Engine): Promise<string> {
 }
 
 /**
- * Makes this session the record's owner (#13): a run it starts or a person's command takes the record. A headless session
+ * Makes this session the record's owner (#13): a start, a resume or a person's command takes the record. A headless session
  * (`-p`, the SDK) never takes one another session holds; false then.
  */
 export async function claimRecord($: Engine, root: string, branch: string): Promise<boolean> {
@@ -341,21 +341,31 @@ export async function isOwnedElsewhere($: Engine, root: string, branch: string):
   return isHeldByOther(await ownerOf($, root, branch), await sessionIdOf($), await $.clock.now())
 }
 
-/** The ticker's beat, every 30 s: false when another session took the record since. */
+/**
+ * The ticker's beat, on its first tick and then every 30 s: false when another session holds the record. A ticker never takes a
+ * record another session holds, not even a restarted one: only a person's command, or an owner gone quiet, moves it (#13).
+ */
 async function beat($: Engine, run: Run, now: number): Promise<boolean> {
-  if (beatAt === 0) return claimRecord($, run.root, run.branch)
-  if (now - beatAt < BEAT_MS) return true
+  if (beatAt !== 0 && now - beatAt < BEAT_MS) return true
   if (await isOwnedElsewhere($, run.root, run.branch)) return false
-  await setOwner($, run.root, run.branch, { sessionId: await sessionIdOf($), beatAt: now })
-  beatAt = now
-  return true
+  return claimRecord($, run.root, run.branch)
+}
+
+/** Whether this session may act on the run's record now; when another session holds it, this one stands down (#13). */
+export async function isStillMine($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<boolean> {
+  if (!(await isOwnedElsewhere($, run.root, run.branch))) return true
+  await standDown($, run)
+  return false
 }
 
 /** Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. */
 async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<void> {
-  stopTicker()
-  isLive = false
-  await update($, runAtom, () => null)
+  const live = await getRun($)
+  if (live === null || (live.root === run.root && live.branch === run.branch)) {
+    stopTicker()
+    isLive = false
+    await update($, runAtom, () => null)
+  }
   $.ui.status('pr-gate: another session runs this lifecycle')
   await logEvent($, run.root, run.branch, 'session', `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`)
 }
@@ -544,7 +554,7 @@ const stopTicker = (): void => {
 
 export function startTicker($: Engine): void {
   stopTicker()
-  // The first tick claims the record for this session (#13).
+  // The first tick beats for this session, unless another holds the record (#13).
   beatAt = 0
   ticker = $.clock.every(1000, () => {
     void (async () => {
@@ -1886,6 +1896,8 @@ export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresol
 export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
   const rec = await loadRecord($, root, branch)
   if (rec === undefined) return
+  // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
+  if (!(await isStillMine($, { root, branch }))) return
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2308,6 +2320,8 @@ export async function onAnswer($: Engine, agentId: string | undefined, answer: s
   const isMine = (one: Pending): boolean =>
     one.isMain === true ? isTurnOf(one, agentId, turnId) : one.agentId !== undefined ? one.agentId === agentId : named === one.step
   if (!run.pending.some(isMine)) return
+  // A result that lands after another session took the record over is not this session's to act on (#13).
+  if (!(await isStillMine($, run))) return
   if (reason === 'aborted') {
     await finish($, run.id, 'stopped', `The ${run.phase} step was interrupted.`)
     return

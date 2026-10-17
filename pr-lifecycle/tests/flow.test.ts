@@ -3005,6 +3005,34 @@ test('#13: a session whose record another session took sends its agent nothing a
   expect(w.run).toBeNull()
 })
 
+test('#13: a reloaded session with its run kept never takes back a record another session took', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  // A reload keeps the run and restarts the ticker: its first tick finds the record held and stands down.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('other')
+  expect(w.run).toBeNull()
+  expect(w.prompts).toHaveLength(prompts)
+})
+
+test('#13: a review that finishes after another session took the record sends nothing and advances nothing', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  // Codex passes before this session's next beat: no "open the PR" prompt, and the record's pre-PR status is left alone.
+  await done($, turn(review('r1-review', 'PASS')))
+  expect(w.prompts).toHaveLength(prompts)
+  expect((await recordOf(w)).preStatus).toBeUndefined()
+  expect(w.run).toBeNull()
+})
+
 // ------------------------------------------- R71: a moved head no longer stops the round
 
 test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
