@@ -391,7 +391,16 @@ export const agentModelFor = (role: Role, lifecycle: Run['lifecycle'], c: Config
 
 // Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
 let holdDepth = 0
-let queued: string[] = []
+let queued: { text: string; key: RecordKey }[] = []
+
+/** The record a prompt is about: it is sent only while this session still holds it (#13). */
+export type RecordKey = Pick<Run, 'root' | 'branch'>
+
+/** Submits a prompt unless another session took its record meanwhile; this one then stands down instead (#13). */
+async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
+  if (!(await isStillMine($, key))) return
+  await $.prompt.submit({ text }).catch(() => undefined)
+}
 
 /** Runs `body` with the prompts it decides held back; once it has returned, they are sent one second later, in order. */
 export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
@@ -402,21 +411,26 @@ export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Prom
     holdDepth -= 1
     if (holdDepth === 0 && queued.length > 0) {
       $.clock.after(1000, () => {
-        const texts = queued
+        const held = queued
         queued = []
-        for (const text of texts) void $.prompt.submit({ text }).catch(() => undefined)
+        void (async () => {
+          for (const one of held) await deliver($, one.key, one.text)
+        })()
       })
     }
   }
 }
 
-/** Sends a prompt to the main agent now, or after the command that holds the turn has returned. */
-export function say($: Engine, text: string): void {
+/**
+ * Sends a prompt about `key`'s record to the main agent now, or after the command that holds the turn has returned. Either way
+ * the owner is checked at delivery: a session that lost the record sends nothing (#13).
+ */
+export async function say($: Engine, key: RecordKey, text: string): Promise<void> {
   if (holdDepth > 0) {
-    queued.push(text)
+    queued.push({ text, key })
     return
   }
-  void $.prompt.submit({ text }).catch(() => undefined)
+  await deliver($, key, text)
 }
 
 export async function getRun($: Engine): Promise<Run | null> {
@@ -1123,7 +1137,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
 async function failPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
-  say($, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
+  await say($, run, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
 }
 
 /**
@@ -1502,7 +1516,7 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
   const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
-  if (saved !== undefined) say($, heldPrompt(saved, why, nextStep))
+  if (saved !== undefined) await say($, saved, heldPrompt(saved, why, nextStep))
 }
 
 /**
@@ -1890,11 +1904,22 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     const moved = isMoved
       ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
       : undefined
-    const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true && !isVerifiedAtEnd(one)).map(one => one.id) ?? [])
+    // Each finding keeps its line as placed at the end head (R73); only the re-check flag spares a fix verified at that head.
+    const placed = new Map(moved?.findings.map(one => [one.id, one]) ?? [])
+    const place = (one: Finding): Finding => {
+      const at = placed.get(one.id)
+      if (at === undefined) return one
+      return {
+        ...one,
+        ...(at.needsRecheck === true && !isVerifiedAtEnd(at) ? { needsRecheck: true } : {}),
+        ...(at.line === undefined ? {} : { line: at.line }),
+        ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+      }
+    }
     return {
       ...withRound(rec, round),
       head: endHead,
-      findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
+      findings: mergeFindings(rec.findings, run.findings).map(place),
       ...(moved === undefined ? {} : { waivers: moved.waivers }),
       effort: run.carriedEffort ?? run.effort,
     }
@@ -1991,12 +2016,12 @@ export async function advance($: Engine, root: string, branch: string, isResume 
       // The round that just ended leaves the PR held: say so once, with why and what can move it.
       const held = heldReason(saved, onExhausted)
       await markPr($, 'skipped', 'held')
-      if (held !== undefined) say($, heldPrompt(saved, held.why, held.nextStep))
+      if (held !== undefined) await say($, saved, heldPrompt(saved, held.why, held.nextStep))
       return
     }
     if (config.openPr) {
       await markPr($, 'running', 'handed to the main agent')
-      say($, prPrompt(ended, saved, next.status))
+      await say($, saved, prPrompt(ended, saved, next.status))
     }
     return
   }
@@ -2012,7 +2037,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     const at = (saved ?? rec).head.slice(0, 7)
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: ready for the merge decision.`)
     else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready for the merge decision at ${at}`)
-    if (saved !== undefined) say($, readyPrompt(saved))
+    if (saved !== undefined) await say($, saved, readyPrompt(saved))
     return
   }
   const isPre = rec.phase === 'pre'
@@ -2044,10 +2069,10 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
   if (isPre) {
-    if (id !== undefined) say($, heldPrompt(saved, next.why, next.nextStep))
+    if (id !== undefined) await say($, saved, heldPrompt(saved, next.why, next.nextStep))
     return
   }
-  say($, reportPrompt(saved, next))
+  await say($, saved, reportPrompt(saved, next))
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */

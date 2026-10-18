@@ -2834,6 +2834,27 @@ test('R76: a trusted reviewer\'s P1 posted after ready holds the merge until a r
   expect((await recordOf(w)).rounds.length).toBe(rounds)
 })
 
+test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Looks fine.', created_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(20 * 60_000)
+  await done($, triaged('r1-triage', [{ id: 'G1-1', action: 'rebutted', severity: 'P3', note: 'no change asked', replyId: '31' }]))
+  await done($, accept('r1-verify', w, { 'G1-1': true }))
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  const rounds = (await recordOf(w)).rounds.length
+  w.gh.comments = [inline(21, '**P1** SQL injection', w.gh.prHead)]
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('SQL injection')
+  expect((await runOf(w)).phase).toBe('triage')
+  expect((await recordOf(w)).rounds.length).toBe(rounds)
+})
+
 test('R1-9: a ready PR with CI still running is held', async ($, on) => {
   const w = world(on)
   await toReady($, w)
@@ -3051,6 +3072,34 @@ test('#13: a review that finishes after another session took the record sends no
   expect(w.run).toBeNull()
 })
 
+test('#13: a pre waiver\'s queued prompt is not sent once another session took the record', async ($, on) => {
+  const w = world(on)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  await say($, 'waive pre hotfix')
+  // Another session takes the record before the command's held prompts are flushed, one second later.
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  await w.clock.advance(1000)
+  expect(w.prompts.filter(one => one.includes('Now open the pull request'))).toHaveLength(0)
+})
+
+test('#13: a person\'s command that is refused leaves the record with its owner', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  // A second interactive session starts while the owner beats: it leaves the record alone.
+  w.clearState()
+  w.sessionId = 'second'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  for (const args of ['allow 0 typo', 'allow 2', 'waive G9-9 not a finding', 'waive pre']) {
+    await say($, args)
+    expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('session-1')
+  }
+  // An accepted one takes it.
+  await say($, 'allow 1 one more look')
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('second')
+})
+
 // ------------------------------------------- R71: a moved head no longer stops the round
 
 test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
@@ -3126,6 +3175,31 @@ test('R72: a reported advisory fix is verified by the same check, at no round', 
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
   expect(rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary').length).toBe(before)
+})
+
+// ------------------------------------------- R73: a finding's line moves with the code across head moves
+
+const hunk = (at: string) => `diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ ${at} @@`
+
+test('R73: a pre-PR round keeps the line its fix moved, so a later edit at the real line reopens the finding', async ($, on) => {
+  const w = world(on)
+  w.git.changed = 'src/app.ts'
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, line: 100 }])))
+  // The fix lands 50 lines above the finding: far from it, so it moves to 150 and is not reopened.
+  w.git.hunks = hunk('-0,0 +1,50')
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  const placed = (await recordOf(w)).findings.find(one => one.id === 'R1-1')
+  expect(placed?.line).toBe(150)
+  expect(placed?.lineHead).toBe('d'.repeat(40))
+  expect(placed?.needsRecheck).toBeUndefined()
+  await done($, turn(review('r2-review', 'PASS')))
+  // The next commit edits line 150, where the finding now is: it needs checking again.
+  w.git.hunks = hunk('-150 +150')
+  w.git.head = 'f'.repeat(40)
+  await $.tool.call(createPr)
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.needsRecheck).toBe(true)
 })
 
 // --------------------------------------------------------------- the run log (/pr-gate log)

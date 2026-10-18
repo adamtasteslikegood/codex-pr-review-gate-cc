@@ -133,3 +133,8 @@ Decided by Adam on 2026-10-17 after the first live runs (cookbook PRs #3705-#370
   - R72: a check that rules on some items and leaves a reported fix out asks again for the fixes left out, once, keeping the verdicts in. The no-verdict-twice path is logged, not noted as an attempt: in an answer run the note overwrote the completed round it answered.
   - R73: a finding keeps `lineHead`, the head its line was last placed at. A head move reads the diff from there and shifts the line by the hunks above it, so an edit after an earlier insertion is still seen.
   - R76: the merge guard re-reads the PR's feedback before a ready PR merges. Feedback no round has triaged holds it, and `/pr-gate resume` triages it on the same head, using no round.
+- Re-review of PR #18 (the same reviewer, at c86ffab; two findings reopened and two new, all fixed before the merge):
+  - R74: every prompt goes through one delivery path (`say`) that checks the record's owner when it is sent, a queued one too: a person's waiver whose record another session took within the second before the flush sends nothing.
+  - R74: the person's waive, allow and reset claim the record only once accepted. A refused one leaves it with its owner, whose review goes on.
+  - R73: a pre-PR round's end saves each finding's moved line and `lineHead` to the record, not only its re-check flag.
+  - R76: the pass-through path of `/pr-gate` is for a pre-PR record only. After the PR opened, a trivial record goes through the controller, so a resume triages late feedback there too.

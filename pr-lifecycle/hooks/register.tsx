@@ -132,8 +132,8 @@ const withScopeNote = (run: Run, note: string): Run =>
   note === '' ? run : { ...run, steps: run.steps.map(one => (one.id === 'scope' ? { ...one, detail: `${one.detail ?? ''}.${note}` } : one)) }
 
 /** Sends the agent to open the PR, once the person's waiver let the pre-PR gate pass; through the command's prompt queue. */
-const sayOpenPr = ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number, waivedNote?: string): void => {
-  if (config.openPr) say($, prPrompt(settledRun(rec, now), rec, status, waivedNote))
+const sayOpenPr = async ($: Engine, rec: LifecycleRecord, status: 'passed' | 'waived', now: number, waivedNote?: string): Promise<void> => {
+  if (config.openPr) await say($, rec, prPrompt(settledRun(rec, now), rec, status, waivedNote))
 }
 
 // ------------------------------------------------------------ starting
@@ -340,7 +340,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
       `${remaining(rec)} of ${rec.allowance} review rounds left.${note}`
     )
   }
-  if (rec.tier === 'trivial') {
+  // After the PR opened, a trivial record goes through the controller like any other: a resume then triages late feedback (R76).
+  if (rec.tier === 'trivial' && rec.phase === 'pre') {
     // A pass-through runs no round: the pane shows it passed, and the held call goes straight through.
     const shown = withScopeNote(passThroughRun(rec, want.cwd ?? root, now, settings), note)
     await update($, runAtom, () => shown)
@@ -350,7 +351,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     const saved = await loadRecord($, root, branch)
     if (want.isHeldCall !== true && config.openPr && saved !== undefined) {
       await markPr($, 'running', 'handed to the main agent')
-      say($, prPrompt(shown, saved, 'passed'))
+      await say($, saved, prPrompt(shown, saved, 'passed'))
     }
     return `Gate passed without Codex: ${scope.why}.${note}`
   }
@@ -875,8 +876,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const stored = await loadRecord($, root, branch)
   const rec = stored?.phase === 'archived' ? undefined : stored
   const now = await $.clock.now()
-  // The person's waive, allow or reset takes the record for this session (#13): what it starts is this session's to run.
-  if (isPersons) await claimRecord($, root, branch)
+  // The person's waive, allow or reset takes the record for this session (#13), once it is accepted: what it starts is this
+  // session's to run. A refused one leaves the record with its owner.
+  const take = async (): Promise<void> => {
+    await claimRecord($, root, branch)
+  }
   const isRunning = run !== null && run.status === 'running'
   const isOurs = isRunning && run.root === root && run.branch === branch
   const none = `/${COMMAND}: there is no lifecycle for ${branch} yet: /${COMMAND} starts one.`
@@ -887,6 +891,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     return `/${COMMAND}: ${await startGate($, { base: rest[0] })}`
   }
   if (verb === 'reset') {
+    await take()
     if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
     // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
     await archiveLifecycle($, root, branch, now)
@@ -897,6 +902,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     const reason = rest.slice(1).join(' ').trim()
     if (!Number.isInteger(n) || n < 1 || n > 5 || reason === '') return `Say how many and why: /${COMMAND} allow <1-5> <reason>`
     if (rec === undefined) return none
+    await take()
     await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
@@ -935,6 +941,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       return { ...one, waivers: [...one.waivers, { scope: 'finding' as const, findingId: scope, head: one.head, reason, by: origin, at: now }] }
     })
     if (refusal !== undefined) return refusal
+    await take()
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
@@ -942,7 +949,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     const after = await loadRecord($, root, branch)
     const wasPassed = before.preStatus === 'passed' && before.preHead === after?.preHead
     if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {
-      sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
+      await sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
     }
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
@@ -997,8 +1004,9 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
     })
     if (refusal !== undefined || waived === undefined) return refusal ?? `/${COMMAND}: no pre waiver was recorded.`
+    await take()
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
-    sayOpenPr($, waived, 'waived', now)
+    await sayOpenPr($, waived, 'waived', now)
     return (
       `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +
       `The PR may open; this waiver covers ${waived.base} only, and post-PR review still runs.`
@@ -1014,6 +1022,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       'No post waiver was recorded.'
     )
   }
+  await take()
   const pr = await openPrOf($, root, branch)
   const at = pr?.headRefOid ?? head
   // A record started here only carries the waiver: its base is the PR's, else the default branch (R1-5), else the first gated base.
