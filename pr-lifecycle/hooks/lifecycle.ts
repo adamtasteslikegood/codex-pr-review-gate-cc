@@ -5,14 +5,17 @@ import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRec
 
 // ----------------------------------------------------------------- budget
 
-export type Allowances = { standard: number; high: number }
+export type Allowances = { standard: number; high: number; light: number }
 
 const TIERS: readonly Tier[] = ['trivial', 'standard', 'high']
 
-/** Discretionary rounds a lifecycle may complete: by tier, one on the light lane, none for a pass-through. */
+/**
+ * Discretionary rounds a lifecycle may complete: by tier, the light lane's own (Adam, decision C), none for a pass-through. A high
+ * blast radius always gets its own allowance: the branch name never lowers it (finding 4).
+ */
 export function allowanceFor(tier: Tier, lane: Lane, a: Allowances): number {
   if (tier === 'trivial') return 0
-  if (lane === 'light') return 1
+  if (lane === 'light' && tier !== 'high') return a.light
   return tier === 'high' ? a.high : a.standard
 }
 
@@ -43,7 +46,9 @@ export function withRound(rec: LifecycleRecord, round: RoundRecord): LifecycleRe
 /** A materially wider change: the tier and allowance only go up, and the rounds already run still count. */
 export function rescope(rec: LifecycleRecord, tier: Tier, why: string, a: Allowances): LifecycleRecord {
   if (TIERS.indexOf(tier) <= TIERS.indexOf(rec.tier)) return rec
-  return { ...rec, tier, tierWhy: why, allowance: Math.max(rec.allowance, allowanceFor(tier, rec.lane, a)) }
+  // A high blast radius takes the full lane whatever the branch is called (R75).
+  const lane = tier === 'high' ? 'full' : rec.lane
+  return { ...rec, tier, tierWhy: why, lane, allowance: Math.max(rec.allowance, allowanceFor(tier, lane, a)) }
 }
 
 export function newRecord(init: {
@@ -191,8 +196,102 @@ export function triage(
   return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
 }
 
-const touches = (one: Finding, changedFiles: ReadonlySet<string> | 'all'): boolean =>
-  changedFiles === 'all' || (one.file !== undefined && changedFiles.has(one.file))
+/** The lines a change touched, per file: each hunk's old and new ranges, both, since a finding's line may predate either side. */
+export type ChangedLines = ReadonlyMap<string, readonly (readonly [number, number])[]>
+
+/** How far from a finding's line a change still reopens it (R58, narrowed by R73): lines drift as a file is edited around them. */
+export const RECHECK_WINDOW = 20
+
+/**
+ * `git diff --unified=0` as the lines it touched, per file (R73). A binary file gets the whole file: what cannot be read as lines
+ * is not narrowed. A mode-only change touches no line, so it reopens nothing.
+ */
+export function changedLines(diff: string): Map<string, [number, number][]> {
+  return readDiff(diff).lines
+}
+
+/** Per file, each hunk's old start, old length and the lines it adds or removes: what shifts the lines below it (R73). */
+export type LineMoves = ReadonlyMap<string, readonly (readonly [number, number, number])[]>
+
+/** `git diff --unified=0` read once: the lines it touched (`changedLines`) and how it moved the lines it did not touch. */
+export function readDiff(diff: string): { lines: Map<string, [number, number][]>; moves: Map<string, [number, number, number][]> } {
+  const out = new Map<string, [number, number][]>()
+  const moves = new Map<string, [number, number, number][]>()
+  let file: string | undefined
+  let from: string | undefined
+  // File headers come between `diff --git` and the first hunk: inside a hunk, a removed `-- comment` line reads as `--- comment`.
+  let isHeader = false
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      file = undefined
+      from = undefined
+      isHeader = true
+      continue
+    }
+    if (line.startsWith('@@')) isHeader = false
+    if (isHeader && line.startsWith('--- ')) from = line === '--- /dev/null' ? undefined : line.replace(/^--- (a\/)?/, '')
+    if (isHeader && line.startsWith('+++ ')) {
+      file = line === '+++ /dev/null' ? from : line.replace(/^\+\+\+ (b\/)?/, '')
+      if (file !== undefined && !out.has(file)) out.set(file, [])
+      continue
+    }
+    const hunk = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
+    if (hunk === null || file === undefined) {
+      const binary = line.match(/^Binary files (?:a\/)?(\S+) and (?:b\/)?(\S+) differ$/)
+      if (binary !== null) out.set(binary[2] === '/dev/null' ? (binary[1] ?? '') : (binary[2] ?? ''), [[1, Number.MAX_SAFE_INTEGER]])
+      continue
+    }
+    const span = (start: string | undefined, count: string | undefined): [number, number] => {
+      const a = Number(start)
+      const n = count === undefined ? 1 : Number(count)
+      return [a, a + Math.max(n, 1) - 1]
+    }
+    out.get(file)?.push(span(hunk[1], hunk[2]), span(hunk[3], hunk[4]))
+    const oldCount = hunk[2] === undefined ? 1 : Number(hunk[2])
+    const newCount = hunk[4] === undefined ? 1 : Number(hunk[4])
+    moves.set(file, [...(moves.get(file) ?? []), [Number(hunk[1]), oldCount, newCount - oldCount]])
+  }
+  return { lines: out, moves }
+}
+
+/** Where an old line is after a change: shifted by every hunk wholly above it. An insertion (`-n,0`) comes after line n. */
+export function moveLine(line: number, moves: readonly (readonly [number, number, number])[]): number {
+  return moves.reduce((at, [start, count, delta]) => ((count === 0 ? start < line : start + count - 1 < line) ? at + delta : at), line)
+}
+
+/**
+ * The head moved to `to` (R73): each finding is read against the head its line was last placed at (`lineHead`, else `from`), so
+ * shifts from earlier commits carry over. A change near it reopens it (`invalidate`); otherwise its line moves with the code, and
+ * `lineHead` becomes `to`. A diff git could not give reopens the finding and leaves its line where it was.
+ */
+export function relocate(
+  findings: readonly Finding[],
+  from: string | undefined,
+  to: string,
+  diffs: ReadonlyMap<string, { lines: ChangedLines; moves: LineMoves } | 'all'>,
+): Finding[] {
+  return findings.map(one => {
+    const base = one.lineHead ?? from
+    if (base === to) return one
+    const diff = base === undefined ? 'all' : (diffs.get(base) ?? 'all')
+    if (diff === 'all') return invalidate([one], 'all')[0] ?? one
+    const flagged = invalidate([one], diff.lines)[0] ?? one
+    const line = flagged.line === undefined || flagged.file === undefined ? undefined : moveLine(flagged.line, diff.moves.get(flagged.file) ?? [])
+    return { ...flagged, ...(line === undefined ? {} : { line }), lineHead: to }
+  })
+}
+
+const touches = (one: Finding, changed: ReadonlySet<string> | ChangedLines | 'all'): boolean => {
+  if (changed === 'all') return true
+  if (one.file === undefined) return false
+  if (changed instanceof Set) return changed.has(one.file)
+  const ranges = (changed as ChangedLines).get(one.file)
+  if (ranges === undefined) return false
+  // A finding with no line, or a file git showed no hunk for, is reopened by any change to its file (R58).
+  if (one.line === undefined || ranges.length === 0) return true
+  const line = one.line
+  return ranges.some(([a, b]) => a <= line + RECHECK_WINDOW && b >= line - RECHECK_WINDOW)
+}
 
 /**
  * The findings the person waived. A waiver lapses when its finding's file changed after it was given (R50, R55): the lapse is
@@ -262,6 +361,14 @@ export const rejections = (f: Pick<Finding, 'history'>): number =>
 /** Rebutted again after Codex rejected a rebuttal: a dispute only the person settles; it never goes to Codex again (R40). */
 export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !isAcceptedRebuttal(f) && rejections(f) > 0
 
+/**
+ * What the gate's own Codex check rules on (Adam, decision A; R36, R58, R72): rebuttals Codex has not accepted, short of a dispute
+ * (R40); verified fixes whose file changed since (R58); and fixes only reported, at any severity, advisories included. A deferral is
+ * the person's to release (R45), never Codex's.
+ */
+export const checksOwed = (findings: readonly Finding[]): Finding[] =>
+  findings.filter(one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one) || one.status === 'reported-fixed')
+
 /** The dispute in words: the agent's last argument and Codex's last rejection. */
 const disputeOf = (f: Finding): string => {
   const argued = f.history.filter(one => one.status === 'rebutted' && one.by !== 'codex').at(-1)?.note ?? 'no argument recorded'
@@ -299,8 +406,12 @@ export const lastReviewedHead = (rec: Pick<LifecycleRecord, 'rounds'>): string |
 export const lastCoveredHead = (rec: Pick<LifecycleRecord, 'rounds'>): string | undefined =>
   rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence.filter(each => each.isComplete)).at(-1)?.head
 
-/** Answered findings whose file changed: their evidence must be checked again. History stays. (A waiver's lapse is `lapseWaivers`.) */
-export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | 'all'): Finding[] {
+/**
+ * Answered findings a change touched: their evidence must be checked again. With line ranges (R73), only a change within
+ * RECHECK_WINDOW lines of the finding counts; with file names, any change to its file. History stays. (A waiver's lapse is
+ * `lapseWaivers`, by file.)
+ */
+export function invalidate(findings: readonly Finding[], changedFiles: ReadonlySet<string> | ChangedLines | 'all'): Finding[] {
   return findings.map(one => (one.status !== 'open' && touches(one, changedFiles) ? { ...one, needsRecheck: true } : one))
 }
 
@@ -517,4 +628,36 @@ export function decideNext(rec: LifecycleRecord): Next {
   // It never holds over an unresolved blocker or a fix still owed its check, whatever wrote them after ready.
   if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && mergeHolds(rec).length === 0) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
+}
+
+// -------------------------------------------------------------------- log
+
+const clockOf = (at: number): string => `${new Date(at).toISOString().slice(11, 16)}Z`
+const minutesOf = (ms: number): string => `${Math.round(ms / 60_000)}m`
+const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
+
+/** `/pr-gate log`: how a lifecycle went, in a few lines: its rounds and time, the person's steps, the stops, the last events. */
+export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15): string {
+  const log = rec.log ?? []
+  const done = rec.rounds.filter(one => one.isCompleted)
+  const pre = done.filter(one => one.phase === 'pre').length
+  const person = log.filter(one => one.kind === 'person')
+  const verbs = new Map<string, number>()
+  for (const one of person) {
+    const verb = one.text.split(/\s+/)[1] ?? '?'
+    verbs.set(verb, (verbs.get(verb) ?? 0) + 1)
+  }
+  const stops = log.filter(one => one.kind === 'stop')
+  const lines = [
+    `${rec.branch}${rec.pr === undefined ? '' : ` (PR #${rec.pr})`} → ${rec.base}: ${isArchived ? 'archived' : rec.phase}.`,
+    `Rounds: ${done.length} completed (${pre} pre-PR, ${done.length - pre} post-PR), ${plural(rec.attempts, 'incomplete attempt')}. ` +
+      `Active ${minutesOf(rec.activeMs)}, waiting ${minutesOf(rec.waitMs)}.`,
+    person.length === 0
+      ? 'The person stepped in 0 times.'
+      : `The person stepped in ${plural(person.length, 'time')}: ${[...verbs].map(([verb, n]) => `${verb} ${n}`).join(', ')}.`,
+    `Stops: ${stops.length}${stops.length === 0 ? '' : `; the last: ${stops.at(-1)?.text ?? ''}`}.`,
+  ]
+  if (log.length === 0) lines.push('No events logged: the record is from before 1.3.0.')
+  else lines.push('Last events:', ...log.slice(-last).map(one => `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.text}`))
+  return lines.join('\n')
 }

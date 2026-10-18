@@ -179,6 +179,8 @@ Maintain a lifecycle record containing:
 
 Persist enough to resume after interruption without resetting the budget or processing the same feedback twice.
 
+One session runs each record: a headless session in the same checkout never takes it over, and another interactive session does only once the owner has been quiet for 2 minutes (R74). After the PR opens, the gate's own Codex check verifies reported fixes on the head each round ends on, at no round (R72). See the rulings doc's "after the first live run" section (R71-R78) for the 1.3.0 changes.
+
 A normal fix commit continues the lifecycle. A rebase or significant scope change triggers coverage reassessment, not automatic deletion of all history.
 
 ## Code areas likely involved

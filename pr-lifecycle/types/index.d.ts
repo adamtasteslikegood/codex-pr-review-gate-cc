@@ -30,6 +30,8 @@ export type Finding = {
   note?: string
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
+  /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
+  lineHead?: string
   history: FindingEvent[]
 }
 
@@ -124,6 +126,13 @@ export type Waiver = {
 
 export type Grant = { n: number; reason: string; head: string; at: number }
 
+/**
+ * One line of the run log (`/pr-gate log`): what cost time or needed the person. stop: a run ended short of done (error, blocked,
+ * stopped, exhausted); end: a run ended done; person: a /pr-gate command; head: the gate caught up to a head itself; session: a
+ * session took the record over, or stood down.
+ */
+export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session' | 'check'; text: string }
+
 export type LifecycleRecord = {
   version: 1
   root: string
@@ -145,6 +154,8 @@ export type LifecycleRecord = {
   attempts: number
   activeMs: number
   waitMs: number
+  /** The run log, oldest first, capped at LOG_CAP entries. Absent on a record from before 1.3.0. */
+  log?: LogEntry[]
   rounds: RoundRecord[]
   findings: Finding[]
   /** Feedback ids already triaged. */
@@ -218,6 +229,8 @@ export type Run = {
   hasRefixed: boolean
   /** The fix step was asked once more about findings it left without an answer (it costs no round). */
   hasReprompted?: boolean
+  /** The Codex check gave no verdict on reported fixes and ran once more (R72); a second miss leaves them owed. */
+  hasRetriedCheck?: boolean
   /** What the fix step in flight (or the last one) was sent: blocking findings, or advisories alone. */
   fixKind: 'blocking' | 'advisory'
   steps: Step[]

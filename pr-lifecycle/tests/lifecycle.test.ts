@@ -5,6 +5,7 @@ import {
   allowanceFor,
   applyAnswer,
   decideNext,
+  changedLines,
   invalidate,
   lastReviewedHead,
   markHeld,
@@ -13,7 +14,10 @@ import {
   isDisputed,
   mergeHolds,
   mergeFindings,
+  moveLine,
   newRecord,
+  readDiff,
+  relocate,
   remaining,
   rejections,
   rescope,
@@ -29,7 +33,7 @@ import {
   reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
-const A = { standard: 4, high: 6 }
+const A = { standard: 4, high: 6, light: 3 }
 const fresh = () =>
   newRecord({ root: '/repo', branch: 'feat/x', base: 'dev', head: 'a', tier: 'standard', tierWhy: '10 lines', lane: 'full', allowance: 4, at: 1 })
 
@@ -37,7 +41,9 @@ test('the allowance follows the tier and the lane', async () => {
   expect(allowanceFor('trivial', 'full', A)).toBe(0)
   expect(allowanceFor('standard', 'full', A)).toBe(4)
   expect(allowanceFor('high', 'full', A)).toBe(6)
-  expect(allowanceFor('high', 'light', A)).toBe(1)
+  // The light lane has its own allowance (decision C); a high blast radius never takes it (finding 4).
+  expect(allowanceFor('standard', 'light', A)).toBe(3)
+  expect(allowanceFor('high', 'light', A)).toBe(6)
 })
 
 test('only completed discretionary rounds use the allowance', async () => {
@@ -64,6 +70,13 @@ test('an advisory-only round needs a round left over afterwards; a blocking one 
 test('grants from the person add rounds', async () => {
   const rec = { ...fresh(), allowance: 0, grants: [{ n: 2, reason: 'odd change', head: 'a', at: 2 }] }
   expect(remaining(rec)).toBe(2)
+})
+
+test('R75: a light-lane lifecycle rescoped to high takes the full lane', async () => {
+  const light = { ...fresh(), lane: 'light' as const, allowance: 3 }
+  const rec = rescope(light, 'high', 'touches auth/', A)
+  expect(rec.lane).toBe('full')
+  expect(rec.allowance).toBe(6)
 })
 
 test('a rescope raises the allowance to the new tier and keeps history; it never lowers it', async () => {
@@ -267,6 +280,48 @@ test('coverage: a change touching a file flags only the answered findings in it'
   // A rebase that lost the reviewed commit: every answered finding is rechecked.
   expect(invalidate(findings, 'all').map(one => one.needsRecheck === true)).toEqual([true, true, false])
   expect(lastReviewedHead({ rounds: [pre({ endHead: 'b' }), pre({ isCompleted: false, endHead: 'z' })] })).toBe('b')
+})
+
+test('R73: only a change near a finding reopens it; one with no line, or a binary file, reopens on any change', async () => {
+  const diff = [
+    'diff --git a/src/app.ts b/src/app.ts',
+    '--- a/src/app.ts',
+    '+++ b/src/app.ts',
+    '@@ -200,3 +200,4 @@ export function far() {',
+    '+  return 1',
+    '--- a removed SQL comment, not a header',
+    'diff --git a/src/new.ts b/src/new.ts',
+    '--- /dev/null',
+    '+++ b/src/new.ts',
+    '@@ -0,0 +1,5 @@',
+    'diff --git a/img.png b/img.png',
+    'Binary files a/img.png and b/img.png differ',
+  ].join('\n')
+  const lines = changedLines(diff)
+  expect(lines.get('src/app.ts')).toEqual([[200, 202], [200, 203]])
+  expect(lines.get('src/new.ts')).toEqual([[0, 0], [1, 5]])
+  const near = finding({ id: 'R1-1', line: 190, status: 'verified-fixed' })
+  const far = finding({ id: 'R1-2', line: 12, status: 'verified-fixed' })
+  const anywhere = finding({ id: 'R1-3', line: undefined, status: 'rebutted' })
+  const image = finding({ id: 'R1-4', file: 'img.png', line: 3, status: 'rebutted' })
+  expect(invalidate([near, far, anywhere, image], lines).map(one => one.needsRecheck === true)).toEqual([true, false, true, true])
+})
+
+test('R73: a finding\'s line moves with the code, so an edit two commits later is still seen', async () => {
+  const hunk = (header: string): string => ['diff --git a/src/app.ts b/src/app.ts', '--- a/src/app.ts', '+++ b/src/app.ts', header].join('\n')
+  const fixed = finding({ line: 100, status: 'verified-fixed' })
+  // Commit 1 inserts 50 lines at the top: far from the finding, which moves down to 150.
+  const [first] = relocate([fixed], 'a', 'b', new Map([['a', readDiff(hunk('@@ -0,0 +1,50 @@'))]]))
+  expect(first?.needsRecheck).toBeUndefined()
+  expect(first?.line).toBe(150)
+  expect(first?.lineHead).toBe('b')
+  // Commit 2 edits line 150: read from b, where the line was placed, not from the older head the caller names.
+  const [second] = relocate([first ?? fixed], 'a', 'c', new Map([['b', readDiff(hunk('@@ -150 +150 @@'))]]))
+  expect(second?.needsRecheck).toBe(true)
+  // A diff git could not give reopens it and leaves its line where it was.
+  const [failed] = relocate([fixed], 'a', 'b', new Map([['a', 'all']]))
+  expect([failed?.needsRecheck, failed?.line, failed?.lineHead]).toEqual([true, 100, undefined])
+  expect([moveLine(100, [[10, 5, -5]]), moveLine(100, [[200, 1, 3]]), moveLine(100, [[100, 0, 2]]), moveLine(100, [[99, 0, 2]])]).toEqual([95, 100, 100, 102])
 })
 
 test('a review answer can confirm fixes and hold rebuttals by id', async () => {

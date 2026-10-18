@@ -48,6 +48,8 @@ test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', a
     ['R1-1', 'verified-fixed'],
     ['R1-2', 'open'],
   ])
+  // The hold says it is Codex's, never leaving the agent's own rebuttal to read as the open item (finding 17).
+  expect(rec.findings.find(one => one.id === 'R1-2')?.note).toBe('Codex held it in the round 2 review, without a reason')
 })
 
 test('a held blocker goes back to the fixer instead of letting the PR open', async ($, on) => {
@@ -386,7 +388,10 @@ test('a merge while post-PR review runs tells the agent to wait, not the person 
   await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   const held = (await $.tool.call(merge)).deny ?? ''
-  expect(held).toContain('End your turn')
+  // A hold, not an error, with the gate as the next actor (finding 7).
+  expect(held.startsWith('pr-gate HOLD (not an error): ')).toBe(true)
+  expect(held).toContain('Next: the gate.')
+  expect(held).toContain('Leave this branch alone')
   expect(held).not.toContain('waive')
   expect(w.opened.some(one => one.includes('gh pr merge'))).toBe(false)
 })
@@ -694,11 +699,11 @@ test('at the wait cap with nobody covering the head, fresh findings still go to 
   expect(run.phase).toBe('triage')
 })
 
-test('when Codex also runs, the round keeps the GitHub evidence', async ($, on) => {
+test('R72: a fix only reported on a covered head gets the Codex check, not a full Codex review', async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["claude[bot]"],"checks":[]}'
   await toPost($, w)
-  // A blocker reported fixed and not yet verified: Codex runs even though the reviewer covered the head.
+  // A blocker reported fixed and not yet verified, on a head the reviewer covered: Codex checks the fix, and reviews nothing else.
   const rec = (await recordOf(w)) as LifecycleRecord
   const owed = {
     id: 'R1-1', severity: 'P1', title: 'x', file: 'src/app.ts', line: 1, round: 1,
@@ -707,12 +712,14 @@ test('when Codex also runs, the round keeps the GitHub evidence', async ($, on) 
   w.store.set(KEY, { ...rec, findings: [owed] })
   w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
   await w.clock.advance(30_000)
-  expect((await runOf(w)).phase).toBe('review')
-  await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'] }), `agent-${w.spawned.length}`))
-  // Nothing left to triage: the round is recorded with both.
-  const round = (await recordOf(w)).rounds.find(one => one.phase === 'post' && one.isCompleted)
-  const sources = (round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)
-  expect(sources).toEqual(['github:claude[bot]', 'codex:codex'])
+  const run = await runOf(w)
+  expect(run.phase).toBe('verify')
+  expect(w.spawned.at(-1)?.prompt).toContain('The main agent reports these findings fixed')
+  await done($, accept(run.pending[0]?.step ?? '', w, { 'R1-1': true }))
+  const after = await recordOf(w)
+  expect(after.findings.find(one => one.id === 'R1-1')?.status).toBe('verified-fixed')
+  const round = after.rounds.find(one => one.phase === 'post' && one.isCompleted)
+  expect((round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)).toEqual(['github:claude[bot]'])
 })
 
 test('a roster reviewer who never posted is recorded as missing evidence', async ($, on) => {
@@ -782,10 +789,13 @@ test('code changes in the first post-PR round require review of the resulting he
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
+  // Codex checks the fix on the new head first (R72).
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.replies['inline:11']).toBe('991')
   expect(rec.processed).toContain('inline:11')
-  expect(rec.findings.find(one => one.externalId === 'inline:11')?.status).toBe('reported-fixed')
+  expect(rec.findings.find(one => one.externalId === 'inline:11')?.status).toBe('verified-fixed')
   // Round 2, the protected one, is collecting on the new head.
   const run = await runOf(w)
   expect(run.phase).toBe('collect')
@@ -810,6 +820,10 @@ test('another agent pushing during triage makes the PR head the round\'s end hea
   w.gh.prHead = '7'.repeat(40) // pushed by someone else; local HEAD unchanged
   w.git.isAncestor = true
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', replyId: '992' }]))
+  // The PR head someone pushed is fetched before its ancestry is read (R71).
+  expect(w.git.fetches).toContain('fetch --quiet origin feat/x')
+  // Codex checks the rebuttal on the PR head the round ends on (R72); the clean checkout catches up to it first (R71).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.phase === 'post').at(-1)?.endHead).toBe('7'.repeat(40))
   expect((await runOf(w)).roundKind).toBe('baseline')
@@ -878,24 +892,25 @@ test('GitHub findings in a final-head check enter the ledger and are never ready
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
-  // Round 3, the protected one: Codex verifies the fix, a nit is fixed and pushed.
+  // Codex verifies the fix on the new head (R72).
+  await done($, accept('r2-verify', w))
+  // Round 3, the protected one: the reviewer covered the head, so no Codex review; a nit is fixed and pushed.
   w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, 'nit: rename this', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  expect((await runOf(w)).phase).toBe('review')
-  await done($, turn(review('r3-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
   expect((await runOf(w)).phase).toBe('triage')
   await w.clock.advance(1000) // the triage prompt enters the main agent's queue
   w.git.head = 'f'.repeat(40)
   w.gh.prHead = 'f'.repeat(40)
   await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
+  // R58, R72: f touched G2-1's file after Codex verified it; the check verifies G3-1 and re-verifies G2-1 on f.
+  await done($, accept('r3-verify', w, { 'G2-1': true, 'G3-1': true }))
   // The allowance is spent: round 4 is the final-head check, and a reviewer raises a P1 on it.
   expect((await runOf(w)).roundKind).toBe('final-head-check')
   w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  // R58: f touched G2-1's file after Codex verified it; the final-head check's review re-verifies it.
-  await done($, turn(review('r4-review', 'PASS', [], { verified: ['G2-1'] }), `agent-${w.spawned.length}`))
+  await done($, turn(review('r4-review', 'PASS'), `agent-${w.spawned.length}`))
   expect(w.prompts.at(-1)).toContain('G4-1')
   await w.clock.advance(1000)
   await done($, triaged('r4-triage', []))
@@ -955,10 +970,10 @@ test('R33: in the protected round, a comment on the lines just fixed is not call
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
   w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, '**P1** SQL injection still here', w.gh.prHead)]
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
-  await done($, turn(review('r3-review', 'PASS'), `agent-${w.spawned.length}`))
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('G3-1')
   expect(said).not.toContain('duplicate of an answered finding')
@@ -2456,6 +2471,7 @@ test('R60: the post-PR Codex fallback reviews from the last head a review covere
   w.git.head = 'e'.repeat(40)
   w.gh.prHead = 'e'.repeat(40)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
   expect((await runOf(w)).roundKind).toBe('baseline')
   // Nobody reviews e...e by the wait cap: Codex falls back, on the range nobody read.
   await w.clock.advance(21 * 60_000)
@@ -2670,7 +2686,8 @@ test('R1-10: a base fetch that fails twice starts no round, says why, and the ne
   const held = (await $.tool.call(createPr)).deny ?? ''
   expect(held).toContain('could not fetch origin/dev')
   expect(held).toContain('Could not resolve host')
-  expect(held).not.toContain('End your turn')
+  // No round started, so the hold promises no gate message.
+  expect(held).not.toContain('Next: the gate.')
   expect(w.spawned).toHaveLength(0)
   expect(w.run?.status === 'running').toBe(false)
   w.git.fetchFails = 2
@@ -2797,6 +2814,45 @@ test('R1-9: a ready PR with failing CI is held, the checks are named, and no wai
   expect(held).toContain('rerun')
   expect(held).not.toContain('waive')
   expect(w.gh.calls.some(one => one.startsWith('pr checks 1'))).toBe(true)
+})
+
+test('R76: a trusted reviewer\'s P1 posted after ready holds the merge until a resume has triaged it, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
+  await toReady($, w)
+  const rounds = (await recordOf(w)).rounds.length
+  // The trusted bot, never waited for, posts once the lifecycle is ready.
+  w.gh.comments = [inline(21, '**P1** SQL injection', w.gh.prHead)]
+  const held = (await $.tool.call(merge)).deny ?? ''
+  expect(held).toContain('1 review comment from claude[bot] arrived after the lifecycle review completed')
+  expect(held).toContain('/pr-gate resume')
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('SQL injection')
+  expect((await runOf(w)).phase).toBe('triage')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  expect((await recordOf(w)).rounds.length).toBe(rounds)
+})
+
+test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.numstat = '3\t1\tdocs/guide.md'
+  w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
+  expect(isHeld(await $.tool.call(createPr))).toBe(false)
+  w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Looks fine.', created_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(20 * 60_000)
+  await done($, triaged('r1-triage', [{ id: 'G1-1', action: 'rebutted', severity: 'P3', note: 'no change asked', replyId: '31' }]))
+  await done($, accept('r1-verify', w, { 'G1-1': true }))
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  const rounds = (await recordOf(w)).rounds.length
+  w.gh.comments = [inline(21, '**P1** SQL injection', w.gh.prHead)]
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('SQL injection')
+  expect((await runOf(w)).phase).toBe('triage')
+  expect((await recordOf(w)).rounds.length).toBe(rounds)
 })
 
 test('R1-9: a ready PR with CI still running is held', async ($, on) => {
@@ -2931,4 +2987,292 @@ test('F5: the controller does not write ready from a read a finding has since ch
   const rec = await recordOf(w)
   expect(rec.findings.some(one => one.id === 'G2-9')).toBe(true)
   expect(rec.phase).not.toBe('ready')
+})
+
+// ------------------------------------------------- #13: one session runs each record
+
+const OWNER = 'lifecycle:/repo:feat/x:owner'
+
+test('#13: a headless session in the same checkout never takes the lifecycle over', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  // A hook's `claude -p` child starts in the PR's checkout while the owner is away.
+  w.clearState()
+  w.sessionId = 'child'
+  await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(300_000)
+  expect(w.prompts).toHaveLength(prompts)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('session-1')
+})
+
+test('#13: another interactive session takes the record over only once its owner has been quiet for 2 minutes', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  w.clearState()
+  w.sessionId = 'second'
+  // The owner beat moments ago: the second session leaves the record alone.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect(w.run).toBeUndefined()
+  // Two quiet minutes later, a new session takes it over and collects.
+  await w.clock.advance(121_000)
+  w.clearState()
+  w.sessionId = 'third'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect((await runOf(w)).lifecycle).toBe('post')
+  await w.clock.advance(1000)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('third')
+})
+
+test('#13: a session whose record another session took sends its agent nothing and stands down', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(60_000)
+  expect(w.prompts).toHaveLength(prompts)
+  expect(w.run).toBeNull()
+})
+
+test('#13: a reloaded session with its run kept never takes back a record another session took', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  // A reload keeps the run and restarts the ticker: its first tick finds the record held and stands down.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('other')
+  expect(w.run).toBeNull()
+  expect(w.prompts).toHaveLength(prompts)
+})
+
+test('#13: a review that finishes after another session took the record sends nothing and advances nothing', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  // Codex passes before this session's next beat: no "open the PR" prompt, and the record's pre-PR status is left alone.
+  await done($, turn(review('r1-review', 'PASS')))
+  expect(w.prompts).toHaveLength(prompts)
+  expect((await recordOf(w)).preStatus).toBeUndefined()
+  expect(w.run).toBeNull()
+})
+
+test('#13: a pre waiver\'s queued prompt is not sent once another session took the record', async ($, on) => {
+  const w = world(on)
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  await say($, 'waive pre hotfix')
+  // Another session takes the record before the command's held prompts are flushed, one second later.
+  w.store.set(OWNER, { sessionId: 'other', beatAt: 10_000_000 })
+  await w.clock.advance(1000)
+  expect(w.prompts.filter(one => one.includes('Now open the pull request'))).toHaveLength(0)
+})
+
+test('#13: a person\'s command that is refused leaves the record with its owner', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  // A second interactive session starts while the owner beats: it leaves the record alone.
+  w.clearState()
+  w.sessionId = 'second'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  for (const args of ['allow 0 typo', 'allow 2', 'waive G9-9 not a finding', 'waive pre']) {
+    await say($, args)
+    expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('session-1')
+  }
+  // An accepted one takes it.
+  await say($, 'allow 1 one more look')
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('second')
+})
+
+// ------------------------------------------- R71: a moved head no longer stops the round
+
+test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.prHead = 'b'.repeat(40) // a bot pushed its own fix to the branch
+  w.git.isAncestor = true
+  const spawned = w.spawned.length
+  await w.clock.advance(20 * 60_000)
+  expect(w.git.head).toBe('b'.repeat(40))
+  expect(w.spawned.length).toBeGreaterThan(spawned)
+  expect((await runOf(w)).status).toBe('running')
+})
+
+test('R71: a checkout switched to another branch is never fast-forwarded; the round stops', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  const before = w.git.head
+  // The person switched the clean checkout to an ancestor branch while reviewers were posting.
+  w.git.branch = 'main'
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.isAncestor = true
+  await w.clock.advance(20 * 60_000)
+  expect(w.git.head).toBe(before)
+  expect((await runOf(w)).status).toBe('error')
+})
+
+test('R71: a push gh has not seen yet does not stop the round', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40) // committed and pushed; gh still reports the old head
+  w.git.remoteHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const run = await runOf(w)
+  expect(run.message ?? '').not.toContain('are not on the PR')
+  expect(run.headSha).toBe('e'.repeat(40))
+})
+
+test('R71: commits that are truly not on the PR still stop the round, naming who wrote them', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.git.unpushed = 'eeeeeee by claude-child'
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('commits on feat/x are not on the PR (eeeeeee by claude-child): pull or push, then /pr-gate resume')
+})
+
+// ---------------------------------------- R72: the gate's own Codex check verifies reported fixes
+
+test('R72: a fix Codex refutes is open again with Codex\'s reason, and the next prompt carries it', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised the query', replyId: '991' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'src/db.ts:9 still concatenates the id' }))
+  const found = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.note).toBe('src/db.ts:9 still concatenates the id')
+})
+
+test('R72: a reported advisory fix is verified by the same check, at no round', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  const before = (await recordOf(w)).rounds.filter(one => one.isCompleted && one.kind === 'discretionary').length
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P3', replyId: '991' }]))
+  expect(w.spawned.at(-1)?.prompt).toContain('G2-1 [P3]')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
+  expect(rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary').length).toBe(before)
+})
+
+// ------------------------------------------- R73: a finding's line moves with the code across head moves
+
+const hunk = (at: string) => `diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ ${at} @@`
+
+test('R73: a pre-PR round keeps the line its fix moved, so a later edit at the real line reopens the finding', async ($, on) => {
+  const w = world(on)
+  w.git.changed = 'src/app.ts'
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [{ ...P1, line: 100 }])))
+  // The fix lands 50 lines above the finding: far from it, so it moves to 150 and is not reopened.
+  w.git.hunks = hunk('-0,0 +1,50')
+  w.git.head = 'd'.repeat(40)
+  await done($, turn(fixed('R1-1')))
+  const placed = (await recordOf(w)).findings.find(one => one.id === 'R1-1')
+  expect(placed?.line).toBe(150)
+  expect(placed?.lineHead).toBe('d'.repeat(40))
+  expect(placed?.needsRecheck).toBeUndefined()
+  await done($, turn(review('r2-review', 'PASS')))
+  // The next commit edits line 150, where the finding now is: it needs checking again.
+  w.git.hunks = hunk('-150 +150')
+  w.git.head = 'f'.repeat(40)
+  await $.tool.call(createPr)
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.needsRecheck).toBe(true)
+})
+
+// --------------------------------------------------------------- the run log (/pr-gate log)
+
+test('/pr-gate log sums up the run: rounds and time, the person\'s steps, the stops', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'resume')
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain('feat/x (PR #1) → dev: post.')
+  expect(out).toContain('Rounds: ')
+  expect(out).toContain('The person stepped in 1 time: resume 1.')
+  expect(out).toMatch(/Stops: [1-9]/)
+  expect(out).toContain('Last events:')
+  expect(out).toMatch(/person +\/pr-gate resume → /)
+})
+
+test('/pr-gate log reads the newest archive once the lifecycle was reset', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'reset')
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain(': archived.')
+  expect(out).toMatch(/Stops: [1-9]/)
+})
+
+test('R72: a check with no verdict on reported fixes runs once more; a second miss leaves them owed, holding nothing', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  const empty = () => turn(`v\n${TRAILER}\n${JSON.stringify({ step: 'r2-verify', verdicts: [] })}`, `agent-${w.spawned.length}`)
+  const spawned = w.spawned.length
+  await done($, empty())
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, empty())
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('reported-fixed')
+  expect((await recordOf(w)).postStatus).not.toBe('blocked')
+})
+
+test('R72: a check that rules on one reported fix and leaves out another asks again for that one only, at no round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P1** SQL injection', w.gh.prHead), inline(12, '**P1** Missing auth check', w.gh.prHead, 40)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  const before = (await recordOf(w)).rounds.filter(one => one.isCompleted).length
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' },
+    { id: 'G2-2', action: 'fixed', severity: 'P1', replyId: '992' },
+  ]))
+  const spawned = w.spawned.length
+  await done($, accept('r2-verify', w, { 'G2-1': true }))
+  // Asked again for G2-2 alone; G2-1's verdict stands.
+  expect(w.spawned).toHaveLength(spawned + 1)
+  expect(w.spawned.at(-1)?.prompt).toContain('G2-2')
+  expect(w.spawned.at(-1)?.prompt).not.toContain('G2-1 [')
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
+  await done($, accept('r2-verify', w, { 'G2-2': true }))
+  const rec = await recordOf(w)
+  expect(rec.findings.filter(one => one.id.startsWith('G2-')).map(one => one.status)).toEqual(['verified-fixed', 'verified-fixed'])
+  expect(rec.rounds.filter(one => one.isCompleted).length).toBe(before + 1)
+})
+
+test('/pr-gate log counts only the person\'s commands, not an agent\'s refused one', async ($, on) => {
+  const w = world(on)
+  await toBlocked($, w, 'Consider renaming this')
+  await say($, 'waive post because', { ...asPerson, origin: { kind: 'sdk' } })
+  const out = String((await say($, 'log')).text ?? '')
+  expect(out).toContain('The person stepped in 0 times.')
 })

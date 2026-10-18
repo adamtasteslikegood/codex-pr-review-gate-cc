@@ -1,6 +1,6 @@
 {
   "name": "pr-lifecycle",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "/pr-gate across the PR lifecycle: pre-PR Codex rounds, then the repository's own post-PR reviews, under one review budget and one record, with a live progress pane.",
   "author": {
     "name": "adam schoen"
@@ -19,6 +19,12 @@
       "title": "Review rounds, high blast-radius changes",
       "description": "The same allowance for a high blast-radius change. A repository's .github/pr-gate.json on the base can set its own.",
       "default": 6
+    },
+    "allowanceLight": {
+      "type": "number",
+      "title": "Review rounds, light lane",
+      "description": "The same allowance for a branch on the light lane (lightBranches), unless its blast radius is high: then it takes the full lane and allowanceHigh. A repository's .github/pr-gate.json on the base can set its own.",
+      "default": 3
     },
     "bases": {
       "type": "string",

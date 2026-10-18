@@ -10,35 +10,40 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 [README.md](README.md) for the component table and [VISION.md](VISION.md) for
 the project's goals and their order.
 
-## Current state (2026-10-17)
+## Current state (2026-10-17, after wave 1)
 
-- `codex-gate/` **0.3.1** is the plugin in daily use, loaded through
-  `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. It is **frozen**:
-  don't change it unless Adam asks for a fix. Known, unfixed issues:
+- `codex-gate/` **0.3.1** is **not loaded** and **frozen**: don't change it
+  unless Adam asks for a fix. Known, unfixed issues:
   - A PR can be created through the github-graphql MCP connector without
     the gate.
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.2.0** is **not loaded** (1.0.0 merged in PR #1).
-  It extends `/pr-gate` across pre-PR and post-PR review and implements
+- `pr-lifecycle/` **1.3.0** is the plugin in daily use, loaded through
+  `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. It gates the PRs of
+  this repo too, so a change to it is gated by the version loaded, and you
+  should expect holds on your own branch. It extends `/pr-gate` across pre-PR
+  and post-PR review and implements
   [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). The Claude model of each sub-agent
   and the Codex model and effort per tier are settings (#10, #11; R68–R70).
   Per-repo settings live in `.github/pr-gate.json`, read from the base
   branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
   - Every ruling made while building it, R1–R66, Adam's rulings on
-    codex-gate's deferred items R1-5 to R1-10, and R67–R70 after 1.0.0:
+    codex-gate's deferred items R1-5 to R1-10, R67–R70 after 1.0.0, and
+    R71–R78 after the first live run:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
-  - Read the spec and the rulings before changing it.
+  - Read the spec and the rulings before changing it. The goals are in
+    [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
+  - `/pr-gate log` sums up how a lifecycle went (R78).
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
   creation, so two would gate the same PR twice. Switching
-  `CLAUDE_CODE_PLUGIN_DIRS` to `pr-lifecycle` is Adam's call.
+  `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.
 - Open follow-ups, left as is on purpose:
   - a failing optional CI check holds a pr-lifecycle merge, with no waiver;
   - a failed fetch of a submodule or of the other base stops a round;
   - in a repo with no reviewer roster, review bots without write access are
-    dropped.
+    dropped (list them under `trusted` to keep them without waiting, R76).
 
 ## Repo setup
 
@@ -92,7 +97,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 389)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 415)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four

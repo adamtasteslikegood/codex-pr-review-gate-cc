@@ -26,7 +26,11 @@ export type Feedback = {
 
 export type Check = { name: string; status: string; conclusion: string | null }
 
-export type Roster = { reviewers: string[]; checks: string[]; requestReview: string[]; quietMinutes?: number; waitCapMinutes?: number }
+/**
+ * A repository's `.github/pr-gate.json` roster: `reviewers` are trusted and waited for, `checks` are waited for, `trusted` are
+ * trusted only (#14): their feedback is triaged, but collection never waits on them.
+ */
+export type Roster = { reviewers: string[]; checks: string[]; requestReview: string[]; trusted: string[]; quietMinutes?: number; waitCapMinutes?: number }
 
 type Row = Record<string, unknown>
 
@@ -162,6 +166,7 @@ export function readRoster(text: string): Roster | undefined {
       reviewers: strings(r.reviewers),
       checks: strings(r.checks),
       requestReview: strings(r.requestReview),
+      trusted: strings(r.trusted),
       ...(quietMinutes === undefined ? {} : { quietMinutes }),
       ...(waitCapMinutes === undefined ? {} : { waitCapMinutes }),
     }
@@ -174,13 +179,15 @@ export function readRoster(text: string): Roster | undefined {
 const WRITERS = ['OWNER', 'MEMBER', 'COLLABORATOR']
 
 /**
- * Whether a piece of feedback is triaged at all (R1-8): its author has write access, or is on the roster (a review bot), or the row
- * does not say (kept, and fenced like the rest). Anyone else's comment is dropped before it reaches a prompt or covers a head.
+ * Whether a piece of feedback is triaged at all (R1-8): its author has write access, or is on the roster (a review bot, waited for
+ * or only trusted, #14), or the row does not say (kept, and fenced like the rest). Anyone else's comment is dropped before it
+ * reaches a prompt or covers a head.
  */
 export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
   one.association === undefined ||
   WRITERS.includes(one.association) ||
   roster?.reviewers.includes(one.reviewer) === true ||
+  roster?.trusted.includes(one.reviewer) === true ||
   roster?.requestReview.some(name => postsFor(one.reviewer, name)) === true
 
 /**
@@ -226,9 +233,10 @@ export type CollectInput = {
 export function collectionDone(input: CollectInput): { isDone: boolean; isComplete: boolean; missing: string[]; covered: string[] } {
   const roster = input.roster
   const hasRoster = roster !== undefined && (roster.reviewers.length > 0 || roster.checks.length > 0)
-  // Who covers the head: with a roster, its reviewers only; without one, reviews and inline comments, never an issue
-  // comment (a deploy-preview bot's note reviews nothing).
-  const counts = (one: Feedback): boolean => (hasRoster && roster !== undefined ? roster.reviewers.includes(one.reviewer) : one.kind !== 'comment')
+  // Who covers the head: with a roster, its reviewers, and a trusted reviewer whose review is already in (#14: never waited for);
+  // without one, reviews and inline comments, never an issue comment (a deploy-preview bot's note reviews nothing).
+  const counts = (one: Feedback): boolean =>
+    hasRoster && roster !== undefined ? roster.reviewers.includes(one.reviewer) || roster.trusted.includes(one.reviewer) : one.kind !== 'comment'
   const isOnHead = (one: Feedback): boolean => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)
   const covered = [...new Set(input.feedback.filter(one => counts(one) && isOnHead(one)).map(one => one.reviewer))]
   const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))

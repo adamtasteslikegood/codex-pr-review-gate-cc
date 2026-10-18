@@ -38,8 +38,8 @@ import {
   acceptRebuttal,
   applyAnswer,
   decideNext,
-  invalidate,
   lapseWaivers,
+  checksOwed,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
@@ -52,7 +52,9 @@ import {
   newRecord,
   nextIds,
   raisedIn,
+  readDiff,
   rejections,
+  relocate,
   roundOf,
   triage,
   unresolvedBlockers,
@@ -62,7 +64,7 @@ import {
   withRound,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, loadRecord, lockRecord, saveRecord, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -125,7 +127,7 @@ const modelOf = (value: unknown): { model: string | undefined } | undefined => {
 }
 
 /** The most rounds an allowance may be set to, by the options or by a repository's file. */
-const CAPS = { standard: 10, high: 12 } as const
+const CAPS = { standard: 10, high: 12, light: 10 } as const
 
 /** A whole count of at least 1, or undefined. */
 const countOf = (value: unknown): number | undefined => {
@@ -157,6 +159,7 @@ export function configOf(options: PluginOptions): Config {
     allowances: {
       standard: Math.min(number('allowanceStandard', number('maxRounds', 4)), CAPS.standard),
       high: Math.min(number('allowanceHigh', 6), CAPS.high),
+      light: Math.min(number('allowanceLight', 3), CAPS.light),
     },
     bases: bases.length > 0 ? bases : ['dev', 'main'],
     enforce: options.enforce !== false,
@@ -188,7 +191,7 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
  * the option. A key whose value is invalid is left to the option and named in `ignored`; an empty regular expression turns its
  * match off, and an empty model names none, as the option does.
  */
@@ -207,7 +210,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
     ignored.push(`${key} (${why})`)
     return undefined
   }
-  const count = (key: 'allowanceStandard' | 'allowanceHigh', cap: number): number | undefined => {
+  const count = (key: 'allowanceStandard' | 'allowanceHigh' | 'allowanceLight', cap: number): number | undefined => {
     const value = r[key]
     if (value === undefined) return undefined
     const n = typeof value === 'number' || typeof value === 'string' ? countOf(value) : undefined
@@ -224,6 +227,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   }
   const standard = count('allowanceStandard', CAPS.standard)
   const high = count('allowanceHigh', CAPS.high)
+  const lightRounds = count('allowanceLight', CAPS.light)
   const light = pattern('lightBranches')
   const onExhausted =
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
@@ -250,7 +254,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   return {
     config: {
       ...c,
-      allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high },
+      allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high, light: lightRounds ?? c.allowances.light },
       onExhausted: onExhausted ?? c.onExhausted,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
@@ -298,6 +302,74 @@ export function setup(c: Config): void {
   queued = []
 }
 
+// This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
+let me: string | undefined
+let isInteractive = true
+// When this session last beat for its run's record; 0 makes the next tick claim it.
+let beatAt = 0
+const BEAT_MS = 30_000
+
+export function setSession(interactive: boolean): void {
+  isInteractive = interactive
+  me = undefined
+}
+
+export async function sessionIdOf($: Engine): Promise<string> {
+  me ??= await $.session.id()
+  return me
+}
+
+/**
+ * Makes this session the record's owner (#13): a start, a resume or a person's command takes the record. A headless session
+ * (`-p`, the SDK) never takes one another session holds; false then.
+ */
+export async function claimRecord($: Engine, root: string, branch: string): Promise<boolean> {
+  const now = await $.clock.now()
+  const id = await sessionIdOf($)
+  const before = await ownerOf($, root, branch)
+  if (!isInteractive && isHeldByOther(before, id, now)) return false
+  await setOwner($, root, branch, { sessionId: id, beatAt: now })
+  beatAt = now
+  if (before !== undefined && before.sessionId !== id) {
+    await logEvent($, root, branch, 'session', `session ${id.slice(0, 8)} took the record over from ${before.sessionId.slice(0, 8)}`)
+  }
+  return true
+}
+
+/** Whether another session holds the record now: this one then sends its agent nothing and stands down. */
+export async function isOwnedElsewhere($: Engine, root: string, branch: string): Promise<boolean> {
+  return isHeldByOther(await ownerOf($, root, branch), await sessionIdOf($), await $.clock.now())
+}
+
+/**
+ * The ticker's beat, on its first tick and then every 30 s: false when another session holds the record. A ticker never takes a
+ * record another session holds, not even a restarted one: only a person's command, or an owner gone quiet, moves it (#13).
+ */
+async function beat($: Engine, run: Run, now: number): Promise<boolean> {
+  if (beatAt !== 0 && now - beatAt < BEAT_MS) return true
+  if (await isOwnedElsewhere($, run.root, run.branch)) return false
+  return claimRecord($, run.root, run.branch)
+}
+
+/** Whether this session may act on the run's record now; when another session holds it, this one stands down (#13). */
+export async function isStillMine($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<boolean> {
+  if (!(await isOwnedElsewhere($, run.root, run.branch))) return true
+  await standDown($, run)
+  return false
+}
+
+/** Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. */
+async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<void> {
+  const live = await getRun($)
+  if (live === null || (live.root === run.root && live.branch === run.branch)) {
+    stopTicker()
+    isLive = false
+    await update($, runAtom, () => null)
+  }
+  $.ui.status('pr-gate: another session runs this lifecycle')
+  await logEvent($, run.root, run.branch, 'session', `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`)
+}
+
 export const isLiveNow = (): boolean => isLive
 export const setLive = (v: boolean): void => {
   isLive = v
@@ -319,7 +391,16 @@ export const agentModelFor = (role: Role, lifecycle: Run['lifecycle'], c: Config
 
 // Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
 let holdDepth = 0
-let queued: string[] = []
+let queued: { text: string; key: RecordKey }[] = []
+
+/** The record a prompt is about: it is sent only while this session still holds it (#13). */
+export type RecordKey = Pick<Run, 'root' | 'branch'>
+
+/** Submits a prompt unless another session took its record meanwhile; this one then stands down instead (#13). */
+async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
+  if (!(await isStillMine($, key))) return
+  await $.prompt.submit({ text }).catch(() => undefined)
+}
 
 /** Runs `body` with the prompts it decides held back; once it has returned, they are sent one second later, in order. */
 export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
@@ -330,21 +411,26 @@ export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Prom
     holdDepth -= 1
     if (holdDepth === 0 && queued.length > 0) {
       $.clock.after(1000, () => {
-        const texts = queued
+        const held = queued
         queued = []
-        for (const text of texts) void $.prompt.submit({ text }).catch(() => undefined)
+        void (async () => {
+          for (const one of held) await deliver($, one.key, one.text)
+        })()
       })
     }
   }
 }
 
-/** Sends a prompt to the main agent now, or after the command that holds the turn has returned. */
-export function say($: Engine, text: string): void {
+/**
+ * Sends a prompt about `key`'s record to the main agent now, or after the command that holds the turn has returned. Either way
+ * the owner is checked at delivery: a session that lost the record sends nothing (#13).
+ */
+export async function say($: Engine, key: RecordKey, text: string): Promise<void> {
   if (holdDepth > 0) {
-    queued.push(text)
+    queued.push({ text, key })
     return
   }
-  void $.prompt.submit({ text }).catch(() => undefined)
+  await deliver($, key, text)
 }
 
 export async function getRun($: Engine): Promise<Run | null> {
@@ -387,6 +473,41 @@ export async function fetchTwice($: Engine, cwd: string | undefined, args: strin
   return { isOk: false, err: err === '' ? 'git fetch failed' : err }
 }
 
+/**
+ * Brings a clean local checkout up to the PR head (R71): a fetch, then a merge that only fast-forwards. True when HEAD is the PR
+ * head after it. A dirty checkout, one with commits the PR lacks, or one on another branch is left as it is: that is the person's to sort out.
+ */
+export async function syncToHead($: Engine, root: string, branch: string, prHead: string): Promise<boolean> {
+  const local = await git($, root, ['rev-parse', 'HEAD'])
+  if (!local.isOk) return false
+  if (local.out === prHead) return true
+  // Only the PR's own branch is moved: a checkout switched to another branch meanwhile is never fast-forwarded to the PR head.
+  const on = await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  if (!on.isOk || on.out !== branch) return false
+  const dirty = await git($, root, ['status', '--porcelain', '--untracked-files=no'])
+  if (!dirty.isOk || dirty.out !== '') return false
+  if (!(await fetchTwice($, root, ['--quiet', 'origin', branch], 60_000)).isOk) return false
+  if (!(await git($, root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk) return false
+  if (!(await git($, root, ['merge', '--ff-only', '--quiet', prHead], 60_000)).isOk) return false
+  const after = await git($, root, ['rev-parse', 'HEAD'])
+  if (!after.isOk || after.out !== prHead) return false
+  await logEvent($, root, branch, 'head', `caught the checkout up from ${local.out.slice(0, 7)} to the PR head ${prHead.slice(0, 7)}`)
+  return true
+}
+
+/** gh can report the PR head from before a push that just landed (R71): origin's branch is the truth when it is the local HEAD. */
+export async function isPushed($: Engine, root: string, branch: string, local: string): Promise<boolean> {
+  const remote = await git($, root, ['ls-remote', 'origin', `refs/heads/${branch}`])
+  return remote.isOk && remote.out.split(/\s/)[0] === local
+}
+
+/** Who wrote the local commits no origin branch has, for a stop that names them (R71): "abc1234 by Ann, def5678 by Bob". */
+export async function unpushedBy($: Engine, root: string): Promise<string> {
+  const log = await git($, root, ['log', '--format=%h by %an', 'HEAD', '--not', '--remotes=origin'])
+  const lines = log.isOk ? log.out.split('\n').filter(Boolean) : []
+  return lines.length === 0 ? '' : ` (${lines.slice(0, 5).join(', ')}${lines.length > 5 ? ', ...' : ''})`
+}
+
 /** The record's waivers at `head`, with each finding waiver whose finding's file changed since it was given marked lapsed (R55). */
 export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'waivers' | 'findings'>, head: string, now: number): Promise<Waiver[]> {
   const froms = [...new Set(rec.waivers.filter(one => one.scope === 'finding' && one.lapsedAt === undefined && one.head !== head).map(one => one.head))]
@@ -399,7 +520,7 @@ export async function lapsedAt($: Engine, rec: Pick<LifecycleRecord, 'root' | 'w
 }
 
 /**
- * The head moved from `from` to `to` (R56): each answered finding whose file changed needs a re-check (`invalidate`), and each
+ * The head moved from `from` to `to` (R56): each answered finding a change came near needs a re-check (`invalidate`, R73), and each
  * finding waiver whose finding's file changed since it was given lapses (R55). Git failing flags and lapses everything.
  */
 export async function headMoved(
@@ -410,9 +531,14 @@ export async function headMoved(
   to: string,
   now: number,
 ): Promise<{ findings: Finding[]; waivers: Waiver[] }> {
-  const diff = from === undefined ? undefined : await git($, root, ['diff', '--name-only', from, to])
-  const files = diff?.isOk === true ? new Set(diff.out.split('\n').filter(Boolean)) : ('all' as const)
-  const findings = invalidate(rec.findings, files)
+  // Only a change near a finding reopens it, read from the head its line was placed at (R73); git failing reopens everything.
+  const bases = new Set(rec.findings.map(one => one.lineHead ?? from ?? to).filter(base => base !== to))
+  const diffs = new Map<string, ReturnType<typeof readDiff> | 'all'>()
+  for (const base of bases) {
+    const diff = await git($, root, ['diff', '--unified=0', '--no-color', '--no-ext-diff', base, to], 60_000)
+    diffs.set(base, diff.isOk ? readDiff(diff.out) : 'all')
+  }
+  const findings = relocate(rec.findings, from, to, diffs)
   return { findings, waivers: await lapsedAt($, { root, waivers: rec.waivers, findings }, to, now) }
 }
 
@@ -423,11 +549,22 @@ export async function headMoved(
 export async function onNewHead($: Engine, run: Run, from: string, to: string, now: number): Promise<void> {
   const live = await getRun($)
   const own = live?.id === run.id ? live.findings : run.findings
-  let flagged = new Set<string>()
-  const flag = (findings: readonly Finding[]): Finding[] => findings.map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one))
+  // Each finding's flag and its line, placed at the new head (R73), go to both copies.
+  let placed = new Map<string, Finding>()
+  const flag = (findings: readonly Finding[]): Finding[] =>
+    findings.map(one => {
+      const at = placed.get(one.id)
+      if (at === undefined) return one
+      return {
+        ...one,
+        ...(at.needsRecheck === true ? { needsRecheck: true } : {}),
+        ...(at.line === undefined ? {} : { line: at.line }),
+        ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+      }
+    })
   const move = async (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Promise<Waiver[]> => {
     const moved = await headMoved($, run.root, { findings: mergeFindings(rec.findings, own), waivers: rec.waivers }, from, to, now)
-    flagged = new Set(moved.findings.filter(one => one.needsRecheck === true).map(one => one.id))
+    placed = new Map(moved.findings.map(one => [one.id, one]))
     return moved.waivers
   }
   // Read and written under the record's lock (R1-6): a waiver the person gives meanwhile is not overwritten.
@@ -446,6 +583,8 @@ const stopTicker = (): void => {
 
 export function startTicker($: Engine): void {
   stopTicker()
+  // The first tick beats for this session, unless another holds the record (#13).
+  beatAt = 0
   ticker = $.clock.every(1000, () => {
     void (async () => {
       const now = await $.clock.now()
@@ -453,6 +592,10 @@ export function startTicker($: Engine): void {
       if (run === null || run.status !== 'running') {
         stopTicker()
         isLive = false
+        return
+      }
+      if (!(await beat($, run, now))) {
+        await standDown($, run)
         return
       }
       await update($, tickAtom, () => now)
@@ -523,6 +666,8 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
   isLive = false
   if (!isEnded || run === null) return null
   const ended: Run = run
+  const isDone = status === 'passed' || status === 'waived'
+  await logEvent($, ended.root, ended.branch, isDone ? 'end' : 'stop', `${ended.lifecycle}-PR round ${ended.round} ${status}: ${message}`)
   // A review that completed below the branch's default sets where the next run starts; a run that never completed one keeps the last.
   const hasReviewed = status === 'passed' || status === 'exhausted' || status === 'blocked'
   // What carries is the start lowered by timeouts, never a re-review's own capped effort.
@@ -671,6 +816,11 @@ async function beginFix($: Engine, id: string, notes: string | undefined, kind: 
       return
     }
     await patch($, id, run => ({ ...run, pending: [{ role: 'fix', step: stepOf(run, 'fix'), agentId }], activity: 'waiting on the fixer…' }))
+    return
+  }
+  // Another session runs this record (#13): this one sends its agent nothing.
+  if (await isOwnedElsewhere($, opened.root, opened.branch)) {
+    await standDown($, opened)
     return
   }
   // The prompt waits for the session to go idle. The step is armed by the main-loop turn that starts with this prompt
@@ -941,8 +1091,6 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   const isCovered = [...evidence, ...rec.rounds.filter(one => one.isCompleted).flatMap(one => one.evidence)].some(
     each => each.isComplete && each.head === got.prHead,
   )
-  // Any fix only reported, at any severity (R39), needs Codex to verify it before the merge.
-  const owesVerification = mergeHolds(rec).some(one => one.status === 'reported-fixed')
   const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
   const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
   const after = await patch($, run.id, one => ({
@@ -959,10 +1107,13 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     }),
   }))
   if (after === null) return
-  if (run.roundKind === 'final-head-check' || ((!isCovered || owesVerification) && !isPassThroughRound1)) {
+  // A fix only reported no longer calls for a full Codex review: the round's own Codex check verifies it (R72).
+  if (run.roundKind === 'final-head-check' || (!isCovered && !isPassThroughRound1)) {
     // Codex reads the local checkout: it must be the PR head, or it would review something else.
+    // A clean checkout behind the PR head (a reviewer's or a bot's push) catches up on its own (R71).
+    const isSynced = await syncToHead($, run.root, run.branch, got.prHead)
     const local = await git($, run.root, ['rev-parse', 'HEAD'])
-    if (!local.isOk || local.out !== got.prHead) {
+    if (!isSynced || !local.isOk || local.out !== got.prHead) {
       const here = local.isOk ? local.out.slice(0, 7) : 'unknown'
       const why = `the local checkout ${here} is not the PR head ${got.prHead.slice(0, 7)}: pull (or push), then run /pr-gate resume`
       await noteAttempt($, after, why)
@@ -986,14 +1137,14 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
 async function failPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
-  say($, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
+  await say($, run, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
 }
 
 /**
  * Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier
  * rounds (R32) go to the main agent in one turn. Nothing to answer and no unreviewed commits end the round clean (R3).
  */
-async function beginTriage($: Engine, id: string): Promise<void> {
+async function beginTriage($: Engine, id: string, isFromCommand = false): Promise<void> {
   const now = await $.clock.now()
   const run = await getRun($)
   if (run === null || run.id !== id || run.status !== 'running') return
@@ -1131,7 +1282,34 @@ async function beginTriage($: Engine, id: string): Promise<void> {
   if (opened === null) return
   $.ui.status(`pr-gate r${opened.round}: answering the reviews`)
   const codexRange = `${opened.diffBase.slice(0, 7)}..${opened.headSha.slice(0, 7)}`
-  await askTriage($, id, triagePrompt(opened, rec, listed, others, { carried, codex, codexRange }))
+  const text = triagePrompt(opened, rec, listed, others, { carried, codex, codexRange })
+  // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
+  if (isFromCommand) await patch($, id, one => ({ ...one, outbox: text }))
+  else await askTriage($, id, text)
+}
+
+/**
+ * Review feedback on the PR that no round has triaged: a trusted reviewer, never waited for (R76), can post after the lifecycle
+ * was ready. undefined when GitHub could not be read.
+ */
+export async function untriagedFeedback($: Engine, rec: LifecycleRecord): Promise<Feedback[] | undefined> {
+  const got = await fetchFeedback($, rec)
+  if (!got.isOk) return undefined
+  const known = new Set(rec.findings.flatMap(one => (one.externalId === undefined ? [] : [one.externalId])))
+  return got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !known.has(one.id))
+}
+
+/** Triages feedback that arrived after the lifecycle was ready, on the same head, as an answer run: no round, no allowance (R76). */
+async function startLateTriage($: Engine, rec: LifecycleRecord): Promise<void> {
+  const now = await $.clock.now()
+  const run = answerRun(rec, [], now, (await configFor($, rec.root, rec.base)).config)
+  await update($, runAtom, () => run)
+  await update($, tickAtom, () => now)
+  isLive = true
+  startTicker($)
+  void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
+  await logEvent($, rec.root, rec.branch, 'head', `review feedback arrived after ready at ${rec.head.slice(0, 7)}: triaged on the same head`)
+  await beginTriage($, run.id, true)
 }
 
 /**
@@ -1139,6 +1317,12 @@ async function beginTriage($: Engine, id: string): Promise<void> {
  * already running is never read as the answer.
  */
 async function askTriage($: Engine, id: string, text: string): Promise<void> {
+  // Another session runs this record (#13): this one sends its agent nothing.
+  const run = await getRun($)
+  if (run !== null && run.id === id && (await isOwnedElsewhere($, run.root, run.branch))) {
+    await standDown($, run)
+    return
+  }
   void $.prompt
     .submit({ text })
     .then(async entered => {
@@ -1149,14 +1333,8 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
     .catch(() => undefined)
 }
 
-/**
- * Rebuttals Codex has not accepted, of any severity and from either phase: after the PR opens, Codex checks every one
- * on the same head (R36, widened by R39). A check that was held, then resumed, finds them again here. A rebuttal of a
- * finding Codex already rejected once is a dispute for the person, never sent to Codex again (R40). A verified fix whose
- * file changed since goes to the same check, to be re-verified on this head (R58).
- */
-const rebuttalsOwed = (run: Run): Finding[] =>
-  run.findings.filter(one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one))
+/** What Codex checks at the end of a post-PR round, on the head the round ends on (`checksOwed`; R36, R58, R72). */
+const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
@@ -1248,9 +1426,19 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     await failPost($, after, `${what}, then run /pr-gate resume`)
     return
   }
+  // gh may not have seen a push that just landed: origin's branch at the local HEAD is the PR head (R71).
+  if (prHead !== local.out && (await isPushed($, run.root, run.branch, local.out))) {
+    await logEvent($, run.root, run.branch, 'head', `gh still reported ${prHead.slice(0, 7)}; origin has the push ${local.out.slice(0, 7)}`)
+    prHead = local.out
+  } else if (prHead !== local.out) {
+    // Someone pushed during the answer: fetch the PR head, so the ancestry check and the unpushed list read it (R71). A failed fetch
+    // leaves the check to fail closed.
+    await fetchTwice($, run.root, ['--quiet', 'origin', run.branch], 60_000)
+  }
   const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
   if (!isContained) {
-    await failPost($, after, `commits on ${run.branch} are not on the PR: pull or push, then /pr-gate resume`)
+    const by = await unpushedBy($, run.root)
+    await failPost($, after, `commits on ${run.branch} are not on the PR${by}: pull or push, then /pr-gate resume`)
     return
   }
   const endHead = prHead
@@ -1266,8 +1454,9 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   }
   const ended = await getRun($)
   if (ended === null || ended.id !== run.id || ended.status !== 'running') return
-  // Only on the head the rebuttals were made about; a new head goes to its own round, which checks them there.
-  const rebuttals = endHead === run.roundStartHead ? rebuttalsOwed(ended) : []
+  // Codex checks the fixes and rebuttals on the head the round ends on (R72): a reported fix is about that head, and syncToHead
+  // brings a clean checkout to it. No round is spent, and no full Codex review is needed only to verify a fix.
+  const rebuttals = rebuttalsOwed(ended)
   if (rebuttals.length > 0) {
     await checkRebuttals($, { ...ended, headSha: endHead }, rebuttals)
     return
@@ -1279,8 +1468,8 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
 async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]): Promise<void> {
   const now = await $.clock.now()
   // Codex reads the checkout: it must be the head the rebuttal is about.
-  const local = await git($, run.root, ['rev-parse', 'HEAD'])
-  if (!local.isOk || local.out !== run.headSha) {
+  // A clean checkout behind the PR head catches up on its own (R71).
+  if (!(await syncToHead($, run.root, run.branch, run.headSha))) {
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }
@@ -1313,8 +1502,8 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
 
 /** The check step's label: rebuttals, re-verifications (R58), or both. */
 const checkLabel = (round: number, checked: readonly Pick<Finding, 'status' | 'needsRecheck'>[]): string => {
-  const reverify = checked.filter(isReverifyOwed).length
-  const what = reverify === 0 ? 'checks the rebuttals' : reverify === checked.length ? 're-verifies the fixes' : 'checks the rebuttals and fixes'
+  const fixes = checked.filter(one => isReverifyOwed(one) || one.status === 'reported-fixed').length
+  const what = fixes === 0 ? 'checks the rebuttals' : fixes === checked.length ? 'verifies the fixes' : 'checks the rebuttals and fixes'
   return `Round ${round} · codex ${what}`
 }
 
@@ -1327,7 +1516,7 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
   const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
-  if (saved !== undefined) say($, heldPrompt(saved, why, nextStep))
+  if (saved !== undefined) await say($, saved, heldPrompt(saved, why, nextStep))
 }
 
 /**
@@ -1353,7 +1542,22 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
     return
   }
   const verdicts = readVerdicts(answer)
-  // Fail closed: no readable verdict at all is no check.
+  // Fail closed: no readable verdict at all is no check. Fixes only reported stay owed, for the next check to rule on (R72): only a
+  // rebuttal or a re-verification, which has no other path, holds the lifecycle for it.
+  const mustRule = run.findings.filter(f => (run.rechecks ?? []).includes(f.id) && f.status !== 'reported-fixed')
+  if (verdicts.size === 0 && mustRule.length === 0) {
+    // Once more at once (R72): an owed fix left after the check would cost a whole round.
+    const owed = checksOwed(run.findings).filter(f => (run.rechecks ?? []).includes(f.id))
+    if (run.hasRetriedCheck !== true && owed.length > 0) {
+      const again = await patch($, run.id, one => ({ ...one, hasRetriedCheck: true }))
+      if (again !== null) await checkRebuttals($, again, owed)
+      return
+    }
+    // Logged, not noted as an attempt: the round completes here, and an answer run's note would undo the round it answers.
+    await logEvent($, run.root, run.branch, 'check', `Codex gave no readable verdict on ${owed.map(f => f.id).join(', ') || 'the reported fixes'}, twice; they stay owed`)
+    await endRound($, run, true)
+    return
+  }
   if (verdicts.size === 0) {
     await holdPost($, run, 'Codex gave no readable verdict on a rebuttal')
     return
@@ -1374,6 +1578,12 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
           ? markVerified(f, one.round, 'codex', now, 'Codex: the fix still holds after its file changed')
           : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix no longer holds')
       }
+      // A fix only reported (R72): confirmed, it is verified; refuted, it is open again, with Codex's reason for the agent.
+      if (f.status === 'reported-fixed') {
+        return verdict.holds
+          ? markVerified(f, one.round, 'codex', now, 'Codex: the fix holds')
+          : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix does not hold')
+      }
       // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
       return verdict.holds ? acceptRebuttal(f, one.round, now) : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex did not accept the rebuttal')
     }),
@@ -1388,7 +1598,15 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
       ].join(' · '),
     }),
   }))
-  if (after !== null) await endRound($, after, true)
+  if (after === null) return
+  // Reported fixes Codex left out while ruling on others get the same one retry (R72): the verdicts in are kept, only these are asked again.
+  const unruled = after.findings.filter(f => missing.includes(f.id) && f.status === 'reported-fixed' && !isReverifyOwed(f))
+  if (run.hasRetriedCheck !== true && unruled.length > 0) {
+    const again = await patch($, run.id, one => ({ ...one, hasRetriedCheck: true }))
+    if (again !== null) await checkRebuttals($, again, unruled)
+    return
+  }
+  await endRound($, after, true)
 }
 
 /**
@@ -1469,6 +1687,7 @@ export async function startRound($: Engine, rec: LifecycleRecord, next: Extract<
     phase: 'scope',
     hasRefixed: false,
     hasReprompted: false,
+    hasRetriedCheck: false,
     fixKind: next.isAdvisory ? 'advisory' : 'blocking',
     steps: isOn
       ? existing.steps
@@ -1601,6 +1820,7 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
     phase: 'triage',
     hasRefixed: false,
     hasReprompted: false,
+    hasRetriedCheck: false,
     fixKind: 'blocking',
     steps: [
       { id: 'scope', label: 'Scope & blast radius', state: 'done', detail: `${rec.tier}${rec.lane === 'light' ? ', light lane' : ''}: ${rec.tierWhy}` },
@@ -1684,11 +1904,22 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     const moved = isMoved
       ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
       : undefined
-    const flagged = new Set(moved?.findings.filter(one => one.needsRecheck === true && !isVerifiedAtEnd(one)).map(one => one.id) ?? [])
+    // Each finding keeps its line as placed at the end head (R73); only the re-check flag spares a fix verified at that head.
+    const placed = new Map(moved?.findings.map(one => [one.id, one]) ?? [])
+    const place = (one: Finding): Finding => {
+      const at = placed.get(one.id)
+      if (at === undefined) return one
+      return {
+        ...one,
+        ...(at.needsRecheck === true && !isVerifiedAtEnd(at) ? { needsRecheck: true } : {}),
+        ...(at.line === undefined ? {} : { line: at.line }),
+        ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+      }
+    }
     return {
       ...withRound(rec, round),
       head: endHead,
-      findings: mergeFindings(rec.findings, run.findings).map(one => (flagged.has(one.id) ? { ...one, needsRecheck: true } : one)),
+      findings: mergeFindings(rec.findings, run.findings).map(place),
       ...(moved === undefined ? {} : { waivers: moved.waivers }),
       effort: run.carriedEffort ?? run.effort,
     }
@@ -1741,6 +1972,8 @@ export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresol
 export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
   const rec = await loadRecord($, root, branch)
   if (rec === undefined) return
+  // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
+  if (!(await isStillMine($, { root, branch }))) return
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -1783,21 +2016,28 @@ export async function advance($: Engine, root: string, branch: string, isResume 
       // The round that just ended leaves the PR held: say so once, with why and what can move it.
       const held = heldReason(saved, onExhausted)
       await markPr($, 'skipped', 'held')
-      if (held !== undefined) say($, heldPrompt(saved, held.why, held.nextStep))
+      if (held !== undefined) await say($, saved, heldPrompt(saved, held.why, held.nextStep))
       return
     }
     if (config.openPr) {
       await markPr($, 'running', 'handed to the main agent')
-      say($, prPrompt(ended, saved, next.status))
+      await say($, saved, prPrompt(ended, saved, next.status))
     }
     return
   }
   if (next.kind === 'ready') {
+    // A resume of a ready lifecycle reads GitHub again: feedback that arrived since is triaged before it is ready again (R76).
+    const late = isResume && id === undefined ? await untriagedFeedback($, rec) : undefined
+    if (late !== undefined && late.length > 0) {
+      await startLateTriage($, rec)
+      return
+    }
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
     if (isStale) return advance($, root, branch, isResume)
     const at = (saved ?? rec).head.slice(0, 7)
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: ready for the merge decision.`)
-    if (saved !== undefined) say($, readyPrompt(saved))
+    else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready for the merge decision at ${at}`)
+    if (saved !== undefined) await say($, saved, readyPrompt(saved))
     return
   }
   const isPre = rec.phase === 'pre'
@@ -1829,10 +2069,10 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
   if (isPre) {
-    if (id !== undefined) say($, heldPrompt(saved, next.why, next.nextStep))
+    if (id !== undefined) await say($, saved, heldPrompt(saved, next.why, next.nextStep))
     return
   }
-  say($, reportPrompt(saved, next))
+  await say($, saved, reportPrompt(saved, next))
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
@@ -1934,7 +2174,9 @@ async function afterReview($: Engine, run: Run): Promise<void> {
         // Only a fix or a rebuttal is Codex's to rule on (R45): a deferral is released by the person's waiver alone.
         // A verified fix whose file changed is Codex's to re-verify (R58): verified clears the flag, held reopens it.
         const isTheirs = (one.lifecycle === 'post' && isDisputed(old)) || (old.status !== 'reported-fixed' && old.status !== 'rebutted' && !isReverifyOwed(old))
-        const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now) : old
+        // A hold names no reason in a review's trailer: say so, rather than leave the agent's own fix note to read as the open item.
+        const heldNote = `Codex held it in the round ${one.round} review, without a reason`
+        const ruled = isTheirs ? old : verified.has(old.id) ? confirmed : held.has(old.id) ? markHeld(old, one.round, 'codex', now, heldNote) : old
         return carried.has(ruled.id) && ruled.status === 'open' && !raisedIn(ruled, one.round) ? markHeld(ruled, one.round, 'pr-gate', now) : ruled
       }),
       ...fresh,
@@ -2160,6 +2402,8 @@ export async function onAnswer($: Engine, agentId: string | undefined, answer: s
   const isMine = (one: Pending): boolean =>
     one.isMain === true ? isTurnOf(one, agentId, turnId) : one.agentId !== undefined ? one.agentId === agentId : named === one.step
   if (!run.pending.some(isMine)) return
+  // A result that lands after another session took the record over is not this session's to act on (#13).
+  if (!(await isStillMine($, run))) return
   if (reason === 'aborted') {
     await finish($, run.id, 'stopped', `The ${run.phase} step was interrupted.`)
     return

@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.2.0. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.3.0. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -106,7 +106,7 @@ rounds, blocking, advisory and rebuttal rounds alike:
 | Tier | Rounds |
 | --- | --- |
 | trivial | 0 |
-| light lane | 1 |
+| light lane | `allowanceLight` (3); a high blast radius takes the full lane |
 | standard | `allowanceStandard` (4) |
 | high | `allowanceHigh` (6) |
 
@@ -236,6 +236,7 @@ overrides; the mod never falls back to HEAD.
   "reviewers": ["claude[bot]", "copilot-pull-request-reviewer[bot]"],
   "checks": ["Claude Review", "ci"],
   "requestReview": ["copilot"],
+  "trusted": ["chatgpt-codex-connector[bot]"],
   "quietMinutes": 3,
   "waitCapMinutes": 20,
   "allowanceStandard": 3,
@@ -253,8 +254,8 @@ overrides; the mod never falls back to HEAD.
 
 All fields are optional. The first five shape post-PR collection (below). The
 rest are round settings, with the same meaning and limits as the plugin
-options of the same name (see Options): `allowanceStandard` is capped at 10
-and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
+options of the same name (see Options): `allowanceStandard` and
+`allowanceLight` are capped at 10 and `allowanceHigh` at 12, `onExhausted` is `open-pr` or `stop`, and
 `lightBranches` and `highRiskPaths` are regular expressions, where `""` (or
 only spaces, as for the plugin options) turns the match off
 (`"lightBranches": ""` turns the light lane off). The models (`runnerModel`,
@@ -292,7 +293,9 @@ names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
   settings apply to the PRs after it merges.
 
 - **With a roster**, collection ends when every listed reviewer has posted on
-  the current head and every listed check has completed.
+  the current head and every listed check has completed. A `trusted` reviewer
+  is never waited for: its feedback is triaged when it arrives, in this round
+  or the next, and its review of the current head, when already in, covers it.
 - **Without one**, it ends when every check run has completed and nothing new
   arrived for `quietMinutes`. The mod never guesses a roster.
 - **Always**, it ends at `waitCapMinutes` with whatever arrived. Missing
@@ -301,7 +304,7 @@ names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
 
 Only feedback from someone with write access to the repository (GitHub's
 author association `OWNER`, `MEMBER` or `COLLABORATOR`) or on the roster
-(`reviewers` by exact login, or `requestReview` by name, where a name also
+(`reviewers` or `trusted` by exact login, or `requestReview` by name, where a name also
 matches the `[bot]` login posting for it, so `copilot` keeps
 `copilot-pull-request-reviewer[bot]`) is read; anyone
 else's comment is dropped before triage and covers no head. A row that does
@@ -311,9 +314,10 @@ The mod polls about every 30 seconds with `gh api` while the session stays
 free. `requestReview` re-requests review from the listed reviewers on a new
 head in round 2 or later; otherwise the mod never triggers reviewers. If `gh`
 is unauthenticated or rate-limited, the attempt is recorded incomplete, the
-pane says what to fix, and `/pr-gate resume` retries. A new session picks a
-post-PR collection back up where it was, and nothing already processed is done
-again.
+pane says what to fix, and `/pr-gate resume` retries. A new interactive session picks a
+post-PR collection back up where it was once the session that ran it has been
+quiet for 2 minutes, and nothing already processed is done again. A headless
+session (`claude -p`, the SDK) in the same checkout never takes it over.
 
 ## What is held
 
@@ -533,6 +537,7 @@ transcript or above the prompt, depending on the host.
 | --- | --- |
 | `/pr-gate [base]`, `/pr-gate start [base]` | start the lifecycle for the current branch, or pick it up from its record; with no base and no record, against the repository's default branch |
 | `/pr-gate status` | one line of where it stands (phase, rounds used, baseline, what is open, owed and holding the merge), and open the pane |
+| `/pr-gate log` | how the lifecycle went: rounds completed, active and waiting time, how often the person stepped in and with what, the stops and their reasons, and the last events. After a merge or reset it reads the newest archive |
 | `/pr-gate stop` | stop the round in flight; the record stays, and opening and merging stay held |
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now, or with no record the repository's default branch (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
@@ -556,7 +561,7 @@ not start again for it.
 
 Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
 repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
-`allowanceHigh`, `onExhausted`, `highRiskPaths`, `lightBranches`,
+`allowanceHigh`, `allowanceLight`, `onExhausted`, `highRiskPaths`, `lightBranches`,
 `waitCapMinutes`, `quietMinutes`, the four models and the four efforts (see
 Settings per repository):
 
@@ -564,6 +569,7 @@ Settings per repository):
 | --- | --- | --- |
 | `allowanceStandard` | 4 | rounds for a standard change (capped at 10) |
 | `allowanceHigh` | 6 | rounds for a high blast-radius change (capped at 12) |
+| `allowanceLight` | 3 | rounds for a branch on the light lane (`lightBranches`), unless its blast radius is high (capped at 10) |
 | `bases` | `dev,main` | gated base branches. A base nobody named is the repository's default branch, not the first of these; a REST, GraphQL or MCP create whose base cannot be read is held against the first |
 | `enforce` | true | hold `gh pr create` and the GitHub MCP create-PR tool |
 | `enforceMerge` | true | hold merges until the lifecycle is done |

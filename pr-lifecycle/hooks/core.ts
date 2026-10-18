@@ -479,7 +479,12 @@ export function reviewPrompt(run: Run, role: 'review' | 'challenge', prior: read
       '',
       'Earlier rounds on this branch settled these, with the evidence shown. Check the answers; do not re-derive them:',
       answered,
-      "After the review, put every rebutted or reported-fixed one to Codex through the same skill's consult mode (one prompt listing them all). List the ids Codex confirms fixed under verified, and the ids whose rebuttal or fix Codex does not accept under held. Do not list a held one again under findings.",
+      // After the PR opens, the gate's own Codex check rules on them (R72): the review does not consult on them again.
+      ...(run.lifecycle === 'post'
+        ? ['Do not raise one of these again under findings: the gate has Codex check the fixes and rebuttals itself.']
+        : [
+            "After the review, put every rebutted or reported-fixed one to Codex through the same skill's consult mode (one prompt listing them all). List the ids Codex confirms fixed under verified, and the ids whose rebuttal or fix Codex does not accept under held. Do not list a held one again under findings.",
+          ]),
     )
   }
   lines.push(
@@ -559,11 +564,13 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
 
 export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Finding[]): string {
   if (rebuttals !== undefined) {
-    // The same check re-verifies a verified fix whose file changed since (R58).
+    // The same check re-verifies a verified fix whose file changed since (R58), and verifies a fix only reported (R72).
     const fixes = rebuttals.filter(isReverifyOwed)
-    const argued = rebuttals.filter(one => !isReverifyOwed(one))
+    const reported = rebuttals.filter(one => one.status === 'reported-fixed')
+    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed')
+    const what = argued.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
     return noted([
-      `You check ${fixes.length === 0 ? 'rebuttals' : argued.length === 0 ? 'fixes' : 'rebuttals and fixes'} for pr-gate's post-PR review. Round ${run.round}.`,
+      `You check ${what} for pr-gate's post-PR review. Round ${run.round}.`,
       where(run),
       ...(argued.length === 0
         ? []
@@ -572,6 +579,9 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
             'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
             listFindings(argued),
           ]),
+      ...(reported.length === 0
+        ? []
+        : ['', 'The main agent reports these findings fixed. A fix settles nothing until you verify it at HEAD:', listFindings(reported)]),
       ...(fixes.length === 0
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),

@@ -28,6 +28,8 @@ export type World = {
     left: string
     /** `git diff --name-only` between two heads: the files a new commit touched. */
     changed: string
+    /** `git diff --unified=0` between two heads; undefined makes every file in `changed` changed throughout. */
+    hunks?: string
     /** Whether the local head is an ancestor of another commit (`merge-base --is-ancestor <head> <sha>`). */
     isAncestor: boolean
     /** `.github/pr-gate.json` on the base (`git show refs/remotes/origin/<base>:...`); empty means none. */
@@ -55,6 +57,10 @@ export type World = {
     fetches: string[]
     /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
     onFetch?: () => void
+    /** The branch's head on origin, as `git ls-remote` prints it; undefined prints nothing. */
+    remoteHead?: string
+    /** `git log --not --remotes=origin`: the local commits no origin branch has, one `<sha> by <author>` per line. */
+    unpushed: string
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -93,6 +99,8 @@ export type World = {
   clock: { advance: (ms: number) => Promise<void> }
   /** A new session: the run state reads as empty until the mod writes it again; the store stays. */
   clearState: () => void
+  /** The session's id, as `$.session.id()` answers it. */
+  sessionId: string
   /** Called after each store read, with the key and how many reads of it came before: a test changes the store between two reads. */
   afterRead?: (key: string, n: number) => void
 }
@@ -146,6 +154,7 @@ export function world(on: On): World {
       fetchFails: 0,
       fetchError: 'fatal: unable to access origin: Could not resolve host: github.com',
       fetches: [],
+      unpushed: '',
       missingRefs: [],
     },
     gh: {
@@ -173,6 +182,7 @@ export function world(on: On): World {
       isCleared = true
       w.run = undefined
     },
+    sessionId: 'session-1',
   }
   let isCleared = false
   latest = w
@@ -288,6 +298,20 @@ export function world(on: On): World {
     if (args.startsWith('rev-list --no-merges')) return out(w.git.left)
     if (args.startsWith('diff --numstat')) return out(w.git.since)
     if (args.startsWith('diff --name-only')) return out(w.git.changed)
+    // Line ranges (R73): each changed file whole, unless a test gives its own hunks.
+    if (args.startsWith('diff --unified=0')) {
+      const whole = w.git.changed.split('\n').filter(Boolean).map(file => `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,100000 +1,100000 @@`)
+      return out(w.git.hunks ?? whole.join('\n'))
+    }
+    if (args.startsWith('ls-remote origin')) return out(w.git.remoteHead === undefined ? '' : `${w.git.remoteHead}\trefs/heads/${w.git.branch}\n`)
+    if (args.startsWith('log --format=%h by %an')) return out(w.git.unpushed)
+    // A fast-forward to a commit the local head is an ancestor of moves the head there.
+    const ff = args.match(/^merge --ff-only --quiet (\S+)$/)?.[1]
+    if (ff !== undefined) {
+      if (!w.git.isAncestor) return out('', 128)
+      w.git.head = ff
+      return out('')
+    }
     if (args.startsWith('remote get-url')) return out('https://github.com/me/repo.git\n')
     return out('')
   })
@@ -313,6 +337,7 @@ export function world(on: On): World {
   on('ui.toast', () => ({ value: undefined }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: w.sessionId }))
   return w
 }
 
