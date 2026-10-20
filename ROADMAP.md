@@ -39,7 +39,7 @@ For wave 2. Recorded as rulings R79 or later when implemented.
 | G | **Each push is its own round** (own head, evidence and log line), but a round is **charged against the allowance only if it raised a new blocking finding**. A round that only verifies fixes and comes back clean is free. |
 | H | **Reviewers are re-requested once per burst**, on the head the agent's triage turn ends on. The gate's Codex pass covers the heads in between. |
 | I | **A P3 answered "no change needed, follow-up recorded"** (with where) settles without a waiver. P1/P2 deferrals and security findings still need one. Holds show the triaged severity. |
-| J | **Approvals settle on their own** when clear-cut (APPROVED, or COMMENTED with no inline comments and no explicit P0-P2 or blocker tag). Anything else goes to the agent, whose new "no action" answer settles it with no reply. |
+| J | **Approvals settle on their own** only on positive no-action evidence, never on missing tags: an APPROVED review, or a COMMENTED one whose body says there is nothing to act on ("no actionable findings", "no blocking findings", "LGTM") and asks for no change. Inline comments are triaged on their own, even on an APPROVED review. Anything else, including an untagged comment, goes to the agent, whose new "no action" answer settles it with no reply. (Narrowed by review G2-2 on PR #19: an untagged actionable comment would otherwise be lost.) |
 | K | **`waive post` covers rostered checks GitHub doesn't require**, pending, failing or cancelled, and names each one it sets aside. Required checks still have to pass. |
 | L | **Wave 2 ships as two PRs:** 2a (1.4.0, the small fixes) first, then 2b (1.5.0, the round changes). |
 
