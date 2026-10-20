@@ -149,7 +149,10 @@ Two PRs (decision L). Specs:
    refusal and the agent's prompts alike.
 4. **Settle approvals on their own (decision J; findings 9, 21).** Includes
    the finding 21 bug: an answered approval stayed open and dropped out of the
-   carried list.
+   carried list. Required regression tests (review G2-2 on PR #19):
+   - an untagged actionable COMMENTED summary goes to triage, not settled;
+   - a clean approval settles with no prompt;
+   - approval text mixed with a requested fix goes to triage.
 5. **Make deferral cheaper (decision I; finding 11).** Holds show the triaged
    severity, never the reviewer's hint.
 
