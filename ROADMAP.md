@@ -28,6 +28,21 @@ later when it is implemented.
 | C | The light lane gets **3** rounds (it was hard-coded to 1). |
 | D | A new **interactive** session takes over a record automatically once the owning session has been quiet for **2 minutes**. Headless (`-p`/SDK) sessions never take over. |
 
+## Decisions made (Adam, 2026-10-20)
+
+For wave 2. Recorded as rulings R79 or later when implemented.
+
+| | Decision |
+| --- | --- |
+| E | **Every manual action tells the agent.** `waive pre\|post\|<findingId>`, `allow`, `stop`, `reset`, `resume` and the pane's buttons each end with one short message to the agent: what the person did, what still holds, and its next step. |
+| F | **Early triage, push as it goes.** Findings already in go to the agent while slow reviewers finish, and it pushes fixes right away. |
+| G | **Each push is its own round** (own head, evidence and log line), but a round is **charged against the allowance only if it raised a new blocking finding**. A round that only verifies fixes and comes back clean is free. |
+| H | **Reviewers are re-requested once per burst**, on the head the agent's triage turn ends on. The gate's Codex pass covers the heads in between. |
+| I | **A P3 answered "no change needed, follow-up recorded"** (with where) settles without a waiver. P1/P2 deferrals and security findings still need one. Holds show the triaged severity. |
+| J | **Approvals settle on their own** when clear-cut (APPROVED, or COMMENTED with no inline comments and no explicit P0-P2 or blocker tag). Anything else goes to the agent, whose new "no action" answer settles it with no reply. |
+| K | **`waive post` covers rostered checks GitHub doesn't require**, pending, failing or cancelled, and names each one it sets aside. Required checks still have to pass. |
+| L | **Wave 2 ships as two PRs:** 2a (1.4.0, the small fixes) first, then 2b (1.5.0, the round changes). |
+
 ## Wave 1: no errors, no babysitting the basics (pr-lifecycle 1.3.0)
 
 **Status:** built on `wave1/pr-lifecycle-1.3.0` (rulings R71-R78). Not built: a
@@ -111,36 +126,48 @@ routine steps.
 ## Wave 2: the post-PR loop runs itself
 
 Serves goal 2. Removes the waits and the one-command-per-blocker routine.
+Two PRs (decision L). Specs:
+`docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2a-design.md` and
+`docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2b-design.md`.
 
-1. **Triage while slow reviewers finish (#14, part 2; findings 5, 10).**
-   - Send the findings already in to the agent during collection.
-   - Either batch its pushes until collection ends, or take them into the
-     round without stopping. Wave 1's head-move handling makes the second
-     option possible.
-2. **Settle approvals on their own (findings 9, 21).** A review with nothing
-   actionable ("no blocking findings") needs no agent round-trip and no answer.
-3. **Make deferral cheaper (finding 11).** A low-severity "no change needed,
-   follow-up recorded" doesn't cost the person a waiver. Severity shown in a
-   hold matches the triaged severity.
-4. **Waivers that work end to end (findings 22, 28, 29).**
-   - `waive post` covers a rostered check that GitHub doesn't require.
+### Wave 2a: the person's actions and holds (pr-lifecycle 1.4.0)
+
+1. **Every manual action tells the agent (decision E; finding 22).** Today
+   `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
+   stop button send the agent nothing, and `waive pre` sends something only
+   when `openPr` is on, so the person has to follow up by hand. Each action
+   ends with one message through `deliver()`, sent only while this session
+   owns the record (R74), and not when a round prompt the action starts
+   already says it.
+2. **Waivers that work end to end (decision K; findings 28, 29).**
+   - `waive post` covers rostered checks GitHub doesn't require.
    - No contradictory hold is sent right after a waiver.
    - A waiver that clears the last hold tells the agent the PR is ready to
-     merge.
-   - **Every manual action tells the agent (Adam, 2026-10-20).** Today
-     `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
-     stop button send the agent nothing, and `waive pre` sends something only
-     when `openPr` is on, so the person has to follow up by hand. Each of
-     `waive pre|post|<findingId>`, `allow`, `stop`, `reset` and `resume`
-     ends with one short message to the agent through `deliver()`: what the
-     person did, what still holds, and the agent's next step ("open the PR",
-     "merge", "stop waiting on the gate"). It's sent only while this session
-     owns the record (R74), and not when a round prompt the action starts
-     already says it.
-5. **One hold lists every blocker (finding 27).** Everything between this head
-   and the merge goes in one message, not one blocker per command.
-6. **Tune the wait times.** Revisit `waitCapMinutes` (20) and `quietMinutes` (3)
-   once `trusted` has changed what the cap means.
+     merge, and names what still holds otherwise (required CI).
+3. **One hold lists every blocker (finding 27).** Everything between this head
+   and the merge goes in one message, built in one place, for the guard's
+   refusal and the agent's prompts alike.
+4. **Settle approvals on their own (decision J; findings 9, 21).** Includes
+   the finding 21 bug: an answered approval stayed open and dropped out of the
+   carried list.
+5. **Make deferral cheaper (decision I; finding 11).** Holds show the triaged
+   severity, never the reviewer's hint.
+
+### Wave 2b: rounds that keep up with the agent (pr-lifecycle 1.5.0)
+
+1. **Triage while slow reviewers finish (decision F; #14 part 2; findings 5, 10).**
+   Findings already in go to the agent during collection, and it pushes as it
+   goes.
+2. **One round per push, charged only for new findings (decision G).**
+   Amends what counts in `usedRounds`.
+3. **One re-request per burst (decision H).**
+4. **Collection ends on GitHub's signals, not a timer (replaces "tune the
+   wait times").** The 3-minute quiet window only applies with no roster: it
+   waits out unknown reviewers and checks that haven't registered yet. 2b
+   reads the head's check suites, the ruleset's required checks and pending
+   review requests instead, and keeps a short quiet window only when none of
+   those exist. Which signals are reliable is probed first (the Codex
+   connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
 
 ## Wave 3: visibility, scoping and fewer person-only steps
 
