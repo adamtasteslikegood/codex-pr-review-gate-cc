@@ -127,6 +127,16 @@ Serves goal 2. Removes the waits and the one-command-per-blocker routine.
    - No contradictory hold is sent right after a waiver.
    - A waiver that clears the last hold tells the agent the PR is ready to
      merge.
+   - **Every manual action tells the agent (Adam, 2026-10-20).** Today
+     `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
+     stop button send the agent nothing, and `waive pre` sends something only
+     when `openPr` is on, so the person has to follow up by hand. Each of
+     `waive pre|post|<findingId>`, `allow`, `stop`, `reset` and `resume`
+     ends with one short message to the agent through `deliver()`: what the
+     person did, what still holds, and the agent's next step ("open the PR",
+     "merge", "stop waiting on the gate"). It's sent only while this session
+     owns the record (R74), and not when a round prompt the action starts
+     already says it.
 5. **One hold lists every blocker (finding 27).** Everything between this head
    and the merge goes in one message, not one blocker per command.
 6. **Tune the wait times.** Revisit `waitCapMinutes` (20) and `quietMinutes` (3)
@@ -137,8 +147,12 @@ Serves goal 2. Removes the waits and the one-command-per-blocker routine.
 Serves goal 2. Makes the gate legible and reachable from anywhere.
 
 1. **Pane actions (finding 8).**
-   - Links for "waive pre" and "merge PR now". "Merge PR now" replaces
-     "[stop the gate]" after a waiver or a ready verdict.
+   - Links next to "[stop the gate]", in the order the lifecycle reaches
+     them: "[waive pre]" before the PR opens, "[waive post]" after, then
+     "[merge PR now]". "Merge PR now" replaces "[stop the gate]" after a
+     waiver or a ready verdict.
+   - Each link runs the same code as its `/pr-gate` command, so it sends the
+     agent the same message (wave 2 item 4). A waiver link asks for a reason.
    - "Stop" stops cleanly, without an error.
 2. **Records by PR, not only by folder (findings 12-15).**
    - `/pr-gate status` lists every live record.
