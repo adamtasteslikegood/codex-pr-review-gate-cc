@@ -48,3 +48,7 @@ Task 1: minor (deferred): first R83 flow test's "New review feedback" check depe
 PR #19: docs fixed in 8755fb1, replied in all 4 threads, threads resolved; docs/wave2 merged into this branch.
 Task 1: fix round 1/5 dispatched (FIX_BASE 3aa05cf; findings PR19-1 classifier, ADVISORY over-match)
 Task 1: fix round 1 implementer DONE, commit 641236d (421 pass); re-review dispatched
+Task 1: fix round 1/5 (1 addressed, 1 open — SETTLES[0] tail accepts trailing actionable clause; new minor: hyphen mark; commits 3aa05cf..641236d)
+Task 1: fix round 2/5 dispatched (FIX_BASE 641236d)
+Ruling: Task 1 "Nit-picking aside…" stays an untagged P3 (the existing nit/minor word guess), not P2 — it is a guess (severitySource 'hint'), so triage can raise it after Task 2 — costs: a guessed P3 shows until triaged.
+Task 1: fix round 2 implementer DONE, commit 1135e23 (421 pass); re-review dispatched

@@ -28,3 +28,12 @@ tests/github.test.ts "a severity is read from the reviewer's own words": `toEqua
 - RED: `claude plugin test pr-lifecycle` -> 419 pass, 2 fail (the R83 and R84 unit tests).
 - GREEN: `claude plugin test pr-lifecycle` -> 421 pass, 0 fail; `npm run lint` and `npm run typecheck` clean.
 - Uncommitted brief.md/progress.md edits in the tree are the coordinator's; not staged.
+
+## Fix round 2
+- Why "No blocking issues for this change and the reset deletes pending findings" settled: it has no sentence-ending mark, so it is one sentence, and the old tail `[\w\s/-]+` swallowed "change and the reset deletes pending findings" whole, matching SETTLES[0] to the end. The split by `[.!?;]+|\n+` never cut it.
+- Fix: scope tail is now `in|for this`, at most two words, then a noun from a fixed list (diff, pr, pull request, change(s), commit, patch, update, revision). Moved into a `SCOPE` string and built with `new RegExp` to stay under 160 columns (lint max-len). Both strings trace to false: one sentence, no regex matches, so `every` fails. "in this roadmap-only diff" stays true.
+- ADVISORY mark class is now `(?:[:,(—]|-\s|$)`: a dash counts only before whitespace.
+- Tests added (github.test.ts): the two scope strings `toBe(false)`; "Nit-picking aside, this leaks" and "Optional-chaining crashes on null" untagged; "Advisory - rename it" tagged P3.
+- Deviation: "Nit-picking aside, this leaks" is untagged but severity P3, not P2, because the later `\bnit\b` guess matches "Nit-". Expected P3/isTagged false in the test. The point (not tagged) holds; say if you want the guess changed.
+- First run: lint failed max-len (164) and one test expected P2; both fixed above.
+- GREEN: `claude plugin test pr-lifecycle` -> 421 pass, 0 fail; lint and typecheck clean.
