@@ -755,7 +755,9 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
           ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
             `or /${COMMAND} allow 1 <reason> for one more review round.`
           : `Your next step: check out ${pr.headRefName} and run /${COMMAND} resume, which reviews ${short} and says when the PR is ready to merge.`
-  const named = new Set(missing.match(/\b[RG]\d+-\d+\b/g) ?? [])
+  const isPushedAfter = rec !== undefined && isOnBase && rec.phase === 'ready' && rec.head !== pr.headRefOid
+  // The pushed-after reason is the standing's head blocker in the same words: given once (final review I1).
+  const named = new Set([...(missing.match(/\b[RG]\d+-\d+\b/g) ?? []), ...(isPushedAfter ? ['head'] : [])])
   const rest = standing === undefined ? '' : holdText(standing, named)
   return (
     [
@@ -964,8 +966,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     await take()
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
-    // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
-    if (!isRunning) await advance($, root, branch)
+    // Released from the merge test and from ready: the controller decides again, unless a round in flight will. After a push no
+    // round recorded, its verdict would be for the record's old head: the note below names the push instead (final review I1).
+    const latest = isRunning ? undefined : await loadRecord($, root, branch)
+    const pushed = latest !== undefined && latest.phase !== 'pre' && latest.pr !== undefined ? await openPrOf($, root, branch) : undefined
+    if (!isRunning && (pushed === undefined || pushed.headRefOid === latest?.head)) await advance($, root, branch)
     const after = await loadRecord($, root, branch)
     const wasPassed = before.preStatus === 'passed' && before.preHead === after?.preHead
     if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {

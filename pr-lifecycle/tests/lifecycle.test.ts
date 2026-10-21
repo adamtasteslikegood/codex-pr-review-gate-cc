@@ -858,8 +858,21 @@ test('R79: unreadable checks are a blocker; a security P1 survives a post waiver
   expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers.map(one => one.kind)).toContain('security-p1')
 })
 
+test('R79: a post head pushed after the review holds, unless a post waiver covers it (final review I1)', async () => {
+  const rec = at([post({ startHead: 'aaaaaaa1', endHead: 'aaaaaaa1' })], { phase: 'ready', pr: 7 })
+  const head = { kind: 'head-unreviewed', id: 'head', said: 'eeeeeee was pushed after the review completed at aaaaaaa', owner: 'gate', release: '/pr-gate resume reviews it' }
+  expect(standingOf(rec, { head: 'aaaaaaa1', base: 'dev' }).blockers).toEqual([])
+  expect(standingOf(rec, { head: 'eeeeeee1', base: 'dev' }).blockers).toEqual([head])
+  const waived = { ...rec, waivers: [{ scope: 'post' as const, head: 'eeeeeee1', reason: 'x', by: 'user', at: 1 }] }
+  expect(standingOf(waived, { head: 'eeeeeee1', base: 'dev' }).blockers).toEqual([])
+  // The pre-PR standing is unchanged (M7).
+  expect(standingOf({ ...fresh(), head: 'aaaaaaa1' }, { head: 'eeeeeee1', base: 'dev' }).blockers.map(one => one.kind)).not.toContain('head-unreviewed')
+})
+
 test('R79: holdText names every blocker once, skipping ids the caller already named', async () => {
-  const rec = postRec({ findings: [finding({ id: 'G2-1', source: 'github', severity: 'P2' }), finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' })] })
+  // The record's own head: a later head adds the push as a blocker (final review I1).
+  const reviewed = (over: object = {}) => at([post({ startHead: 'abcdef1234', endHead: 'abcdef1234' })], { phase: 'post', pr: 7, ...over })
+  const rec = reviewed({ findings: [finding({ id: 'G2-1', source: 'github', severity: 'P2' }), finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' })] })
   const s = standingOf(rec, { head: 'abcdef1234', base: 'dev' }, [{ name: 'check', bucket: 'fail', isRequired: true }])
   const all = holdText(s)
   expect(all).toContain('Everything between abcdef1 and the merge:')
@@ -869,7 +882,7 @@ test('R79: holdText names every blocker once, skipping ids the caller already na
   const rest = holdText(s, new Set(['G2-1']))
   expect(rest).not.toContain('G2-1')
   expect(rest).toContain('Also holding:')
-  expect(holdText(standingOf(postRec(), { head: 'abcdef1234', base: 'dev' }, []))).toContain('Nothing else holds the merge of abcdef1.')
+  expect(holdText(standingOf(reviewed(), { head: 'abcdef1234', base: 'dev' }, []))).toContain('Nothing else holds the merge of abcdef1.')
 })
 
 test('R79: an exhausted post report states its reason once, not again under the standing', async () => {

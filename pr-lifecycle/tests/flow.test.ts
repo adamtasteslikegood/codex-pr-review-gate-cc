@@ -359,6 +359,8 @@ test('a ready lifecycle lets its own head merge; a later push holds it again', a
   w.gh.prHead = 'e'.repeat(40)
   const held = await $.tool.call(merge)
   expect(held.deny).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
+  // The standing's head blocker says the same: the refusal gives it once (final review I1).
+  expect(held.deny?.split('was pushed after the review completed')).toHaveLength(2)
   expect(held.deny?.startsWith('/')).toBe(false)
 })
 
@@ -3761,10 +3763,12 @@ test('R81: waiving a finding after a push no round recorded sends one message', 
   await w.clock.advance(1000)
   const sent = w.prompts.slice(prompts)
   expect(sent.filter(one => one.startsWith('pr-gate: the person waived G2-1'))).toHaveLength(1)
-  // advance's own ready prompt, keyed on the record's head, merges behind the note here; the note's standing is not observable
-  // through the merge, so this pins one message and the lookup of the PR head (no crash, no second prompt).
   expect(sent).toHaveLength(1)
   expect(sent[0]?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
+  // The live head is not the reviewed one: nothing says ready, and the note names the push (final review I1).
+  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  expect(sent[0]).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
+  expect(sent[0]).toContain('/pr-gate resume reviews it')
 })
 
 test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {

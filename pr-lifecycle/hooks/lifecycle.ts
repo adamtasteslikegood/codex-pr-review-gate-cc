@@ -464,6 +464,10 @@ export function standingOf(rec: LifecycleRecord, at: { head: string; base: strin
     if (next.kind === 'exhausted') {
       // Its id lets a text that already gives this reason as its own leave it out (holdText's `named`).
       blockers.push({ kind: 'head-unreviewed', id: 'head', said: next.why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' })
+    } else if (next.kind !== 'round' && waiver === undefined && at.head !== rec.head) {
+      // A push no round has seen (final review I1): the record's verdict is for its own head, never the live one. An owed round or
+      // an exhausted review already holds this head, with its own step, so this is said only when neither is.
+      blockers.push({ kind: 'head-unreviewed', id: 'head', said: `${short(at.head)} was pushed after the review completed at ${short(rec.head)}`, owner: 'gate', release: '/pr-gate resume reviews it' })
     }
   }
   const setAside: string[] = []
