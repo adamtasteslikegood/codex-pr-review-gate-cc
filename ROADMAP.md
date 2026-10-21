@@ -36,7 +36,7 @@ For wave 2. Recorded as rulings R79 or later when implemented.
 | --- | --- |
 | E | **Every manual action tells the agent.** `waive pre\|post\|<findingId>`, `allow`, `stop`, `reset`, `resume` and the pane's buttons each end with one short message to the agent: what the person did, what still holds, and its next step. |
 | F | **Early triage, push as it goes.** Findings already in go to the agent while slow reviewers finish, and it pushes fixes right away. |
-| G | **Each push is its own round** (own head, evidence and log line), but a round is **charged against the allowance only if it raised a new blocking finding**. A round that only verifies fixes and comes back clean is free. |
+| G | **Each push is its own round** (own head, evidence and log line), but a round is **charged against the allowance unless it comes back clean**. It is charged when it raises a new blocking finding, and also when Codex rejects a fix or a rebuttal: a rejected fix is a used round. Only a round that verifies its fixes and finds nothing new is free, so a fix loop that keeps failing still runs out of rounds and ends in the usual exhausted hold, which tells the person why the PR isn't ready. |
 | H | **Reviewers are re-requested once per burst**, on the head the agent's triage turn ends on. The gate's Codex pass covers the heads in between. |
 | I | **A P3 answered "no change needed, follow-up recorded"** (with where) settles without a waiver. P1/P2 deferrals and security findings still need one. Holds show the triaged severity. |
 | J | **Approvals settle on their own** only on positive no-action evidence, never on missing tags: an APPROVED review, or a COMMENTED one whose body says there is nothing to act on ("no actionable findings", "no blocking findings", "LGTM") and asks for no change. Inline comments are triaged on their own, even on an APPROVED review. Anything else, including an untagged comment, goes to the agent, whose new "no action" answer settles it with no reply. (Narrowed by review G2-2 on PR #19: an untagged actionable comment would otherwise be lost.) |
@@ -161,7 +161,8 @@ Two PRs (decision L). Specs:
 1. **Triage while slow reviewers finish (decision F; #14 part 2; findings 5, 10).**
    Findings already in go to the agent during collection, and it pushes as it
    goes.
-2. **One round per push, charged only for new findings (decision G).**
+2. **One round per push; only a clean round is free (decision G).** A new
+   blocking finding or a rejected fix or rebuttal charges the round.
    Amends what counts in `usedRounds`.
 3. **One re-request per burst (decision H).**
 4. **Collection ends on GitHub's signals, not a timer (replaces "tune the
