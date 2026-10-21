@@ -42,3 +42,9 @@ Ruling: PR19-2 (required checks partial) — accept: each source must be parsed 
 Ruling: PR19-3 (post waiver guard too late) — accept: advance checks a valid head/base post waiver + no security hold right after its ownership/staleness checks, before startRound/startAnswer/startRecheck. Tests: waived head with open P2, with verification owed, with a round owed → resume starts no triage/recheck/review. Plan Task 8 amended — costs: none.
 Ruling: PR19-4 (note merging spans commands) — accept: queue entries carry a batch id per holdingPrompts call; mergeNotes merges within a batch only; stop/reset drop queued prompts for the same record from earlier batches. Regression: waive pre then reset before the flush → agent gets the reset note and no open-PR prompt. Plan Tasks 8/9 amended — costs: none.
 Docs fixes go on docs/wave2 (PR #19) via a worktree, then docs/wave2 is merged into this branch between tasks.
+Task 1: review Approved (spec ✅); minors: (1) ADVISORY regex over-matches "Optional chaining…" — Ruling: fix in round 1 with the plan's tightened regex, cheap and it mislabels real findings as tagged P3 — costs: none; (2) loose text outside the no-action sentence = PR19-1; (3) logEvent loop then updateRecord not atomic — deferred minor; (4) 'New review feedback' assertion wording-dependent — deferred minor.
+Task 1: minor (deferred): beginTriage logs approvals before marking processed; crash between re-logs once
+Task 1: minor (deferred): first R83 flow test's "New review feedback" check depends on prompt wording
+PR #19: docs fixed in 8755fb1, replied in all 4 threads, threads resolved; docs/wave2 merged into this branch.
+Task 1: fix round 1/5 dispatched (FIX_BASE 3aa05cf; findings PR19-1 classifier, ADVISORY over-match)
+Task 1: fix round 1 implementer DONE, commit 641236d (421 pass); re-review dispatched
