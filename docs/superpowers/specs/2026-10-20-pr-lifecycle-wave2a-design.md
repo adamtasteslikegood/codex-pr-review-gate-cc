@@ -105,7 +105,10 @@ function holdText(s: Standing, named?: ReadonlySet<string>): string   // skips b
 - `decideNext` keeps deciding only what the controller runs next. The words
   sent come from `standingOf`.
 - A post waiver covering this head, with no security P1, leaves only CI
-  blockers. `advance` then sends no review hold for that head. It sends the
+  blockers. `advance` checks it right after its ownership and staleness
+  checks and **before** any branch that dispatches work (`startRound`,
+  `startAnswer`, `startRecheck`), so a waived head never starts triage, a
+  recheck or a review round (PR #19 review). `advance` then sends no review hold for that head. It sends the
   waiver's action message (section 2), and only if the command hasn't
   already sent it.
 - `mergeHolds`, `unresolvedBlockers`, `verificationOwed` and `ciHold` become
@@ -165,8 +168,13 @@ run or no longer running. The lines named by the trace are `1556`, `1609`,
   - `resume`: the prompt the restarted step sends, with no extra note.
 - **One message per action.** If the action makes `advance` queue a round
   prompt, the action line is put at the front of that prompt, and no separate
-  message is sent. `holdingPrompts` already queues per record; the merge
-  happens there.
+  message is sent. Each `holdingPrompts` call is a batch with its own id;
+  queued entries carry it, and a note merges only into a prompt of the same
+  batch and record. Two commands before one flush never merge into each
+  other. `stop` and `reset` also drop prompts for their record that earlier
+  batches queued and that haven't been delivered, so the agent never gets a
+  superseded instruction (for example `waive pre`'s open-PR prompt after a
+  reset) (PR #19 review).
 - **The pane's Stop button** calls the command handler with `stop` and origin
   `pane`. It gets the owner check, `take()`, the log line and the message.
   Wave 3's links use the same route. `pane` counts as the person (the pane is
@@ -228,15 +236,23 @@ the same on main.
    (`github.ts:98`), a review is `isFinding: false` (it covers the head and
    raises nothing, as an empty approval does today) only when all of these
    hold:
-   - its state is `APPROVED`, or `COMMENTED` with a body whose first paragraph
-     states there is nothing to act on. The phrases are "no actionable
-     findings", "no blocking findings", "no issues found", "nothing to fix"
-     and "LGTM", case-insensitive, with no "but", "except" or "however" in
-     the sentence that says so;
-   - no sentence of the body carries a request ("please", "should", "must",
-     "needs to", "need to", "consider", "suggest", "recommend") or an explicit
-     `P0`-`P2`, critical, blocker or high tag;
-   - `CHANGES_REQUESTED` never qualifies.
+   - its state is `APPROVED` or `COMMENTED`; `CHANGES_REQUESTED` never
+     qualifies;
+   - the body is empty and the state is `APPROVED` or `COMMENTED`, or **every**
+     sentence of the body (split on `.`, `!`, `?`, `;` and line breaks) is,
+     as a whole sentence and case-insensitive, one of these no-action forms:
+     "LGTM", "looks good (to me)", "approved", "ship it", "thanks" or "thank
+     you"; "no actionable/blocking findings/issues/comments", optionally
+     followed by "in/for this …"; "no issues found"; "nothing to fix";
+     "reviewed <sha>", optionally followed by "against <base>". Trailing
+     punctuation and a leading emoji or `#` heading mark are ignored.
+   - A `COMMENTED` body must also contain at least one of the no-action
+     forms other than "thanks" and "reviewed …".
+
+   The test is the whole body, never a list of request words: any sentence
+   that isn't a no-action form, such as "LGTM. Preserve the pending findings
+   before archiving." or "LGTM. Reset still deletes pending findings.", sends
+   the review to triage (PR #19 review, thread on this section).
 
    Inline comments are separate `Feedback` rows and are triaged on their own,
    even under an APPROVED review. A settled review is logged (`approval`
@@ -293,8 +309,13 @@ the same on main.
 
   The result is cached per base for the session. Here, main's ruleset gives
   `check`, `analyze (actions)` and `analyze (javascript-typescript)`.
-- If neither endpoint can be read (other than a 404), every check counts as
-  required (fail closed), and the standing says so (`ci-unreadable`).
+- Rulesets and classic protection apply together, so the required set is the
+  union of both, and **each** source must be established: parsed
+  successfully, or authoritatively absent (classic protection's 404 "Branch
+  not protected"; a ruleset list `[]`). If either source fails in any other
+  way (a thrown request, 403, 500, or a payload that doesn't parse), the
+  required set is unknown and every check counts as required (fail closed):
+  a waiver sets nothing aside (PR #19 review, thread on this section).
 - In `standingOf`:
   - a required check that is failing, cancelled or running is a `ci-*`
     blocker, waiver or not;
