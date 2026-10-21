@@ -3276,3 +3276,36 @@ test('/pr-gate log counts only the person\'s commands, not an agent\'s refused o
   const out = String((await say($, 'log')).text ?? '')
   expect(out).toContain('The person stepped in 0 times.')
 })
+
+test('R83: a COMMENTED review that says there is nothing to act on covers the head and asks the agent nothing', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const prompts = w.prompts.length
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'No actionable findings in this diff.', state: 'COMMENTED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect(w.prompts.slice(prompts).some(one => one.includes('New review feedback'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.findings.filter(one => one.source === 'github')).toHaveLength(0)
+  expect(rec.processed).toContain('review:5')
+  expect(rec.log?.some(one => one.kind === 'approval' && one.text.includes('No actionable findings'))).toBe(true)
+})
+
+test('R83: an untagged actionable COMMENTED summary still goes to triage', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'The reset path deletes the pending findings. Preserve them before archiving.', state: 'COMMENTED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect(w.prompts.at(-1)).toContain('The reset path deletes the pending findings')
+})
+
+test('R83: an inline comment under an APPROVED review is triaged', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'LGTM', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  w.gh.comments = [inline(11, 'this branch never closes the file', w.gh.prHead)]
+  await w.clock.advance(30_000)
+  expect(w.prompts.at(-1)).toContain('this branch never closes the file')
+})

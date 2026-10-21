@@ -131,7 +131,7 @@ export type Grant = { n: number; reason: string; head: string; at: number }
  * stopped, exhausted); end: a run ended done; person: a /pr-gate command; head: the gate caught up to a head itself; session: a
  * session took the record over, or stood down.
  */
-export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session' | 'check'; text: string }
+export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session' | 'check' | 'approval'; text: string }
 
 export type LifecycleRecord = {
   version: 1

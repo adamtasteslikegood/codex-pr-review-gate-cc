@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   collectionDone,
+  isNoAction,
   isTrusted,
   readCheckRuns,
   readInlineComments,
@@ -92,12 +93,12 @@ test('check runs and the roster file are read; a bad roster is ignored', async (
 })
 
 test('a severity is read from the reviewer\'s own words, P2 when it says none', async () => {
-  expect(severityHint('**P1** SQL injection')).toEqual({ severity: 'P1', isSecurity: true })
-  expect(severityHint('Critical: crashes on empty input')).toEqual({ severity: 'P1', isSecurity: false })
-  expect(severityHint('nit: typo')).toEqual({ severity: 'P3', isSecurity: false })
+  expect(severityHint('**P1** SQL injection')).toEqual({ severity: 'P1', isSecurity: true, isTagged: true })
+  expect(severityHint('Critical: crashes on empty input')).toEqual({ severity: 'P1', isSecurity: false, isTagged: false })
+  expect(severityHint('nit: typo')).toEqual({ severity: 'P3', isSecurity: false, isTagged: true })
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
-  expect(severityHint('minor: possible XSS here')).toEqual({ severity: 'P2', isSecurity: true })
-  expect(severityHint('Consider renaming')).toEqual({ severity: 'P2', isSecurity: false })
+  expect(severityHint('minor: possible XSS here')).toEqual({ severity: 'P2', isSecurity: true, isTagged: false })
+  expect(severityHint('Consider renaming')).toEqual({ severity: 'P2', isSecurity: false, isTagged: false })
 })
 
 const base = { head: 'b', headAt: 0, startedAt: 0, lastArrivalAt: 0, quietMs: 180_000, capMs: 1_200_000 }
@@ -381,4 +382,42 @@ test('F3: a requestReview name keeps the bot that posts for it, and nothing more
   expect(isTrusted(by('copilotx[bot]'), roster)).toBe(false)
   expect(isTrusted(by('my-copilot[bot]'), roster)).toBe(false)
   expect(isTrusted(by('copilot-pull-request-reviewer'), roster)).toBe(false)
+})
+
+test('R83: only positive no-action evidence settles a review (review G2-2)', async () => {
+  // Untagged but actionable: never settled.
+  expect(isNoAction('COMMENTED', 'The reset path deletes the pending findings. Preserve them before archiving.')).toBe(false)
+  // Clean approvals.
+  expect(isNoAction('APPROVED', '')).toBe(true)
+  expect(isNoAction('APPROVED', 'LGTM')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No actionable findings in this diff.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
+  // Approval text mixed with a requested fix.
+  expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM. Should we also cover the retry path?')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings, however the cache is never cleared.')).toBe(false)
+  // A severity tag or a strong word means there is something to act on.
+  expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
+  expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+})
+
+test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {
+  const rows = readReviews(JSON.stringify([
+    { id: 1, user: { login: 'a' }, body: 'No actionable findings.', state: 'COMMENTED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+    { id: 2, user: { login: 'a' }, body: 'The cache is never cleared.', state: 'COMMENTED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+    { id: 3, user: { login: 'a' }, body: 'LGTM', state: 'APPROVED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+  ]))
+  expect(rows.map(one => one.isFinding)).toEqual([false, true, false])
+})
+
+test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 anywhere wins', async () => {
+  expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- add a log line')).toEqual({ severity: 'P3', isSecurity: false, isTagged: true })
+  expect(severityHint('## Advisory (non-blocking)\n1. tidy the docs')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('nit: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
+  // Quoted inside a sentence, the word labels nothing.
+  expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
+  expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
 })

@@ -104,7 +104,7 @@ export const readReviews = (text: string): Feedback[] =>
       url: str(row.html_url),
       state: str(row.state),
       at: when(row.submitted_at),
-      isFinding: body.trim() !== '' || row.state === 'CHANGES_REQUESTED',
+      isFinding: row.state === 'CHANGES_REQUESTED' || (body.trim() !== '' && !isNoAction(str(row.state), body)),
       association: associationOf(row),
     }
   })
@@ -204,15 +204,42 @@ const postsFor = (login: string, name: string): boolean => {
 
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 
-/** The reviewer's own severity, when it gave one; the main agent can still change it. */
-export function severityHint(body: string): { severity: Severity; isSecurity: boolean } {
+/** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)\b/im
+
+/** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
+export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
   const isSecurity = SECURITY.test(body)
-  const tagged = body.match(/\bP([0-3])\b/)?.[1]
-  if (tagged !== undefined) return { severity: `P${tagged}` as Severity, isSecurity }
-  if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity }
+  // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
+  const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
+  if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+  if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
-  if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity }
-  return { severity: isSecurity ? 'P1' : 'P2', isSecurity }
+  if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
+  return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
+}
+
+const NO_ACTION = /\b(?:lgtm|no (?:actionable|blocking) (?:findings|issues|comments)|no issues found|nothing to fix)\b/i
+const REQUEST = /\b(?:please|should|must|needs? to|consider|suggest|recommend)\b/i
+const STRONG = /\b(?:P[0-2]|critical|blocker|high)\b/i
+const CAVEAT = /\b(?:but|except|however)\b/i
+
+/**
+ * Whether a review says there is nothing to act on (R83): positive evidence only, never a missing tag (review G2-2 on PR #19).
+ * An APPROVED review, or a COMMENTED one whose first paragraph says so in a sentence with no caveat; either way no sentence may
+ * ask for anything or carry a P0-P2, critical, blocker or high tag. Inline comments are separate rows, triaged on their own.
+ */
+export function isNoAction(state: string | undefined, body: string): boolean {
+  if (state === 'CHANGES_REQUESTED') return false
+  const text = body.trim()
+  if (text === '') return state === 'APPROVED' || state === 'COMMENTED'
+  if (REQUEST.test(text) || STRONG.test(text)) return false
+  if (state === 'APPROVED') return !CAVEAT.test(text)
+  if (state !== 'COMMENTED') return false
+  const first = text.split(/\n\s*\n/)[0] ?? ''
+  const said = first.split(/(?<=[.!?])\s+/).find(one => NO_ACTION.test(one))
+  return said !== undefined && !CAVEAT.test(said)
 }
 
 export type CollectInput = {

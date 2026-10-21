@@ -1176,6 +1176,12 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     ? ((await updateRecord($, run.root, run.branch, one => ({ ...one, replies: { ...own, ...one.replies } }))) ?? prior)
     : prior
   const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id))
+  // A review that said there is nothing to act on settles on its own (R83): logged once, and processed so it is never asked about.
+  const settled = got.feedback.filter(one => one.kind === 'review' && !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
+  for (const one of settled) await logEvent($, run.root, run.branch, 'approval', `${one.reviewer}: ${one.body.split('\n')[0]?.slice(0, 120) ?? ''}`)
+  if (settled.length > 0) {
+    await updateRecord($, run.root, run.branch, one => ({ ...one, processed: [...new Set([...one.processed, ...settled.map(each => each.id)])] }))
+  }
   const ledger = mergeFindings(rec.findings, run.findings)
   // Changed files are read from a finding's own head (or the previous post round's start) to this round's head (R33).
   const prevStart = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)?.startHead
