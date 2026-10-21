@@ -3420,6 +3420,8 @@ test('R85: a P3 deferred with a recorded follow-up settles without a waiver, onc
   expect(found?.followUpLabel).toBe('P3')
   expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16')
   expect(labelled(w, 9, 'P3')).toBe(true)
+  // The label is logged in the same write as its result (gate R9-1).
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: labelled me/repo#9 severity:P3')).toBe(true)
 })
 
 test('gate R7-7: a severity label the repository already has is kept as it is, and the issue is still labelled', async ($, on) => {

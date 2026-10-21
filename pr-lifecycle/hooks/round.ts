@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
+import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, LogEntry, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -83,7 +83,7 @@ import {
   wouldSettle,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, isHeldByOther, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -2374,6 +2374,9 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
   const isMoved = (latest: LifecycleRecord | undefined): boolean =>
     latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
   const results = new Map<string, { followUp: string | undefined; peak: Severity; error?: string }>()
+  // Logged with the results, in the same guarded write: a reset between a check and a log write of its own would put the line in
+  // another lifecycle's log (gate R9-1).
+  const lines: LogEntry[] = []
   for (const one of owed) {
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
     const peak = peakOf(one)
@@ -2390,7 +2393,8 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
     const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
     results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
-    await logEvent($, rec.root, rec.branch, 'check', edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`)
+    const text = edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`
+    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
   }
   // And on the write itself: nothing is written, and nothing is decided (gate G7-8, R7-4).
   let isSuperseded = false
@@ -2403,7 +2407,7 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
       if (got === undefined || got.followUp !== f.followUp || got.peak !== peakOf(f)) return f
       return got.error === undefined ? { ...f, followUpLabel: got.peak, followUpLabelError: undefined } : { ...f, followUpLabelError: got.error }
     })
-    return { ...latest, findings }
+    return { ...latest, findings, log: [...(latest.log ?? []), ...lines].slice(-LOG_CAP) }
   })
   return isSuperseded ? undefined : (saved ?? rec)
 }
