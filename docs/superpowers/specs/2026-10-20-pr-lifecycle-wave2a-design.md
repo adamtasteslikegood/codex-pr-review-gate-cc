@@ -203,17 +203,20 @@ the same on main.
    An unresolved thread always gets a reply and/or a fix. That rule is older
    than the gate (Adam's PR guidance and tool-use hooks), and the gate keeps
    it, so this answer never closes an item silently.
-   - `Answer.action` and `FindingStatus` gain `'acknowledged'`: the agent says
-     the comment asks for no change (an approval with notes, a status
-     report). Unlike a rebuttal, it doesn't claim the comment is wrong.
+   - `Answer.action` gains `'acknowledged'`: the agent says the comment asks
+     for no change (an approval with notes, a status report). Unlike a
+     rebuttal, it doesn't claim the comment is wrong.
+   - It is stored as a rebuttal (status `rebutted`, note starting "No change
+     requested:"), so Codex's rebuttal check, acceptance, rejection and
+     R40's dispute rule apply unchanged. `FindingStatus` doesn't change.
    - It needs a reply in the item's thread (`replyId`). Without one, the
      answer counts as unanswered and goes through the R34 reprompt.
    - It is allowed only for a `source: 'github'` finding that is not
      security-flagged and carries no explicit `P0`-`P2` tag. Anything else
      answered `acknowledged` counts as unanswered.
-   - Codex checks it as it checks a rebuttal: `checksOwed` includes it, on
-     the same head, using no round (R36, R39). Its prompt asks whether the
-     comment requests any change. Upheld, it settles. Rejected, it is open
+   - Codex checks it as it checks a rebuttal, on the same head, using no
+     round (R36, R39). The "No change requested:" note tells Codex the
+     question is whether the comment asks for any change. Upheld, it settles. Rejected, it is open
      again with Codex's reason, and R40's rule applies: the agent fixes or
      defers it, and a second `acknowledged` goes to the person as a dispute.
    - The triage prompt explains it: "acknowledged: the comment asks for no
