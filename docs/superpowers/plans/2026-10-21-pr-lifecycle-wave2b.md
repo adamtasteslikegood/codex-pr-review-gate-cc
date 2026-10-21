@@ -1382,3 +1382,318 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
+
+### Task 8: The agent answers feedback while collection still waits (R92, spec §1.1, §1.2)
+
+**Why:** In 1.4.0 the agent sees nothing until collection ends (roster covered, checks done, quiet window, or the 20-minute cap). In 1.5.0, feedback that arrives while collection is still waiting goes to the agent after one quiet poll, in a triage turn that does not end the round. A push in that turn ends the round when the turn ends.
+
+**Plan rulings (record them in Task 15's rulings):**
+- A mid-collection turn runs in phase `'triage'` with `run.collect` kept. The ticker polls whenever `run.collect` is set, so polling goes on during the turn. The step timeout applies to the turn, because its phase is not `'collect'`. `afterTriage` tells a mid-collection turn by `run.collect !== undefined` (`endCollect` clears it). There is no `Run.isMidCollect` field.
+- While a turn is in flight a poll only notes arrivals. It never starts a turn, never ends collection and never acts on a head move; a failed poll is tried again at the next one. The turn's own end reads the head it pushed.
+- When collection is already done at the poll that sees new feedback, the end-of-head triage (1.4.0's) asks it, with no mid-collection turn first. The existing tests where feedback and coverage arrive together keep working.
+- A mid-collection turn asks only the fresh feedback no turn of this round was handed (`Run.handed`). It does not ask Codex's findings or the carried ones; the end-of-head turn does, as in 1.4.0.
+- A mid-collection turn that pushes nothing returns to collecting. Its rebuttals and acknowledgements are checked by Codex when the head's collection ends, through the end-of-head triage (`asked` empty → `checkRebuttals`). A rejection there is charged to this round (spec §1.4).
+- A push in a mid-collection turn ends the round when the turn ends, not at the push itself: "straight away" in spec §1.2 slips by up to one turn. That way the round that asked keeps the triage step, and every answer in the turn is recorded first.
+- A mid-collection turn's time counts as active time. It also stays inside the collection's wait, because the cap runs from `collect.startedAt`. The log reads both, as before.
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`Run.handed`, `Run.polled`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`startTicker`, `pollOnce`, new `closeCollect`, `endCollect`, `beginTriage`, `afterTriage`)
+- Test: `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `collectionDone` with signals (Task 5); `Fetched.headAt` (Task 4); `triagePrompt(run, rec, items, others, more)` with `more.intro` (`core.ts`); `POLL_MS` (30 000).
+- Produces:
+  - `Run.handed?: string[]`: the feedback ids every triage turn of this round was handed; `startRound` builds a new Run, so it resets per round.
+  - `Run.polled?: string[]`: the fresh feedback ids the last poll saw. The next poll tells an arrival by an id not in it. This replaces `pollOnce`'s use of `Run.triaged`, which now only means "what this turn was asked".
+  - `closeCollect($, id, now, detail, extra?): Promise<Run | null>` in `round.ts`: ends collection on the round's head (adds the wait, clears `collect`, marks the collect step done). Task 9 uses it.
+  - `beginTriage($, id, isFromCommand = false, isMidCollect = false)`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+/** Feedback a reviewer posted before the poll that reads it: its time never counts as a later arrival. */
+const early = <T extends object>(one: T): T => ({ ...one, created_at: '1970-01-01T00:00:01Z' })
+const ciRunning = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
+const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}"`))
+
+test('R92: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(30_000)
+  // The poll that sees it waits one more, so a reviewer's burst arrives as one turn.
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  w.gh.comments = [...w.gh.comments, early(inline(12, '**P2** and this one too', w.gh.prHead, 9))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  const asked = triageTurns(w, 'r2-triage')[0] ?? ''
+  expect(asked).toContain('G2-1')
+  expect(asked).toContain('G2-2')
+  expect(asked).toContain('still coming in')
+  const turnRun = await runOf(w)
+  expect([turnRun.phase, turnRun.collect !== undefined]).toEqual(['triage', true])
+  // Polling goes on during the turn: a comment that arrives now waits for the next turn.
+  w.gh.comments = [...w.gh.comments, early(inline(13, '**P2** a third one', w.gh.prHead, 20))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block, src/app.ts:30', replyId: '991' },
+    { id: 'G2-2', action: 'rebutted', severity: 'P2', note: 'same handle, same finally block', replyId: '992' },
+  ]))
+  // No push: the round goes on collecting, nothing is recorded as a round, the answers are kept.
+  const after = await runOf(w)
+  expect([after.phase, after.round, after.status]).toEqual(['collect', 2, 'running'])
+  const rec = await recordOf(w)
+  expect(rec.processed).toEqual(expect.arrayContaining(['inline:11', 'inline:12']))
+  expect(rec.rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+  // The comment that arrived during the turn gets a turn of its own, asking it alone.
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  const second = triageTurns(w, 'r2-triage')[1] ?? ''
+  expect(second).toContain('G2-3')
+  expect(second).not.toContain('- G2-1 from')
+  await done($, triaged('r2-triage', [{ id: 'G2-3', action: 'rebutted', severity: 'P2', note: 'same finally block', replyId: '993' }]))
+  expect((await runOf(w)).phase).toBe('collect')
+  // ci finishes and the reviewer covers the head: the head's end has Codex check the rebuttals, then the round ends.
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('verify')
+})
+
+test('R92: a push in a mid-collection turn ends the round on the old head when the turn ends', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P1** SQL injection', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  // Codex checks the fix on the new head first (R72); then the round on a…a ends and the next one collects on e…e.
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40), true]])
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind]).toEqual([3, 'collect', 'e'.repeat(40), 'baseline'])
+  // A new head restarts the cap (spec §1.6): collection began when the round did.
+  expect(next.collect?.startedAt).toBe(next.roundStartedAt)
+})
+```
+
+`toPost` leaves the PR head at `'a'.repeat(40)`.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/flow.test.ts`
+Expected: FAIL. In 1.4.0 no triage prompt is sent while `ci` runs, so `triageTurns(w, 'r2-triage')` stays empty.
+
+- [ ] **Step 3: Implement**
+
+In `pr-lifecycle/types/index.d.ts`, add to `Run` after `triaged`:
+
+```ts
+  /** Post-PR: the feedback ids every triage turn of this round was handed (R92); a turn while collecting asks only what is not in it. */
+  handed?: string[]
+  /** Post-PR: the fresh feedback ids the last poll saw, so the next poll can tell what arrived since. */
+  polled?: string[]
+```
+
+and change the `triaged` doc comment to `/** Post-PR: the feedback ids handed to the main agent in the triage turn in flight (or the last one). */`.
+
+In `pr-lifecycle/hooks/round.ts`:
+
+1. In `startTicker`, replace
+
+```ts
+      if (run.phase === 'collect') {
+        await poll($, run)
+        return // waiting on reviewers is not a step: no step timeout while collecting
+      }
+```
+
+   with
+
+```ts
+      if (run.collect !== undefined) {
+        // Collection polls on while a triage turn answers what arrived (R92); only the turn itself has a step timeout.
+        await poll($, run)
+        if (run.phase === 'collect') return // waiting on reviewers is not a step: no step timeout while collecting
+      }
+```
+
+2. Add `closeCollect` above `endCollect`:
+
+```ts
+/** Collection on the round's head is over: its wait is added, `collect` is cleared and its step is marked done. */
+async function closeCollect($: Engine, id: string, now: number, detail: string, extra: Partial<Run> = {}): Promise<Run | null> {
+  return patch($, id, one => ({
+    ...one,
+    ...extra,
+    waitMs: one.waitMs + (one.collect === undefined ? 0 : now - one.collect.startedAt),
+    collect: undefined,
+    steps: withStep(one.steps, { id: `r${one.round}-collect`, label: `Round ${one.round} · collect reviews (${one.roundKind})`, state: 'done', detail }),
+  }))
+}
+```
+
+   In `endCollect`, drop `const waitMs = ...` and replace the `const after = await patch($, run.id, one => ({ ... }))` block with:
+
+```ts
+  const detail = `${done.covered.length} reviewer${done.covered.length === 1 ? '' : 's'}${done.isComplete ? '' : `, missing ${done.missing.join(', ')}`}`
+  const after = await closeCollect($, run.id, now, detail, { evidence, headSha: got.prHead })
+```
+
+3. In `pollOnce`:
+   - Change the guard to read a run collecting, or answering while collecting:
+
+```ts
+  if (run === null || run.id !== seen.id || run.status !== 'running' || collect === undefined || (run.phase !== 'collect' && run.phase !== 'triage')) return
+```
+
+   - Replace the `if (!got.isOk) { ... }` block with:
+
+```ts
+  const isTurn = run.pending.length > 0
+  if (!got.isOk) {
+    // A triage turn is answering: a failed poll is tried again at the next one, not a stop under the agent's feet.
+    if (isTurn) return
+    await noteAttempt($, run, got.why ?? 'gh failed')
+    await finish($, run.id, 'error', `Post-PR round ${run.round} could not read GitHub: ${got.why ?? 'gh failed'}. Fix that, then /pr-gate resume.`)
+    return
+  }
+```
+
+   - After `const lastArrivalAt = ...`, add:
+
+```ts
+  const seenIds = new Set(run.polled ?? [])
+  const isArrival = fresh.some(one => !seenIds.has(one.id))
+  // While a triage turn answers, a poll only notes what arrived; the turn's own end reads the head it pushed (R92).
+  if (isTurn) {
+    await patch($, run.id, one => ({
+      ...one,
+      collect: one.collect === undefined ? one.collect : { ...one.collect, polledAt: now, lastArrivalAt: isArrival ? now : lastArrivalAt },
+      polled: fresh.map(each => each.id),
+    }))
+    return
+  }
+```
+
+   - Change `const arrived = isNewHead || fresh.length > (run.triaged?.length ?? 0)` to `const arrived = isNewHead || isArrival`. In the `after` patch, replace `triaged: fresh.map(each => each.id),` with `polled: fresh.map(each => each.id),`.
+   - Replace the tail from `if (!done.isDone) {` to the end of the function with:
+
+```ts
+  if (done.isDone) {
+    await endCollect($, after, got, done)
+    return
+  }
+  // Feedback no turn of this round was handed, with one quiet poll since the last arrival: the agent answers it now (R92).
+  const handed = new Set(after.handed ?? [])
+  const unhanded = fresh.filter(one => one.isFinding && !handed.has(one.id))
+  if (unhanded.length > 0 && now - (after.collect?.lastArrivalAt ?? now) >= POLL_MS) {
+    await beginTriage($, after.id, false, true)
+    return
+  }
+  const waiting = done.missing.length > 0 ? `waiting on ${done.missing.join(', ')}` : 'waiting for feedback to go quiet'
+  if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))
+```
+
+4. In `beginTriage`:
+   - Change the signature to `async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCollect = false): Promise<void>` and its doc comment's first sentence to: `Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier rounds (R32) go to the main agent in one turn. While collection still waits (R92), only the fresh feedback no turn of the round was handed.`
+   - Change `const items = ...` to:
+
+```ts
+  const handed = new Set(run.handed ?? [])
+  const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !(isMidCollect && handed.has(one.id)))
+```
+
+   - Change `const codex = ...` to `const codex = isMidCollect ? [] : run.findings.filter(...)` (same filter), and wrap the `carried` value the same way: `const carried = isMidCollect ? [] : mergeHolds(...).filter(...)`.
+   - Change `if (got.prHead !== rec.head) {` to `if (!isMidCollect && got.prHead !== rec.head) {`.
+   - Before `if (asked.length === 0 && others.length === 0) {`, add:
+
+```ts
+  // Nothing new to hand over while collecting: the round goes on collecting.
+  if (isMidCollect && asked.length === 0) return
+```
+
+   - In the `opened` patch, add `handed: [...new Set([...(one.handed ?? []), ...items.map(each => each.id)])],` and `hasReprompted: false,`. Change `activity` and the step label so a mid-collection turn says so:
+
+```ts
+    activity: isMidCollect ? 'waiting on the main agent to answer feedback while reviews come in…' : 'waiting on the main agent to answer the reviews…',
+```
+
+```ts
+      label:
+        count === 0
+          ? `Round ${one.round} · check the new commits (main agent)`
+          : `Round ${one.round} · answer ${count} review item${count === 1 ? '' : 's'}${isMidCollect ? ' while reviews come in' : ''} (main agent)`,
+```
+
+   - Pass an intro to `triagePrompt` for a mid-collection turn:
+
+```ts
+  const intro = isMidCollect
+    ? `Reviews are still coming in on ${opened.roundStartHead.slice(0, 7)}: answer these now. Feedback that arrives meanwhile comes in a ` +
+      'later turn. A push ends this round when your turn ends, and the next round reviews the new head.'
+    : undefined
+  const text = triagePrompt(opened, rec, listed, others, { carried, codex, codexRange, ...(intro === undefined ? {} : { intro }) })
+```
+
+5. In `afterTriage`, after `const endHead = prHead`, add:
+
+```ts
+  // A turn while collecting that pushed nothing: the round goes on collecting on the same head (R92). Its rebuttals and
+  // acknowledgements are checked when the head's collection ends.
+  if (after.collect !== undefined && endHead === run.roundStartHead) {
+    const back = await $.clock.now()
+    await patch($, run.id, one => ({
+      ...one,
+      phase: 'collect',
+      phaseStartedAt: back,
+      activeMs: one.activeMs + (back - one.phaseStartedAt),
+      pending: [],
+      hasReprompted: false,
+      activity: 'waiting on reviewers…',
+    }))
+    $.ui.status(`pr-gate r${after.round}: waiting on reviewers`)
+    return
+  }
+```
+
+   Then, before `const ended = await getRun($)`, add:
+
+```ts
+  // A push in a turn while collecting ends the round on the head it pushed (R92): collection on the old head is over.
+  if (after.collect !== undefined) await closeCollect($, run.id, await $.clock.now(), `ended by the push of ${endHead.slice(0, 7)}`)
+```
+
+   The rest of the tail (`onNewHead`, the exemption, `checkRebuttals` or `endRound`, then `advance` → `startRound` → `beginCollect` on the new head) is 1.4.0's and ends the round.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. A test that relied on `Run.triaged` being rewritten by every poll now reads `Run.polled`; update only those and list them in your report.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: the agent answers feedback while collection waits (R92)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
