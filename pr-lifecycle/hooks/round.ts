@@ -2899,12 +2899,14 @@ export async function advance($: Engine, root: string, branch: string, isResume 
       await startLateTriage($, rec)
       return
     }
+    // Read before the currency check below, so no await sits between that check and the say.
+    const method = (await configFor($, rec.root, rec.base)).config.mergeMethod
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
     if (isStale) return advance($, root, branch, isResume)
     const at = (saved ?? rec).head.slice(0, 7)
-    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: nothing holds the merge.`)
+    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: no review finding holds the merge.`)
     else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready to merge at ${at}`)
-    if (saved !== undefined) await say($, saved, readyPrompt(saved, (await configFor($, saved.root, saved.base)).config.mergeMethod))
+    if (saved !== undefined) await say($, saved, readyPrompt(saved, method))
     return
   }
   const isPre = rec.phase === 'pre'

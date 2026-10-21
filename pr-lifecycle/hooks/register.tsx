@@ -1011,13 +1011,18 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       ? { number: settled.pr, baseRefName: live?.baseRefName ?? settled.base, headRefOid: live?.headRefOid ?? settled.head }
       : undefined
     const standing = settled !== undefined && pr !== undefined ? await gatherStanding($, settled, pr) : undefined
+    const method = (await configFor($, root, pr?.baseRefName ?? settled?.base ?? '')).config.mergeMethod
+    // advance has just sent the ready prompt, merge step included, when this waiver is what made the lifecycle ready: say it once.
+    const hasMergeStep = before.phase !== 'ready' && settled?.phase === 'ready'
     // A reset while the standing was gathered supersedes this note (gate G7-3).
     if (settled !== undefined && pr !== undefined && !(await isStillCurrent($, settled))) return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
     await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`,
       standing === undefined
         ? 'nothing more is needed from you for this finding; the pre-PR review continues.'
         : standing.mayProceed
-          ? `nothing holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? settled?.base ?? '')).config.mergeMethod)}.`
+          ? hasMergeStep
+            ? 'no review finding holds the merge: the gate has just sent you the merge step; follow that one.'
+            : `no review finding holds the merge: ${mergeStep(pr?.number, method)}.`
           : 'answer what is yours in the list above, and leave the rest to who it names.',
       standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
@@ -1127,6 +1132,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
   const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
+  const method = (await configFor($, root, pr?.baseRefName ?? after?.base ?? '')).config.mergeMethod
   // A reset while the standing was gathered supersedes this note (gate G7-3).
   const isSuperseded = after !== undefined && pr !== undefined && !(await isStillCurrent($, after))
   if (!isSuperseded) {
@@ -1135,7 +1141,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
             'Check it with gh pr view before telling the person anything; do not merge.'
         : standing.mayProceed
-          ? `nothing else holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? after?.base ?? '')).config.mergeMethod)}.`
+          ? `no other review finding holds the merge: ${mergeStep(pr?.number, method)}.`
           : 'the waiver covers the review only: wait for what is listed, then tell the person.',
       standing)
   }

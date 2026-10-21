@@ -3869,7 +3869,7 @@ test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver nam
   const last = w.prompts.slice(prompts).at(-1) ?? ''
   expect(last).toContain(`the PR head is now ${moved.slice(0, 7)}`)
   expect(last).toContain('pull (or push), then run /pr-gate resume')
-  expect(last).not.toContain('Nothing else holds')
+  expect(last).not.toContain('other review finding holds')
 })
 
 test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
@@ -3987,7 +3987,7 @@ test('R81: waive post tells the agent what it covers and what still holds', asyn
   await w.clock.advance(1000)
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('pr-gate: the person waived post-PR review of PR #1')
-  expect(said).toContain('Nothing else holds the merge')
+  expect(said).toContain('no other review finding holds the merge')
   expect(said).toContain('merge it now with gh pr merge 1 --merge')
 })
 
@@ -4188,7 +4188,7 @@ test('gate G7-7: a reset and a fresh start while waive post gathers the standing
   const sent = w.prompts.slice(prompts)
   // The new lifecycle reports for itself; the old waiver's note, which the new record no longer carries, is not sent.
   expect(sent.some(one => one.includes('waived post-PR review'))).toBe(false)
-  expect(sent.some(one => one.includes('Nothing else holds the merge') || one.includes('nothing else holds the merge'))).toBe(false)
+  expect(sent.some(one => one.includes('other review finding holds the merge'))).toBe(false)
   expect((await recordOf(w)).waivers).toEqual([])
   expect((await recordOf(w)).generation).toBe(1)
 })
@@ -4215,7 +4215,7 @@ test('R81: waive post with no PR from gh says the standing is unknown, not ready
   expect(sent).toHaveLength(1)
   expect(sent[0]).toContain('what else holds the merge is unknown')
   expect(sent[0]).not.toContain('PR #?')
-  expect(sent[0]).not.toContain('gh pr merge 1 --merge')
+  expect(sent[0]).not.toContain('gh pr merge')
 })
 
 test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
@@ -5543,4 +5543,14 @@ test('R93: the base\'s mergeMethod reaches the ready prompt', async ($, on) => {
   expect(w.prompts.at(-1)).toContain('gh pr merge 1 --squash')
   // The guard still lets the merge through on the ready head (spec section 6.3).
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+
+test('R93: a waiver that makes the lifecycle ready sends the merge step once', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts).join('\n')
+  expect(sent.split('gh pr merge ').length - 1).toBe(1)
 })

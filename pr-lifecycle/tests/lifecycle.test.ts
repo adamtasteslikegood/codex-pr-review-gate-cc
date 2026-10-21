@@ -1640,12 +1640,13 @@ test('R92: a new answer makes an earlier filing failure stale, so it is cleared'
 test('R93: the ready prompt tells the agent to merge with the repository\'s method and report the merge commit', async () => {
   const rec = { ...fresh(), pr: 7 }
   const said = readyPrompt(rec)
-  expect(said).toContain('Nothing holds the merge: merge it now with gh pr merge 7 --merge and tell the person the merge commit')
-  expect(said).toContain("if GitHub refuses the merge, tell the person GitHub's words and stop")
+  expect(said).toContain('No review finding holds the merge: merge it now with gh pr merge 7 --merge and tell the person the merge commit')
+  expect(said).toContain('wait for them (gh pr checks 7 --watch) and merge again')
+  expect(said).toContain("if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop")
   expect(said).not.toContain("the person's")
   expect(said).not.toContain('do not merge')
   expect(readyPrompt(rec, 'squash')).toContain('gh pr merge 7 --squash')
   expect(mergeStep(12, 'rebase')).toBe(
-    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, and the gate checks them after the merge; if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is",
+    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; if the merge guard holds it for checks still running, wait for them (gh pr checks 12 --watch) and merge again; never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, and the gate checks them after the merge; if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop: the lifecycle stays where it is",
   )
 })
