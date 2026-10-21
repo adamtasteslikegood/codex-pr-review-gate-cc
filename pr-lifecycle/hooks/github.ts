@@ -205,7 +205,7 @@ const postsFor = (login: string, name: string): boolean => {
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 
 /** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)\b/im
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—-]|$)/im
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
@@ -220,26 +220,29 @@ export function severityHint(body: string): { severity: Severity; isSecurity: bo
   return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
 }
 
-const NO_ACTION = /\b(?:lgtm|no (?:actionable|blocking) (?:findings|issues|comments)|no issues found|nothing to fix)\b/i
-const REQUEST = /\b(?:please|should|must|needs? to|consider|suggest|recommend)\b/i
-const STRONG = /\b(?:P[0-2]|critical|blocker|high)\b/i
-const CAVEAT = /\b(?:but|except|however)\b/i
+/** Whole sentences that settle a review (R83). */
+const SETTLES = [
+  /^no (?:actionable|blocking) (?:findings|issues|comments)(?: (?:in|for) this [\w\s/-]+)?$/i,
+  /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
+]
+/** Whole sentences that may sit beside them and change nothing. */
+const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
 
 /**
- * Whether a review says there is nothing to act on (R83): positive evidence only, never a missing tag (review G2-2 on PR #19).
- * An APPROVED review, or a COMMENTED one whose first paragraph says so in a sentence with no caveat; either way no sentence may
- * ask for anything or carry a P0-P2, critical, blocker or high tag. Inline comments are separate rows, triaged on their own.
+ * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
+ * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
+ * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
  */
 export function isNoAction(state: string | undefined, body: string): boolean {
-  if (state === 'CHANGES_REQUESTED') return false
-  const text = body.trim()
-  if (text === '') return state === 'APPROVED' || state === 'COMMENTED'
-  if (REQUEST.test(text) || STRONG.test(text)) return false
-  if (state === 'APPROVED') return !CAVEAT.test(text)
-  if (state !== 'COMMENTED') return false
-  const first = text.split(/\n\s*\n/)[0] ?? ''
-  const said = first.split(/(?<=[.!?])\s+/).find(one => NO_ACTION.test(one))
-  return said !== undefined && !CAVEAT.test(said)
+  if (state !== 'APPROVED' && state !== 'COMMENTED') return false
+  const sentences = body
+    .split(/[.!?;]+|\n+/)
+    .map(one => one.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(one => one !== '')
+  if (sentences.length === 0) return true
+  const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
+  if (!sentences.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
+  return state === 'APPROVED' || sentences.some(settles)
 }
 
 export type CollectInput = {

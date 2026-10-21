@@ -391,7 +391,17 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   expect(isNoAction('APPROVED', '')).toBe(true)
   expect(isNoAction('APPROVED', 'LGTM')).toBe(true)
   expect(isNoAction('COMMENTED', 'No actionable findings in this diff.')).toBe(true)
-  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
+  expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
+  expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
+  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
   // Approval text mixed with a requested fix.
   expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
   expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
@@ -420,4 +430,8 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
   expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
   expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
+  // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
+  expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
 })
