@@ -1023,7 +1023,9 @@ async function beginVerify($: Engine, id: string, fromSha: string): Promise<void
 
 const POLL_MS = 30_000
 
-/** Post-PR collection: the ticker polls GitHub every 30 s until the roster, the checks and a quiet spell say it is over, or the wait cap. */
+/**
+ * Post-PR collection: the ticker polls GitHub every 30 s until the roster, the checks and a quiet spell say it is over, or the wait cap.
+ * Reviewers are asked again where a turn pushed (R88), not here. */
 async function beginCollect($: Engine, id: string): Promise<void> {
   const now = await $.clock.now()
   const opened = await patch($, id, run => ({
@@ -1041,32 +1043,20 @@ async function beginCollect($: Engine, id: string): Promise<void> {
   if (arrival !== undefined && arrival.at !== now) {
     await patch($, id, run => (run.collect === undefined ? run : { ...run, collect: { ...run.collect, headAt: arrival.at } }))
   }
-  const rec = await loadRecord($, opened.root, opened.branch)
-  // A later post-PR round, on a new head: ask the roster's reviewers to look again.
-  if (rec !== undefined && rec.rounds.some(one => one.phase === 'post' && one.isCompleted) && rec.pr !== undefined && rec.slug !== undefined) {
-    const roster = await rosterOf($, opened.root, opened.base)
-    const names = roster?.requestReview ?? []
-    for (const who of names) await askAgain($, rec, who)
-    // Asked for this head: a comment that may predate it is not asked about a second time (#24).
-    const head = opened.roundStartHead
-    if (names.length > 0) {
-      await updateRecord($, opened.root, opened.branch, one => {
-        if (one.headArrival?.head !== head) return one
-        return { ...one, headArrival: { ...one.headArrival, asked: [...new Set([...(one.headArrival.asked ?? []), ...names])] } }
-      })
-    }
-  }
   $.ui.status(`pr-gate r${opened.round}: waiting on reviewers`)
 }
 
-/** Asks a requestReview reviewer to review the PR again: the POST to `requested_reviewers` (1.4.0). */
+/** Asks a requestReview reviewer to review the PR again: the POST to `requested_reviewers` (1.4.0). A failed or hung request is logged, never a stop. */
 async function askAgain($: Engine, rec: LifecycleRecord, who: string): Promise<void> {
-  await $.process
-    .run(['gh', 'api', '-X', 'POST', `repos/${rec.slug ?? ''}/pulls/${rec.pr ?? ''}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
-      cwd: rec.root,
-      timeoutMs: 30_000,
-    })
-    .catch(() => undefined)
+  const args = ['gh', 'api', '-X', 'POST', `repos/${rec.slug ?? ''}/pulls/${rec.pr ?? ''}/requested_reviewers`, '-f', `reviewers[]=${who}`]
+  let why: string | undefined
+  try {
+    const done = await $.process.run(args, { cwd: rec.root, timeoutMs: 30_000 })
+    if (done.exitCode !== 0) why = done.stderr.slice(0, 160)
+  } catch (error) {
+    why = error instanceof Error ? error.message.slice(0, 160) : 'the request failed'
+  }
+  if (why !== undefined) await logEvent($, rec.root, rec.branch, 'head', `could not ask ${who} to review again: ${why}`)
 }
 
 type HeadArrival = NonNullable<LifecycleRecord['headArrival']>
@@ -2229,6 +2219,12 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
       findings.map(f => (run.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f))
     await updateRecord($, run.root, run.branch, one => ({ ...one, findings: exempt(one.findings) }))
     await patch($, run.id, one => ({ ...one, findings: exempt(one.findings) }))
+    // The turn pushed (R88): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
+    // A failed request is no reason to stop (askAgain swallows it).
+    if (rec.pr !== undefined && rec.slug !== undefined) {
+      const roster = await rosterOf($, run.root, run.base)
+      for (const who of roster?.requestReview ?? []) await askAgain($, rec, who)
+    }
   }
   const ended = await getRun($)
   // After `closeCollect` no settling flag guards the tail (no poll runs for the round): the run, its round and the record's generation do.

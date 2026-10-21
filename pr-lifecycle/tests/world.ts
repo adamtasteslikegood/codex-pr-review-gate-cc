@@ -132,6 +132,8 @@ export type World = {
     isStatusBroken?: boolean
     /** `GET .../requested_reviewers` fails, as a 502 would. */
     isRequestedBroken?: boolean
+    /** `POST .../requested_reviewers` fails, as a 502 would. */
+    isRequestPostBroken?: boolean
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
@@ -377,6 +379,7 @@ export function world(on: On): World {
       if (/requested_reviewers/.test(args)) {
         if (args.includes('-X POST')) {
           w.gh.requests.push(args)
+          if (w.gh.isRequestPostBroken === true) return failed('gh: Server Error (HTTP 502)')
           return out('{}')
         }
         if (w.gh.isRequestedBroken === true) return failed('gh: Server Error (HTTP 502)')

@@ -5182,3 +5182,55 @@ test('R88 (Review Focus 4): a finding left unanswered when its round rolled over
   expect(g?.history.at(-1)?.round).toBe(3)
   expect((await recordOf(w)).processed).toContain('inline:11')
 })
+
+test('R88: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  // Someone else pushes: round 2 ends, round 3 starts on c…c, and nobody is asked again.
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.head = 'c'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  expect(w.gh.requests).toHaveLength(0)
+  // Feedback on c…c; the agent's turn pushes three commits, and GitHub reports the last.
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r3-verify', w, { 'G3-1': true }))
+  expect(w.gh.requests).toHaveLength(1)
+  expect(w.gh.requests[0]).toContain('reviewers[]=claude[bot]')
+  // Round 4 on f…f: nobody covers it by the cap, and one Codex review reads from the last covered head, a…a, over c…c and f…f.
+  expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  expect(run.phase).toBe('review')
+  expect(run.diffBase).toBe('a'.repeat(40))
+  expect(w.gh.requests).toHaveLength(1)
+})
+
+test('R88: a failed re-request is logged and the turn goes on', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.gh.isRequestPostBroken = true
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.head = 'c'.repeat(40)
+  await w.clock.advance(30_000)
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r3-verify', w, { 'G3-1': true }))
+  expect(w.gh.requests).toHaveLength(1)
+  expect((await logOf(w)).some(one => one.startsWith('could not ask claude[bot] to review again: gh: Server Error (HTTP 502)'))).toBe(true)
+  expect((await runOf(w)).status).toBe('running')
+  expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
+})
