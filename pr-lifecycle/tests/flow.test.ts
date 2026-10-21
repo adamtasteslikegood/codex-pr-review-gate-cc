@@ -3454,6 +3454,27 @@ test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing f
   expect((await runOf(w)).status).not.toBe('running')
 })
 
+test('gate R8-2: a reset while the severity label is created prevents the issue edit', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  let isResetting = false
+  w.gh.onLabelCreate = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  expect(rec.rounds).toEqual([])
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('labelled')
+  expect((await runOf(w)).status).not.toBe('running')
+})
+
 test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
   const w = world(on)
   await toAwaiting($, w, 'Consider renaming this', { severity: 'P2', followUp: ISSUE })
