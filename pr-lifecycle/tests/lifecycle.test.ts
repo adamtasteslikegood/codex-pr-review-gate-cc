@@ -14,6 +14,7 @@ import {
   acceptRebuttal,
   isAcceptedRebuttal,
   raisedIn,
+  raiseOf,
   rebuttedAt,
   decideNext,
   changedLines,
@@ -1184,9 +1185,14 @@ test('R90 A1: a link carries security to the original, both ways, and nothing cl
   expect(raised.isSecurity).toBe(true)
   // A security problem never settles by its issue: it holds for the person.
   expect(isSettledDeferral(raised)).toBe(false)
-  // The link's raise is no new deferral of the agent's: Codex's agreement still stands (R92 M2, read from answersOf).
-  expect(isDeferralAgreed(raised)).toBe(true)
-  const rec = postRec({ findings: [raised, dup] })
+  // Made security, the deferral Codex agreed with goes back to Codex first (R92 M2, ruling on Task 11 concern 4).
+  expect(isDeferralAgreed(raised)).toBe(false)
+  expect(standingOf(postRec({ findings: [raised, dup] }), { head: 'a', base: 'dev' }).blockers.map(one => [one.id, one.owner])).toEqual([['G2-1', 'codex']])
+  // Agreed again, it still never settles by its issue: it holds for the person.
+  const again = ruleDeferral(raised, true, 2, 6)
+  expect(isDeferralAgreed(again)).toBe(true)
+  expect(isSettledDeferral(again)).toBe(false)
+  const rec = postRec({ findings: [again, dup] })
   expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
   expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers.map(one => [one.id, one.owner])).toEqual([['G2-1', 'person']])
   // Neither dropping a link nor an unknown peak clears it.
@@ -1430,4 +1436,53 @@ test('6b fix 1: a re-check a link raised names the link, its severity and its re
   expect(secured.needsRecheck).toBe(true)
   expect(verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [secured, dup] }), 'abcdef0', [secured])).toContain('(raised to P1, security, by its linked item G3-1: re-check)')
   expect(loweringOf(secured)).toBeUndefined()
+})
+
+test('R92: a link that raises a deferral Codex agreed with into P1 or security makes Codex check it again, free; a refusal reopens it and charges the round', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', severitySource: 'tag', title: 'cache never cleared' })
+  const deferred = { ...applyAnswer(p3, { id: 'G2-1', action: 'deferred', note: 'needs the cache rework', followUp: '#12' }, 2, 'main', 4), followUpLabel: 'P3' as const }
+  const agreed = ruleDeferral(deferred, true, 2, 5)
+  expect(isSettledDeferral(agreed)).toBe(true)
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1', title: 'session cache leaks tokens',
+    detail: 'tokens stay readable after logout', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), agreed, 'gate', 3, 9)
+  const raised = withLinkedPeak(agreed, dup)
+  expect(raised.severity).toBe('P1')
+  expect(raised.status).toBe('deferred')
+  expect(raised.needsRecheck).toBe(true)
+  expect(raiseOf(raised)).toMatchObject({ raisedBy: 'G3-1' })
+  // Codex's agreement was given at P3: it is owed again, nothing settles or waits on the person before it.
+  expect(isDeferralAgreed(raised)).toBe(false)
+  expect(isDeferralOwed(raised)).toBe(true)
+  expect(wouldSettle(raised)).toBe(false)
+  expect(isSettledDeferral(raised)).toBe(false)
+  expect(checksOwed([raised]).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(postRec({ findings: [raised, dup] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(decideNext(postRec({ findings: [raised, dup] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  // The link's round is not charged by the raise.
+  expect(isChargedRound([raised], 3)).toBe(false)
+  // The check names the link, the new severity and the linked item's report.
+  const text = verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [raised, dup] }), 'abcdef0', [raised])
+  expect(text).toContain('(raised to P1 by its linked item G3-1: re-check)')
+  expect(text).toContain('G3-1, linked to G2-1 as the same problem, raised it to P1. Its report:')
+  expect(text).toContain('tokens stay readable after logout')
+  expect(text).toContain('You agreed before that G2-1 cannot reasonably be fixed in this PR: does that still hold at P1, given that report?')
+  // Agreed again: it waits once more, the flag cleared; the same link raises nothing more.
+  const again = ruleDeferral(raised, true, 3, 10)
+  expect(again.needsRecheck).toBeUndefined()
+  expect(isDeferralOwed(again)).toBe(false)
+  expect(isDeferralAgreed(again)).toBe(true)
+  expect(withLinkedPeak(again, dup).needsRecheck).toBeUndefined()
+  // Refused: open again with Codex's reason, and the round is charged as for any refused deferral.
+  const refused = ruleDeferral(raised, false, 3, 10, 'at P1 it must be fixed here')
+  expect(refused.status).toBe('open')
+  expect(refused.history.at(-1)).toMatchObject({ round: 3, status: 'open', deferral: 'refused', by: 'codex' })
+  expect(isChargedRound([refused], 3)).toBe(true)
+  // A link that makes it security does the same; a raise that stays advisory, P3 to P2, does not.
+  expect(isDeferralOwed(withLinkedPeak(agreed, { ...dup, id: 'G3-2', severity: 'P3', peakSeverity: 'P3', isSecurity: true }))).toBe(true)
+  const p2 = withLinkedPeak(agreed, { ...dup, id: 'G3-3', severity: 'P2', peakSeverity: 'P2' })
+  expect(p2.needsRecheck).toBeUndefined()
+  expect(isDeferralAgreed(p2)).toBe(true)
+  // A deferral Codex has not ruled on is owed already: the raise adds no flag.
+  expect(withLinkedPeak(deferred, dup).needsRecheck).toBeUndefined()
+  expect(isDeferralOwed(withLinkedPeak(deferred, dup))).toBe(true)
 })

@@ -4765,6 +4765,36 @@ test('R92: in a discretionary round, Codex refusing a deferral charges the round
   expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: a one-line rename fixes it')
 })
 
+test('R92: a P1 comment the gate links to a deferral Codex agreed with sends it back to Codex; a refusal reopens it and charges the round', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, true)
+  // Round 5, on a push to another file: a reviewer reports the same problem at P1, a line away; the gate links it to G4-1 and raises G4-1 to P1.
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.changed = 'src/other.ts'
+  await say($, 'resume')
+  w.gh.comments = [...w.gh.comments, inline(15, '**P1** this helper name is unclear and misleads callers', w.gh.prHead, 31)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  const run = await runOf(w)
+  expect(run.round).toBe(5)
+  expect(run.findings.find(one => one.id === 'G5-1')).toMatchObject({ duplicateOf: 'G4-1', linkBy: 'gate' })
+  expect(run.findings.find(one => one.id === 'G4-1')).toMatchObject({ status: 'deferred', severity: 'P1', needsRecheck: true })
+  await done($, triaged('r5-triage', [{ id: 'G5-1', duplicateOf: 'G4-1', replyId: '995' }]))
+  // Codex's agreement was given at P3: it checks the deferral again, told why.
+  expect((await runOf(w)).rechecks).toEqual(['G4-1'])
+  const asked = w.spawned.at(-1)?.prompt ?? ''
+  expect(asked).toContain('(raised to P1 by its linked item G5-1: re-check)')
+  expect(asked).toContain('You agreed before that G4-1 cannot reasonably be fixed in this PR: does that still hold at P1, given that report?')
+  await done($, accept('r5-verify', w, { 'G4-1': 'at P1 the rename belongs in this PR' }))
+  const g4 = (await recordOf(w)).findings.find(one => one.id === 'G4-1')
+  expect(g4?.status).toBe('open')
+  expect(g4?.history.at(-1)).toMatchObject({ round: 5, status: 'open', deferral: 'refused', by: 'codex' })
+  expect((await chargedOf(w)).at(-1)).toEqual([5, 'discretionary', true])
+  expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: at P1 the rename belongs in this PR')
+})
+
 test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
   const w = world(on)
   w.git.roster = roster

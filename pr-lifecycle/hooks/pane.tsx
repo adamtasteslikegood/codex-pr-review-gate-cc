@@ -85,7 +85,15 @@ const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
     if (isDisputed(one)) return { glyph: '↩', said: ` — disputed: awaiting the person${lapse}`, isSettled: false, isOwed: true, isStruck: false }
     return { glyph: '↩', said: ` — ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} awaiting Codex${lapse}`, isSettled: false, isOwed: false, isStruck: false }
   }
-  if (one.status === 'deferred') return { glyph: '⏸', said: ` — deferred${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+  if (one.status === 'deferred') {
+    // An agreed deferral a link raised (R92 M2): Codex checks it again at the new severity.
+    const raise = raiseOf(one)
+    if (raise !== undefined) {
+      const why = `re-check owed (raised to ${one.severity}${one.isSecurity === true ? ', security,' : ''} by ${raise.raisedBy ?? '?'})`
+      return { glyph: '⏸', said: ` — ${why}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
+    }
+    return { glyph: '⏸', said: ` — deferred${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+  }
   return { glyph: isBlocking(one) ? '●' : '·', said: lapse, isSettled: false, isOwed: false, isStruck: false }
 }
 

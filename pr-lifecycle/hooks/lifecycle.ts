@@ -114,11 +114,11 @@ export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => findi
 export const answersOf = (f: Pick<Finding, 'history'>): FindingEvent[] => f.history.filter(one => one.raisedBy === undefined)
 
 /**
- * The link's raise a rebuttal's re-check is owed for (6b fix 1): the newest raise entry, when it comes after Codex's last ruling.
- * Otherwise the re-check, if any, is for a file change (R58).
+ * The link's raise a rebuttal's, or an agreed deferral's (R92 M2), re-check is owed for (6b fix 1): the newest raise entry, when it
+ * comes after Codex's last ruling. Otherwise the re-check, if any, is for a file change (R58).
  */
 export function raiseOf(f: Pick<Finding, 'history' | 'status' | 'needsRecheck'>): FindingEvent | undefined {
-  if (f.needsRecheck !== true || f.status !== 'rebutted') return undefined
+  if (f.needsRecheck !== true || (f.status !== 'rebutted' && f.status !== 'deferred')) return undefined
   let raise = -1
   let ruled = -1
   f.history.forEach((one, i) => {
@@ -289,9 +289,10 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
   // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
   // raise: Codex's ruling clears it, and only a further raise sets it again. The raise entry says why (`raiseOf`), even for security alone.
+  // A deferral Codex agreed with goes back the same way (R92 M2): its "cannot be fixed in this PR" was given at the lower severity.
   const isRaisedToBlocking = severity !== original.severity && isBlocking({ severity })
   const isMadeSecurity = linked.isSecurity === true && original.isSecurity !== true
-  const isRecheck = (isRaisedToBlocking || isMadeSecurity) && isAcceptedRebuttal(original)
+  const isRecheck = (isRaisedToBlocking || isMadeSecurity) && (isAcceptedRebuttal(original) || isDeferralAgreed(original))
   const recheck = isRecheck ? { needsRecheck: true } : {}
   const raised =
     severity === original.severity && !isRecheck
@@ -671,13 +672,15 @@ const deferralRuling = (f: Pick<Finding, 'history'>): FindingEvent | undefined =
 }
 
 /**
- * A deferral Codex has not ruled on (R92 M2, Adam 2026-10-21): at any severity, security included. The round's free check rules on
- * it, as on a rebuttal; nothing settles by an issue, or waits for the person, before it.
+ * A deferral Codex has not ruled on (R92 M2, Adam 2026-10-21): at any severity, security included, or one Codex agreed with that a
+ * link has since raised into P0/P1 or security (`raiseOf`, as for an accepted rebuttal). The round's free check rules on it, as on a
+ * rebuttal; nothing settles by an issue, or waits for the person, before it.
  */
-export const isDeferralOwed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f) === undefined
+export const isDeferralOwed = (f: Finding): boolean => f.status === 'deferred' && (deferralRuling(f) === undefined || raiseOf(f) !== undefined)
 
-/** A deferral Codex agreed cannot reasonably be fixed in this PR (R92 M2): it waits. */
-export const isDeferralAgreed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f)?.deferral === 'agreed'
+/** A deferral Codex agreed cannot reasonably be fixed in this PR (R92 M2), with no re-check owed since: it waits. */
+export const isDeferralAgreed = (f: Finding): boolean =>
+  f.status === 'deferred' && deferralRuling(f)?.deferral === 'agreed' && raiseOf(f) === undefined
 
 /**
  * Codex's ruling on a deferral (R92 M2): agreed, it stays deferred and waits; refused, it is open again with Codex's reason and goes
@@ -686,7 +689,8 @@ export const isDeferralAgreed = (f: Finding): boolean => f.status === 'deferred'
 export function ruleDeferral(f: Finding, holds: boolean, round: number, at: number, note?: string): Finding {
   if (holds) {
     const said = note ?? 'Codex: it cannot reasonably be fixed in this PR'
-    return { ...f, history: [...f.history, { round, status: 'deferred', note: said, deferral: 'agreed', by: 'codex', at }] }
+    // The ruling clears a raise's re-check, as `acceptRebuttal` does.
+    return { ...f, needsRecheck: undefined, history: [...f.history, { round, status: 'deferred', note: said, deferral: 'agreed', by: 'codex', at }] }
   }
   const held = markHeld(f, round, 'codex', at, note ?? 'Codex: it can be fixed in this PR')
   const last = held.history.at(-1)

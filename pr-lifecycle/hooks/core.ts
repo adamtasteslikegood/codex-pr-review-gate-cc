@@ -610,8 +610,8 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
 }
 
 /**
- * For a rebuttal Codex accepted before a linked item raised it (6b fix 1): the link, the new severity and the linked item's own report,
- * so Codex rules on the rebuttal at that severity.
+ * For a rebuttal Codex accepted, or a deferral it agreed with (R92 M2), before a linked item raised it (6b fix 1): the link, the new
+ * severity and the linked item's own report, so Codex rules on it again at that severity.
  */
 const raisedBy = (run: Run, argued: readonly Finding[]): string[] =>
   argued.flatMap(one => {
@@ -627,7 +627,9 @@ const raisedBy = (run: Run, argued: readonly Finding[]): string[] =>
           : `\n    ${titleOf(by)}${by.detail === undefined ? '' : `\n    ${by.detail.replace(/\n/g, '\n    ')}`}`
     return [
       `   ${raise.raisedBy ?? '?'}, linked to ${one.id} as the same problem, raised it to ${at}. Its report:${report}`,
-      `   You accepted ${one.id}'s ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} before: does the rebuttal still hold at ${one.severity}, given that report?`,
+      one.status === 'deferred'
+        ? `   You agreed before that ${one.id} cannot reasonably be fixed in this PR: does that still hold at ${one.severity}, given that report?`
+        : `   You accepted ${one.id}'s ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} before: does the rebuttal still hold at ${one.severity}, given that report?`,
     ]
   })
 
@@ -678,6 +680,7 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
             '',
             'The main agent deferred these findings instead of fixing them in this PR. A deferral settles nothing until you agree with it:',
             ...deferred,
+            ...raisedBy(run, deferrals),
             '   For each one: given the finding and the code at HEAD, can it reasonably be fixed in this PR, and if the agent lowered its severity, ' +
               'is the lower one right? holds is true when it cannot reasonably be fixed in this PR and its severity stands.',
           ]),
