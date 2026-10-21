@@ -1014,18 +1014,21 @@ export async function readChecks($: Engine, root: string, pr: number, repo?: str
   return /no checks reported/i.test(ran.stderr) ? [] : { unreadable: ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}` }
 }
 
-const required = new Map<string, Set<string>>()
+const required = new Map<string, { found: Set<string>; at: number }>()
+/** How long a base's required checks are reused: a check made required since is read again after this (gate R1-4). */
+const REQUIRED_TTL_MS = 5 * 60_000
 
 /**
- * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for the session.
+ * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for REQUIRED_TTL_MS.
  * Each source must be parsed, or authoritatively absent (classic's 404 "not protected"); a throw, a 403 or 500, or a payload that
  * doesn't parse from either makes it 'unknown', which fails closed (every check required) and is not cached (PR #19 review).
  */
 export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | 'unknown'> {
   if (slug === undefined) return 'unknown'
   const key = `${slug}:${base}`
+  const now = await $.clock.now()
   const seen = required.get(key)
-  if (seen !== undefined) return seen
+  if (seen !== undefined && now - seen.at < REQUIRED_TTL_MS) return seen.found
   const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
   // One page holds every rule a branch is likely to have (final review M3): GitHub's default of 30 could cut a required-checks rule.
   const rules = await api(`repos/${slug}/rules/branches/${base}?per_page=100`)
@@ -1037,7 +1040,7 @@ export async function requiredChecksOf($: Engine, root: string, slug: string | u
   const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
   if (listed === undefined) return 'unknown'
   const found = new Set(listed)
-  required.set(key, found)
+  required.set(key, { found, at: now })
   return found
 }
 

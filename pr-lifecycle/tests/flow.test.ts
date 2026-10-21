@@ -3462,6 +3462,11 @@ test('R86: the required set is known only when both sources are established (PR 
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toBe('unknown')
   w.gh.rulesAnswer = 'ok'
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+  // A known answer is reused for a while, then read again: a check made required since counts (gate R1-4).
+  w.gh.required = ['check', 'lint']
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+  await w.clock.advance(6 * 60_000)
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check', 'lint']))
 })
 
 // ------------------------------------------------- task 7: the merge guard renders from the standing

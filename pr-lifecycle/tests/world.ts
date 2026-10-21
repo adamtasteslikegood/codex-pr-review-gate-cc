@@ -142,7 +142,10 @@ export async function done($: Dispatch, t: Ended): Promise<unknown> {
 
 /** Everything beneath the mod: git, the agents, the main agent's prompt queue. */
 export function world(on: On): World {
-  const clock = mock.clock(on, { now: 1_000 })
+  const mocked = mock.clock(on, { now: 1_000 })
+  // The engine stand-in reads the same time the test's clock moves to.
+  let now = 1_000
+  const clock = { ...mocked, advance: async (ms: number) => { now += ms; await mocked.advance(ms) } }
   const w: World = {
     engine: undefined as never,
     spawned: [],
@@ -352,7 +355,10 @@ export function world(on: On): World {
   }
   on('process.run', async (_$, e) => fake(e))
   // The tests' own `$` has no `process`, and the host refuses it to a module that never calls it: this engine stand-in runs the same fake.
-  w.engine = { process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value } } as never
+  w.engine = {
+    process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value },
+    clock: { now: async () => now },
+  } as never
   on('agent.spawn', (_$, e) => {
     w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })
     return { model: 'test', agentId: `agent-${w.spawned.length}` }
