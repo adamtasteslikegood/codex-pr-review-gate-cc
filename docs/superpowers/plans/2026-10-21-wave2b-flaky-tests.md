@@ -5,12 +5,12 @@ which tests, why, and what was done.
 
 ## Method
 
-- Eight busy loops (`while :; do :; done`) ran beside `claude plugin test pr-lifecycle`, six times. The load average was 15-17 in runs 4-6.
+- Eight busy loops (`while :; do :; done`) ran beside `claude plugin test pr-lifecycle`, seven times (run 8 was cut short, see Step 4). The load average was 15-17 in runs 4-7.
   Runs 1-3 are **contaminated**: another agent was editing tests while they ran, so they show the same timeouts but also one unrelated
   assertion failure (R81 in run 2, `waive post tells the agent what it covers`, which is a half-edited test and not a timeout). Runs 4-6
   ran on a clean tree.
 - `idle-1.txt` is one run at low load: 606 of 606 tests pass, and its per-test times are the "idle" column below.
-- Outputs are kept in `.superpowers/flaky/` (run-1..6, idle-1).
+- Outputs are kept in `.superpowers/flaky/` (run-1..8, idle-1, and post-fix: the normal-load suite after the bounds, 606/606).
 
 ## Cause: load, for every failure
 
