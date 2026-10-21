@@ -152,6 +152,8 @@ export type World = {
   sessionId: string
   /** Called after each store read, with the key and how many reads of it came before: a test changes the store between two reads. */
   afterRead?: (key: string, n: number) => void
+  /** Awaited before each store read, with its key: a test holds a step at a read until it lets it go. */
+  beforeRead?: (key: string) => void | Promise<void>
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
@@ -246,7 +248,8 @@ export function world(on: On): World {
     isCleared ? next(e).then(read => (read.value === undefined ? read : { value: { ...read.value, value: null } })) : next(e),
   )
   const reads = new Map<string, number>()
-  on('store.get', (_$, e) => {
+  on('store.get', async (_$, e) => {
+    await w.beforeRead?.(e.key)
     const value = w.store.get(e.key)
     const n = reads.get(e.key) ?? 0
     reads.set(e.key, n + 1)

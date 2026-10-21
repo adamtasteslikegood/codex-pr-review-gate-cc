@@ -701,7 +701,11 @@ export function startTicker($: Engine): void {
       if (now - run.phaseStartedAt > config.stepTimeoutMs) {
         // The first turn taken while collecting that times out in a round goes back to collecting and is asked again (R88): the gate
         // runs on without the person. Only a second one stops the run.
-        if (run.phase === 'triage' && run.collect !== undefined && run.pending.length > 0 && (run.midTurnTimeouts ?? 0) === 0) {
+        // Only a turn still unanswered: an answered one whose afterTriage failed before settling it falls through to the stop below,
+        // never a requeue that cannot apply on every tick.
+        const isUnanswered = run.pending.some(one => one.answer === undefined)
+        if (run.phase === 'triage' && run.collect !== undefined && isUnanswered && (run.midTurnTimeouts ?? 0) === 0) {
+          // Missed (the run moved on, or the turn was answered since this tick read it): nothing this tick; the next one reads afresh.
           await requeueMidTurn($, run, now)
           return
         }
@@ -733,7 +737,7 @@ export function startTicker($: Engine): void {
  * no attempt noted. The feedback it left unanswered leaves `handed`, so the next poll asks it again in a turn of its own; a late answer
  * to this turn matches nothing pending (`isTurnOf` knows a turn by its id).
  */
-async function requeueMidTurn($: Engine, run: Run, now: number): Promise<void> {
+async function requeueMidTurn($: Engine, run: Run, now: number): Promise<boolean> {
   const rec = await loadRecord($, run.root, run.branch)
   const unanswered = (run.triaged ?? []).filter(id => !(rec?.processed ?? []).includes(id))
   const step = run.pending[0]
@@ -763,10 +767,11 @@ async function requeueMidTurn($: Engine, run: Run, now: number): Promise<void> {
       }),
     }
   })
-  if (!isBack) return
+  if (!isBack) return false
   const what = unanswered.length === 0 ? 'nothing was left unanswered' : `${unanswered.length} unanswered item${unanswered.length === 1 ? '' : 's'} will be asked again`
   await logEvent($, run.root, run.branch, 'head', `post-PR round ${run.round}: a turn taken while collecting timed out after ${elapsed(config.stepTimeoutMs)}; collection goes on, ${what}`)
   $.ui.status(`pr-gate r${run.round}: waiting on reviewers`)
+  return true
 }
 
 // ------------------------------------------------------------- the end
@@ -2037,21 +2042,30 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && (f.status !== 'open' || f.duplicateOf !== undefined))
   const triaged = (run.triaged ?? []).filter(answered)
   if (!(await isOwn())) return
-  const rec = await updateRecord($, run.root, run.branch, one => ({
-    ...one,
-    ...withOwnReplies(one, run.pending[0]?.answer ?? ''),
-    findings: mergeFindings(one.findings, after.findings),
-    processed: [...new Set([...one.processed, ...triaged])],
-    replies: {
-      ...one.replies,
-      ...Object.fromEntries(
-        [...said, ...proposed.filter(each => linked.includes(each.id))].flatMap(each => {
-          const externalId = after.findings.find(f => f.id === each.id)?.externalId
-          return each.replyId === undefined || externalId === undefined ? [] : [[externalId, each.replyId]]
-        }),
-      ),
-    },
-  }))
+  // Checked again under the record's lock: a reset since isOwn writes nothing into the new record, and this turn stands down.
+  let isReset = false
+  const rec = await updateRecord($, run.root, run.branch, one => {
+    if ((one.generation ?? 0) !== generation) {
+      isReset = true
+      return one
+    }
+    return {
+      ...one,
+      ...withOwnReplies(one, run.pending[0]?.answer ?? ''),
+      findings: mergeFindings(one.findings, after.findings),
+      processed: [...new Set([...one.processed, ...triaged])],
+      replies: {
+        ...one.replies,
+        ...Object.fromEntries(
+          [...said, ...proposed.filter(each => linked.includes(each.id))].flatMap(each => {
+            const externalId = after.findings.find(f => f.id === each.id)?.externalId
+            return each.replyId === undefined || externalId === undefined ? [] : [[externalId, each.replyId]]
+          }),
+        ),
+      },
+    }
+  })
+  if (isReset) return
   if (rec === undefined) {
     // The record went while the answers were read (A4): stop with the reason, never leave a settling turn to freeze collection. Only
     // the run this turn settles is stopped; there is no record left whose generation could say more.

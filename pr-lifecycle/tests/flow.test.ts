@@ -4782,7 +4782,8 @@ test('R90: in a discretionary round, Codex agreeing the agent\'s link, beside an
 /** Feedback a reviewer posted before the poll that reads it: its time never counts as a later arrival. */
 const early = <T extends object>(one: T): T => ({ ...one, created_at: '1970-01-01T00:00:01Z' })
 const ciRunning = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
-const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}"`))
+/** The triage prompts of a round's step, a re-ask's own marker (`r2-triage-2`) included. */
+const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}`))
 
 test('R88: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
   const w = world(on)
@@ -4934,6 +4935,9 @@ test('R88: a mid-collection turn that never answers goes back to collecting once
   for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
   expect(triageTurns(w, 'r2-triage')).toHaveLength(2)
   expect(triageTurns(w, 'r2-triage').at(-1)).toContain('G2-1')
+  // The re-ask has a marker of its own, so the timed-out prompt's turn can never arm it.
+  expect(triageTurns(w, 'r2-triage-2')).toHaveLength(1)
+  expect((await runOf(w)).pending[0]?.step).toBe('r2-triage-2')
   expect((await runOf(w)).phase).toBe('triage')
   // A second timeout in the same round stops the run, saying how to go on.
   await w.clock.advance(62_000)
@@ -4966,9 +4970,74 @@ test('R88: a late answer to a timed-out mid-collection turn is not read as the a
   expect([still.phase, still.pending.length, still.pending[0]?.answer]).toEqual(['triage', 1, undefined])
   expect(still.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
   // The new turn's own answer is the one recorded.
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  await done($, triaged('r2-triage-2', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
   expect((await runOf(w)).phase).toBe('collect')
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+})
+
+test('R88: the timed-out prompt\'s turn starting late does not arm the re-ask', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  const old = triageTurns(w, 'r2-triage')[0] ?? ''
+  await w.clock.advance(62_000)
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage-2').length < 1; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage-2')).toHaveLength(1)
+  // The first prompt's turn only starts now, after the re-ask was sent: it carries r2-triage, not the re-ask's marker.
+  await $.turn.start({ text: old, turnId: 'turn-late' })
+  expect((await runOf(w)).pending[0]?.turnId).toBeUndefined()
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'late', replyId: '990' }]), turnId: 'turn-late' })
+  const still = await runOf(w)
+  expect([still.phase, still.pending[0]?.answer]).toEqual(['triage', undefined])
+  // The re-ask's own turn is the one answered.
+  await done($, triaged('r2-triage-2', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+})
+
+test('R88: an answered mid-collection turn whose afterTriage failed before settling stops at the step timeout, never hangs', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  // The answer is recorded on the run, then afterTriage stalls at its first read, before it clears the turn: what a session that
+  // dies there leaves. (A throw there is no such state: the turn-end hook stops the run with "The gate itself failed".)
+  let isHeld = false
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  w.beforeRead = async key => {
+    if (key !== KEY || isHeld || w.run?.phase !== 'triage' || w.run.pending[0]?.answer === undefined) return
+    isHeld = true
+    reached()
+    await released
+  }
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  await isReached
+  const stuck = await runOf(w)
+  expect([stuck.phase, stuck.pending[0]?.answer !== undefined, stuck.isSettling]).toEqual(['triage', true, undefined])
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect([run.status, run.phase]).toEqual(['error', 'done'])
+  expect(run.message).toContain('triage step ran past')
+  // The stalled afterTriage, let go after the stop, writes nothing over it.
+  release()
+  await answering
+  expect((await runOf(w)).status).toBe('error')
+})
+
+test('R88 (A4): a reset between afterTriage\'s ownership check and its record write writes nothing into the new record', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let isReset = false
+  w.afterRead = key => {
+    if (key !== KEY || isReset || w.run?.isSettling === undefined) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.processed).not.toContain('inline:11')
+  expect(rec.replies['inline:11']).toBeUndefined()
 })
 
 test('R88 (A4): a reset while afterTriage lists the unpushed commits writes no stop over it', async ($, on) => {

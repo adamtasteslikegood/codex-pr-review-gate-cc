@@ -397,7 +397,12 @@ const where = (run: Run): string =>
   `Repository: ${run.root}\nBranch: ${run.branch}\nBase: origin/${run.base} (already fetched)\nHEAD: ${run.headSha}`
 
 /** A step's name: what its agent repeats in its trailer, so its answer is known for this step's. */
-export const stepOf = (run: Pick<Run, 'round'>, role: Role): string => `r${run.round}-${role}`
+/**
+ * A step's marker in its prompt and trailer. A triage turn that asks again after a turn timed out while collecting (R88) has one of its
+ * own (`r2-triage-2`), so the timed-out prompt's turn, starting late, can never arm it (`onTurnStart` arms by marker).
+ */
+export const stepOf = (run: Pick<Run, 'round' | 'midTurnTimeouts'>, role: Role): string =>
+  role === 'triage' && (run.midTurnTimeouts ?? 0) > 0 ? `r${run.round}-triage-${(run.midTurnTimeouts ?? 0) + 1}` : `r${run.round}-${role}`
 
 const trailerRule = (step: string, shape: string): string =>
   `End your final message with the word ${TRAILER} on its own line, followed by one JSON object and nothing after it. Copy "step" exactly:\n${TRAILER}\n{"step":"${step}",${shape.slice(1)}`
