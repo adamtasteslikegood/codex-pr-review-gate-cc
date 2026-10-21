@@ -59,3 +59,4 @@ Task 5: fix round 1 0283ef8, 541/541 (roster-only request coverage; failed reque
 Task 5: re-review All addressed. Minors deferred to final review: "could not read requested reviewers/commit statuses" logged every poll while broken (log flood; requested line uses kind 'head') — log once per head; no test for a context both as running check run and final status. Rulings note (Task 16): inline thread replies carry original_commit_id, so an old-thread reply no longer covers a new head.
 Task 5: complete (commits 3ec5fd8..0283ef8, review clean)
 Task 6: dispatched (BASE d3c4305, sonnet) — R88 charging; acknowledgement stored as rebutted so REJECTABLE covers it
+Task 6: implemented c8f1412 + report 1e981a2 (BASE d3c4305), 544/544, DONE_WITH_CONCERNS (unbounded clean post rounds? — sent to reviewer as named risk); rejectedFix fixture set P2 (P1 default made it a round-2 blocker) → task review on opus dispatched
