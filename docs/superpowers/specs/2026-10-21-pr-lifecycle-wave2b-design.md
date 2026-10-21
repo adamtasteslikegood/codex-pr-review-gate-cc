@@ -161,6 +161,15 @@ summary G2-1 stayed a separate blocker beside its own inline G2-2.
    severity either had.
    Security travels the same way: the original is security when either one
    is, so a link never lets a security problem be filed without the person.
+   The original's `severity` rises the same way (amendment A9, Task 7
+   review): every hold reads `severity`, so a P1 or security duplicate linked
+   to a P2 or P3 original keeps its P1 hold, and a P3 deferral of that
+   original waits for the person. A raised severity is lowered only through
+   R85's Codex-checked lowering. A refused agent link leaves it raised.
+7. **No match through an unchecked link (A9).** The gate never matches new
+   feedback through the agent's link that Codex has not checked: the new item
+   stands alone. Otherwise a later refusal would leave it settling with the
+   wrong original.
 6. **Canonical ids (PR #25 review).** Links are checked on canonical ids: a
    link that resolves to the finding itself is no answer, and linking an
    original re-points its own linked findings, so nothing chains. R33 and the
