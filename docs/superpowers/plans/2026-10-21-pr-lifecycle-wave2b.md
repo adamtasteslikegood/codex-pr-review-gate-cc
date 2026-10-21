@@ -625,3 +625,387 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
+### Task 5: Collection ends on GitHub's signals (R89, spec §2)
+
+**Why:** collection waits for the roster, or for running checks and a 3-minute quiet spell. GitHub already says what to wait for: the base's required checks (R86), the PR's pending review requests, and the roster. The quiet window stays only where none of the three exists. Review Focus 2: the person may request a review from this machine's own login; the gate must not wait for it.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/github.ts` (`CollectInput`, `collectionDone`, new `readRequested`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`Fetched`, `fetchFeedback`, `pollOnce`)
+- Modify: `pr-lifecycle/tests/world.ts` (knobs `requested` and `requests`)
+- Test: `pr-lifecycle/tests/github.test.ts`, `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `requiredChecksOf($, root, slug, base): Promise<Set<string> | { unknown: string }>` (`round.ts`, R86).
+- Produces:
+  - `CollectInput.requested?: readonly string[]` and `CollectInput.required?: readonly string[] | 'unknown'` (absent reads as `'unknown'`: every reported check stands in).
+  - `export function readRequested(text: string, self: string): string[]` in `github.ts`.
+  - `Fetched.requested?: string[]`.
+  - World: `w.gh.requested?: string[]` (logins `requested_reviewers` lists; default none) and `w.gh.requests: string[]` (every `-X POST .../requested_reviewers` call, in order). Task 10 reads `w.gh.requests`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add `readRequested` to the imports in `pr-lifecycle/tests/github.test.ts`. Replace the test `without a roster, collection ends when checks are done and feedback has gone quiet` with:
+
+```ts
+test('R89: a running required check holds collection; a completed one is a signal, so no quiet wait; with no signal at all, the quiet window decides', async () => {
+  const running = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  const done = [{ name: 'ci', status: 'completed', conclusion: 'failure' }]
+  expect(collectionDone({ ...base, feedback: [], checks: running, now: 600_000 }).isDone).toBe(false)
+  // Unknown required checks: every reported check stands in, and is a signal.
+  expect(collectionDone({ ...base, feedback: [], checks: done, lastArrivalAt: 500_000, now: 600_000 })).toMatchObject({ isDone: true, isComplete: true })
+  // No required check, no request, no roster: only the quiet window.
+  expect(collectionDone({ ...base, required: [], feedback: [], checks: done, lastArrivalAt: 500_000, now: 600_000 }).isDone).toBe(false)
+  expect(collectionDone({ ...base, required: [], feedback: [], checks: done, lastArrivalAt: 400_000, now: 600_000 })).toMatchObject({ isDone: true, isComplete: true })
+})
+```
+
+Append:
+
+```ts
+test('R89: required checks need a completed run on the head; a check that is not required is not waited for', async () => {
+  const running = (name: string) => ({ name, status: 'in_progress', conclusion: null })
+  const completed = (name: string) => ({ name, status: 'completed', conclusion: 'success' })
+  expect(collectionDone({ ...base, required: ['ci'], feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: true, isComplete: true })
+  // A required check with no run yet is missing.
+  expect(collectionDone({ ...base, required: ['ci', 'analyze'], feedback: [], checks: [completed('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['analyze'] })
+  expect(collectionDone({ ...base, required: 'unknown', feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['preview'] })
+  // With a roster, a required check is waited for too.
+  const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [], trusted: [] }
+  expect(collectionDone({ ...base, roster, required: ['ci'], feedback: [fb('claude[bot]', 'b')], checks: [running('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['ci'] })
+  // The cap still ends it.
+  expect(collectionDone({ ...base, required: ['analyze'], feedback: [], checks: [], now: 1_200_000 })).toMatchObject({ isDone: true, isComplete: false, missing: ['analyze'] })
+})
+
+test('R89: a pending review request holds collection until that reviewer reviews the head; this machine\'s login is never waited for', async () => {
+  const req = { ...base, required: [] as string[], checks: [], now: 60_000 }
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [] })).toMatchObject({ isDone: false, missing: ['alice'] })
+  // A review of an older head does not answer the request.
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [fb('alice', 'a')] }).isDone).toBe(false)
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [fb('alice', 'b')] })).toMatchObject({ isDone: true, isComplete: true })
+  // A GitHub App's review answers the request made to its name (F3).
+  expect(collectionDone({ ...req, requested: ['copilot'], feedback: [fb('copilot-pull-request-reviewer[bot]', 'b')] }).isDone).toBe(true)
+  expect(readRequested(JSON.stringify({ users: [{ login: 'alice' }, { login: 'me' }], teams: [{ slug: 'core' }] }), 'me')).toEqual(['alice'])
+  expect(readRequested('{}', 'me')).toEqual([])
+  expect(readRequested('<html>proxy error</html>', 'me')).toEqual([])
+})
+```
+
+In `pr-lifecycle/tests/world.ts`, add to the `gh` type after `labelled: string[]`:
+
+```ts
+    /** Logins `GET .../requested_reviewers` lists (R89); undefined lists none. */
+    requested?: string[]
+    /** Every `-X POST .../requested_reviewers` call the gate made, in order. */
+    requests: string[]
+```
+
+initialise `requests: []` next to `labelled: []`, and replace the line
+
+```ts
+      if (/requested_reviewers/.test(args)) return out('{}')
+```
+
+with
+
+```ts
+      if (/requested_reviewers/.test(args)) {
+        if (args.includes('-X POST')) {
+          w.gh.requests.push(args)
+          return out('{}')
+        }
+        return out(JSON.stringify({ users: (w.gh.requested ?? []).map(login => ({ login })), teams: [] }))
+      }
+```
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+test('R89: a pending review request holds the round until that reviewer reviews the head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['alice']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on alice')
+  // GitHub drops the request once alice reviews.
+  w.gh.requested = []
+  w.gh.reviews = [...covers(w.gh.prHead), { id: 6, user: { login: 'alice' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89 (Review Focus 2): a review requested from this machine\'s own login is never waited for', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['me']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/github.test.ts` and `claude plugin test pr-lifecycle -- tests/flow.test.ts`
+Expected: FAIL: `readRequested` is not exported; the flow test for alice reaches `ready` without her.
+
+- [ ] **Step 3: Implement**
+
+In `pr-lifecycle/hooks/github.ts`, add to `CollectInput`:
+
+```ts
+  /** Logins with a pending review request on the PR, this machine's own left out (R89). */
+  requested?: readonly string[]
+  /** The base's required checks (R86), or 'unknown', where every reported check stands in. Absent reads as 'unknown'. */
+  required?: readonly string[] | 'unknown'
+```
+
+Replace `collectionDone` with:
+
+```ts
+/**
+ * Whether a post-PR round has collected enough (R89): every required check has a completed run on the head, every pending review
+ * request has a review of the head, and every roster reviewer covered it. Check suites are never read: an installed app can leave
+ * one queued forever. The quiet window applies only where none of the three exists. The cap applies always.
+ */
+export function collectionDone(input: CollectInput): { isDone: boolean; isComplete: boolean; missing: string[]; covered: string[] } {
+  const roster = input.roster
+  const hasRoster = roster !== undefined && (roster.reviewers.length > 0 || roster.checks.length > 0)
+  // Who covers the head: with a roster, its reviewers, and a trusted reviewer whose review is already in (#14: never waited for);
+  // without one, reviews and inline comments, never an issue comment (a deploy-preview bot's note reviews nothing).
+  const counts = (one: Feedback): boolean =>
+    hasRoster && roster !== undefined ? roster.reviewers.includes(one.reviewer) || roster.trusted.includes(one.reviewer) : one.kind !== 'comment'
+  const isOnHead = (one: Feedback): boolean => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)
+  const covered = [...new Set(input.feedback.filter(one => counts(one) && isOnHead(one)).map(one => one.reviewer))]
+  const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
+  const required = input.required === undefined || input.required === 'unknown' ? [...new Set(input.checks.map(one => one.name))] : input.required
+  const requested = input.requested ?? []
+  const isReviewed = (who: string): boolean => input.feedback.some(one => one.kind === 'review' && one.head === input.head && postsFor(one.reviewer, who))
+  const missing = [
+    ...new Set([
+      ...(hasRoster ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))] : []),
+      ...requested.filter(one => !isReviewed(one)),
+      ...required.filter(one => !finished.has(one)),
+    ]),
+  ]
+  const hasSignals = hasRoster || requested.length > 0 || required.length > 0
+  const isQuiet = hasSignals || input.now - input.lastArrivalAt >= input.quietMs
+  if (missing.length === 0 && isQuiet) return { isDone: true, isComplete: true, missing, covered }
+  if (input.now - input.startedAt >= input.capMs) return { isDone: true, isComplete: missing.length === 0, missing, covered }
+  return { isDone: false, isComplete: false, missing, covered }
+}
+
+/**
+ * The logins a PR's review is requested from (R89), as `GET .../requested_reviewers` lists them; teams are not people the gate can
+ * match, so they are left out, and so is this machine's own login (Review Focus 2). Unreadable text lists none.
+ */
+export function readRequested(text: string, self: string): string[] {
+  try {
+    const users = (JSON.parse(text) as { users?: unknown } | null)?.users
+    if (!Array.isArray(users)) return []
+    return users.flatMap(one => {
+      const name = str((one as Row | null)?.login)
+      return name === undefined || name === self ? [] : [name]
+    })
+  } catch {
+    return []
+  }
+}
+```
+
+`postsFor` is defined further down the file as a `const`; move its definition (with its doc comment) above `collectionDone` so it is initialised before use.
+
+In `pr-lifecycle/hooks/round.ts`:
+
+- Add to `Fetched`: `/** Logins with a pending review request (R89), this machine's own left out. */ requested?: string[]`.
+- Import `readRequested` from `./github`.
+- In `fetchFeedback`, add a fifth read to the `Promise.all` and to `bad`:
+
+```ts
+  const [reviews, inline, comments, checks, requests] = await Promise.all([
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/comments`),
+    ghJson($, rec.root, `${at}/issues/${rec.pr}/comments`),
+    ghJson($, rec.root, `${at}/commits/${prHead}/check-runs`),
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/requested_reviewers`),
+  ])
+  const bad = [reviews, inline, comments, checks, requests].find(one => !one.isOk)
+```
+
+  and add `requested: readRequested(requests.out, self)` to the returned object (Task 4 already changed that return line).
+- In `pollOnce`, before `const done = collectionDone({`, add:
+
+```ts
+  // The base's required checks (R86): unknown makes every reported check stand in.
+  const needed = await requiredChecksOf($, run.root, rec.slug, run.base)
+```
+
+  and add to the `collectionDone` input:
+
+```ts
+    requested: got.requested ?? [],
+    required: needed instanceof Set ? [...needed] : 'unknown',
+```
+
+- [ ] **Step 4: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. In the world, `w.gh.required` undefined means every reported check is required, so a flow test that had a running check and a roster now waits for that check too. That is the intended change (spec §2). If such a test fails, make its check complete or set `w.gh.required = []` so it tests what it tested, and list each change in your report.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pr-lifecycle/hooks/github.ts pr-lifecycle/hooks/round.ts pr-lifecycle/tests/world.ts pr-lifecycle/tests/github.test.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: collection ends on required checks, review requests and the roster (R89)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
+
+### Task 6: A post round is charged only when it finds something (R88, spec §1.4)
+
+**Why:** every completed discretionary round draws on the allowance, clean or not. A post round should cost one only when a new blocker was raised in it, or Codex rejected a fix, rebuttal or acknowledgement in it. A pre-PR round is always charged, as in 1.4.0 (plan ruling: the spec's charging is about the post-PR rounds the agent pushes through).
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`RoundRecord`)
+- Modify: `pr-lifecycle/hooks/lifecycle.ts` (`usedRounds`, new `isChargedRound`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`endRound`, about line 2077)
+- Test: `pr-lifecycle/tests/lifecycle.test.ts`, `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Produces: `RoundRecord.isCharged?: boolean` (set on every post round from 1.5.0; absent on older records and on pre rounds). `export function isChargedRound(findings: readonly Finding[], round: number): boolean`. Task 7 adds "a linked duplicate is not new" to it.
+- Ruling for the plan: a Codex rejection in an answer run (R37, which records no round) charges nothing.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add `isChargedRound` to the imports in `pr-lifecycle/tests/lifecycle.test.ts` and append:
+
+```ts
+test('R88: a post round is charged for a new blocker or a Codex rejection in it; a pre round and an older record always count', async () => {
+  const blocker = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P1' })
+  const advisory = finding({ id: 'G3-2', round: 3, source: 'github', severity: 'P3' })
+  expect(isChargedRound([blocker], 3)).toBe(true)
+  expect(isChargedRound([advisory], 3)).toBe(false)
+  expect(isChargedRound([blocker], 4)).toBe(false)
+  // A fix Codex rejects is charged to the round that rejects it.
+  const rejectedFix = finding({ id: 'R2-1', round: 2, history: [
+    { round: 2, status: 'open', by: 'codex', at: 1 },
+    { round: 3, status: 'reported-fixed', by: 'main', at: 2 },
+    { round: 3, status: 'open', note: 'still reachable', by: 'codex', at: 3 },
+  ] })
+  expect(isChargedRound([rejectedFix], 3)).toBe(true)
+  expect(isChargedRound([rejectedFix], 2)).toBe(false)
+  const upheld = finding({ id: 'R2-2', round: 2, status: 'verified-fixed', history: [
+    { round: 3, status: 'reported-fixed', by: 'main', at: 1 },
+    { round: 3, status: 'verified-fixed', by: 'codex', at: 2 },
+  ] })
+  expect(isChargedRound([upheld], 3)).toBe(false)
+  // A rejected rebuttal and a rejected acknowledgement charge too.
+  expect(isChargedRound([rejected()], 2)).toBe(true)
+  const d = (n: number, over: object = {}) => roundOf({ n, phase: 'post', kind: 'discretionary', ...over })
+  expect(usedRounds({ rounds: [pre(), d(2, { isCharged: false }), d(3, { isCharged: true }), d(4)] })).toBe(3)
+  expect(usedRounds({ rounds: [pre({ isCharged: false })] })).toBe(1)
+  expect(remaining({ allowance: 2, grants: [], rounds: [d(2, { isCharged: false }), d(3, { isCharged: false })] })).toBe(2)
+})
+```
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+test('R88: each post round records whether it was charged: a clean one is free, a new blocker charges it', async ($, on) => {
+  const clean = world(on)
+  clean.git.roster = roster
+  await toPost($, clean)
+  clean.gh.reviews = covers(clean.gh.prHead)
+  await clean.clock.advance(30_000)
+  expect((await recordOf(clean)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([false])
+})
+
+test('R88: a round that raises a new blocker is charged', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([true])
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts`
+Expected: FAIL: `isChargedRound` is not exported.
+
+- [ ] **Step 3: Implement**
+
+In `pr-lifecycle/types/index.d.ts`, add to `RoundRecord` after `isCompleted`:
+
+```ts
+  /**
+   * Post only (R88): whether the round drew on the allowance, because a new blocker was raised in it or Codex rejected a fix,
+   * rebuttal or acknowledgement in it. Absent on a pre round and on a record from before 1.5.0, which count as charged.
+   */
+  isCharged?: boolean
+```
+
+In `pr-lifecycle/hooks/lifecycle.ts`, replace `usedRounds` with:
+
+```ts
+/**
+ * Rounds that drew on the allowance: completed discretionary ones. A post round from 1.5.0 counts only when it was charged (R88);
+ * a pre round, and a round from an older record, always count. Baseline rounds, final-head checks and incomplete attempts use nothing.
+ */
+export const usedRounds = (rec: Pick<LifecycleRecord, 'rounds'>): number =>
+  rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary' && (one.phase === 'pre' || one.isCharged !== false)).length
+```
+
+Below it, add (it uses `isBlocking`, defined further down as a `const`; place this function after `isBlocking`'s definition):
+
+```ts
+/** The agent's answers Codex can reject. */
+const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
+
+/**
+ * Whether a post round costs one (R88): a blocking finding first raised in it, or Codex reopening, in it, a finding the agent had
+ * answered (a fix, a rebuttal, an acknowledgement, a deferral). "A rejected fix still uses a round, because it does."
+ */
+export function isChargedRound(findings: readonly Finding[], round: number): boolean {
+  const isNewBlocker = findings.some(one => one.round === round && isBlocking(one))
+  const isRejected = findings.some(one =>
+    one.history.some((each, i) => each.round === round && each.by === 'codex' && each.status === 'open' && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open')),
+  )
+  return isNewBlocker || isRejected
+}
+```
+
+(If `FindingStatus` is not imported as a type in `lifecycle.ts`, add it to the type import from `'../types'`.)
+
+In `pr-lifecycle/hooks/round.ts`, in `endRound`, where the `RoundRecord` is built (the object with `raised`, `rebutted`, `deferredBlocking`), add:
+
+```ts
+    ...(run.lifecycle === 'post' ? { isCharged: isChargedRound(run.findings, run.round) } : {}),
+```
+
+and import `isChargedRound` from `./lifecycle`.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. A flow test that counted on a clean discretionary post round using up the allowance (an `exhausted` after N clean rounds) now gets more rounds. Change it so its rounds raise a new blocker each time, keeping what it tests, and list each change in your report.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/lifecycle.ts pr-lifecycle/hooks/round.ts pr-lifecycle/tests/lifecycle.test.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: a post round is charged only for a new blocker or a Codex rejection (R88)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
+
