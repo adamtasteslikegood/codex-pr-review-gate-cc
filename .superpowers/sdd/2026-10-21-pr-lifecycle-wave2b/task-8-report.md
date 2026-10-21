@@ -206,3 +206,48 @@ This report section is a commit of its own.
 - The "step timeout stops the run" concern above is resolved by item 1. A second mid-collection timeout in a round still needs `/pr-gate resume`, as ruled.
 - The re-ask after a timeout reuses the step id `r{n}-triage`. That is safe because answers match by turn id, not by step marker. If the engine's matching ever moved to step markers alone, the re-ask would need a distinct marker.
 - Minor 3 (the stale check sits behind the poll lock) is left alone, as directed.
+
+## Fix round 2
+
+Commit: `b39f6e8` pr-lifecycle 1.5.0: an answered turn never blocks the step timeout; the re-ask has its own marker; the record write checks its generation (R88, A4).
+This report section is a commit of its own.
+
+### Changes
+1. **Stuck path: answered but unsettled (Important).**
+   - **The stuck state:** before this fix, the ticker's requeue branch fired whenever `pending` was non-empty, but `requeueMidTurn`'s patch needs an unanswered entry. A turn whose answer was recorded but whose `afterTriage` never cleared `pending` therefore entered the branch on every tick, missed, and returned. The generic stop was never reached.
+   - **Entry condition:** the requeue branch now requires `run.pending.some(p => p.answer === undefined)`. An answered but unsettled turn falls through to the generic step-timeout stop: `noteAttempt` + `finish('error')`.
+   - **Why the stop and not a re-run:** I chose the stop over re-running `afterTriage` on the stored answer. It is the smaller change, its path is already tested, and a re-run could repeat an `afterTriage` that is still alive and merely slow.
+   - **`requeueMidTurn` now returns whether it applied.** On a miss the ticker does nothing that tick, and the next tick reads the run afresh. If the turn was answered and is truly stuck, that next tick falls through to the stop.
+   - **The one-tick wait (accepted by the controller):** this differs from the ask to fall through at once. The tick that missed holds a stale copy of the run, and stopping on it could kill a healthy `afterTriage` that had only just begun.
+   - **Why a throw can't leave the stuck state:** `register.tsx` (~1206) wraps `onAnswer` in a try/catch that calls `finish('error', 'The gate itself failed: …')`. Within one session, a throw in `afterTriage` stops the run at once. The stuck state arises only when `afterTriage` stalls, or its session dies, after the answer is recorded and before its first patch.
+   - **How the test reaches it:** a new world hook, `w.beforeRead(key)`, is awaited before each store read (`pr-lifecycle/tests/world.ts`). The test holds the first record read after the answer is set, which is `afterTriage`'s opening `loadRecord`, so the run sits in phase `'triage'` with the answer set and no `isSettling`.
+   - **What the test checks:** after the step timeout, the run ends with status `'error'` and "triage step ran past". Released late, the stalled `afterTriage` writes nothing over the stop.
+2. **The re-ask has its own marker (Minor).**
+   - `stepOf` (`core.ts`) returns `r{n}-triage-{midTurnTimeouts+1}` for the triage role once a mid-collection turn has timed out in the round. For a timed-out round that is `r2-triage-2`.
+   - Every triage marker comes from `stepOf`: the pending entry in `beginTriage`, the re-prompt in `afterTriage`, and `triagePrompt`'s trailer.
+   - **Readers checked:**
+     - The pane step id (`withStep` `r{n}-triage`) stays as it is, since it is display only.
+     - The answer-run literal `r${round}-triage` is a fresh run with no timeouts.
+     - `readTriage` does not read the step.
+     - The main agent's answer matches by turn id.
+     - A8's stamped-round test is unaffected.
+   - **Test helper:** `triageTurns` now matches on the marker's prefix, so a round's re-asks are counted with it.
+   - **New test:** "R88: the timed-out prompt's turn starting late does not arm the re-ask". The old prompt's turn, starting after the re-ask was sent, leaves the re-ask's `turnId` unset, and its answer is ignored.
+3. **The record write checks its own generation (Minor).**
+   - The `updateRecord` callback in `afterTriage` compares `generation` under the record's lock. On a mismatch it writes nothing, and `afterTriage` stands down.
+   - **New test:** "R88 (A4): a reset between afterTriage's ownership check and its record write writes nothing into the new record". The generation is bumped through `w.afterRead`.
+
+### Tests and results
+- **Updated** for the marker: "…goes back to collecting once; a second timeout…" and "a late answer to a timed-out mid-collection turn…".
+- **New:**
+  - "…timed-out prompt's turn starting late does not arm the re-ask";
+  - "an answered mid-collection turn whose afterTriage failed before settling stops at the step timeout, never hangs";
+  - "a reset between afterTriage's ownership check and its record write…".
+- **Results:** my process could not run `claude plugin test` ("hooks modules are turned off in this process"). The controller ran the suite from its session on this exact tree:
+  - pr-lifecycle 576/576;
+  - codex-gate 22/22;
+  - `npm run lint` clean;
+  - `npm run typecheck` clean.
+
+### Concerns
+- Only the stop recovers an answered but unsettled mid-collection turn: an attempt plus `/pr-gate resume`. No automatic re-run, by choice (see item 1).
