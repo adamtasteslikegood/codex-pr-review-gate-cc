@@ -19,6 +19,22 @@ Success: each finding below has a regression test that fails on 1.3.0 and
 passes on 1.4.0, the existing suite passes (adjusted only where behaviour
 deliberately changes), and `npm run check` is green.
 
+**Needed, not designed yet: one finding per problem.** The gate should merge
+findings from separate rounds and reviewers that name the same problem (Adam,
+2026-10-20). Today it doesn't:
+- `triage()` (`lifecycle.ts:185`) only labels new feedback a duplicate for the
+  prompt, and only against an answered finding in the same file with similar
+  title words;
+- the agent's `duplicateOf` answer is read (`core.ts:218`) but never used, so
+  each copy stays its own blocker. On PR #19, review summary G2-1 was carried
+  as a separate P2 blocker next to its own inline finding G2-2.
+
+A later wave designs this. It needs to say: what counts as the same finding
+(the gate's match, the agent's `duplicateOf`, or both), whether a duplicate
+takes on its original's status and replies, and how a summary and its inline
+findings are linked. This wave's `acknowledged` answer and advisory labels
+reduce the cost, but don't solve it.
+
 Out of scope here (wave 2b, 1.5.0): early triage during collection, one round
 per push, charging only rounds with new findings, one re-request per burst,
 and ending collection on GitHub's signals. Wave 3: the pane's waive and merge
@@ -223,6 +239,16 @@ the same on main.
      keyword test at all (point 3).
    - Holds show `severity` as stored, so a hold shows the triaged severity
      (finding 11, G3-1).
+5. **Advisory markers (Adam, 2026-10-20).** `severityHint` (`github.ts:208`)
+   reads a reviewer's own advisory label as P3. The labels are "advisory",
+   "non-blocking", "nit", "optional" and "follow-up", when they label the
+   comment or its list of findings, not inside a quoted phrase. Its
+   `severitySource` is `'tag'`: it is the reviewer's own word, so the agent
+   can't raise it to blocking by itself, though Codex still can. A review
+   comment that lists several advisory findings stays one finding, P3, with
+   the list in its detail. The agent answers it once: fixing what it fixes,
+   `acknowledged`, or deferred with a follow-up (section 4). An explicit
+   `P0`-`P2` tag on any item in the list wins over the label.
 
 ## 4. Cheap deferral (decision I; finding 11)
 
@@ -272,7 +298,7 @@ the same on main.
 | R81 | Every manual action, the pane's Stop included, ends with one agent message through `say()`; merged into a round prompt the action starts | — |
 | R82 | Triage carries open findings by the round raised in; `acknowledged` settles a GitHub item with no reply or Codex check | R32, R34 |
 | R83 | A review is `isFinding: false` only on positive no-action evidence | readReviews' non-empty rule |
-| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered | applyAnswer's rule |
+| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
 | R85 | A P3 deferral with a `followUp`, not security, settles without a waiver | R42 |
 | R86 | Required checks come from rulesets and classic protection; `waive post` sets aside the rest | R1-9 |
 
@@ -305,6 +331,10 @@ fails on 1.3.0:
   nothing.
 - **Severity:** a hinted P2 triaged P3 shows as P3 in the hold; a tagged P2
   triaged P3 stays P2.
+- **Advisory labels:** "Advisory, non-blocking:" followed by a list of
+  findings becomes one P3 finding with the list in its detail; the same list
+  with one item tagged P1 becomes P1; "the reviewer's advisory note" quoted
+  inside a sentence doesn't count.
 - **Deferral:** a P3 with `followUp` settles; a P2 with `followUp`, a P3
   without one, and a security P3 each hold.
 

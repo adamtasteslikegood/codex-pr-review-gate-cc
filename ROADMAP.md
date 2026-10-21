@@ -173,6 +173,16 @@ Two PRs (decision L). Specs:
    those exist. Which signals are reliable is probed first (the Codex
    connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
 
+### Not yet placed: one finding per problem (Adam, 2026-10-20)
+
+The gate should merge findings from separate rounds and reviewers that name
+the same problem. Today `triage()` only labels a duplicate for the prompt, and
+the agent's `duplicateOf` answer is read but unused, so each copy is its own
+blocker (on PR #19, review summary G2-1 was carried next to its inline G2-2).
+Needs its own design: what counts as the same finding, whether a duplicate
+takes on its original's status, and how a summary links to its inline
+findings. See the wave 2a spec's note.
+
 ## Wave 3: visibility, scoping and fewer person-only steps
 
 Serves goal 2. Makes the gate legible and reachable from anywhere.
