@@ -610,9 +610,10 @@ const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | un
   if (ci.length === 0) return undefined
   const head = `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held`
   const short = pr.headRefOid.slice(0, 7)
-  if (ci.some(one => one.kind === 'ci-unreadable')) {
+  const unreadable = ci.find(one => one.kind === 'ci-unreadable')
+  if (unreadable !== undefined) {
     return [
-      `${head}: the CI checks on ${short} could not be read, and a merge waits until they can.`,
+      `${head}: the CI checks on ${short} could not be read${unreadable.detail === undefined ? '' : ` (${unreadable.detail})`}, and a merge waits until they can.`,
       'Do not merge another way. Check gh auth status and the network, then try the merge again.',
     ].join('\n') + unknownNote(action)
   }

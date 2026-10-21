@@ -256,6 +256,8 @@ export type Blocker = {
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string
+  /** gh's own words for a ci-unreadable blocker. */
+  detail?: string
   /** One line, with the stored (triaged) severity. */
   said: string
   owner: 'agent' | 'codex' | 'person' | 'gate'

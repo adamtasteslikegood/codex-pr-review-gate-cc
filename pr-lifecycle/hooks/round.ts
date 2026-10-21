@@ -937,8 +937,8 @@ type Fetched = {
   ownReplies?: Record<string, string>
 }
 
-/** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, 'unreadable' when it can't say. */
-export async function readChecks($: Engine, root: string, pr: number, repo?: string): Promise<{ name: string; bucket: string }[] | 'unreadable'> {
+/** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, { unreadable: gh's own words } when it can't say. */
+export async function readChecks($: Engine, root: string, pr: number, repo?: string): Promise<{ name: string; bucket: string }[] | { unreadable: string }> {
   let ran: { exitCode: number; stdout: string; stderr: string }
   try {
     ran = await $.process.run(['gh', 'pr', 'checks', String(pr), ...(repo === undefined ? [] : ['--repo', repo]), '--json', 'name,state,bucket'], {
@@ -955,7 +955,7 @@ export async function readChecks($: Engine, root: string, pr: number, repo?: str
   } catch {
     // Not JSON: read stderr below.
   }
-  return /no checks reported/i.test(ran.stderr) ? [] : 'unreadable'
+  return /no checks reported/i.test(ran.stderr) ? [] : { unreadable: ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}` }
 }
 
 const required = new Map<string, Set<string>>()
@@ -991,9 +991,9 @@ export async function gatherStanding(
   repo?: string,
 ): Promise<Standing> {
   const checks = await readChecks($, rec.root, pr.number, repo)
-  const needed = checks === 'unreadable' || checks.length === 0 ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
-  const ci: CheckState[] | 'unreadable' =
-    checks === 'unreadable' ? 'unreadable' : checks.map(one => ({ ...one, isRequired: needed === 'unknown' || needed.has(one.name) }))
+  const needed = !Array.isArray(checks) || checks.length === 0 ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
+  const ci: CheckState[] | { unreadable: string } =
+    !Array.isArray(checks) ? checks : checks.map(one => ({ ...one, isRequired: needed === 'unknown' || needed.has(one.name) }))
   return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, ci)
 }
 

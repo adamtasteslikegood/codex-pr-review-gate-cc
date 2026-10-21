@@ -2883,6 +2883,7 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
   w.gh.isChecksUnreadable = true
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('could not be read')
+  expect(held).toContain('HTTP 502')
   expect(held).toContain('gh auth status')
   expect(held).not.toContain('waive')
 })
@@ -3461,6 +3462,8 @@ test('R86: waive post sets aside a cancelled check GitHub does not require, and 
   expect(isHeld(held)).toBe(true)
   expect(held.deny ?? '').toContain('check')
   expect(held.deny ?? '').not.toContain('failing: Independent Claude review')
+  expect(held.deny ?? '').toContain('Set aside')
+  expect(held.deny ?? '').toContain('Independent Claude review')
   w.gh.checks = [
     { name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' },
     { name: 'check', status: 'completed', conclusion: 'success' },
@@ -3485,5 +3488,7 @@ test('R86: with the required checks unreadable, a waiver sets nothing aside', as
   w.gh.garbage = '<html>proxy error</html>'
   w.gh.checks = [{ name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' }]
   await say($, 'waive post reviewed by hand')
-  expect(isHeld(await $.tool.call(merge))).toBe(true)
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('Independent Claude review')
 })

@@ -433,7 +433,7 @@ function blockerOf(f: Finding): Blocker {
  * Everything between this head and its merge (R79): findings, the head's own review, and CI, with nothing short-circuited. A post
  * waiver for this head and base leaves only a security P1 and CI; CI a waiver covers is only what GitHub does not require (R86).
  */
-export function standingOf(rec: LifecycleRecord, at: { head: string; base: string }, ci?: readonly CheckState[] | 'unreadable'): Standing {
+export function standingOf(rec: LifecycleRecord, at: { head: string; base: string }, ci?: readonly CheckState[] | 'unreadable' | { unreadable: string }): Standing {
   const phase = rec.phase === 'pre' ? 'pre' : 'post'
   const isOnBase = rec.base === at.base
   const waiver = isOnBase ? rec.waivers.find(one => one.scope === phase && one.head === at.head && (phase === 'post' || one.base === at.base)) : undefined
@@ -451,8 +451,9 @@ export function standingOf(rec: LifecycleRecord, at: { head: string; base: strin
     }
   }
   const setAside: string[] = []
-  if (ci === 'unreadable') {
-    blockers.push({ kind: 'ci-unreadable', said: `the CI checks on ${short(at.head)} could not be read`, owner: 'agent', release: 'check gh auth status and the network, then try again' })
+  if (ci === 'unreadable' || (ci !== undefined && 'unreadable' in ci)) {
+    const why = typeof ci === 'object' && 'unreadable' in ci ? ci.unreadable : ''
+    blockers.push({ kind: 'ci-unreadable', ...(why === '' ? {} : { detail: why }), said: `the CI checks on ${short(at.head)} could not be read${why === '' ? '' : ` (${why})`}`, owner: 'agent', release: 'check gh auth status and the network, then try again' })
   } else {
     for (const one of ci ?? []) {
       const isBad = one.bucket === 'fail' || one.bucket === 'cancel'
