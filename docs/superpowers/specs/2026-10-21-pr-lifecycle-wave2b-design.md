@@ -36,6 +36,7 @@ comes back as a new item.
 | S | Collection ends on GitHub's signals; the quiet window stays only where there are none | ROADMAP wave 2b item 4; probe on PR #20 (§2) |
 | O | A new item that names a problem already on the list is linked to it and follows its status | Adam, 2026-10-21 |
 | M | Where the gate would ask the person to waive a finding, it files a GitHub issue instead, and the issue settles it; security still needs the person | Adam, 2026-10-21 |
+| M2 | Only after the rounds: deferrals get Codex's check, issues are filed when the gate can do nothing more, a late blocker adds a round (at most two per lifecycle) | Adam, 2026-10-21 (amendment) |
 | N | When nothing holds the merge, the agent merges with a merge commit | Adam, 2026-10-21 |
 | L2 | 2b (this, 1.5.0) then 2c (parallel fixer lanes, 1.6.0) | Adam, 2026-10-21 |
 
@@ -179,15 +180,34 @@ touched their file (R55).
 **Change.** At every point where the gate would ask the person to waive a
 finding, it files a GitHub issue instead, and the issue settles the finding.
 
-1. **When.** A deferral at any severity, and a dispute (Codex rejected a
-   rebuttal and the agent stands by it, R40), once the round's answers and
-   Codex's check are in. Not before: the gate first resolves everything it
-   can.
-2. **Not security.** A security-flagged finding still waits for the person's
+1. **First the rounds (amended by Adam, 2026-10-21).** Every finding,
+   blocking or advisory, first goes through Codex and a fix attempt. A
+   deferral at any severity goes to Codex in the round's free check, as a
+   rebuttal does:
+   - Codex says it is fixable in this PR: the finding is open again and goes
+     back to the agent, and the rejection charges the round (§1.4);
+   - Codex agrees it is out of scope: it waits for the filing pass (item 2).
+
+   Nothing settles by an issue while the gate can still do something on the
+   head. This replaces R85's early settle of a P3 deferred to an issue: that
+   deferral waits for Codex's check and the filing pass too.
+2. **When it files.** The filing pass runs where 1.4.0 would end in
+   `exhausted` or `awaiting-decision`. That means the allowance is spent, or
+   all that holds the head is Codex-agreed deferrals and disputes (Codex
+   rejected a rebuttal and the agent stands by it, R40). It files an issue for
+   every finding still holding the merge, not security: open, deferred,
+   disputed, or a fix Codex rejected.
+3. **Late blockers add a round.** At exhaustion, a blocking finding first
+   raised in the round that spent the allowance gets one more round instead of
+   an issue. The gate adds it as a grant `by: 'gate'`, logged. A late advisory
+   gets its issue. The gate adds at most two such rounds per lifecycle. After
+   that, a late blocker gets its issue like the rest. Each added round is a sign
+   to the person that the PR's scope is too wide, and the report says so.
+4. **Not security.** A security-flagged finding still waits for the person's
    waiver. `waive post` stays for whole-head decisions.
-3. **Reuse.** If the agent's answer names an issue (`followUp`, R85), the gate
+5. **Reuse.** If the agent's answer names an issue (`followUp`, R85), the gate
    uses it: it labels and links it instead of filing another.
-4. **The issue.**
+6. **The issue.**
    - Title: `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`,
      for example `R4-3 Major [P2] Workflows rules ignored when reading
      required checks (#20, wave2a/pr-lifecycle-1.4.0)`. Names: P0 Blocker,
@@ -200,17 +220,17 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
      for a dispute); linked findings (§3) and related issues. Issues #21-#23
      are the model.
    - Label: `severity:<peak>` (R85), created when missing with R85's colours.
-5. **Settling.** The finding settles once its issue exists and carries the
+7. **Settling.** The finding settles once its issue exists and carries the
    label; the record keeps `followUp` and `followUpLabel` as for R85 today.
    `/pr-gate status` and the hold list name the issue ("R4-3 → #21 Major
    [P2]"). If filing or labelling fails, the finding holds with gh's error,
    and the next pass retries, as R85's labelling does. A reset, a fresh start
    or a stop while gh runs ends the pass with nothing written (G7-8, R8-2).
-6. **Lapse.** A finding settled by its issue does not lapse when its file
+8. **Lapse.** A finding settled by its issue does not lapse when its file
    changes (unlike a waiver, R55); its issue stays open for the person. R5-3
    (#23) asks whether a file change should reopen a settled deferral; that
    stays the person's call and is not changed here.
-7. **Bash text.** The gate files issues through `gh api -X POST
+9. **Bash text.** The gate files issues through `gh api -X POST
    repos/<slug>/issues`, never a command line the PR-create guards read.
 
 ## 6. The agent merges (decision N)
@@ -244,6 +264,17 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
    fake process that sleeps); raise the timeout only for tests whose cost is
    the machine's load, and say so beside each.
 
+4. **Resume forgets when the head arrived (#24).** `beginCollect` sets
+   `collect.headAt` to the time collection began, and a comment with no
+   commit counts for the head only from then on. After `/pr-gate resume`, a
+   roster reviewer's comment already on the head stops counting, and the round
+   waits out the cap (PR 3749 in the cookbook repo, 2026-10-21). `headAt` is
+   now the time the head reached the PR. It is the earliest `started_at` of
+   the check runs on the head, which the poll already fetches. With no check
+   runs, it is the head commit's committer date. It is never later than now.
+   It must be no earlier than the push and no later than the first comment on
+   the head.
+
 ## 8. Rulings to record (from R88)
 
 Each with its cost if wrong, in the rulings doc:
@@ -257,7 +288,9 @@ Each with its cost if wrong, in the rulings doc:
   checked by Codex.
 - R91: every reply id the agent reports is the gate's own, whatever the
   answer.
-- R92 (M): issues instead of waivers, except security; amends R39, R40, R55
+- R92 (M, M2): issues instead of waivers, except security, filed only when the
+  gate can do nothing more; deferrals get Codex's check; late blockers add up
+  to two rounds; amends R39, R40, R55
   and R85.
 - R93 (N): the agent merges when nothing holds the merge; `mergeMethod`.
 - R94: tags are standalone tokens; acknowledgements are named as such.
@@ -278,9 +311,13 @@ Each with its cost if wrong, in the rulings doc:
   - a slow reviewer's comment on a fixed problem links instead of opening;
   - a reply to a Codex-only finding and a dropped answer's reply are never
     read back (the PR #20 cases G7-4, G7-9, G11-2);
-  - a P2 deferral and a dispute file issues with the title and label above
-    and settle; filing fails, holds, retries; a security deferral waits for
-    the person;
+  - a deferral goes to Codex's check: refused, it is open and the round is
+    charged; agreed, it waits;
+  - at exhaustion, a P2 deferral, an open finding and a dispute file issues
+    with the title and label above and settle; filing fails, holds, retries;
+    a security deferral waits for the person;
+  - a blocker first raised in the round that spent the allowance adds a
+    round, twice at most; the third files its issue;
   - ready tells the agent to merge with `mergeMethod`.
 - `world.ts`: fakes for `requested_reviewers`, check runs per head, issue
   filing (`issues` POST) with a failure knob, and `pr merge`.
