@@ -123,3 +123,7 @@ Task 10: complete (commits f8d8e03..03df5e2, review clean)
 Task 10: minor (deferred): pane stop's runCommand rejection uncaught (same as old button)
 Task 12: implementer dispatched (sonnet), BASE 8a00832
 Task 12: implementer DONE, commit f01ed96 (472 pass); review dispatched
+Task 12: review Approved (spec ✅)
+Task 12: complete (commits 2a83456..f01ed96, review clean)
+Task 12: minor (deferred): CHAINED wording mentions a PR body for merges too; hasOtherSteps misses background &, backticks/nested $() can false-positive; no unit test for 2>&1 or "don't"
+Task 11: implementer dispatched (sonnet), BASE 2fb4f58
