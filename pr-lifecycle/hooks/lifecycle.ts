@@ -449,7 +449,10 @@ function blockerOf(f: Finding): Blocker {
  * waiver for this head and base leaves only a security P1 and CI; CI a waiver covers is only what GitHub does not require (R86).
  */
 export function standingOf(rec: LifecycleRecord, at: { head: string; base: string }, ci?: readonly CheckState[] | 'unreadable' | { unreadable: string }): Standing {
-  const phase = rec.phase === 'pre' ? 'pre' : 'post'
+  // A post waiver for this head means a PR exists, even on a record never adopted into post review (a waiver-only or a hand-opened
+  // PR's record): its standing is the merge's, as judgeMerge already reads it (gate R1-2).
+  const isPostNamed = rec.waivers.some(one => one.scope === 'post' && one.head === at.head)
+  const phase = rec.phase === 'pre' && !isPostNamed ? 'pre' : 'post'
   const isOnBase = rec.base === at.base
   const waiver = isOnBase ? rec.waivers.find(one => one.scope === phase && one.head === at.head && (phase === 'post' || one.base === at.base)) : undefined
   const security = securityHolds(rec)

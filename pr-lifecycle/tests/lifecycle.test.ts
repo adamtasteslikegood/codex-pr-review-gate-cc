@@ -849,6 +849,17 @@ test('R79/R86: CI joins the standing; a post waiver sets aside only checks GitHu
   expect(standingOf(waived, { head: 'a', base: 'dev' }, ci.filter(one => one.name !== 'check')).mayProceed).toBe(true)
 })
 
+test('gate R1-2: a post waiver on a record still in phase pre sets aside the checks GitHub does not require', async () => {
+  const rec = { ...fresh(), head: 'a', waivers: [{ scope: 'post' as const, head: 'a', reason: 'hand-opened PR', by: 'composer', at: 2 }] }
+  const s = standingOf(rec, { head: 'a', base: 'dev' }, [
+    { name: 'Independent Claude review', bucket: 'fail', isRequired: false },
+    { name: 'check', bucket: 'pass', isRequired: true },
+  ])
+  expect(s.phase).toBe('post')
+  expect(s.setAside).toEqual(['Independent Claude review'])
+  expect(s.mayProceed).toBe(true)
+})
+
 test('R79: unreadable checks are a blocker; a security P1 survives a post waiver', async () => {
   expect(standingOf(postRec(), { head: 'a', base: 'dev' }, 'unreadable').blockers.map(one => one.kind)).toContain('ci-unreadable')
   const rec = postRec({
