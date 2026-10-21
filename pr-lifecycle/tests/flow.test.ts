@@ -2872,6 +2872,8 @@ test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 
   w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Looks fine.', created_at: '1970-01-01T00:01:00Z' }]
   await w.clock.advance(20 * 60_000)
   await done($, triaged('r1-triage', [{ id: 'G1-1', action: 'rebutted', severity: 'P3', note: 'no change asked', replyId: '31' }]))
+  // The comment was answered while collection waited (R88); the cap has passed, so the next poll ends it and Codex checks the rebuttal.
+  await w.clock.advance(30_000)
   await done($, accept('r1-verify', w, { 'G1-1': true }))
   await w.clock.advance(1000)
   expect((await recordOf(w)).phase).toBe('ready')
@@ -4773,4 +4775,198 @@ test('R90: in a discretionary round, Codex agreeing the agent\'s link, beside an
   await done($, accept('r4-verify', w, { 'G4-1': true, 'G4-2': true }))
   expect((await recordOf(w)).findings.find(one => one.id === 'G4-2')).toMatchObject({ duplicateOf: 'G4-1', isLinkChecked: true })
   expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', false])
+})
+
+// ------------------------------------------------- R88: the agent answers feedback while collection waits
+
+/** Feedback a reviewer posted before the poll that reads it: its time never counts as a later arrival. */
+const early = <T extends object>(one: T): T => ({ ...one, created_at: '1970-01-01T00:00:01Z' })
+const ciRunning = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
+const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}"`))
+
+test('R88: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(30_000)
+  // The poll that sees it waits one more, so a reviewer's burst arrives as one turn.
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  w.gh.comments = [...w.gh.comments, early(inline(12, '**P2** and this one too', w.gh.prHead, 9))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  const asked = triageTurns(w, 'r2-triage')[0] ?? ''
+  expect(asked).toContain('G2-1')
+  expect(asked).toContain('G2-2')
+  expect(asked).toContain('still coming in')
+  const turnRun = await runOf(w)
+  expect([turnRun.phase, turnRun.collect !== undefined]).toEqual(['triage', true])
+  // Polling goes on during the turn: a comment that arrives now waits for the next turn.
+  w.gh.comments = [...w.gh.comments, early(inline(13, '**P2** a third one', w.gh.prHead, 20))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block, src/app.ts:30', replyId: '991' },
+    { id: 'G2-2', action: 'rebutted', severity: 'P2', note: 'same handle, same finally block', replyId: '992' },
+  ]))
+  // No push: the round goes on collecting, nothing is recorded as a round, the answers are kept.
+  const after = await runOf(w)
+  expect([after.phase, after.round, after.status]).toEqual(['collect', 2, 'running'])
+  const rec = await recordOf(w)
+  expect(rec.processed).toEqual(expect.arrayContaining(['inline:11', 'inline:12']))
+  expect(rec.rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+  // The comment that arrived during the turn gets a turn of its own, asking it alone.
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  const second = triageTurns(w, 'r2-triage')[1] ?? ''
+  expect(second).toContain('G2-3')
+  expect(second).not.toContain('- G2-1 from')
+  await done($, triaged('r2-triage', [{ id: 'G2-3', action: 'rebutted', severity: 'P2', note: 'same finally block', replyId: '993' }]))
+  expect((await runOf(w)).phase).toBe('collect')
+  // ci finishes and the reviewer covers the head: the head's end has Codex check the rebuttals, then the round ends.
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('verify')
+})
+
+test('R88: a push in a mid-collection turn ends the round on the old head when the turn ends', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P1** SQL injection', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  // Codex checks the fix on the new head first (R72); then the round on a…a ends and the next one collects on e…e.
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40), true]])
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind]).toEqual([3, 'collect', 'e'.repeat(40), 'baseline'])
+  // A new head restarts the cap (spec §1.6): collection began when the round did.
+  expect(next.collect?.startedAt).toBe(next.roundStartedAt)
+})
+
+/** Round 2 collects on a…a with ci running, and a mid-collection turn asks G2-1. */
+const toMidTurn = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P1** SQL injection', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+}
+
+test('R88 (A4): a poll while afterTriage settles a pushed head opens no round under it; the turn\'s end opens exactly one', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let held = false
+  w.git.onHead = async () => {
+    if (held) return
+    held = true
+    reached()
+    await released
+  }
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  await isReached
+  const settling = await runOf(w)
+  expect([settling.phase, settling.pending, typeof settling.isSettling]).toEqual(['triage', [], 'number'])
+  // Ticks with the pushed head on the PR while afterTriage is held: they only note arrivals.
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  const during = await runOf(w)
+  expect([during.round, during.phase, during.roundStartHead]).toEqual([2, 'triage', 'a'.repeat(40)])
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  release()
+  await answering
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post').map(one => [one.n, one.startHead, one.endHead])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40)]])
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead]).toEqual([3, 'collect', 'e'.repeat(40)])
+  expect(next.isSettling).toBeUndefined()
+  // The old round's triage step is done; the new round's steps were made by its own start alone.
+  expect(next.steps.find(one => one.id === 'r2-triage')?.state).toBe('done')
+  expect(next.steps.filter(one => one.id.startsWith('r3-')).map(one => [one.id, one.state])).toEqual([['r3-collect', 'running']])
+})
+
+test('R88: a head pushed during a mid-collection turn gets its arrival noted by the poll that sees it', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  const seenAt = (await runOf(w)).collect?.polledAt
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: 'e'.repeat(40), at: seenAt, isPushTime: false })
+  await w.clock.advance(30_000)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  // The next round's collection keeps the first sight, not its own start, as the head's arrival.
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: 'e'.repeat(40), at: seenAt })
+})
+
+test('R88: a mid-collection turn that never answers times out with an attempt, never a stuck triage', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect([run.status, run.phase]).toEqual(['error', 'done'])
+  expect(run.message).toContain('triage step ran past')
+  expect(run.message).toContain('/pr-gate resume to collect again')
+  expect((await recordOf(w)).attempts).toBe(1)
+  // As the message says: a resume collects again on the same head, and the unanswered feedback is asked again.
+  await say($, 'resume')
+  const again = await runOf(w)
+  expect([again.status, again.phase, again.round]).toEqual(['running', 'collect', 2])
+  const asked = triageTurns(w, 'r2-triage').length
+  await w.clock.advance(90_000)
+  expect(triageTurns(w, 'r2-triage').length).toBe(asked + 1)
+  expect(triageTurns(w, 'r2-triage').at(-1)).toContain('SQL injection')
+})
+
+test('R88: a settling flag older than the step timeout is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let held = false
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  w.git.onHead = async () => {
+    if (held) return
+    held = true
+    reached()
+    await released
+  }
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  await isReached
+  // afterTriage never gets past its head read: past the step timeout, a poll clears the flag and collection goes on.
+  await w.clock.advance(62_000)
+  const back = await runOf(w)
+  expect([back.status, back.phase, back.isSettling, back.pending]).toEqual(['running', 'collect', undefined, []])
+  expect(await logOf(w)).toEqual(expect.arrayContaining([expect.stringContaining('settling flag')]))
+  // The held afterTriage, released late, writes nothing: the poll took over.
+  release()
+  await answering
+  expect([(await runOf(w)).phase, (await runOf(w)).round]).toEqual(['collect', 2])
+  // The head's end still has Codex check the rebuttal the turn recorded.
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('verify')
 })

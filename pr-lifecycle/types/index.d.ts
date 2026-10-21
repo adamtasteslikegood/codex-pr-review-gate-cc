@@ -292,8 +292,17 @@ export type Run = {
   waitMs: number
   /** Post-PR collection: when it started, when feedback last arrived, when gh was last polled. */
   collect?: { startedAt: number; lastArrivalAt: number; polledAt: number; headAt: number }
-  /** Post-PR: the feedback ids handed to the main agent this round. */
+  /** Post-PR: the feedback ids handed to the main agent in the triage turn in flight (or the last one). */
   triaged?: string[]
+  /** Post-PR: the feedback ids every triage turn of this round was handed (R88); a turn while collecting asks only what is not in it. */
+  handed?: string[]
+  /** Post-PR: the fresh feedback ids the last poll saw, so the next poll can tell what arrived since. */
+  polled?: string[]
+  /**
+   * afterTriage is between clearing a turn taken while collecting and its last write (R88, A4): when it began, so polls only note
+   * arrivals; a flag older than the step timeout is stale, and a poll clears it.
+   */
+  isSettling?: number
   /** Post-PR: the finding ids the triage step was asked to answer (fresh, Codex's, carried). */
   asked?: string[]
   /** Post-PR: the security rebuttals Codex is checking (R36). */

@@ -691,16 +691,23 @@ export function startTicker($: Engine): void {
         await askTriage($, run.id, text)
         return
       }
-      if (run.phase === 'collect') {
+      if (run.collect !== undefined) {
+        // Collection polls on while a triage turn answers what arrived (R88); only the turn itself has a step timeout.
         await poll($, run)
-        return // waiting on reviewers is not a step: no step timeout while collecting
+        if (run.phase === 'collect') return // waiting on reviewers is not a step: no step timeout while collecting
+        // afterTriage settling a turn taken while collecting (A4): the poll clears a stale flag, so the step timeout does not apply.
+        if (run.isSettling !== undefined && run.pending.length === 0) return
       }
       if (now - run.phaseStartedAt > config.stepTimeoutMs) {
         // A main-agent step whose prompt's turn never started could not have been answered: say so, not only that it ran long.
         const isUnseen = run.pending.some(one => one.isMain === true && one.answer === undefined && one.turnId === undefined)
         const why =
           `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.` +
-          (isUnseen ? ' Its prompt\'s turn was never seen: the main agent never started on it, so no answer could count.' : '')
+          (isUnseen ? ' Its prompt\'s turn was never seen: the main agent never started on it, so no answer could count.' : '') +
+          // A turn taken while collecting (R88) ends here too, never a triage with nothing in flight: the feedback it was handed stays unprocessed.
+          (run.phase === 'triage' && run.collect !== undefined
+            ? ' It was answering feedback while reviews were still being collected; that feedback stays unanswered: run /pr-gate resume to collect again and be asked it.'
+            : '')
         if (run.phase === 'review') {
           await noteAttempt($, run, why)
           await retryLower($, run, why)
@@ -737,6 +744,7 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
       message,
       endedAt: now,
       pending: [],
+      isSettling: undefined,
       activity: '',
       steps: one.steps.map(step =>
         // After the PR opened, its step stays done.
@@ -1427,11 +1435,44 @@ async function poll($: Engine, seen: Run): Promise<void> {
 
 async function pollOnce($: Engine, seen: Run): Promise<void> {
   const now = await $.clock.now()
-  // Read again: another tick may have polled since this one read the run.
-  const run = await getRun($)
-  const collect = run?.collect
-  if (run === null || run.id !== seen.id || run.status !== 'running' || run.phase !== 'collect' || collect === undefined) return
-  if (now - collect.polledAt < POLL_MS) return
+  // Read again: another tick may have polled since this one read the run. A run collecting, or answering while collecting (R88).
+  const read = await getRun($)
+  if (read === null || read.id !== seen.id || read.status !== 'running' || read.collect === undefined) return
+  if (read.phase !== 'collect' && read.phase !== 'triage') return
+  let run: Run = read
+  // A settling flag older than the step timeout (A4): afterTriage threw, or its session died, between clearing the turn and its last
+  // write. The gate never gets stuck: the flag is cleared, the round goes back to collecting, and the log says so. The answers it
+  // recorded stand; what it did not record is asked again.
+  const settling = read.isSettling
+  if (settling !== undefined && read.pending.length === 0 && now - settling > config.stepTimeoutMs) {
+    const cleared = await patch($, read.id, one =>
+      one.isSettling !== settling || one.round !== read.round
+        ? one
+        : {
+            ...one,
+            isSettling: undefined,
+            phase: 'collect',
+            phaseStartedAt: now,
+            activeMs: one.activeMs + (now - one.phaseStartedAt),
+            hasReprompted: false,
+            activity: 'waiting on reviewers…',
+          },
+    )
+    if (cleared === null || cleared.collect === undefined) return
+    await logEvent(
+      $,
+      read.root,
+      read.branch,
+      'stop',
+      `post-PR round ${read.round}: the answers to a turn taken while collecting were not settled within ${elapsed(config.stepTimeoutMs)}; ` +
+        'settling flag cleared, collection goes on',
+    )
+    run = cleared
+  }
+  const collect = run.collect
+  if (collect === undefined || now - collect.polledAt < POLL_MS) return
+  // A triage turn in flight, or afterTriage settling one (A4): this poll only notes arrivals.
+  const isTurn = run.phase === 'triage'
   await patch($, run.id, one => ({ ...one, collect: one.collect === undefined ? one.collect : { ...one.collect, polledAt: now } }))
   const rec = await loadRecord($, run.root, run.branch)
   if (rec === undefined) {
@@ -1450,12 +1491,16 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     return
   }
   if (!got.isOk) {
+    // A triage turn is answering: a failed poll is tried again at the next one, not a stop under the agent's feet.
+    if (isTurn) return
     await noteAttempt($, run, got.why ?? 'gh failed')
     await finish($, run.id, 'error', `Post-PR round ${run.round} could not read GitHub: ${got.why ?? 'gh failed'}. Fix that, then /pr-gate resume.`)
     return
   }
   const fresh = got.feedback.filter(one => !rec.processed.includes(one.id))
   const lastArrivalAt = Math.max(collect.lastArrivalAt, ...fresh.map(one => Math.min(one.at, now)))
+  const seenIds = new Set(run.polled ?? [])
+  const isArrival = fresh.some(one => !seenIds.has(one.id))
   // The PR's head, not the local one, is what the round covers (an adopted PR, another agent's push).
   const isNewHead = got.prHead !== run.roundStartHead
   // When the head reached the PR (#24): the record's, read from GitHub on first sight and, while GitHub has given no push time, on
@@ -1464,15 +1509,33 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   const arrival =
     known?.isPushTime === true ? known : ((await noteArrival($, run.root, run.branch, got.prHead, isNewHead ? now : collect.headAt, got.where)) ?? known)
   let headAt = arrival?.at ?? (isNewHead ? now : collect.headAt)
+  // While a triage turn answers, a poll only notes what arrived, and when a head it sees reached the PR (#24); the turn's own end
+  // reads the head it pushed (R88). Written only to the collection this poll read: the turn's end may have closed it meanwhile.
+  if (isTurn) {
+    const startedAt = collect.startedAt
+    await patch($, run.id, one =>
+      one.round !== run.round || one.collect?.startedAt !== startedAt
+        ? one
+        : {
+            ...one,
+            collect: { ...one.collect, polledAt: now, lastArrivalAt: isArrival ? now : lastArrivalAt, ...(isNewHead ? {} : { headAt }) },
+            polled: fresh.map(each => each.id),
+          },
+    )
+    await updateRecord($, run.root, run.branch, one =>
+      one.headArrival?.head !== got.prHead ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } },
+    )
+    return
+  }
   // A new head restarts the quiet period: its checks may not be registered yet.
-  const arrived = isNewHead || fresh.length > (run.triaged?.length ?? 0)
+  const arrived = isNewHead || isArrival
   // Judged from the head the round had before this one replaces it (R56).
   if (isNewHead) await onNewHead($, run, run.roundStartHead, got.prHead, now)
   const after = await patch($, run.id, one => ({
     ...one,
     roundStartHead: got.prHead,
     collect: { ...collect, polledAt: now, lastArrivalAt: arrived ? now : lastArrivalAt, headAt },
-    triaged: fresh.map(each => each.id),
+    polled: fresh.map(each => each.id),
   }))
   if (after === null) return
   // This poll saw the head on the PR: a later head reached it after now, the lower bound of a guess about it (#24).
@@ -1532,12 +1595,30 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
       done = judge()
     }
   }
-  if (!done.isDone) {
-    const waiting = done.missing.length > 0 ? `waiting on ${done.missing.join(', ')}` : 'waiting for feedback to go quiet'
-    if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))
+  if (done.isDone) {
+    await endCollect($, after, got, done)
     return
   }
-  await endCollect($, after, got, done)
+  // Feedback no turn of this round was handed, with one quiet poll since the last arrival: the agent answers it now (R88).
+  const handed = new Set(after.handed ?? [])
+  const unhanded = fresh.filter(one => one.isFinding && !handed.has(one.id))
+  if (unhanded.length > 0 && now - (after.collect?.lastArrivalAt ?? now) >= POLL_MS) {
+    await beginTriage($, after.id, false, true)
+    return
+  }
+  const waiting = done.missing.length > 0 ? `waiting on ${done.missing.join(', ')}` : 'waiting for feedback to go quiet'
+  if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))
+}
+
+/** Collection on the round's head is over: its wait is added, `collect` is cleared and its step is marked done. */
+async function closeCollect($: Engine, id: string, now: number, detail: string, extra: Partial<Run> = {}): Promise<Run | null> {
+  return patch($, id, one => ({
+    ...one,
+    ...extra,
+    waitMs: one.waitMs + (one.collect === undefined ? 0 : now - one.collect.startedAt),
+    collect: undefined,
+    steps: withStep(one.steps, { id: `r${one.round}-collect`, label: `Round ${one.round} · collect reviews (${one.roundKind})`, state: 'done', detail }),
+  }))
 }
 
 /** Collection is over: Codex covers a head nobody reviewed (or verification owed); then the feedback goes to triage. */
@@ -1545,7 +1626,6 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
   const now = await $.clock.now()
   const rec = await loadRecord($, run.root, run.branch)
   if (rec === undefined) return
-  const waitMs = now - (run.collect?.startedAt ?? now)
   // Each reviewer who covered the head; each roster reviewer who never did, as missing evidence.
   const roster = await rosterOf($, run.root, run.base)
   const evidence: Evidence[] = [
@@ -1559,20 +1639,10 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     each => each.isComplete && each.head === got.prHead,
   )
   const isPassThroughRound1 = rec.passThrough !== undefined && rec.rounds.every(one => one.phase !== 'post' || !one.isCompleted)
-  const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id))
-  const after = await patch($, run.id, one => ({
-    ...one,
-    waitMs: one.waitMs + waitMs,
-    evidence,
-    headSha: got.prHead,
-    collect: undefined,
-    steps: withStep(one.steps, {
-      id: `r${one.round}-collect`,
-      label: `Round ${one.round} · collect reviews (${one.roundKind})`,
-      state: 'done',
-      detail: `${done.covered.length} reviewer${done.covered.length === 1 ? '' : 's'}${done.isComplete ? '' : `, missing ${done.missing.join(', ')}`}`,
-    }),
-  }))
+  // Feedback a turn of this round already answered while collecting (R88) counts as the round's, as it did when it waited until now.
+  const hasFindings = got.feedback.some(one => one.isFinding && !rec.processed.includes(one.id)) || (run.handed ?? []).length > 0
+  const detail = `${done.covered.length} reviewer${done.covered.length === 1 ? '' : 's'}${done.isComplete ? '' : `, missing ${done.missing.join(', ')}`}`
+  const after = await closeCollect($, run.id, now, detail, { evidence, headSha: got.prHead })
   if (after === null) return
   // A fix only reported no longer calls for a full Codex review: the round's own Codex check verifies it (R72).
   if (run.roundKind === 'final-head-check' || (!isCovered && !isPassThroughRound1)) {
@@ -1612,12 +1682,14 @@ async function failPost($: Engine, run: Run, why: string): Promise<void> {
 
 /**
  * Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier
- * rounds (R32) go to the main agent in one turn. Nothing to answer and no unreviewed commits end the round clean (R3).
+ * rounds (R32) go to the main agent in one turn. While collection still waits (R88), only the fresh feedback no turn of the round
+ * was handed. Nothing to answer and no unreviewed commits end the round clean (R3).
  */
-async function beginTriage($: Engine, id: string, isFromCommand = false): Promise<void> {
+async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCollect = false): Promise<void> {
   const now = await $.clock.now()
   const run = await getRun($)
   if (run === null || run.id !== id || run.status !== 'running') return
+  if (isMidCollect && (run.phase !== 'collect' || run.collect === undefined)) return
   const prior = await loadRecord($, run.root, run.branch)
   if (prior === undefined) {
     const why = `The lifecycle record of ${run.branch} is gone, so post-PR round ${run.round} cannot go on. Run /pr-gate to start it again.`
@@ -1647,7 +1719,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
   const rec = Object.keys(own).some(key => prior.replies[key] === undefined)
     ? ((await updateRecord($, run.root, run.branch, one => ({ ...one, replies: { ...own, ...one.replies } }))) ?? prior)
     : prior
-  const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id))
+  const handed = new Set(run.handed ?? [])
+  const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !(isMidCollect && handed.has(one.id)))
   // A review that said there is nothing to act on settles on its own (R83): logged once, and processed so it is never asked about.
   const settled = got.feedback.filter(one => one.kind === 'review' && !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
   for (const one of settled) await logEvent($, run.root, run.branch, 'approval', `${one.reviewer}: ${one.body.split('\n')[0]?.slice(0, 120) ?? ''}`)
@@ -1731,16 +1804,19 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     listed.push({ feedback, cls, ...(matchId === undefined ? {} : { matchId }), findingId: finding.id })
   }
   // Codex's findings of this round still open (the fallback or the final-head check): answered in the same turn.
-  const codex = run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
+  // A turn while collecting asks neither: the end of the head's collection does, as before R88.
+  const codex = isMidCollect ? [] : run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
   // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
-  const carried = mergeHolds({ findings: mergeFindings(ledger, [...fresh, ...raised]), waivers: rec.waivers }).filter(
-    // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
-    one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
-  )
+  const carried = isMidCollect
+    ? []
+    : mergeHolds({ findings: mergeFindings(ledger, [...fresh, ...raised]), waivers: rec.waivers }).filter(
+        // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
+        one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
+      )
   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
   let others: string[] = []
-  if (got.prHead !== rec.head) {
+  if (!isMidCollect && got.prHead !== rec.head) {
     // A failed fetch, twice, stops the round here (R1-10): the log would read a stale origin.
     const fetched = await fetchTwice($, run.root, ['--quiet', 'origin'], 60_000)
     if (!fetched.isOk) {
@@ -1752,6 +1828,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
   }
   if (!(await isRunning($, id))) return
   const asked = [...listedIds, ...carried.map(one => one.id)]
+  // Nothing new to hand over while collecting: the round goes on collecting.
+  if (isMidCollect && asked.length === 0) return
   if (asked.length === 0 && others.length === 0) {
     const rebuttals = rebuttalsOwed(run)
     if (rebuttals.length > 0) await checkRebuttals($, run, rebuttals)
@@ -1759,28 +1837,40 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     return
   }
   const count = asked.length
-  const opened = await patch($, id, one => ({
-    ...one,
-    phase: 'triage',
-    phaseStartedAt: now,
-    findings: mergeFindings(one.findings, [...fresh, ...raised]),
-    triaged: items.map(each => each.id),
-    asked,
-    pending: [{ role: 'triage', step: stepOf(one, 'triage'), isMain: true }],
-    activity: 'waiting on the main agent to answer the reviews…',
-    steps: withStep(one.steps, {
-      id: `r${one.round}-triage`,
-      label:
-        count === 0
-          ? `Round ${one.round} · check the new commits (main agent)`
-          : `Round ${one.round} · answer ${count} review item${count === 1 ? '' : 's'} (main agent)`,
-      state: 'running',
-    }),
-  }))
-  if (opened === null) return
+  // A turn while collecting opens only on the collection the poll saw: a stop, a waiver or a new round meanwhile asks nothing.
+  let isOpened = false
+  const opened = await patch($, id, one => {
+    if (isMidCollect && (one.round !== run.round || one.phase !== 'collect' || one.collect === undefined)) return one
+    isOpened = true
+    return {
+      ...one,
+      phase: 'triage',
+      phaseStartedAt: now,
+      findings: mergeFindings(one.findings, [...fresh, ...raised]),
+      triaged: items.map(each => each.id),
+      handed: [...new Set([...(one.handed ?? []), ...items.map(each => each.id)])],
+      asked,
+      pending: [{ role: 'triage', step: stepOf(one, 'triage'), isMain: true }],
+      hasReprompted: false,
+      activity: isMidCollect ? 'waiting on the main agent to answer feedback while reviews come in…' : 'waiting on the main agent to answer the reviews…',
+      steps: withStep(one.steps, {
+        id: `r${one.round}-triage`,
+        label:
+          count === 0
+            ? `Round ${one.round} · check the new commits (main agent)`
+            : `Round ${one.round} · answer ${count} review item${count === 1 ? '' : 's'}${isMidCollect ? ' while reviews come in' : ''} (main agent)`,
+        state: 'running',
+      }),
+    }
+  })
+  if (opened === null || !isOpened) return
   $.ui.status(`pr-gate r${opened.round}: answering the reviews`)
   const codexRange = `${opened.diffBase.slice(0, 7)}..${opened.headSha.slice(0, 7)}`
-  const text = triagePrompt(opened, rec, listed, others, { carried, codex, codexRange })
+  const intro = isMidCollect
+    ? `Reviews are still coming in on ${opened.roundStartHead.slice(0, 7)}: answer these now. Feedback that arrives meanwhile comes in a ` +
+      'later turn. A push ends this round when your turn ends, and the next round reviews the new head.'
+    : undefined
+  const text = triagePrompt(opened, rec, listed, others, { carried, codex, codexRange, ...(intro === undefined ? {} : { intro }) })
   // A command cannot submit a prompt while it holds the turn: the ticker sends it once the command has returned.
   if (isFromCommand) await patch($, id, one => ({ ...one, outbox: text }))
   else await askTriage($, id, text)
@@ -1853,7 +1943,10 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   // The agent's links (R90), checked on canonical ids over the round's ledger and the record (A2): a link from or to an id not on
   // the list, to itself, on a cycle, or one Codex already refused is no answer, and the item is asked about again.
   const proposed = readLinks(run.pending[0]?.answer ?? '')
-  const kept = (await loadRecord($, run.root, run.branch))?.findings ?? []
+  const start = await loadRecord($, run.root, run.branch)
+  const kept = start?.findings ?? []
+  // The round and the record's generation this turn settles (A4): kept from the start, and read again after each await below.
+  const generation = start?.generation ?? 0
   let linked: string[] = []
   const after = await patch($, run.id, one => {
     const ledger = mergeFindings(kept, one.findings)
@@ -1864,6 +1957,8 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     return {
       ...one,
       pending: [],
+      // A turn taken while collecting is in flight until this settles it (A4): polls only note arrivals meanwhile.
+      isSettling: one.collect === undefined ? undefined : now,
       findings: mergeFindings(one.findings, changed).map(finding => {
         if (linked.includes(finding.id)) return finding
         const answer = said.find(each => each.id === finding.id)
@@ -1879,10 +1974,20 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     }
   })
   if (after === null) return
+  const isMid = after.collect !== undefined
+  // A4: after each await, the run and the record must still be the ones this turn settles. A stop, a new round, a reset, or a poll
+  // that cleared a stale settling flag means another path owns them now: this one writes nothing more.
+  const isOwn = async (): Promise<boolean> => {
+    const live = await getRun($)
+    if (live === null || live.id !== run.id || live.status !== 'running' || live.round !== run.round) return false
+    if (isMid && live.isSettling !== now) return false
+    return ((await loadRecord($, run.root, run.branch))?.generation ?? 0) === generation
+  }
   // Before anything can end the round: answered feedback is processed and its replies are known, so no reply is asked for twice.
   // Feedback still without an answer is not processed (R34): a later round asks again.
   const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && (f.status !== 'open' || f.duplicateOf !== undefined))
   const triaged = (run.triaged ?? []).filter(answered)
+  if (!(await isOwn())) return
   const rec = await updateRecord($, run.root, run.branch, one => ({
     ...one,
     ...withOwnReplies(one, run.pending[0]?.answer ?? ''),
@@ -1906,9 +2011,11 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   )
   if (unanswered.length > 0 && after.hasReprompted !== true) {
     const step = stepOf(after, 'triage')
+    if (!(await isOwn())) return
     const asked = await patch($, run.id, one => ({
       ...one,
       hasReprompted: true,
+      isSettling: undefined,
       phaseStartedAt: now,
       pending: [{ role: 'triage', step, isMain: true }],
       steps: withStep(one.steps, { id: `r${one.round}-triage`, label: `Round ${one.round} · answer the reviews again (main agent)`, state: 'running' }),
@@ -1925,6 +2032,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     return
   }
   const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
+  if (!(await isOwn())) return
   if (dirty.isOk && dirty.out !== '') {
     await failPost($, after, 'the reviews were answered with uncommitted changes left: commit and push them, then run /pr-gate resume')
     return
@@ -1942,6 +2050,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   } catch {
     prHead = undefined
   }
+  if (!(await isOwn())) return
   if (state === 'MERGED' || state === 'CLOSED') {
     await closeLifecycle($, run.root, run.branch, rec.pr, state)
     return
@@ -1961,12 +2070,33 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     await fetchTwice($, run.root, ['--quiet', 'origin', run.branch], 60_000)
   }
   const isContained = prHead === local.out || (await git($, run.root, ['merge-base', '--is-ancestor', local.out, prHead])).isOk
+  if (!(await isOwn())) return
   if (!isContained) {
     const by = await unpushedBy($, run.root)
     await failPost($, after, `commits on ${run.branch} are not on the PR${by}: pull or push, then /pr-gate resume`)
     return
   }
   const endHead = prHead
+  // A turn while collecting that pushed nothing: the round goes on collecting on the same head (R88). Its rebuttals and
+  // acknowledgements are checked when the head's collection ends.
+  if (isMid && endHead === run.roundStartHead) {
+    const back = await $.clock.now()
+    await patch($, run.id, one => ({
+      ...one,
+      phase: 'collect',
+      phaseStartedAt: back,
+      activeMs: one.activeMs + (back - one.phaseStartedAt),
+      pending: [],
+      isSettling: undefined,
+      hasReprompted: false,
+      activity: 'waiting on reviewers…',
+    }))
+    $.ui.status(`pr-gate r${after.round}: waiting on reviewers`)
+    return
+  }
+  // A push in a turn while collecting ends the round on the head it pushed (R88): collection on the old head is over. With `collect`
+  // cleared, no poll runs for this round any more, so the awaits below need no settling flag.
+  if (isMid) await closeCollect($, run.id, await $.clock.now(), `ended by the push of ${endHead.slice(0, 7)}`, { isSettling: undefined })
   if (endHead !== run.roundStartHead) {
     await onNewHead($, run, run.roundStartHead, endHead, await $.clock.now())
     // The answers given in this run are about the new head already, except a fix only reported: its file changed, so it is checked
