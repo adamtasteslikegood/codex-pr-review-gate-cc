@@ -3404,15 +3404,22 @@ test('R82: Codex rejecting an acknowledgement reopens the item with its reason',
 })
 
 const ISSUE = 'https://github.com/me/repo/issues/9'
+/** The gate's label call on a follow-up issue (R85). */
+const labelled = (w: ReturnType<typeof world>, n: number, peak: string): boolean =>
+  w.gh.labelled.some(one => one === `issue edit ${n} --repo me/repo --add-label severity:${peak}`)
 
-test('R85: a P3 deferred with a recorded follow-up settles without a waiver', async ($, on) => {
+test('R85: a P3 deferred with a recorded follow-up settles without a waiver, once its issue is labelled', async ($, on) => {
   const w = world(on)
-  // The reviewer's own P3 (I2: a severity the agent lowered never settles).
+  // The reviewer's own P3.
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
-  expect(rec.findings.find(one => one.id === 'G2-1')?.followUp).toBe(ISSUE)
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.followUp).toBe(ISSUE)
+  expect(found?.followUpLabel).toBe('P3')
+  expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16 --force')
+  expect(labelled(w, 9, 'P3')).toBe(true)
 })
 
 test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
@@ -3425,31 +3432,96 @@ test('R85: a P3 deferral without a follow-up still waits for the person', async 
   await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
 })
 
+test('R85: a P3 deferral whose follow-up is a ticket key alone still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'nit: rename this', { severity: 'P3', followUp: 'KAN-9' })
+  expect(w.gh.labelled).toEqual([])
+})
+
 test('R85: a security P3 deferral with a follow-up still waits for the person', async ($, on) => {
   const w = world(on)
   await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
+  expect(w.gh.labelled).toEqual([])
 })
 
-test('R85: a finding whose advisory label is not at the start, deferred as P3 with a follow-up, still holds (final review C1, I2)', async ($, on) => {
+test('R85: a guessed P1 the agent lowers to P3 waits on Codex; Codex agrees, and the issue carries severity:P1 (Adam, 2026-10-20)', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'The reset path deletes pending findings.\n\n**Optional:** add a test.', { severity: 'P3', followUp: ISSUE })
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: 'KAN-9 #12', replyId: '992' }]))
+  // Not ready: Codex checks the lowering in the round's own check, using no round.
+  const run = await runOf(w)
+  expect(run.phase).toBe('verify')
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  const asked = w.spawned.at(-1)?.prompt ?? ''
+  expect(asked).toContain('The agent lowered it from P1 to P3 and deferred it to KAN-9 #12. Its reason: only the typo is real')
+  expect(asked).toContain('This is a critical bug.')
+  expect(asked).toContain('is P3, with a follow-up issue, right?')
+  expect(w.gh.labelled).toEqual([])
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', lowering: 'agreed' })
+  // The peak, not the lowered severity, goes on the issue.
+  expect(labelled(w, 12, 'P1')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('(follow-up at KAN-9 #12, labelled severity:P1)')
 })
 
-test('R85: a guessed P1 the agent lowers to P3 and defers with a follow-up still holds (final review I2)', async ($, on) => {
+test('R85: Codex disagreeing with a lowering leaves the deferral to the person, with its reason (Adam, 2026-10-20)', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'This is a critical bug.\n\nNit: the comment has a typo.', { severity: 'P3', followUp: ISSUE })
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: '#12', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'the comment reports a real crash' }))
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('deferred')
+  expect(w.prompts.at(-1)).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  expect((await say($, 'status')).text).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  expect(w.gh.labelled).toEqual([])
 })
 
-test('R85: a mixed comment guessed P3 from a "nit" in its middle, deferred as P3 with a follow-up, still holds (controller ruling)', async ($, on) => {
+test('R85: a finding whose advisory label is not at the start, lowered to P3, settles once Codex agrees (final review C1)', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.', { severity: 'P3', followUp: ISSUE })
+  await toTriage($, w, 'The reset path deletes pending findings.\n\n**Optional:** add a test.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'a test later', followUp: ISSUE, replyId: '992' }]))
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(labelled(w, 9, 'P2')).toBe(true)
 })
 
-test('R85: /pr-gate status names the follow-up of a settled deferral', async ($, on) => {
+test('R85: a mixed comment guessed P3 from a "nit" in its middle, kept P3 and deferred to an issue, settles once labelled (Adam, 2026-10-20)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'tracked', followUp: ISSUE, replyId: '992' }]))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(labelled(w, 9, 'P3')).toBe(true)
+})
+
+test('R85: an issue the gate could not label holds the merge, and the next pass labels it (fail closed)', async ($, on) => {
+  const w = world(on)
+  w.gh.labelAnswer = 'fail'
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: '#12', replyId: '992' }]))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('Could not resolve to an issue')
+  expect(w.prompts.at(-1)).toContain('could not label issue #12 severity:P3 (GraphQL: Could not resolve to an issue')
+  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass')
+  w.gh.labelAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toBeUndefined()
+  expect(labelled(w, 12, 'P3')).toBe(true)
+})
+
+test('R85: /pr-gate status names the follow-up of a settled deferral and its label', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
-  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}`)
+  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}, labelled severity:P3`)
 })
 
 test('R86: the required set is known only when both sources are established (PR #19 review)', async ($, on) => {

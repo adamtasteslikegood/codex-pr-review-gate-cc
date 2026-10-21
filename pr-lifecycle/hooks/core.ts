@@ -6,9 +6,12 @@ import {
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
+  isLoweringOwed,
   isReverifyOwed,
   isSettledDeferral,
+  loweringOf,
   mergeHolds,
+  peakOf,
   raisedIn,
   rejections,
   securityHolds,
@@ -568,8 +571,15 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
     // The same check re-verifies a verified fix whose file changed since (R58), and verifies a fix only reported (R72).
     const fixes = rebuttals.filter(isReverifyOwed)
     const reported = rebuttals.filter(one => one.status === 'reported-fixed')
-    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed')
-    const what = argued.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
+    // A deferral whose severity the agent lowered (R85, Adam 2026-10-20): Codex rules on the lowering, not on a fix.
+    const lowered = rebuttals.filter(isLoweringOwed)
+    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed' && !isLoweringOwed(one))
+    const what = argued.length + lowered.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
+    const lowerings = lowered.map(one => {
+      const low = loweringOf(one)
+      const reason = low?.note ?? one.note ?? 'no reason given'
+      return `${listFindings([one])}\n    The agent lowered it from ${low?.from ?? '?'} to ${low?.to ?? one.severity} and deferred it to ${one.followUp ?? 'no issue'}. Its reason: ${reason}`
+    })
     return noted([
       `You check ${what} for pr-gate's post-PR review. Round ${run.round}.`,
       where(run),
@@ -586,6 +596,14 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       ...(fixes.length === 0
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
+      ...(lowered.length === 0
+        ? []
+        : [
+            '',
+            "The main agent lowered these findings' severity and deferred each to a follow-up GitHub issue. A lowered deferral settles nothing until you agree with the lowering:",
+            ...lowerings,
+            '   For each one: given the reviewer\'s comment and the code at HEAD, is P3, with a follow-up issue, right? holds is true when Codex agrees with the lowering.',
+          ]),
       '',
       // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
       `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: ` +
@@ -685,7 +703,9 @@ export function triagePrompt(
     '',
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
-    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason (only what the person must rule on; a P3 the reviewer labelled or Codex rated, not lowered by you, with followUp naming where it is tracked (an issue or comment URL, #<n> or owner/repo#<n>), needs no waiver), or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason, or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    '   A deferral waits for the person, except a P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it): that needs no waiver. ' +
+      'If you lowered its severity, Codex checks the lowering first. The gate labels the issue with the highest severity the finding had.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
@@ -697,7 +717,7 @@ export function triagePrompt(
     '',
     trailerRule(
       stepOf(run, 'triage'),
-      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one","followUp":"https://… for a P3 deferral"}]}',
+      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one","followUp":"#<n>, owner/repo#<n> or the issue URL, for a P3 deferral"}]}',
     ),
     '',
     'Then end your turn. /pr-gate collects the next reviews by itself.',
@@ -757,7 +777,9 @@ export function readyPrompt(rec: LifecycleRecord): string {
   const summary = [
     `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
     `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
-    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp})` : ''}`).join('; ')}`,
+    deferred.length === 0
+      ? 'no deferrals'
+      : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp}, labelled severity:${peakOf(one)})` : ''}`).join('; ')}`,
   ].join('; ')
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }

@@ -5,7 +5,21 @@ export type FindingStatus = 'open' | 'reported-fixed' | 'verified-fixed' | 'rebu
 
 export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
-export type FindingEvent = { round: number; status: FindingStatus; note?: string; evidence?: string; severity?: Severity; by: string; at: number }
+/**
+ * `severity`: the severity an answer set, with `from` the one before it (R85). `lowering`: Codex's ruling on the agent's lowering of
+ * the severity before it (Adam, 2026-10-20).
+ */
+export type FindingEvent = {
+  round: number
+  status: FindingStatus
+  note?: string
+  evidence?: string
+  severity?: Severity
+  from?: Severity
+  lowering?: 'agreed' | 'refused'
+  by: string
+  at: number
+}
 
 export type Finding = {
   id: string
@@ -30,8 +44,14 @@ export type Finding = {
   headSeen: string
   status: FindingStatus
   note?: string
-  /** Where a P3 deferral's follow-up is recorded (R85): an issue or comment URL, or #<n>. */
+  /** The GitHub issue a P3 deferral's follow-up is tracked in (R85): `#<n>`, `owner/repo#<n>` or its URL, other text around it. */
   followUp?: string
+  /** The highest severity the finding had during the gate (R85): what its follow-up issue is labelled with. */
+  peakSeverity?: Severity
+  /** The `severity:<P>` label the gate put on the follow-up issue; a deferral settles only once it is the peak's. */
+  followUpLabel?: Severity
+  /** gh's error when the gate last failed to label the follow-up issue: the deferral holds until a pass labels it. */
+  followUpLabelError?: string
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
@@ -253,6 +273,7 @@ export type CheckState = { name: string; bucket: string; isRequired: boolean }
 export type Blocker = {
   kind:
     | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
+    | 'lowering-unchecked' | 'label-owed' | 'label-failed'
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string

@@ -21,6 +21,8 @@ import {
   holdText,
   isReverifyOwed,
   isSettledDeferral,
+  loweringRefusal,
+  peakOf,
   mergeHolds,
   reverifyOwed,
   newRecord,
@@ -816,7 +818,11 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
-  const settled = rec.findings.filter(isSettledDeferral).map(one => ` ${one.id} deferred, follow-up at ${one.followUp}.`).join('')
+  const settled = rec.findings
+    .filter(isSettledDeferral)
+    .map(one => ` ${one.id} deferred, follow-up at ${one.followUp}, labelled severity:${peakOf(one)}.`)
+    .concat(rec.findings.flatMap(one => (loweringRefusal(one) === undefined || one.status !== 'deferred' ? [] : [` ${loweringRefusal(one) ?? ''}.`])))
+    .join('')
   return (
     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
     `${usedRounds(rec)}/${rec.allowance + granted} rounds used, baseline ${baseline}/2, ${unresolvedBlockers(rec).length} blocking open, ` +

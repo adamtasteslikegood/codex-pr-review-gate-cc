@@ -267,6 +267,10 @@ the same on main.
      `'hint'` finding, lower or higher, and records the change in history.
      For `'tag'` and `'codex'` findings the R-rule stands: a fixer can't
      lower its own finding.
+   - A lowering is Codex's call, not the person's (Adam, 2026-10-20): the
+     history event records the severity before it (`from`), and a P3
+     deferral the agent lowered settles only once Codex agrees (section 4).
+     `peakSeverity` keeps the highest severity the finding had.
    - A security flag stays as set. This wave doesn't let the agent clear a
      keyword-only security flag; clear-cut approvals no longer reach the
      keyword test at all (point 3).
@@ -288,31 +292,43 @@ the same on main.
 
 ## 4. Cheap deferral (decision I; finding 11)
 
-- `Answer` gains `followUp?: string`: where the follow-up is recorded, as an
-  issue URL, `#<n>`, or a PR comment URL.
+- `Answer` gains `followUp?: string`: the GitHub issue that tracks it, as
+  `#<n>`, `owner/repo#<n>` or the issue's URL; a ticket key may sit beside it.
 - A `deferred` finding settles, so it is no longer in `mergeHolds` or
-  `unresolvedBlockers`, when all of these hold:
-  - it has a `followUp` that names where it is tracked: an `https://` URL,
-    `#<n>`, or `owner/repo#<n>`; any other text keeps the deferral but
-    settles nothing (final review T4);
-  - its stored severity is `P3`, and the agent never lowered it: no answer
-    changed it to `P3` from a higher guess, in the deferring answer or an
-    earlier one (final review I2);
-  - its P3 is the reviewer's label or Codex's, not a guess from the
-    comment's words (`severitySource` is not `'hint'`): a mixed comment that
-    says "nit" or "minor" anywhere is guessed P3 and must not settle on the
-    agent's word (controller's ruling after the final fix round);
+  `unresolvedBlockers`, when all of these hold (amended by Adam, 2026-10-20,
+  after the final review, replacing the controller's I2 and guessed-P3
+  rulings):
+  - its `followUp` names a GitHub issue (`issueOf`); a PR, comment or other
+    URL alone keeps the deferral but settles nothing (final review T4);
+  - its stored severity is `P3`, guessed or tagged alike;
+  - if the agent lowered its severity (an answer set one below the one
+    before it, recorded as `from` on the history event), Codex agreed with
+    the lowering since. The lowering goes to Codex in the round's own check
+    (`checksOwed`, `checkRebuttals`), with the reviewer's comment, the
+    severity before and after and the agent's reason. Agreed: Codex's entry
+    (`lowering: 'agreed'`) follows the lowering. Disagreed: it holds for the
+    person, said as "Codex disagrees with lowering G2-1 from P1 to P3:
+    <reason>". A later lowering needs Codex again;
+  - the gate labelled the issue `severity:<peak>`: `peakSeverity` is the
+    highest severity the finding had (set at creation, raised by any
+    answer; older records read it from their history). `advance` labels
+    each such issue first (`gh label create … --force`, then
+    `gh issue edit <n> --repo <owner/repo> --add-label severity:<peak>`),
+    once per peak, recording `followUpLabel`. A failure records gh's error
+    and holds: "could not label issue #<n> severity:<peak> (<error>)",
+    owner agent, retried on the next pass;
   - it is not security-flagged.
 
   A deferral that comes without a `followUp` clears an earlier one.
 
-  It shows in `/pr-gate status` and the log as "deferred, follow-up at …".
-- P0-P2, security, or no `followUp`: held for the person's waiver, as today
+  It shows in `/pr-gate status` and the ready prompt as "deferred,
+  follow-up at …, labelled severity:<peak>".
+- P0-P2, security, or no issue named: held for the person's waiver, as today
   (R42).
-- The triage prompt says: "deferred: only for what the person must rule on;
-  a P3 the reviewer labelled or Codex rated, not lowered by you, with followUp naming where it is
-  tracked (an issue or comment URL, #<n> or owner/repo#<n>), needs no
-  waiver" (amended after the final review, T4 and I2).
+- The triage prompt says a P3, not security, deferred with followUp naming
+  the GitHub issue that tracks it needs no waiver; if the agent lowered its
+  severity, Codex checks the lowering; the gate labels the issue with the
+  highest severity the finding had.
 
 ## 5. `waive post` and checks GitHub doesn't require (decision K; findings 28, 29)
 
@@ -351,8 +367,8 @@ the same on main.
 | R81 | Every manual action, the pane's Stop included, ends with one agent message through `say()`; merged into a round prompt the action starts | — |
 | R82 | Triage carries open findings by the round raised in; `acknowledged` ("asks for no change") needs a reply and a Codex check, as a rebuttal does | R32, R34, R36, R40 |
 | R83 | A review is `isFinding: false` only on positive no-action evidence | readReviews' non-empty rule |
-| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
-| R85 | A P3 deferral with a `followUp` naming a URL or issue, not security, that the agent never lowered to P3, settles without a waiver | R42 |
+| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag; a lowering is Codex's to check | applyAnswer's rule, severityHint |
+| R85 | A P3 deferral, not security, with a `followUp` naming a GitHub issue settles without a waiver once the issue is labelled with the peak severity; a lowering needs Codex's agreement first | R42 |
 | R86 | Required checks come from rulesets and classic protection; `waive post` sets aside the rest | R1-9 |
 | R87 | A hold on a Bash command that does more than its PR action says that nothing in it ran (section 5a) | R77 wording |
 
@@ -416,8 +432,11 @@ fails on 1.3.0:
   findings becomes one P3 finding with the list in its detail; the same list
   with one item tagged P1 becomes P1; "the reviewer's advisory note" quoted
   inside a sentence doesn't count.
-- **Deferral:** a P3 with `followUp` settles; a P2 with `followUp`, a P3
-  without one, and a security P3 each hold.
+- **Deferral:** a P3 with an issue `followUp` settles once its issue is
+  labelled; a guessed P1 lowered to P3 waits on Codex, settles when Codex
+  agrees (the issue labelled severity:P1) and holds for the person when it
+  disagrees; a failed label holds until a later pass labels it; a P2 with
+  `followUp`, a P3 without one, and a security P3 each hold.
 
 Checks: `npm run check` from the repo root (lint, both test suites, validate,
 typecheck with the generated types present).

@@ -99,6 +99,10 @@ export type World = {
     /** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */
     classicAnswer?: 'none' | 'off' | 'ok' | 'garbage' | 'throw' | number
     calls: string[]
+    /** How `gh issue edit` answers when the gate labels a follow-up issue (R85): 'ok' (default) or 'fail'. */
+    labelAnswer?: 'ok' | 'fail'
+    /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
+    labelled: string[]
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
@@ -194,6 +198,7 @@ export function world(on: On): World {
       isChecksUnreadable: false,
       isBroken: false,
       calls: [],
+      labelled: [],
     },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
@@ -297,6 +302,12 @@ export function world(on: On): World {
           bucket: bucket(one),
         }))
         return out(JSON.stringify(rows))
+      }
+      // The follow-up issue's severity label (R85): the label is made, then added to the issue, unless the test makes the edit fail.
+      if (args.startsWith('label create') || args.startsWith('issue edit')) {
+        w.gh.labelled.push(args)
+        if (args.startsWith('issue edit') && w.gh.labelAnswer === 'fail') return failed('GraphQL: Could not resolve to an issue or pull request with the number of 12.')
+        return out('')
       }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))

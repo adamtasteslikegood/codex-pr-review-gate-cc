@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Standing, Step, Waiver } from '../types'
+import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -54,7 +54,9 @@ import {
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
+  isLoweringOwed,
   isReverifyOwed,
+  issueOf,
   lastCoveredHead,
   markHeld,
   markVerified,
@@ -63,11 +65,13 @@ import {
   newRecord,
   nextIds,
   mayAcknowledge,
+  peakOf,
   raisedIn,
   readDiff,
   rejections,
   relocate,
   roundOf,
+  ruleLowering,
   securityHolds,
   standingOf,
   triage,
@@ -76,6 +80,7 @@ import {
   verificationOwed,
   waivedIds,
   withRound,
+  wouldSettle,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
 import { archiveRecord, isHeldByOther, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
@@ -1421,6 +1426,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
       ...(feedback.threadId === undefined ? {} : { threadId: feedback.threadId }),
       ...(feedback.url === undefined ? {} : { url: feedback.url }),
       severity: hint.severity,
+      peakSeverity: hint.severity,
       severitySource: hint.isTagged ? 'tag' : 'hint',
       ...(hint.isSecurity ? { isSecurity: true } : {}),
       title,
@@ -1802,6 +1808,8 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
           ? markVerified(f, one.round, 'codex', now, 'Codex: the fix holds')
           : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix does not hold')
       }
+      // The agent's lowering of a deferral's severity (R85): agreed, it may settle; refused, it is the person's, with Codex's reason.
+      if (isLoweringOwed(f)) return ruleLowering(f, verdict.holds, one.round, now, verdict.holds ? undefined : (verdict.note ?? 'no reason given'))
       // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
       return verdict.holds ? acceptRebuttal(f, one.round, now) : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex did not accept the rebuttal')
     }),
@@ -2201,7 +2209,7 @@ export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresol
  * /pr-gate or resume, which alone re-opens a pre-PR fix step on the same head (R63); a held create or a grant does not.
  */
 export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
-  const rec = await loadRecord($, root, branch)
+  let rec = await loadRecord($, root, branch)
   if (rec === undefined) return
   // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
   if (!(await isStillMine($, { root, branch }))) return
@@ -2220,7 +2228,8 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   // The waiver covers the checkout's head, but the PR moved past it: no review or waiver covers the PR's head yet.
-  if (rec.pr !== undefined && at !== rec.head && posts.some(one => one.head === rec.head)) {
+  const recHead = rec.head
+  if (rec.pr !== undefined && at !== recHead && posts.some(one => one.head === recHead)) {
     await say(
       $,
       rec,
@@ -2229,6 +2238,8 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     )
     return
   }
+  // A deferral that settles once its issue carries the finding's peak severity is labelled first, every pass until it is (R85).
+  rec = await labelDeferrals($, rec)
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2336,6 +2347,51 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   await say($, saved, reportPrompt(saved, next, standing))
 }
 
+/** The colour of each severity label the gate makes on a follow-up's repository (R85). */
+const LABEL_COLOURS: Record<Severity, string> = { P0: 'b60205', P1: 'd93f0b', P2: 'fbca04', P3: '0e8a16' }
+
+/**
+ * Labels the follow-up issue of each deferral that would settle with the highest severity its finding had (R85, Adam 2026-10-20),
+ * once per peak: a peak that rose since adds the new label. The label is made first (`--force` keeps one that exists); a failed edit
+ * is recorded on the finding, which holds the merge until a later pass labels it (fail closed). Only after the PR opens.
+ */
+export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord> {
+  if (rec.phase === 'pre') return rec
+  const owed = rec.findings.filter(one => wouldSettle(one) && one.followUpLabel !== peakOf(one))
+  if (owed.length === 0) return rec
+  const gh = async (args: string[]): Promise<{ exitCode: number; stderr: string }> => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  const results = new Map<string, { followUp: string | undefined; peak: Severity; error?: string }>()
+  for (const one of owed) {
+    const peak = peakOf(one)
+    const issue = issueOf(one.followUp, rec.slug)
+    if (issue === undefined) {
+      results.set(one.id, { followUp: one.followUp, peak, error: 'no repository is known for this issue' })
+      continue
+    }
+    const label = `severity:${peak}`
+    await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak], '--force'])
+    const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
+    results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
+    await logEvent($, rec.root, rec.branch, 'check', edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`)
+  }
+  // Written only where the follow-up and peak are still the ones labelled: a later answer that moved either is labelled anew.
+  const saved = await updateRecord($, rec.root, rec.branch, latest => ({
+    ...latest,
+    findings: latest.findings.map(f => {
+      const got = results.get(f.id)
+      if (got === undefined || got.followUp !== f.followUp || got.peak !== peakOf(f)) return f
+      return got.error === undefined ? { ...f, followUpLabel: got.peak, followUpLabelError: undefined } : { ...f, followUpLabelError: got.error }
+    }),
+  }))
+  return saved ?? rec
+}
+
 /** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */
 async function isPostWaived($: Engine, rec: LifecycleRecord): Promise<boolean> {
   const latest = await loadRecord($, rec.root, rec.branch)
@@ -2437,6 +2493,7 @@ async function afterReview($: Engine, run: Run): Promise<void> {
         round: run.round,
         source: role === 'challenge' ? 'codex-challenge' : 'codex-review',
         reviewer: 'codex',
+        peakSeverity: one.severity,
         ...(severityHint(`${one.title} ${one.detail ?? ''}`).isSecurity ? { isSecurity: true } : {}),
         headSeen: run.headSha,
         status: 'open',
