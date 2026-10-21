@@ -82,3 +82,5 @@ Ruling: A8 broadened to Adam's words — a discretionary post round is charged w
 Ruling: a refused raise re-check is a full rejection (rejections+1, charged if discretionary) — it is a real Codex rejection at the new severity — cost if wrong: one round
 Note: A8 does not verify a push happened ("fixed" answer + Codex holds still charged) — low impact, accepted
 Task 6b: fix round 1 3bbdaa0 + report c77b336, 564/564 (raiseOf labels; A8 any fix in round; R90 flow test on discretionary) → scoped re-review on sonnet
+Task 6b: re-review All addressed, no new breakage ("not on this run" fallback unreachable; label names only the raise if a file change lands after an un-ruled raise — wording only, deferred).
+Task 6b: complete (commits 8c71e69..c77b336, review clean)
