@@ -77,3 +77,5 @@ Task 4: fix round 1 implementer DONE, commit 87c5c44 (437 pass); /pr-gate log ha
 Task 4: fix round 1/5 (1 addressed, 0 open; commits 9a27eae..87c5c44)
 Task 4: complete (commits 5c51b96..87c5c44, review clean)
 Task 4: minor (deferred): status puts the settled-deferral note before rec.message (cosmetic)
+Task 5: implementer dispatched (sonnet), BASE 14ddf6e
+Task 5: implementer DONE, commit d2a3afe (441 pass); review dispatched
