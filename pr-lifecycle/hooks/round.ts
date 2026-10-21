@@ -974,7 +974,16 @@ async function beginCollect($: Engine, id: string): Promise<void> {
   // A later post-PR round, on a new head: ask the roster's reviewers to look again.
   if (rec !== undefined && rec.rounds.some(one => one.phase === 'post' && one.isCompleted) && rec.pr !== undefined && rec.slug !== undefined) {
     const roster = await rosterOf($, opened.root, opened.base)
-    for (const who of roster?.requestReview ?? []) await askAgain($, rec, who)
+    const names = roster?.requestReview ?? []
+    for (const who of names) await askAgain($, rec, who)
+    // Asked for this head: a comment that may predate it is not asked about a second time (#24).
+    const head = opened.roundStartHead
+    if (names.length > 0) {
+      await updateRecord($, opened.root, opened.branch, one => {
+        if (one.headArrival?.head !== head) return one
+        return { ...one, headArrival: { ...one.headArrival, asked: [...new Set([...(one.headArrival.asked ?? []), ...names])] } }
+      })
+    }
   }
   $.ui.status(`pr-gate r${opened.round}: waiting on reviewers`)
 }
@@ -992,16 +1001,31 @@ async function askAgain($: Engine, rec: LifecycleRecord, who: string): Promise<v
 type HeadArrival = NonNullable<LifecycleRecord['headArrival']>
 
 /** Where the PR's head branch lives: its repository (a fork's, for a PR from one) and branch name. Absent parts are the record's. */
-export type HeadPlace = { repo?: string; branch?: string }
+export type HeadPlace = { repo?: string; branch?: string; isCrossRepository?: boolean }
+
+/**
+ * The repository and branch whose activity log holds the PR head's pushes: gh's word from this poll, else the record's, else the
+ * PR's own repository and the checked-out branch. A PR from a fork whose repository gh never named has none: the base repository's
+ * log would be another branch's.
+ */
+const pushPlaceOf = (rec: LifecycleRecord, where: HeadPlace = {}): { repo: string; branch: string } | undefined => {
+  const place = { ...rec.headPlace, ...where }
+  const repo = place.repo ?? (place.isCrossRepository === true ? undefined : rec.slug)
+  const branch = place.branch ?? rec.branch
+  return repo === undefined || repo === '' || branch === '' ? undefined : { repo, branch }
+}
+
+/** The activity rows that move a branch to a commit; a deletion's all-zero sha is none. */
+const MOVES = ['push', 'force_push', 'branch_creation']
 
 /** A push into the PR's head branch, as GitHub's repository activity log lists it: the sha it moved the branch to, and when. */
 type Push = { after: string; at: number }
 
 /** The head branch's pushes from GitHub's repository activity log (#24); undefined when gh fails or the answer does not parse. */
 async function pushesOf($: Engine, rec: LifecycleRecord, where: HeadPlace = {}): Promise<Push[] | undefined> {
-  const repo = where.repo ?? rec.slug
-  const branch = where.branch ?? rec.branch
-  if (repo === undefined || repo === '' || branch === '') return undefined
+  const place = pushPlaceOf(rec, where)
+  if (place === undefined) return undefined
+  const { repo, branch } = place
   const ref = `refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`
   try {
     const ran = await $.process.run(['gh', 'api', `repos/${repo}/activity?ref=${ref}&per_page=100`], { cwd: rec.root, timeoutMs: 30_000 })
@@ -1009,9 +1033,10 @@ async function pushesOf($: Engine, rec: LifecycleRecord, where: HeadPlace = {}):
     const rows = JSON.parse(ran.stdout) as unknown
     if (!Array.isArray(rows)) return undefined
     return rows.flatMap(row => {
-      const one = row as { after?: unknown; timestamp?: unknown } | null
+      const one = row as { after?: unknown; timestamp?: unknown; activity_type?: unknown } | null
       const at = typeof one?.timestamp === 'string' ? Date.parse(one.timestamp) : Number.NaN
-      return typeof one?.after === 'string' && Number.isFinite(at) ? [{ after: one.after, at }] : []
+      const isMove = typeof one?.activity_type === 'string' && MOVES.includes(one.activity_type)
+      return isMove && typeof one.after === 'string' && !/^0+$/.test(one.after) && Number.isFinite(at) ? [{ after: one.after, at }] : []
     })
   } catch {
     return undefined
@@ -1037,7 +1062,8 @@ export async function latestPushOf($: Engine, rec: LifecycleRecord, where: HeadP
 /**
  * Notes on the record when `head` reached the PR (#24): GitHub's push time when it gives one (never later than now), which replaces
  * a stored time for the same head; else the stored time; else `fallback`, the time the gate first saw it. A record whose
- * `headArrival` names another head never lends that head's time. undefined when there is no record.
+ * `headArrival` names another head never lends that head's time, only a lower bound (`since`): the new head reached the PR after
+ * the gate last saw the old one there, and after the old one arrived. undefined when there is no record.
  */
 export async function noteArrival(
   $: Engine,
@@ -1050,16 +1076,24 @@ export async function noteArrival(
   const rec = await loadRecord($, root, branch)
   if (rec === undefined) return undefined
   const now = await $.clock.now()
-  const stored = rec.headArrival?.head === head ? rec.headArrival : undefined
+  const read = rec.headArrival
+  const stored = read?.head === head ? read : undefined
+  const before = read === undefined || stored !== undefined ? undefined : Math.max(read.seenAt ?? 0, read.at, read.since ?? 0)
+  const fresh = { head, ...(before === undefined || before <= 0 ? {} : { since: before }) }
   const push = await pushTimeOf($, rec, head, where)
   const at = push === undefined ? undefined : Math.min(push, now)
   const next: HeadArrival =
     at === undefined
-      ? (stored ?? { head, at: Math.min(fallback, now), isPushTime: false })
+      ? (stored ?? { ...fresh, at: Math.min(fallback, now), isPushTime: false })
       : stored?.isPushTime === true && stored.at === at
         ? stored
-        : { head, at, isPushTime: true }
-  if (next !== stored) await updateRecord($, root, branch, one => ({ ...one, headArrival: next }))
+        : { ...(stored ?? fresh), at, isPushTime: true }
+  // Written only over the arrival this read: one another poll wrote meanwhile, for another head, is not replaced by an older one.
+  if (next !== stored) {
+    await updateRecord($, root, branch, one =>
+      one.headArrival === undefined || one.headArrival.head === read?.head || one.headArrival.head === head ? { ...one, headArrival: next } : one,
+    )
+  }
   return next
 }
 
@@ -1080,12 +1114,17 @@ async function guessCover($: Engine, rec: LifecycleRecord, roster: Roster, arriv
   const nameOf = (one: Feedback): string | undefined => roster.requestReview.find(name => postsFor(one.reviewer, name))
   const open = doubtful.filter(one => !counted.has(one.id) && !asked.has(nameOf(one) ?? ''))
   if (open.length > 0) {
-    // The committer date only bounds the window: a commit is never pushed before it was made. Unknown, nothing bounds it.
-    const dated = await $.process
-      .run(['gh', 'api', `repos/${rec.slug ?? ''}/commits/${head}`, '--jq', '.commit.committer.date'], { cwd: rec.root, timeoutMs: 30_000 })
-      .catch(() => undefined)
-    const parsed = dated?.exitCode === 0 ? Date.parse(dated.stdout.trim()) : Number.NaN
-    const since = Number.isFinite(parsed) ? parsed : 0
+    // The window's start: a commit is never pushed before it was made (its committer date, read once per head), nor before the
+    // gate last saw the head before it on the PR (`since`). Neither known, nothing bounds it.
+    let committedAt = arrival.committedAt
+    if (committedAt === undefined) {
+      const dated = await $.process
+        .run(['gh', 'api', `repos/${rec.slug ?? ''}/commits/${head}`, '--jq', '.commit.committer.date'], { cwd: rec.root, timeoutMs: 30_000 })
+        .catch(() => undefined)
+      const parsed = dated?.exitCode === 0 ? Date.parse(dated.stdout.trim()) : Number.NaN
+      committedAt = Number.isFinite(parsed) ? parsed : undefined
+    }
+    const since = Math.max(committedAt ?? 0, arrival.since ?? 0)
     for (const one of open.filter(each => each.at > since).sort((a, b) => a.at - b.at)) {
       const name = nameOf(one)
       if (name !== undefined) {
@@ -1098,10 +1137,12 @@ async function guessCover($: Engine, rec: LifecycleRecord, roster: Roster, arriv
         await logEvent($, rec.root, rec.branch, 'head', `${one.reviewer}: comment at ${isoOf(one.at)} counted for ${head.slice(0, 7)}; GitHub gave no push time`)
       }
     }
-    const isChanged = asked.size !== (arrival.asked ?? []).length || counted.size !== (arrival.counted ?? []).length
+    const isChanged =
+      asked.size !== (arrival.asked ?? []).length || counted.size !== (arrival.counted ?? []).length || committedAt !== arrival.committedAt
     if (isChanged) {
+      const dated = committedAt === undefined ? {} : { committedAt }
       await updateRecord($, rec.root, rec.branch, one =>
-        one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, asked: [...asked], counted: [...counted] } },
+        one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, asked: [...asked], counted: [...counted], ...dated } },
       )
     }
   }
@@ -1266,7 +1307,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     const found = self
     await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }))
   }
-  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state,headRefName,headRepository,headRepositoryOwner'], {
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state,headRefName,headRepository,headRepositoryOwner,isCrossRepository'], {
     cwd: rec.root,
     timeoutMs: 30_000,
   })
@@ -1282,6 +1323,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
       headRefName?: unknown
       headRepository?: { name?: unknown } | null
       headRepositoryOwner?: { login?: unknown } | null
+      isCrossRepository?: unknown
     } | null
     prHead = read?.headRefOid as string | undefined
     state = prStateIn(read)
@@ -1289,6 +1331,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     const owner = read?.headRepositoryOwner?.login
     const name = read?.headRepository?.name
     if (typeof owner === 'string' && owner !== '' && typeof name === 'string' && name !== '') where.repo = `${owner}/${name}`
+    if (typeof read?.isCrossRepository === 'boolean') where.isCrossRepository = read.isCrossRepository
   } catch {
     prHead = undefined
   }
@@ -1296,6 +1339,9 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   if (typeof prHead !== 'string' || prHead === '') {
     return fail(`gh returned unreadable output for PR #${rec.pr} (${pr.stdout.trim().slice(0, 80)}); check gh auth login, rate limits and the network`)
   }
+  // Where the head branch lives, kept for the steps that read push times without asking gh for the PR (#24).
+  const place = { ...rec.headPlace, ...where }
+  if (JSON.stringify(place) !== JSON.stringify(rec.headPlace ?? {})) await updateRecord($, rec.root, rec.branch, one => ({ ...one, headPlace: place }))
   const at = `repos/${rec.slug}`
   const [reviews, inline, comments, checks] = await Promise.all([
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
@@ -1400,6 +1446,10 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     triaged: fresh.map(each => each.id),
   }))
   if (after === null) return
+  // This poll saw the head on the PR: a later head reached it after now, the lower bound of a guess about it (#24).
+  await updateRecord($, run.root, run.branch, one =>
+    one.headArrival?.head !== got.prHead ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } },
+  )
   const roster = await rosterOf($, run.root, run.base)
   let cover = got.cover ?? got.feedback
   if (roster !== undefined && arrival !== undefined && !arrival.isPushTime) {
@@ -1423,7 +1473,8 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   // Coverage that rests on an issue comment (no commit) is checked against the branch's newest push before it ends collection
   // (#24, A→B→A between two polls): the branch may have left the head and come back after the comment. Reviews carry their commit.
   const restsOnComment = cover.some(one => one.kind === 'comment' && one.head === undefined && one.at >= headAt && done.covered.includes(one.reviewer))
-  if (done.isDone && restsOnComment) {
+  // A PR from a fork whose repository gh never named has no log to read: the stored time stands.
+  if (done.isDone && restsOnComment && pushPlaceOf(rec, got.where) !== undefined) {
     const newest = await latestPushOf($, rec, got.where)
     const head7 = got.prHead.slice(0, 7)
     if (newest === undefined) {
@@ -1437,7 +1488,13 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     } else if (newest.after === got.prHead && Math.min(newest.at, now) > headAt) {
       headAt = Math.min(newest.at, now)
       const at = headAt
-      await updateRecord($, run.root, run.branch, one => ({ ...one, headArrival: { head: got.prHead, at, isPushTime: true } }))
+      // A new arrival of the same head: its guesses are over, its lower bound and commit date still hold.
+      await updateRecord($, run.root, run.branch, one => {
+        const was = one.headArrival
+        if (was !== undefined && was.head !== got.prHead) return one
+        const kept = { ...(was?.since === undefined ? {} : { since: was.since }), ...(was?.committedAt === undefined ? {} : { committedAt: was.committedAt }) }
+        return { ...one, headArrival: { head: got.prHead, at, isPushTime: true, ...kept, seenAt: now } }
+      })
       await patch($, run.id, one => (one.collect === undefined ? one : { ...one, collect: { ...one.collect, headAt: at } }))
       done = judge()
     }

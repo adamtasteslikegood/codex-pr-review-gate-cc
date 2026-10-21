@@ -56,3 +56,36 @@ Full suite: **523 pass, 0 fail** (509 before). `npm run lint` and `npm run typec
 5. The coordinator's doc changes (0a76163 and the next commit on docs/wave2b) were not merged here, as instructed.
 6. `pushesOf` does not filter on `activity_type`. A `branch_creation` row is a real arrival. A `branch_deletion` row (after `000…`) never matches a head, but `latestPushOf` can return it as the newest push. That reads as "moved" for one poll, until the poll sees the PR closed. Harmless.
 7. `gh pr view --json headRefName,headRepository,headRepositoryOwner` was checked against live gh on PR #25: the fields exist, `headRepository.name` and `headRepositoryOwner.login` are present, and `npm run validate` passes.
+
+## Fix round 1
+
+Important:
+1. **A lower bound for the guess window.**
+   - Each poll that sees the PR head writes `headArrival.seenAt`.
+   - When `noteArrival` replaces an arrival stored for another head, the new one gets `since = max(old.seenAt, old.at, old.since)`. This is the last time the gate saw the old head on the PR. `seenAt` is a superset of the suggested `collect.polledAt`: it also survives across runs, for example a round 1 that ended ready before round 2 started.
+   - `guessCover`'s window now starts at `max(committedAt ?? 0, since ?? 0)`.
+   - Test 14 covers round 2 with the activity log broken and no commit date. Round 1's roster comment is not counted, the round waits, and the cap ends collection, after which Codex covers the head.
+2. **The world fake now answers `headRepository`, `headRepositoryOwner` and `isCrossRepository`.**
+   - It has a `gh.forkOwner` knob.
+   - The activity fake checks the repository in the URL path.
+   - Test 15 covers a fork PR: the push is only in `forker/repo`'s log, and the head's time comes from it. The record keeps `headPlace`.
+
+Minor:
+1. `fetchFeedback` persists `LifecycleRecord.headPlace { repo, branch, isCrossRepository }`.
+   - `pushesOf` (and so `beginCollect` and `onOpened`) uses `pushPlaceOf`: gh's word from this poll, then the record's, then the slug and the branch.
+   - A cross-repository PR whose head repo is unknown reads no log, so the pre-end re-read is skipped.
+2. `pushesOf` keeps only rows whose `activity_type` is `push`, `force_push` or `branch_creation`, and drops all-zero `after` shas. This closes the old concern 6.
+3. `beginCollect`'s requestReview asks are added to `headArrival.asked` for the head.
+4. Guarded writes:
+   - The `noteArrival` write applies only when the stored arrival is still the one read: it is absent, or it names the head that was read or this head.
+   - The pre-end re-read applies only when the stored arrival is absent or names the PR head. It keeps `since` and `committedAt`.
+5. The committer date is cached as `headArrival.committedAt`.
+6. Tests 16 and 17:
+   - 16: while the log's newest push stays on another sha, the wait cap ends collection on the "moved" path.
+   - 17: `asked` persists across stop and resume, with no second POST.
+
+Other changes:
+- The world's engine stand-in now has a `store`, because `fetchFeedback` writes `headPlace` and `untriagedFeedback` (R91 test) runs through it.
+- The `headArrival` assertions use `toMatchObject`, since `seenAt` changes with each poll.
+
+Result: 527 pass, 0 fail. Lint, typecheck and validate are clean.

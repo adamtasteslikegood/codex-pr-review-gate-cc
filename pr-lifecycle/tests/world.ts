@@ -84,6 +84,8 @@ export type World = {
      * Only the PR's head branch (`headRef`) has any; undefined lists none.
      */
     pushes?: { after: string; timestamp: string }[]
+    /** The owner of the fork the PR comes from; undefined means the PR's own repository (me/repo). Its activity log is the fork's. */
+    forkOwner?: string
     /** The activity log call fails, as it does for a token that cannot read it. */
     isActivityBroken?: boolean
     /** The head commit's committer date, as `gh api repos/<slug>/commits/<sha> --jq .commit.committer.date` prints it; undefined fails it. */
@@ -293,7 +295,17 @@ export function world(on: On): World {
         if (w.gh.isHeadReadBroken === true && /--json headRefOid(,baseRefName)?$/.test(args)) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
-        return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
+        const owner = w.gh.forkOwner ?? 'me'
+        return out(JSON.stringify({
+          number: w.gh.pr,
+          baseRefName,
+          headRefName: w.gh.headRef,
+          headRefOid: w.gh.prHead,
+          state: w.gh.state,
+          headRepository: { id: 'R_1', name: 'repo', nameWithOwner: `${owner}/repo` },
+          headRepositoryOwner: { id: 'U_1', login: owner },
+          isCrossRepository: owner !== 'me',
+        }))
       }
       // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
       if (args.startsWith('pr checks')) {
@@ -327,10 +339,12 @@ export function world(on: On): World {
         if (args.startsWith('issue edit') && w.gh.labelAnswer === 'fail') return failed('GraphQL: Could not resolve to an issue or pull request with the number of 12.')
         return out('')
       }
-      const activity = args.match(/^api repos\/\S+\/activity\?ref=refs\/heads\/(\S+)&per_page=100$/)?.[1]
-      if (activity !== undefined) {
+      const activity = args.match(/^api repos\/(\S+)\/activity\?ref=refs\/heads\/(\S+)&per_page=100$/)
+      if (activity !== null) {
         if (w.gh.isActivityBroken === true) return failed('gh: Resource not accessible by integration (HTTP 403)')
-        const rows = decodeURIComponent(activity) === w.gh.headRef ? (w.gh.pushes ?? []) : []
+        // Only the head repository's log has the head branch's pushes: the fork's, for a PR from one.
+        const isHeadRepo = activity[1] === `${w.gh.forkOwner ?? 'me'}/repo`
+        const rows = isHeadRepo && decodeURIComponent(activity[2] ?? '') === w.gh.headRef ? (w.gh.pushes ?? []) : []
         return out(JSON.stringify(rows.map(one => ({ ...one, activity_type: 'push', ref: `refs/heads/${w.gh.headRef}` }))))
       }
       if (/^api repos\/\S+\/commits\/[0-9a-f]+ --jq \.commit\.committer\.date$/.test(args)) {
@@ -404,6 +418,13 @@ export function world(on: On): World {
   w.engine = {
     process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value },
     clock: { now: async () => now },
+    // The same store the mod's own engine reads: a helper that notes something on the record writes where the test reads it.
+    store: {
+      get: async (key: string) => w.store.get(key),
+      set: async (key: string, value: unknown) => void w.store.set(key, value),
+      delete: async (key: string) => void w.store.delete(key),
+      keys: async () => [...w.store.keys()],
+    },
   } as never
   on('agent.spawn', (_$, e) => {
     w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })

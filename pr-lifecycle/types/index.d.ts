@@ -194,8 +194,22 @@ export type LifecycleRecord = {
    * When the PR's head reached the PR (#24), kept across stop, resume and another session: GitHub's push time (the latest push into
    * the head, from the repository activity log), else when the gate first saw it. `asked`: the requestReview names asked again for
    * this head because a comment may predate it; `counted`: comments counted for it on a guess while GitHub gave no push time.
+   * `since`: a time the head had surely not reached the PR yet (the last time the gate saw the head before it as the PR's), the
+   * lower bound of that guess with `committedAt`, the head commit's committer date once read. `seenAt`: the last poll that saw
+   * this head as the PR's.
    */
-  headArrival?: { head: string; at: number; isPushTime: boolean; asked?: string[]; counted?: string[] }
+  headArrival?: {
+    head: string
+    at: number
+    isPushTime: boolean
+    asked?: string[]
+    counted?: string[]
+    since?: number
+    committedAt?: number
+    seenAt?: number
+  }
+  /** Where the PR's head branch lives, as gh last said (#24): a fork's repository for a PR from one, and its branch name. */
+  headPlace?: { repo?: string; branch?: string; isCrossRepository?: boolean }
   waivers: Waiver[]
   phase: LifecyclePhase
   /**
