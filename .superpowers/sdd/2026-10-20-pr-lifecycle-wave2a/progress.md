@@ -99,3 +99,4 @@ Task 7: fix round 1/5 (2 addressed, 0 open; commits ee94802..e8b9dd3)
 Task 7: complete (commits e853524..e8b9dd3, review clean)
 Task 7: minor (deferred): unreadable reason in both said and detail (harmless duplication)
 Task 8: implementer dispatched (opus — timing + queue), BASE d32640d
+Task 8: implementer DONE, commits 98f8b48, ba79873 (454 pass); concern: waiver landing mid-round names the PR head while rec.head stays old → a later resume reviews the waived head again; waiver message resent each session; review dispatched (opus)
