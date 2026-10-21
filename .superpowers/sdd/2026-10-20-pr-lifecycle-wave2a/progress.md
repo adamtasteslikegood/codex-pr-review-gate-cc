@@ -90,3 +90,4 @@ Task 6: review Approved (spec ✅)
 Task 6: complete (commits 7efabdb..1290918, review clean)
 Task 6: minor (deferred): required cache keyed slug:base, cleared only in setup; classic 404 regex reads all of stderr
 Task 7: implementer dispatched (sonnet), BASE 5dc0b21
+Task 7: implementer DONE, commit ee94802 (446 pass); unreadable-CI refusal lost gh's stderr (test now matches 'gh auth status'); review dispatched
