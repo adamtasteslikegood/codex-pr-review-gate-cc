@@ -120,6 +120,10 @@ export type World = {
     onLabel?: () => void | Promise<void>
     /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
     labelled: string[]
+    /** Logins `GET .../requested_reviewers` lists (R89); undefined lists none. */
+    requested?: string[]
+    /** Every `-X POST .../requested_reviewers` call the gate made, in order. */
+    requests: string[]
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
@@ -216,6 +220,7 @@ export function world(on: On): World {
       isBroken: false,
       calls: [],
       labelled: [],
+      requests: [],
     },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
@@ -354,7 +359,13 @@ export function world(on: On): World {
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))
       if (/issues\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.issueComments))
       if (/commits\/[0-9a-f]+\/check-runs/.test(args)) return out(JSON.stringify({ check_runs: w.gh.checks }))
-      if (/requested_reviewers/.test(args)) return out('{}')
+      if (/requested_reviewers/.test(args)) {
+        if (args.includes('-X POST')) {
+          w.gh.requests.push(args)
+          return out('{}')
+        }
+        return out(JSON.stringify({ users: (w.gh.requested ?? []).map(login => ({ login })), teams: [] }))
+      }
       return out('')
     }
     if (args.startsWith('fetch')) {

@@ -40,6 +40,7 @@ import {
   readCheckRuns,
   readInlineComments,
   readIssueComments,
+  readRequested,
   readRequired,
   readReviews,
   readRoster,
@@ -1190,6 +1191,8 @@ type Fetched = {
   ownReplies?: Record<string, string>
   /** Where the PR's head branch lives, as gh says (a fork's, for a PR from one), for its push times (#24). */
   where?: HeadPlace
+  /** Logins with a pending review request (R89), this machine's own left out. */
+  requested?: string[]
 }
 
 /** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, { unreadable: gh's own words } when it can't say. */
@@ -1343,13 +1346,14 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   const place = { ...rec.headPlace, ...where }
   if (JSON.stringify(place) !== JSON.stringify(rec.headPlace ?? {})) await updateRecord($, rec.root, rec.branch, one => ({ ...one, headPlace: place }))
   const at = `repos/${rec.slug}`
-  const [reviews, inline, comments, checks] = await Promise.all([
+  const [reviews, inline, comments, checks, requests] = await Promise.all([
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/comments`),
     ghJson($, rec.root, `${at}/issues/${rec.pr}/comments`),
     ghJson($, rec.root, `${at}/commits/${prHead}/check-runs`),
+    ghJson($, rec.root, `${at}/pulls/${rec.pr}/requested_reviewers`),
   ])
-  const bad = [reviews, inline, comments, checks].find(one => !one.isOk)
+  const bad = [reviews, inline, comments, checks, requests].find(one => !one.isOk)
   if (bad !== undefined) return fail(`gh api failed (${bad.err.slice(0, 160)}); check gh auth login, rate limits and the network`)
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
@@ -1378,7 +1382,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
         .at(-1)
       if (answered !== undefined) ownReplies[answered.id] = mine.id.slice('inline:'.length)
     }
-    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies, where }
+    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies, where, requested: readRequested(requests.out, self) }
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
     return fail(`gh returned unreadable output (${said}); check gh auth login, rate limits and the network`)
@@ -1456,6 +1460,8 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     cover = await guessCover($, (await loadRecord($, run.root, run.branch)) ?? rec, roster, arrival, cover)
   }
   const capMs = (roster?.waitCapMinutes ?? config.waitCapMs / 60_000) * 60_000
+  // The base's required checks (R86): unknown makes every reported check stand in.
+  const needed = await requiredChecksOf($, run.root, rec.slug, run.base)
   const judge = () =>
     collectionDone({
       roster,
@@ -1468,6 +1474,8 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
       now,
       quietMs: (roster?.quietMinutes ?? config.quietMs / 60_000) * 60_000,
       capMs,
+      requested: got.requested ?? [],
+      required: needed instanceof Set ? [...needed] : 'unknown',
     })
   let done = judge()
   // Coverage that rests on an issue comment (no commit) is checked against the branch's newest push before it ends collection

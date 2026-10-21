@@ -240,7 +240,7 @@ test('a roster only on the branch\'s HEAD is ignored: collection does not wait o
   await w.clock.advance(30_000)
   expect((await runOf(w)).activity).not.toContain('junie[bot]')
   expect(w.prompts.some(one => one.includes('crypto miner'))).toBe(false)
-  expect(w.gh.calls.some(one => one.includes('requested_reviewers'))).toBe(false)
+  expect(w.gh.requests).toEqual([])
 })
 
 test('a roster on the base is used: collection waits on its reviewer, whose comment is trusted', async ($, on) => {

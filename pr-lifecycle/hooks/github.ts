@@ -274,9 +274,17 @@ export type CollectInput = {
   now: number
   quietMs: number
   capMs: number
+  /** Logins with a pending review request on the PR, this machine's own left out (R89). */
+  requested?: readonly string[]
+  /** The base's required checks (R86), or 'unknown', where every reported check stands in. Absent reads as 'unknown'. */
+  required?: readonly string[] | 'unknown'
 }
 
-/** Whether a post-PR round has collected enough: the roster's list, or settled checks and a quiet spell; always the cap. */
+/**
+ * Whether a post-PR round has collected enough (R89): every required check has a completed run on the head, every pending review
+ * request has a review of the head, and every roster reviewer covered it. Check suites are never read: an installed app can leave
+ * one queued forever. The quiet window applies only where none of the three exists. The cap applies always.
+ */
 export function collectionDone(input: CollectInput): { isDone: boolean; isComplete: boolean; missing: string[]; covered: string[] } {
   const roster = input.roster
   const hasRoster = roster !== undefined && (roster.reviewers.length > 0 || roster.checks.length > 0)
@@ -287,13 +295,42 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
   const isOnHead = (one: Feedback): boolean => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)
   const covered = [...new Set(input.feedback.filter(one => counts(one) && isOnHead(one)).map(one => one.reviewer))]
   const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
-  const missing = hasRoster
-    ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))]
-    : input.checks.filter(one => one.status !== 'completed').map(one => one.name)
-  const isQuiet = hasRoster || input.now - input.lastArrivalAt >= input.quietMs
+  const required = input.required === undefined || input.required === 'unknown' ? [...new Set(input.checks.map(one => one.name))] : input.required
+  const requested = input.requested ?? []
+  // A request is answered by a review of the head, or by the reviewer covering it as the roster counts it: a roster reviewer the
+  // gate asked again may reply in a comment, which GitHub never clears the request for (#24: never a wait on the cap).
+  const isAnswered = (who: string): boolean =>
+    input.feedback.some(one => one.kind === 'review' && one.head === input.head && postsFor(one.reviewer, who)) ||
+    covered.some(one => postsFor(one, who))
+  const missing = [
+    ...new Set([
+      ...(hasRoster ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))] : []),
+      ...requested.filter(one => !isAnswered(one)),
+      ...required.filter(one => !finished.has(one)),
+    ]),
+  ]
+  const hasSignals = hasRoster || requested.length > 0 || required.length > 0
+  const isQuiet = hasSignals || input.now - input.lastArrivalAt >= input.quietMs
   if (missing.length === 0 && isQuiet) return { isDone: true, isComplete: true, missing, covered }
   if (input.now - input.startedAt >= input.capMs) return { isDone: true, isComplete: missing.length === 0, missing, covered }
   return { isDone: false, isComplete: false, missing, covered }
+}
+
+/**
+ * The logins a PR's review is requested from (R89), as `GET .../requested_reviewers` lists them; teams are not people the gate can
+ * match, so they are left out, and so is this machine's own login (Review Focus 2). Unreadable text lists none.
+ */
+export function readRequested(text: string, self: string): string[] {
+  try {
+    const users = (JSON.parse(text) as { users?: unknown } | null)?.users
+    if (!Array.isArray(users)) return []
+    return users.flatMap(one => {
+      const name = str((one as Row | null)?.login)
+      return name === undefined || name === self ? [] : [name]
+    })
+  } catch {
+    return []
+  }
 }
 
 // ----------------------------------------------------------- PR actions

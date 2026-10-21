@@ -3804,6 +3804,8 @@ test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver nam
 test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
   const w = world(on)
   w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  // Not required, so collection does not wait for it (R89); the hold still names it.
+  w.gh.required = []
   await toAwaiting($, w)
   expect(w.prompts.at(-1)).toContain('check check running')
 })
@@ -4277,13 +4279,13 @@ test('#24 (5): with no push time, a requestReview reviewer whose comment may pre
   await w.clock.advance(30_000)
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('collect')
-  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=alice'])
+  expect(w.gh.requests).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=alice'])
   expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z may predate aaaaaaa; asked again')
   expect((await recordOf(w)).headArrival?.asked).toEqual(['alice'])
   w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
   await w.clock.advance(30_000)
   expect((await recordOf(w)).phase).toBe('ready')
-  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toHaveLength(1)
+  expect(w.gh.requests).toHaveLength(1)
 })
 
 test('#24 (5b): with no push time, a roster reviewer the gate cannot ask has its comment counted, and the log says so', async ($, on) => {
@@ -4296,7 +4298,7 @@ test('#24 (5b): with no push time, a roster reviewer the gate cannot ask has its
   await w.clock.advance(30_000)
   expect((await recordOf(w)).phase).toBe('ready')
   expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z counted for aaaaaaa; GitHub gave no push time')
-  expect(w.gh.calls.some(one => one.includes('requested_reviewers'))).toBe(false)
+  expect(w.gh.requests).toEqual([])
 })
 
 test('#24 (6): a push time GitHub gives at a later poll replaces the first-seen time', async ($, on) => {
@@ -4490,7 +4492,7 @@ test('#24 (17): a re-request for a head is remembered across stop and resume: no
   w.gh.issueComments = [remark(31, 120, 'alice')]
   await adoptAt($, w, 600)
   await w.clock.advance(30_000)
-  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toHaveLength(1)
+  expect(w.gh.requests).toHaveLength(1)
   expect((await recordOf(w)).headArrival).toMatchObject({ asked: ['alice'], committedAt: 10_000 })
   await $.command.run(cmd('stop'))
   await w.clock.advance(60_000)
@@ -4498,5 +4500,61 @@ test('#24 (17): a re-request for a head is remembered across stop and resume: no
   await w.clock.advance(30_000)
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('collect')
-  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toHaveLength(1)
+  expect(w.gh.requests).toHaveLength(1)
+})
+
+test('R89: a pending review request holds the round until that reviewer reviews the head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['alice']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on alice')
+  // GitHub drops the request once alice reviews.
+  w.gh.requested = []
+  w.gh.reviews = [...covers(w.gh.prHead), { id: 6, user: { login: 'alice' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89 (Review Focus 2): a review requested from this machine\'s own login is never waited for', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['me']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: without a roster, a completed required check ends collection with no quiet wait; a running one that is not required is not waited for', async ($, on) => {
+  const w = world(on)
+  w.gh.required = ['ci']
+  await toPost($, w)
+  w.gh.checks = [
+    { name: 'ci', status: 'completed', conclusion: 'success' },
+    { name: 'preview', status: 'in_progress', conclusion: null },
+  ]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).not.toBe('collect')
+})
+
+test('R89 with #24 (5): the request the gate made stays pending on GitHub; the reviewer\'s reply in a comment still answers it, with no wait on the cap', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect(w.gh.requests).toHaveLength(1)
+  // GitHub lists alice as requested from now on: a comment never clears a request.
+  w.gh.requested = ['alice']
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on alice')
+  w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
 })

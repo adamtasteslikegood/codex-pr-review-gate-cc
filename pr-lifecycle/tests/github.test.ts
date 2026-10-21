@@ -10,6 +10,7 @@ import {
   readIssueComments,
   readJsonList,
   readPrAction,
+  readRequested,
   readRequired,
   readReviews,
   readRoster,
@@ -126,12 +127,16 @@ test('#14: a trusted reviewer is never waited for, but its review already in cov
   expect(isTrusted(bot, { ...roster, trusted: [] })).toBe(false)
 })
 
-test('without a roster, collection ends when checks are done and feedback has gone quiet', async () => {
+test('R89: a running required check holds collection; a completed one is a signal, so no quiet wait; with no signal at all, the quiet window decides', async () => {
   const running = [{ name: 'ci', status: 'in_progress', conclusion: null }]
   const done = [{ name: 'ci', status: 'completed', conclusion: 'failure' }]
   expect(collectionDone({ ...base, feedback: [], checks: running, now: 600_000 }).isDone).toBe(false)
-  expect(collectionDone({ ...base, feedback: [], checks: done, lastArrivalAt: 500_000, now: 600_000 }).isDone).toBe(false)
-  expect(collectionDone({ ...base, feedback: [], checks: done, lastArrivalAt: 400_000, now: 600_000 })).toMatchObject({ isDone: true, isComplete: true })
+  // Unknown required checks: every reported check stands in, and is a signal.
+  expect(collectionDone({ ...base, feedback: [], checks: done, lastArrivalAt: 500_000, now: 600_000 })).toMatchObject({ isDone: true, isComplete: true })
+  // No required check, no request, no roster: only the quiet window.
+  expect(collectionDone({ ...base, required: [], feedback: [], checks: done, lastArrivalAt: 500_000, now: 600_000 }).isDone).toBe(false)
+  const quiet = { ...base, required: [], feedback: [], checks: done, lastArrivalAt: 400_000, now: 600_000 }
+  expect(collectionDone(quiet)).toMatchObject({ isDone: true, isComplete: true })
 })
 
 test('the wait cap ends collection with what arrived, marked incomplete', async () => {
@@ -515,4 +520,41 @@ test('R94: a tag is a token standing alone; any other P0-P3 mention is a hint', 
   // A security mention never reads below P2 unless the reviewer tagged it.
   expect(severityHint('this was a P3 but it leaks a secret')).toEqual({ severity: 'P2', isSecurity: true, isTagged: false })
   expect(severityHint('[P3] the secret name is misspelt')).toEqual({ severity: 'P3', isSecurity: true, isTagged: true })
+})
+
+test('R89: required checks need a completed run on the head; a check that is not required is not waited for', async () => {
+  const running = (name: string) => ({ name, status: 'in_progress', conclusion: null })
+  const completed = (name: string) => ({ name, status: 'completed', conclusion: 'success' })
+  expect(collectionDone({ ...base, required: ['ci'], feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: true, isComplete: true })
+  // A required check with no run yet is missing.
+  expect(collectionDone({ ...base, required: ['ci', 'analyze'], feedback: [], checks: [completed('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['analyze'] })
+  expect(collectionDone({ ...base, required: 'unknown', feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['preview'] })
+  // With a roster, a required check is waited for too.
+  const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [], trusted: [] }
+  expect(collectionDone({ ...base, roster, required: ['ci'], feedback: [fb('claude[bot]', 'b')], checks: [running('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['ci'] })
+  // The cap still ends it.
+  expect(collectionDone({ ...base, required: ['analyze'], feedback: [], checks: [], now: 1_200_000 })).toMatchObject({ isDone: true, isComplete: false, missing: ['analyze'] })
+})
+
+test('R89: a pending review request holds collection until that reviewer reviews the head; this machine\'s login is never waited for', async () => {
+  const req = { ...base, required: [] as string[], checks: [], now: 60_000 }
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [] })).toMatchObject({ isDone: false, missing: ['alice'] })
+  // A review of an older head does not answer the request.
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [fb('alice', 'a')] }).isDone).toBe(false)
+  expect(collectionDone({ ...req, requested: ['alice'], feedback: [fb('alice', 'b')] })).toMatchObject({ isDone: true, isComplete: true })
+  // A GitHub App's review answers the request made to its name (F3).
+  expect(collectionDone({ ...req, requested: ['copilot'], feedback: [fb('copilot-pull-request-reviewer[bot]', 'b')] }).isDone).toBe(true)
+  expect(readRequested(JSON.stringify({ users: [{ login: 'alice' }, { login: 'me' }], teams: [{ slug: 'core' }] }), 'me')).toEqual(['alice'])
+  expect(readRequested('{}', 'me')).toEqual([])
+  expect(readRequested('<html>proxy error</html>', 'me')).toEqual([])
+})
+
+test('R89: a roster reviewer the gate asked again answers its request by covering the head, as the roster counts it (#24: never a wait on the cap)', async () => {
+  const roster = { reviewers: ['alice'], checks: [], requestReview: ['alice'], trusted: [] }
+  const req = { ...base, roster, required: [] as string[], checks: [], requested: ['alice'], now: 60_000 }
+  // A comment with no commit, placed on the head by the roster's rules (a reply to a re-request, or a counted guess), covers it.
+  const reply = { id: 'comment:31', kind: 'comment' as const, reviewer: 'alice', body: 'done', head: 'b', at: 10, isFinding: false }
+  expect(collectionDone({ ...req, feedback: [reply] })).toMatchObject({ isDone: true, isComplete: true, covered: ['alice'] })
+  // A comment on an older head does not.
+  expect(collectionDone({ ...req, feedback: [{ ...reply, head: 'a' }] })).toMatchObject({ isDone: false, missing: ['alice'] })
 })
