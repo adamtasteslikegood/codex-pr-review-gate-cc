@@ -71,3 +71,6 @@ Task 7: review Spec ✅ (⚠️ §3.5 severity gap) Quality Changes needed: (I1)
 Ruling (A9, spec §3.5/§3.7 amended): a link raises the original's severity too (higher of the two; lowered only via R85 Codex lowering; refused agent link leaves it raised); triage skips isLinkOwed candidates (new item stands alone) — fail closed — cost if wrong: extra holds/extra findings, never a dropped hold
 Task 7: fix round 1 sent (I1, I2, Minor #3); Minors #4, #5 deferred to final review
 Task 7: fix round 1 b641e4a + report 1c3cee2, 558/558 (I1 no match via owed link; I2 link raises severity, tag kept if dup tagged; Minor #3) → scoped re-review on opus
+Task 7: re-review All addressed. New Minor (folded into Task 6b dispatch): the severity-raise event copies original.status, so on a rebutted original it reads as a new gate 'rebutted' entry → isAcceptedRebuttal false (fail-closed), rebuttedAt moves forward (R33: an earlier reviewer reply no longer answers it — hold-drop vector), isAcknowledged lost. Spec note for Task 16: a raise from a guessed dup onto a tagged/Codex original has no Codex lowering path (fix/rebuttal/waiver release it; fail-closed).
+Task 7: complete (commits fd2ae67..1c3cee2, review clean)
+Task 6b: A8 charging (push fixing a finding raised in the round) + Task 7 raise-event minor; dispatched opus
