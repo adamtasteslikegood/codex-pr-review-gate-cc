@@ -84,3 +84,6 @@ Note: A8 does not verify a push happened ("fixed" answer + Codex holds still cha
 Task 6b: fix round 1 3bbdaa0 + report c77b336, 564/564 (raiseOf labels; A8 any fix in round; R90 flow test on discretionary) → scoped re-review on sonnet
 Task 6b: re-review All addressed, no new breakage ("not on this run" fallback unreachable; label names only the raise if a file change lands after an un-ruled raise — wording only, deferred).
 Task 6b: complete (commits 8c71e69..c77b336, review clean)
+Ruling: A4's isSettling carries its set time; a flag older than the agent step timeout is stale, cleared with a log line, and the poll proceeds (cap still ends collection) — a crash mid-afterTriage must not freeze collection — cost if wrong: a very slow afterTriage could race one poll
+Ruling: a mid-collection turn's step timeout returns to collecting or holds; never phase 'triage' with collect set and nothing in flight
+Task 8: dispatched (BASE d6dacd9, opus) with rulings above, polls during a turn still persist headArrival
