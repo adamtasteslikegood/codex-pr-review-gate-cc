@@ -35,3 +35,9 @@ Task 1: minor (deferred): TAG misses "P2 —" (em dash), "Severity: P1", "Priori
 Task 1: minor (deferred): R94 test loop has no per-body label; no P0 / lowercase / full Codex badge-body case
 Task 1: minor (deferred): \bP([0-3])\b duplicated across TAG and mention paths; case differs
 Task 1: complete (commits f9f772c..3a02a2b, review clean)
+Task 2: implemented 0d2588c (BASE 0a320ae), 506/506
+Task 2: review Approved (minors: history copy on no-op answer; no mixed ack+rebuttal recheck test; async w/o await). Scope ⚠️: pane/rejection text still say "rebuttal" for acks.
+Ruling: spec §7.2 "texts say acknowledgement" covers the pane and agent-facing rejection text — fix round 1 on Task 2; Codex verify prompt left as is — cost if wrong: a few strings.
+Ruling: PR #25 Codex review (7 findings) folded into the plan as amendments A1-A7 (docs a47400f): Task 4 4a (A5 headArrival, replaces commit/check times), Task 7 5a (A1-A3), Task 8 3a (A4 isSettling), Task 12 9a (A7 label verify), Task 15 6a (A6 generation guard + A7 refile). Task 4 now opus (prose). Merge docs/wave2b into build branch before Task 3's brief.
+Task 2: fix round 1 4967be1 (pane + rejection text say acknowledgement), re-reviewed by controller (small diff): clean. Minor deferred: rejection wording untested.
+Task 2: complete (commits 0a320ae..4967be1, review clean)
