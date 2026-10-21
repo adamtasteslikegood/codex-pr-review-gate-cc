@@ -5234,3 +5234,32 @@ test('R88: a failed re-request is logged and the turn goes on', async ($, on) =>
   expect((await runOf(w)).status).toBe('running')
   expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
 })
+
+test('R88: a first post round\'s turn that pushes re-requests the roster reviewers', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(w.gh.requests).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=claude[bot]'])
+})
+
+test('R88: a reset after the push is recorded but before the request sends no request', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  let isReset = false
+  // The gate reads the roster just before it asks: a reset lands then.
+  w.git.onRoster = () => {
+    if (isReset) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  expect(w.gh.requests).toEqual([])
+})

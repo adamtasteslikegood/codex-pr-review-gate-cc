@@ -2219,17 +2219,22 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
       findings.map(f => (run.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f))
     await updateRecord($, run.root, run.branch, one => ({ ...one, findings: exempt(one.findings) }))
     await patch($, run.id, one => ({ ...one, findings: exempt(one.findings) }))
-    // The turn pushed (R88): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
-    // A failed request is no reason to stop (askAgain swallows it).
-    if (rec.pr !== undefined && rec.slug !== undefined) {
-      const roster = await rosterOf($, run.root, run.base)
-      for (const who of roster?.requestReview ?? []) await askAgain($, rec, who)
-    }
   }
   const ended = await getRun($)
   // After `closeCollect` no settling flag guards the tail (no poll runs for the round): the run, its round and the record's generation do.
   if (ended === null || ended.id !== run.id || ended.status !== 'running' || ended.round !== run.round) return
   if (((await loadRecord($, run.root, run.branch))?.generation ?? 0) !== generation) return
+  // The turn pushed (R88): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
+  // Only a run that still owns the turn asks; a failed request is no reason to stop (askAgain logs it and goes on).
+  if (endHead !== run.roundStartHead && rec.pr !== undefined && rec.slug !== undefined) {
+    const roster = await rosterOf($, run.root, run.base)
+    for (const who of roster?.requestReview ?? []) {
+      const live = await getRun($)
+      if (live === null || live.id !== run.id || live.status !== 'running' || live.round !== run.round) return
+      if (((await loadRecord($, run.root, run.branch))?.generation ?? 0) !== generation) return
+      await askAgain($, rec, who)
+    }
+  }
   // Codex checks the fixes and rebuttals on the head the round ends on (R72): a reported fix is about that head, and syncToHead
   // brings a clean checkout to it. No round is spent, and no full Codex review is needed only to verify a fix.
   const rebuttals = rebuttalsOwed(ended)

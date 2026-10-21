@@ -67,6 +67,8 @@ export type World = {
     unpushed: string
     /** Called on each `git log --not --remotes=origin`, before it answers: a test acts while a step lists the unpushed commits. */
     onUnpushed?: () => void | Promise<void>
+    /** Called on each read of a base's roster file, before it answers: a test acts while the gate reads the roster. */
+    onRoster?: () => void | Promise<void>
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -401,6 +403,7 @@ export function world(on: On): World {
     if (/^show origin\/\S+:\.github\/pr-gate\.json$/.test(args)) return out(w.git.shadow, w.git.shadow === '' ? 128 : 0)
     const onBase = args.match(/^show refs\/remotes\/origin\/(\S+):\.github\/pr-gate\.json$/)?.[1]
     if (onBase !== undefined) {
+      await w.git.onRoster?.()
       const file = Object.hasOwn(w.git.byBase, onBase) ? (w.git.byBase[onBase] ?? '') : w.git.rosterOn === undefined || w.git.rosterOn === onBase ? w.git.roster : ''
       return out(file, file === '' ? 128 : 0)
     }
