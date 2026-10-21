@@ -3240,3 +3240,74 @@ git commit -m "pr-lifecycle 1.5.0: the agent merges when nothing holds the merge
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
+
+---
+
+### Task 14: Flaky flow tests: find the cause first (spec §7.3)
+
+**Why:** on PR #20 some flow tests failed at the kit's 5000 ms test limit when the machine was loaded (load average 5-6), and passed when they were run again. The suite has no real wait: `world.ts` fakes the clock and every process, and nothing in `pr-lifecycle/hooks/` or `pr-lifecycle/tests/` calls `setTimeout`. So the cost is the engine's own work under load, or one of the kit's wall-clock bounds. The kit fails a test that "throws, rejects or outlasts its time (5000 ms, or `timeoutMs`)". It also skips a hook that outlasts its own short wall-clock bound (1.5 s for `session.end`), and the failure lists each skipped hook and why. This task finds which of these fails before it changes anything. It raises the limit only for tests whose cost is the machine's load, and says so beside each one.
+
+**Files:**
+- Modify: `pr-lifecycle/tests/flow.test.ts` (and any other test file the run names)
+- Modify, only if the cause is in the code: the hook it names
+- Create: `docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md` (the findings)
+
+**Interfaces:**
+- Consumes: the whole suite after Tasks 1-13.
+- Produces: nothing other tasks use.
+- Rulings for the plan:
+  - A test whose failure under load lists a skipped hook does not get a higher limit. That is a hook doing too much in one call, so fix the hook, or record it in the findings for the person with the hook's name.
+  - A test that only outlasts 5000 ms under load gets `{ timeoutMs: 15_000 }` and the comment `// Machine load: <N> engine steps, no real wait (spec §7.3).` The limit is not raised for the whole suite.
+
+- [ ] **Step 1: Reproduce under load**
+
+From the repo root, load all 8 cores and run the suite three times, keeping each output:
+
+```bash
+mkdir -p .superpowers/flaky
+for i in 1 2 3 4 5 6 7 8; do (timeout 900 sh -c 'while :; do :; done' &) ; done
+for n in 1 2 3; do claude plugin test pr-lifecycle > .superpowers/flaky/run-$n.txt 2>&1; echo "run $n exit $?"; done
+pkill -f "while :; do :; done"
+uptime
+```
+
+Expected: the load average is 5 or more, and some runs fail. If none fail, run two suites at once (`claude plugin test pr-lifecycle & claude plugin test pr-lifecycle; wait`), which is how two sessions on one machine load it.
+
+- [ ] **Step 2: Classify each failure**
+
+For each failing test in `.superpowers/flaky/run-*.txt`, write one row in `docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md`. Each row has the test name, the runs it failed in, the kit's reason, any skipped hook with its event and reason, and the test's count of `w.clock.advance`, `done(…)` and `say(…)` calls. Then give the cause in one line:
+
+- **load:** it outlasted 5000 ms, no hook was skipped, and it passes alone in under 5000 ms. Time it with `time claude plugin test pr-lifecycle -- tests/flow.test.ts` while the machine is idle; the per-test times the run prints, if any, go in the row.
+- **hook:** the failure lists a skipped hook. Name the hook, and find which call in it waits (a loop over gh calls, a store write per finding).
+- **order:** it fails only after another test, without load. Run it alone and in its file to tell.
+
+- [ ] **Step 3: Fix by cause**
+
+- **load:** give the test `{ timeoutMs: 15_000 }` (the kit's `test(name, options, body)` form) with the comment from the rulings, naming its step count. Example:
+
+```ts
+// Machine load: 14 engine steps, no real wait (spec §7.3).
+test('R88 (Review Focus 3): two pushes between polls end one round, on the newest head', { timeoutMs: 15_000 }, async ($, on) => {
+```
+
+- **hook:** fix the hook so that one call does bounded work, for example by moving a loop of gh calls out of the hook into the ticker the way `fileIssues` runs in `advance`. Add a test that fails at the kit's default limit before the fix and passes after it. If the fix would change the gate's behaviour, record it in the findings file as a follow-up for the person, and do not change the code in this task.
+- **order:** find the state the earlier test leaves behind (a module-level variable, a store the world does not reset), and reset it in `world()`.
+
+- [ ] **Step 4: Check under load again**
+
+Run Step 1 again. Expected: three passing runs at a load average of 5 or more. Add the result to the findings file.
+
+- [ ] **Step 5: Run the checks**
+
+Run `npm run check` from the repo root. Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add pr-lifecycle/tests docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md
+git add pr-lifecycle/hooks   # only if Step 3 changed a hook
+git commit -m "pr-lifecycle 1.5.0: flaky flow tests, cause found and fixed or bounded (spec §7.3)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
