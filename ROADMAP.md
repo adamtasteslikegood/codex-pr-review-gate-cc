@@ -28,6 +28,21 @@ later when it is implemented.
 | C | The light lane gets **3** rounds (it was hard-coded to 1). |
 | D | A new **interactive** session takes over a record automatically once the owning session has been quiet for **2 minutes**. Headless (`-p`/SDK) sessions never take over. |
 
+## Decisions made (Adam, 2026-10-20)
+
+For wave 2. Recorded as rulings R79 or later when implemented.
+
+| | Decision |
+| --- | --- |
+| E | **Every manual action tells the agent.** `waive pre\|post\|<findingId>`, `allow`, `stop`, `reset`, `resume` and the pane's buttons each end with one short message to the agent: what the person did, what still holds, and its next step. |
+| F | **Early triage, push as it goes.** Findings already in go to the agent while slow reviewers finish, and it pushes fixes right away. |
+| G | **Each push is its own round** (own head, evidence and log line), but a round is **charged against the allowance unless it comes back clean**. It is charged when it raises a new blocking finding, and also when Codex rejects a fix or a rebuttal: a rejected fix is a used round. Only a round that verifies its fixes and finds nothing new is free, so a fix loop that keeps failing still runs out of rounds and ends in the usual exhausted hold, which tells the person why the PR isn't ready. |
+| H | **Reviewers are re-requested once per burst**, on the head the agent's triage turn ends on. The gate's Codex pass covers the heads in between. |
+| I | **A P3 answered "no change needed, follow-up recorded"** (with where) settles without a waiver. P1/P2 deferrals and security findings still need one. Holds show the triaged severity. |
+| J | **Approvals settle on their own** only on positive no-action evidence, never on missing tags: an APPROVED review, or a COMMENTED one whose body says there is nothing to act on ("no actionable findings", "no blocking findings", "LGTM") and asks for no change. Inline comments are triaged on their own, even on an APPROVED review. Anything else, including an untagged comment, goes to the agent, which replies in its thread. Its new "no change needed" answer is checked by Codex as a rebuttal is (every unresolved thread gets a reply and/or a fix, as Adam's PR guidance and tool-use hooks required before the gate existed). (Narrowed by review G2-2 on PR #19: an untagged actionable comment would otherwise be lost.) |
+| K | **`waive post` covers rostered checks GitHub doesn't require**, pending, failing or cancelled, and names each one it sets aside. Required checks still have to pass. |
+| L | **Wave 2 ships as two PRs:** 2a (1.4.0, the small fixes) first, then 2b (1.5.0, the round changes). |
+
 ## Wave 1: no errors, no babysitting the basics (pr-lifecycle 1.3.0)
 
 **Status:** built on `wave1/pr-lifecycle-1.3.0` (rulings R71-R78). Not built: a
@@ -111,34 +126,74 @@ routine steps.
 ## Wave 2: the post-PR loop runs itself
 
 Serves goal 2. Removes the waits and the one-command-per-blocker routine.
+Two PRs (decision L). Specs:
+`docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2a-design.md` and
+`docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2b-design.md`.
 
-1. **Triage while slow reviewers finish (#14, part 2; findings 5, 10).**
-   - Send the findings already in to the agent during collection.
-   - Either batch its pushes until collection ends, or take them into the
-     round without stopping. Wave 1's head-move handling makes the second
-     option possible.
-2. **Settle approvals on their own (findings 9, 21).** A review with nothing
-   actionable ("no blocking findings") needs no agent round-trip and no answer.
-3. **Make deferral cheaper (finding 11).** A low-severity "no change needed,
-   follow-up recorded" doesn't cost the person a waiver. Severity shown in a
-   hold matches the triaged severity.
-4. **Waivers that work end to end (findings 22, 28, 29).**
-   - `waive post` covers a rostered check that GitHub doesn't require.
+### Wave 2a: the person's actions and holds (pr-lifecycle 1.4.0)
+
+1. **Every manual action tells the agent (decision E; finding 22).** Today
+   `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
+   stop button send the agent nothing, and `waive pre` sends something only
+   when `openPr` is on, so the person has to follow up by hand. Each action
+   ends with one message through `deliver()`, sent only while this session
+   owns the record (R74), and not when a round prompt the action starts
+   already says it.
+2. **Waivers that work end to end (decision K; findings 28, 29).**
+   - `waive post` covers rostered checks GitHub doesn't require.
    - No contradictory hold is sent right after a waiver.
    - A waiver that clears the last hold tells the agent the PR is ready to
-     merge.
-5. **One hold lists every blocker (finding 27).** Everything between this head
-   and the merge goes in one message, not one blocker per command.
-6. **Tune the wait times.** Revisit `waitCapMinutes` (20) and `quietMinutes` (3)
-   once `trusted` has changed what the cap means.
+     merge, and names what still holds otherwise (required CI).
+3. **One hold lists every blocker (finding 27).** Everything between this head
+   and the merge goes in one message, built in one place, for the guard's
+   refusal and the agent's prompts alike.
+4. **Settle approvals on their own (decision J; findings 9, 21).** Includes
+   the finding 21 bug: an answered approval stayed open and dropped out of the
+   carried list. Required regression tests (review G2-2 on PR #19):
+   - an untagged actionable COMMENTED summary goes to triage, not settled;
+   - a clean approval settles with no prompt;
+   - approval text mixed with a requested fix goes to triage.
+5. **Make deferral cheaper (decision I; finding 11).** Holds show the triaged
+   severity, never the reviewer's hint.
+
+### Wave 2b: rounds that keep up with the agent (pr-lifecycle 1.5.0)
+
+1. **Triage while slow reviewers finish (decision F; #14 part 2; findings 5, 10).**
+   Findings already in go to the agent during collection, and it pushes as it
+   goes.
+2. **One round per push; only a clean round is free (decision G).** A new
+   blocking finding or a rejected fix or rebuttal charges the round.
+   Amends what counts in `usedRounds`.
+3. **One re-request per burst (decision H).**
+4. **Collection ends on GitHub's signals, not a timer (replaces "tune the
+   wait times").** The 3-minute quiet window only applies with no roster: it
+   waits out unknown reviewers and checks that haven't registered yet. 2b
+   reads the head's check suites, the ruleset's required checks and pending
+   review requests instead, and keeps a short quiet window only when none of
+   those exist. Which signals are reliable is probed first (the Codex
+   connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
+
+### Not yet placed: one finding per problem (Adam, 2026-10-20)
+
+The gate should merge findings from separate rounds and reviewers that name
+the same problem. Today `triage()` only labels a duplicate for the prompt, and
+the agent's `duplicateOf` answer is read but unused, so each copy is its own
+blocker (on PR #19, review summary G2-1 was carried next to its inline G2-2).
+Needs its own design: what counts as the same finding, whether a duplicate
+takes on its original's status, and how a summary links to its inline
+findings. See the wave 2a spec's note.
 
 ## Wave 3: visibility, scoping and fewer person-only steps
 
 Serves goal 2. Makes the gate legible and reachable from anywhere.
 
 1. **Pane actions (finding 8).**
-   - Links for "waive pre" and "merge PR now". "Merge PR now" replaces
-     "[stop the gate]" after a waiver or a ready verdict.
+   - Links next to "[stop the gate]", in the order the lifecycle reaches
+     them: "[waive pre]" before the PR opens, "[waive post]" after, then
+     "[merge PR now]". "Merge PR now" replaces "[stop the gate]" after a
+     waiver or a ready verdict.
+   - Each link runs the same code as its `/pr-gate` command, so it sends the
+     agent the same message (wave 2 item 4). A waiver link asks for a reason.
    - "Stop" stops cleanly, without an error.
 2. **Records by PR, not only by folder (findings 12-15).**
    - `/pr-gate status` lists every live record.
