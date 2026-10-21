@@ -7,7 +7,9 @@ export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
 /**
  * `answer`: an acknowledgement, stored as a rebuttal (R94). `severity`: the severity an answer set, with `from` the one before it (R85).
- * `lowering`: Codex's ruling on the agent's lowering of the severity before it (Adam, 2026-10-20).
+ * `lowering`: Codex's ruling on the agent's lowering of the severity before it, on a record from 1.4.0 (R85, replaced by `deferral`).
+ * `deferral`: Codex's ruling on the agent's deferral (R92 M2): agreed, it cannot reasonably be fixed in this PR; refused, it can, and
+ * the finding is open again.
  */
 export type FindingEvent = {
   round: number
@@ -17,6 +19,7 @@ export type FindingEvent = {
   severity?: Severity
   from?: Severity
   lowering?: 'agreed' | 'refused'
+  deferral?: 'agreed' | 'refused'
   /** The answer as the agent gave it, when the status alone does not say: an acknowledgement is stored as a rebuttal (R82, R94). */
   answer?: 'acknowledged'
   /** Codex's refusal of the agent's link (R90): the original it found a different problem. A link to it again is no answer. */
@@ -336,7 +339,7 @@ export type CheckState = { name: string; bucket: string; isRequired: boolean }
 export type Blocker = {
   kind:
     | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
-    | 'lowering-unchecked' | 'label-owed' | 'label-failed' | 'link-unchecked'
+    | 'deferral-unchecked' | 'label-owed' | 'label-failed' | 'link-unchecked'
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string

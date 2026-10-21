@@ -64,7 +64,7 @@ import {
   isChargedRound,
   isDisputed,
   isLinkOwed,
-  isLoweringOwed,
+  isDeferralOwed,
   isReverifyOwed,
   issueOf,
   lastCoveredHead,
@@ -82,7 +82,7 @@ import {
   rejections,
   relocate,
   roundOf,
-  ruleLowering,
+  ruleDeferral,
   securityHolds,
   standingOf,
   triage,
@@ -2284,18 +2284,24 @@ async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]
   await patch($, run.id, one => ({ ...one, pending: [{ role: 'verify', step: stepOf(one, 'verify'), agentId }], activity: 'waiting on the rebuttal check…' }))
 }
 
-/** The check step's label: rebuttals, re-verifications (R58), or both. */
-const checkLabel = (round: number, checked: readonly Pick<Finding, 'status' | 'needsRecheck'>[]): string => {
-  const fixes = checked.filter(one => isReverifyOwed(one) || one.status === 'reported-fixed').length
-  const what = fixes === 0 ? 'checks the rebuttals' : fixes === checked.length ? 'verifies the fixes' : 'checks the rebuttals and fixes'
-  return `Round ${round} · codex ${what}`
+/** The check step's label: rebuttals (links among them), fixes (R58, R72), deferrals (R92 M2), or a mix. */
+const checkLabel = (round: number, checked: readonly Finding[]): string => {
+  const fixes = checked.filter(one => !isLinkOwed(one) && (isReverifyOwed(one) || one.status === 'reported-fixed')).length
+  const deferrals = checked.filter(one => !isLinkOwed(one) && isDeferralOwed(one)).length
+  const kinds = [
+    ...(checked.length - fixes - deferrals > 0 ? ['rebuttals'] : []),
+    ...(fixes > 0 ? ['fixes'] : []),
+    ...(deferrals > 0 ? ['deferrals'] : []),
+  ]
+  return `Round ${round} · codex ${fixes === checked.length ? 'verifies the fixes' : `checks the ${kinds.join(' and ')}`}`
 }
 
 /** Codex could not check a rebuttal or re-verify a fix: the merge is held, never ready on the agent's word alone (R36, R58). */
 async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   const ids = (run.rechecks ?? []).join(', ') || 'the rebutted findings'
-  const isReverify = run.findings.some(one => (run.rechecks ?? []).includes(one.id) && isReverifyOwed(one))
-  const what = isReverify ? `check ${ids} again` : `check the rebuttal of ${ids} again`
+  // Not only rebuttals: a re-verification (R58) or a deferral (R92 M2) is said plainly.
+  const isRebuttalOnly = !run.findings.some(one => (run.rechecks ?? []).includes(one.id) && (isReverifyOwed(one) || isDeferralOwed(one)))
+  const what = isRebuttalOnly ? `check the rebuttal of ${ids} again` : `check ${ids} again`
   const nextStep = `run /pr-gate resume to have Codex ${what}, or fix ${ids} and push`
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
@@ -2382,8 +2388,8 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
           ? markVerified(f, one.round, 'codex', now, 'Codex: the fix holds')
           : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix does not hold')
       }
-      // The agent's lowering of a deferral's severity (R85): agreed, it may settle; refused, it is the person's, with Codex's reason.
-      if (isLoweringOwed(f)) return ruleLowering(f, verdict.holds, one.round, now, verdict.holds ? undefined : (verdict.note ?? 'no reason given'))
+      // A deferral (R92 M2): agreed, it waits; refused, it is open again with Codex's reason, back to the agent, and charges the round.
+      if (isDeferralOwed(f)) return ruleDeferral(f, verdict.holds, one.round, now, verdict.note)
       // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
       return verdict.holds ? acceptRebuttal(f, one.round, now) : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex did not accept the rebuttal')
     }),

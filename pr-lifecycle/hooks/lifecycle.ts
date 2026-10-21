@@ -279,7 +279,8 @@ export function refuseLink(f: Finding, round: number, at: number, note: string):
  * A link never lowers anything (R90): the original's peak becomes the higher of the two, so its issue carries it (R85), and it is
  * security when either one is (PR #25 review A1), even when a peak is unknown, so a link never lets a security problem past the person.
  * Its severity rises the same way (A9), since every hold reads it, recorded as the gate's change with the one before it (R85); only
- * R85's Codex-checked lowering takes it down again. A reviewer's tag on the link keeps it from being re-guessed lower (R84).
+ * the agent's lowering, which Codex checks with its deferral (R92 M2), takes it down again. A reviewer's tag on the link keeps it
+ * from being re-guessed lower (R84).
  */
 export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   const security = original.isSecurity === true || linked.isSecurity === true ? { isSecurity: true } : {}
@@ -602,9 +603,8 @@ export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !i
 
 /**
  * What the gate's own Codex check rules on (Adam, decision A; R36, R58, R72): rebuttals Codex has not accepted, short of a dispute
- * (R40); verified fixes whose file changed since (R58); fixes only reported, at any severity, advisories included; a P3 deferral
- * whose severity the agent lowered (R85, Adam 2026-10-20); and the agent's links (R90). Any other deferral is the person's to
- * release (R45), never Codex's.
+ * (R40); verified fixes whose file changed since (R58); fixes only reported, at any severity, advisories included; the agent's links
+ * (R90); and every deferral, at any severity, that Codex has not ruled on (R92 M2, Adam 2026-10-21; it replaces R85's lowering check).
  */
 export const checksOwed = (findings: readonly Finding[]): Finding[] =>
   findings.filter(
@@ -612,7 +612,7 @@ export const checksOwed = (findings: readonly Finding[]): Finding[] =>
       (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) ||
       isReverifyOwed(one) ||
       one.status === 'reported-fixed' ||
-      isLoweringOwed(one) ||
+      isDeferralOwed(one) ||
       isLinkOwed(one),
   )
 
@@ -657,40 +657,47 @@ export function loweringOf(f: Pick<Finding, 'history' | 'severity' | 'peakSeveri
   return found
 }
 
-/** Codex's ruling on the last lowering, if it gave one after it. */
-const loweringRuling = (f: Finding): Finding['history'][number] | undefined => {
-  const low = loweringOf(f)
-  return low === undefined ? undefined : f.history.slice(low.at + 1).filter(one => one.lowering !== undefined).at(-1)
-}
-
 /** A P3 deferred to a GitHub issue, not security: what may settle without the person (R85). */
 const isIssueDeferral = (f: Finding): boolean => f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp)
 
-
-/** A deferral that would settle but for the agent's lowering of its severity: Codex rules on the lowering first (Adam, 2026-10-20). */
-export const isLoweringOwed = (f: Finding): boolean =>
-  isIssueDeferral(f) && !isPeakUnknown(f) && loweringOf(f) !== undefined && loweringRuling(f) === undefined
-
-/** Codex disagreed with the last lowering, in words; undefined when it did not. */
-export function loweringRefusal(f: Finding): string | undefined {
-  const low = loweringOf(f)
-  const ruling = loweringRuling(f)
-  return low === undefined || ruling?.lowering !== 'refused' ? undefined : `Codex disagrees with lowering ${f.id} from ${low.from} to ${low.to}: ${ruling.note ?? 'no reason given'}`
-}
-
-/** Codex's ruling on a lowering, as the history entry after it: agreed settles the deferral, refused leaves it to the person. */
-export const ruleLowering = (f: Finding, holds: boolean, round: number, at: number, note?: string): Finding => {
-  const low = loweringOf(f)
-  const said = note ?? (holds ? `Codex agrees with lowering ${low?.from ?? '?'} to ${low?.to ?? f.severity}` : 'no reason given')
-  return { ...f, history: [...f.history, { round, status: f.status, note: said, lowering: holds ? 'agreed' : 'refused', by: 'codex', at }] }
+/**
+ * Codex's ruling on the agent's last deferral (R92 M2), if it gave one since. A 1.4.0 lowering ruling is not one. Read from the
+ * answers (`answersOf`), so a link's raise, which copies the status, is never taken for a new deferral.
+ */
+const deferralRuling = (f: Pick<Finding, 'history'>): FindingEvent | undefined => {
+  const answers = answersOf(f)
+  const last = answers.reduce((found, one, i) => (one.status === 'deferred' && one.by !== 'codex' ? i : found), -1)
+  return answers.slice(last + 1).filter(one => one.by === 'codex' && one.deferral !== undefined).at(-1)
 }
 
 /**
- * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-20): a P3, not security, deferred to a
- * GitHub issue, whose severity the agent either never lowered or lowered with Codex agreeing since. A guessed P3 settles as a tagged one.
+ * A deferral Codex has not ruled on (R92 M2, Adam 2026-10-21): at any severity, security included. The round's free check rules on
+ * it, as on a rebuttal; nothing settles by an issue, or waits for the person, before it.
  */
-export const wouldSettle = (f: Finding): boolean =>
-  isIssueDeferral(f) && !isPeakUnknown(f) && (loweringOf(f) === undefined || loweringRuling(f)?.lowering === 'agreed')
+export const isDeferralOwed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f) === undefined
+
+/** A deferral Codex agreed cannot reasonably be fixed in this PR (R92 M2): it waits. */
+export const isDeferralAgreed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f)?.deferral === 'agreed'
+
+/**
+ * Codex's ruling on a deferral (R92 M2): agreed, it stays deferred and waits; refused, it is open again with Codex's reason and goes
+ * back to the agent. The refusal is a Codex `open` right after a deferral, so `isChargedRound` charges the round it is in (R88).
+ */
+export function ruleDeferral(f: Finding, holds: boolean, round: number, at: number, note?: string): Finding {
+  if (holds) {
+    const said = note ?? 'Codex: it cannot reasonably be fixed in this PR'
+    return { ...f, history: [...f.history, { round, status: 'deferred', note: said, deferral: 'agreed', by: 'codex', at }] }
+  }
+  const held = markHeld(f, round, 'codex', at, note ?? 'Codex: it can be fixed in this PR')
+  const last = held.history.at(-1)
+  return last === undefined ? held : { ...held, history: [...held.history.slice(0, -1), { ...last, deferral: 'refused' }] }
+}
+
+/**
+ * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-21): a P3, not security, deferred to a
+ * GitHub issue, that Codex agreed cannot reasonably be fixed in this PR (R92 M2). A guessed P3 settles as a tagged one.
+ */
+export const wouldSettle = (f: Finding): boolean => isIssueDeferral(f) && !isPeakUnknown(f) && isDeferralAgreed(f)
 
 /**
  * A P3 deferral settled without the person's waiver (R85, decision I): it would settle, and the gate labelled its issue with the
@@ -739,12 +746,9 @@ function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
   }
   if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
   if (f.status === 'deferred') {
-    const low = loweringOf(f)
-    if (isLoweringOwed(f) && low !== undefined) {
-      return { kind: 'lowering-unchecked', id: f.id, said: `${tag}: lowered from ${low.from} to ${low.to}, Codex has not checked the lowering`, owner: 'codex', release: "the gate's Codex check rules on it" }
+    if (isDeferralOwed(f)) {
+      return { kind: 'deferral-unchecked', id: f.id, said: `${tag}: deferred, Codex has not checked the deferral`, owner: 'codex', release: "the gate's Codex check rules on it" }
     }
-    const refusal = loweringRefusal(f)
-    if (refusal !== undefined && isIssueDeferral(f)) return { kind: 'deferred', id: f.id, said: refusal, owner: 'person', release: waive }
     if (wouldSettle(f)) {
       const issue = `issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'}`
       return f.followUpLabelError === undefined
@@ -970,14 +974,14 @@ function decidePost(rec: LifecycleRecord): Next {
   const owed = holding.filter(one => one.status === 'reported-fixed')
   // A dispute is the person's (R40); every other rebuttal Codex has not accepted is Codex's to check.
   const disputed = holding.filter(isDisputed)
-  // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58); so is the agent's
-  // lowering of a deferral's severity (R85, Adam 2026-10-20).
+  // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58); so is every deferral
+  // Codex has not ruled on (R92 M2).
   // The agent's link is Codex's to check too (R90): answered, so never an open finding the agent left.
-  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isLoweringOwed(one) || isLinkOwed(one))
+  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isDeferralOwed(one) || isLinkOwed(one))
   const open = holding.filter(one => one.status === 'open' && !isLinkOwed(one))
   // A deferral held only by its issue's label is the gate's to retry, not the person's to decide (R85).
   const unlabelled = holding.filter(wouldSettle)
-  const deferred = holding.filter(one => one.status === 'deferred' && !isLoweringOwed(one) && !wouldSettle(one) && !isLinkOwed(one))
+  const deferred = holding.filter(one => one.status === 'deferred' && !isDeferralOwed(one) && !wouldSettle(one) && !isLinkOwed(one))
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -989,20 +993,27 @@ function decidePost(rec: LifecycleRecord): Next {
   // On an unchanged head, what the agent can answer, and Codex's free rebuttal check, come before the final-head check's verdict (R43).
   // The pre-PR backstop (R32), at any severity (R39): findings left open on an unchanged head; another round would say the same.
   if (!isChanged && open.length > 0) {
+    // A deferral Codex says can be fixed in this PR (R92 M2): the agent's to fix, or to rebut with evidence. Said as such, even after
+    // an earlier rebuttal Codex rejected: Codex's last word is on the deferral.
+    const undeferred = open.filter(one => {
+      const last = answersOf(one).at(-1)
+      return last?.by === 'codex' && last.deferral === 'refused'
+    })
     // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding; it may be fixed or deferred, not rebutted again (R40).
-    const rejected = open.filter(one => rejections(one) > 0)
+    const rejected = open.filter(one => rejections(one) > 0 && !undeferred.includes(one))
     // A fix Codex re-verified after its file changed and found no longer holds (R58): the agent's to fix or rebut again.
     const refuted = open.filter(one => {
       const answers = answersOf(one)
       return answers.at(-1)?.by === 'codex' && answers.at(-2)?.status === 'verified-fixed'
     })
-    const ignored = open.filter(one => !rejected.includes(one) && !refuted.includes(one))
+    const ignored = open.filter(one => !rejected.includes(one) && !refuted.includes(one) && !undeferred.includes(one))
     const isFeedbackOnly =
-      ignored.length > 0 && rejected.length + refuted.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))
+      ignored.length > 0 && rejected.length + refuted.length + undeferred.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))
     const codexSaid = (one: Finding): string => one.history.filter(each => each.by === 'codex').at(-1)?.note ?? 'no reason given'
     const said = [
       ...rejected.map(one => `Codex did not accept the rebuttal of ${one.id}: ${codexSaid(one)}`),
       ...refuted.map(one => `Codex re-verified ${one.id} after its file changed, and the fix no longer holds: ${codexSaid(one)}`),
+      ...undeferred.map(one => `Codex says ${one.id} can be fixed in this PR: ${codexSaid(one)}`),
       ...(ignored.length === 0
         ? []
         : isFeedbackOnly
@@ -1012,7 +1023,7 @@ function decidePost(rec: LifecycleRecord): Next {
     const steps = isFeedbackOnly
       ? [`answer ${ids(open)} in ${open.length === 1 ? 'its thread' : 'their threads'} (fix, rebut or defer)`]
       : [
-          ...(ignored.length + refuted.length === 0 ? [] : [`fix or rebut ${ids([...refuted, ...ignored])}`]),
+          ...(ignored.length + refuted.length + undeferred.length === 0 ? [] : [`fix or rebut ${ids([...refuted, ...undeferred, ...ignored])}`]),
           ...(rejected.length === 0 ? [] : [`fix or defer ${ids(rejected)}`]),
         ]
     return { kind: 'blocked', why: said.join('; '), nextStep: `${steps.join('; ')}, then /pr-gate resume`, answer: open.map(one => one.id) }
@@ -1020,8 +1031,8 @@ function decidePost(rec: LifecycleRecord): Next {
   // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
   const recheck = (): Next => {
     const links = unchecked.filter(isLinkOwed)
-    const lowered = unchecked.filter(one => isLoweringOwed(one) && !isLinkOwed(one))
-    const answered = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one) && !isLinkOwed(one))
+    const deferrals = unchecked.filter(one => isDeferralOwed(one) && !isLinkOwed(one))
+    const answered = unchecked.filter(one => !isReverifyOwed(one) && !isDeferralOwed(one) && !isLinkOwed(one))
     const acks = answered.filter(isAcknowledged)
     const rebuttals = answered.filter(one => !isAcknowledged(one))
     const reverify = unchecked.filter(one => isReverifyOwed(one) && !isLinkOwed(one))
@@ -1029,10 +1040,10 @@ function decidePost(rec: LifecycleRecord): Next {
       ...(links.length === 0 ? [] : [`Codex has not checked the link of ${ids(links)}`]),
       ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
       ...(acks.length === 0 ? [] : [`Codex has not checked the acknowledgement of ${ids(acks)} on ${last.endHead.slice(0, 7)}`]),
-      ...(lowered.length === 0 ? [] : [`Codex has not checked the lowered severity of ${ids(lowered)}`]),
+      ...(deferrals.length === 0 ? [] : [`Codex has not checked the deferral of ${ids(deferrals)}`]),
       ...reverify.map(reverifyOwed),
     ]
-    const kinds = [rebuttals, acks, lowered, reverify, links].filter(one => one.length > 0)
+    const kinds = [rebuttals, acks, deferrals, reverify, links].filter(one => one.length > 0)
     const what =
       kinds.length !== 1
         ? 'them'
@@ -1042,8 +1053,8 @@ function decidePost(rec: LifecycleRecord): Next {
             ? 'the acknowledgement'
             : links.length > 0
               ? 'the link'
-              : lowered.length === 1
-                ? 'the lowering'
+              : deferrals.length === 1
+                ? 'the deferral'
                 : 'them'
     return {
       kind: 'blocked',
@@ -1097,10 +1108,7 @@ function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = [
   const all = [...deferred, ...disputed]
   const one = all.length === 1
   const are = (list: readonly Finding[], word: string): string[] => (list.length === 0 ? [] : [`${ids(list)} ${list.length === 1 ? 'is' : 'are'} ${word}`])
-  // A deferral Codex would not let the agent lower is said with Codex's reason (R85).
-  const refused = deferred.filter(each => loweringRefusal(each) !== undefined)
-  const plain = deferred.filter(each => !refused.includes(each))
-  const what = [...are(plain, 'deferred'), ...refused.map(each => loweringRefusal(each) ?? ''), ...disputed.map(disputeOf)].join('; ')
+  const what = [...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')
   const told = [...are(deferred, 'deferred'), ...are(disputed, 'disputed')]
   return {
     kind: 'awaiting-decision',

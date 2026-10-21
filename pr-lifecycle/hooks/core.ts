@@ -10,7 +10,7 @@ import {
   isBlocking,
   isDisputed,
   isLinkOwed,
-  isLoweringOwed,
+  isDeferralOwed,
   isReverifyOwed,
   isSettledDeferral,
   loweringOf,
@@ -639,14 +639,21 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
     const rest = rebuttals.filter(one => !isLinkOwed(one))
     const fixes = rest.filter(isReverifyOwed)
     const reported = rest.filter(one => one.status === 'reported-fixed')
-    // A deferral whose severity the agent lowered (R85, Adam 2026-10-20): Codex rules on the lowering, not on a fix.
-    const lowered = rest.filter(isLoweringOwed)
-    const argued = rest.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed' && !isLoweringOwed(one))
-    const what = argued.length + lowered.length + links.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
-    const lowerings = lowered.map(one => {
+    // Every deferral Codex has not ruled on (R92 M2): Codex rules on whether it can be fixed in this PR, not on a fix.
+    const deferrals = rest.filter(isDeferralOwed)
+    const argued = rest.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed' && !isDeferralOwed(one))
+    // A link is ruled on as a rebuttal is, so a check of links alone is named as one.
+    const kinds = [
+      ...(argued.length + links.length === 0 ? [] : ['rebuttals']),
+      ...(fixes.length + reported.length === 0 ? [] : ['fixes']),
+      ...(deferrals.length === 0 ? [] : ['deferrals']),
+    ]
+    const what = kinds.join(' and ')
+    const deferred = deferrals.map(one => {
       const low = loweringOf(one)
-      const reason = low?.note ?? one.note ?? 'no reason given'
-      return `${listFindings([one])}\n    The agent lowered it from ${low?.from ?? '?'} to ${low?.to ?? one.severity} and deferred it to ${one.followUp ?? 'no issue'}. Its reason: ${reason}`
+      const lowered = low === undefined ? '' : `The agent lowered it from ${low.from} to ${low.to}. `
+      const follow = one.followUp === undefined ? '' : `Follow-up: ${one.followUp}. `
+      return `${listFindings([one])}\n    ${lowered}${follow}Its reason: ${one.note ?? 'no reason given'}`
     })
     return noted([
       `You check ${what} for pr-gate's post-PR review. Round ${run.round}.`,
@@ -665,13 +672,14 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       ...(fixes.length === 0
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
-      ...(lowered.length === 0
+      ...(deferrals.length === 0
         ? []
         : [
             '',
-            "The main agent lowered these findings' severity and deferred each to a follow-up GitHub issue. A lowered deferral settles nothing until you agree with the lowering:",
-            ...lowerings,
-            '   For each one: given the reviewer\'s comment and the code at HEAD, is P3, with a follow-up issue, right? holds is true when Codex agrees with the lowering.',
+            'The main agent deferred these findings instead of fixing them in this PR. A deferral settles nothing until you agree with it:',
+            ...deferred,
+            '   For each one: given the finding and the code at HEAD, can it reasonably be fixed in this PR, and if the agent lowered its severity, ' +
+              'is the lower one right? holds is true when it cannot reasonably be fixed in this PR and its severity stands.',
           ]),
       ...(links.length === 0
         ? []
@@ -685,8 +693,8 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
       `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: ` +
         'its preamble, its probes and its consult mode.',
-      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, or the fix), and ask Codex to read the code at HEAD ' +
-        'and rule on each one: does the rebuttal, or the fix, still hold?',
+      '   Put every finding above to Codex in one consult prompt, with its answer (the rebuttal, the fix or the deferral), and ask Codex to read the code at HEAD ' +
+        'and rule on each one: does the rebuttal, the fix or the deferral hold?',
       ...codexRules(run, 'give no verdicts, error is model'),
       "2. Report Codex's ruling, not your own: one verdict per finding id, each on its own. holds is true when Codex says it holds, " +
         'false when it does not, with a note saying why it fails. Leave out no id.',
@@ -791,8 +799,9 @@ export function triagePrompt(
     '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason, or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. ' +
       'An item that names the same problem as an earlier finding gets one pointer reply in its thread ("Same as G2-1: fixed in abc1234"), not a new argument, ' +
       'and the answer {"id":"G2-2","duplicateOf":"G2-1","replyId":"…"}. To say it is a different problem, answer it on its own instead.',
-    '   A deferral waits for the person, except a P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it): that needs no waiver. ' +
-      'If you lowered its severity, Codex checks the lowering first. The gate labels the issue with the highest severity the finding had.',
+    '   Codex checks every deferral at the end of the round: if it says the finding can be fixed in this PR, the finding comes back to you open and the round is charged. ' +
+      'A P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it) needs no waiver once Codex agrees; ' +
+      'the gate labels the issue with the highest severity the finding had.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +

@@ -1133,6 +1133,8 @@ test('R37: a deferred P2 answered on resume ends awaiting the person\'s decision
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   // R39: a deferral is an answer, but only the person's waiver lets it into the merge.
   expect(rec.phase).not.toBe('ready')
@@ -1181,6 +1183,8 @@ test('R39: a deferred P3 after the PR opened is not ready, and the merge is held
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).not.toBe('ready')
   expect(rec.postStatus).toBe('awaiting-decision')
@@ -1222,6 +1226,8 @@ test('R39: a pre-PR deferred advisory carried into the PR holds the merge', asyn
   expect((await recordOf(w)).preStatus).toBe('passed')
   await $.tool.call(createPr)
   await w.clock.advance(21 * 60_000)
+  // Codex checks the carried deferral in the first post round's free check (R92 M2).
+  await done($, accept('r2-verify', w, { 'R1-1': true }))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
   expect(rec.phase).not.toBe('ready')
@@ -1383,6 +1389,8 @@ test('R45: a deferral a later Codex review calls verified stays deferred, and th
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // Someone pushes; no reviewer covers the new head, so Codex reviews it and calls G2-1 verified.
   w.git.head = 'e'.repeat(40)
@@ -1504,6 +1512,8 @@ test('a session start leaves a ready, held or awaiting record alone', async ($, 
   await say($, 'resume')
   await w.clock.advance(1000)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   const prompts = w.prompts.length
   const spawned = w.spawned.length
@@ -1519,6 +1529,8 @@ test('a session start leaves a ready, held or awaiting record alone', async ($, 
 const toAwaiting = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = 'Consider renaming this', extra: object = {}) => {
   await toTriage($, w, body)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', ...extra }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
 }
 
@@ -2276,6 +2288,8 @@ test('the pane counts a deferred P3 as holding the merge and says what the perso
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.postStatus).toBe('awaiting-decision')
   expect(mergeHolds(rec)).toHaveLength(1)
@@ -2358,6 +2372,8 @@ test('rendering the pane starts no run and writes no state', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const snapshot = (): string => JSON.stringify({ store: [...w.store.entries()], run: w.run, spawned: w.spawned.length, prompts: w.prompts, opened: w.opened })
   const before = snapshot()
   const ui = await mountPane($)
@@ -3011,6 +3027,8 @@ test('F5: the controller does not write ready from a read a finding has since ch
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // The waiver is written; on the controller's next read, a blocker lands that its own read did not see.
   const late = { ...P1, id: 'G2-9', round: 2, source: 'codex-review', reviewer: 'codex', headSeen: 'a', status: 'open', history: [] }
@@ -3425,6 +3443,8 @@ test('R85: a P3 deferred with a recorded follow-up settles without a waiver, onc
   // The reviewer's own P3.
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   const found = rec.findings.find(one => one.id === 'G2-1')
@@ -3441,6 +3461,8 @@ test('gate R7-7: a severity label the repository already has is kept as it is, a
   w.gh.labelCreateAnswer = 'exists'
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect(w.gh.labelled.some(one => one.includes('--force'))).toBe(false)
   expect(labelled(w, 9, 'P3')).toBe(true)
   expect((await recordOf(w)).phase).toBe('ready')
@@ -3456,6 +3478,8 @@ test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing f
     await say($, 'reset')
   }
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isResetting).toBe(true)
   const rec = await recordOf(w)
@@ -3478,6 +3502,8 @@ test('gate R8-2: a reset while the severity label is created prevents the issue 
     await say($, 'reset')
   }
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isResetting).toBe(true)
   expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
@@ -3511,40 +3537,49 @@ test('R85: a security P3 deferral with a follow-up still waits for the person', 
   expect(w.gh.labelled).toEqual([])
 })
 
-test('R85: a guessed P1 the agent lowers to P3 waits on Codex; Codex agrees, and the issue carries severity:P1 (Adam, 2026-10-20)', async ($, on) => {
+test('R92: a deferral waits on Codex\'s check; a lowered P3 Codex agrees with carries severity:P1 on its issue (Adam, 2026-10-21)', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: 'KAN-9 #12', replyId: '992' }]))
-  // Not ready: Codex checks the lowering in the round's own check, using no round.
-  const run = await runOf(w)
-  expect(run.phase).toBe('verify')
+  // Not ready: Codex checks the deferral in the round's own check, using no round.
+  expect((await runOf(w)).phase).toBe('verify')
   expect((await recordOf(w)).phase).not.toBe('ready')
   const asked = w.spawned.at(-1)?.prompt ?? ''
-  expect(asked).toContain('The agent lowered it from P1 to P3 and deferred it to KAN-9 #12. Its reason: only the typo is real')
+  expect(asked).toContain('The main agent deferred these findings instead of fixing them in this PR.')
+  expect(asked).toContain('The agent lowered it from P1 to P3. Follow-up: KAN-9 #12. Its reason: only the typo is real')
   expect(asked).toContain('This is a critical bug.')
-  expect(asked).toContain('is P3, with a follow-up issue, right?')
+  expect(asked).toContain('holds is true when it cannot reasonably be fixed in this PR and its severity stands')
   expect(w.gh.labelled).toEqual([])
   await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
-  const found = rec.findings.find(one => one.id === 'G2-1')
-  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', lowering: 'agreed' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
   // The peak, not the lowered severity, goes on the issue.
   expect(labelled(w, 12, 'P1')).toBe(true)
   expect(w.prompts.at(-1)).toContain('(follow-up at KAN-9 #12, labelled severity:P1)')
 })
 
-test('R85: Codex disagreeing with a lowering leaves the deferral to the person, with its reason (Adam, 2026-10-20)', async ($, on) => {
+test('R92: Codex refusing a deferral opens it again for the agent, with its reason (Adam, 2026-10-21)', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: '#12', replyId: '992' }]))
   await done($, accept('r2-verify', w, { 'G2-1': 'the comment reports a real crash' }))
   const rec = await recordOf(w)
-  expect(rec.postStatus).toBe('awaiting-decision')
-  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('deferred')
-  expect(w.prompts.at(-1)).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
-  expect((await say($, 'status')).text).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', status: 'open', deferral: 'refused', note: 'the comment reports a real crash' })
+  // Round 2 is the baseline, which carries no isCharged; the charge is tested on a discretionary round below.
+  // The agent is told, with Codex's words; the person is not asked to waive anything.
+  expect(w.prompts.at(-1)).toContain('Codex says G2-1 can be fixed in this PR: the comment reports a real crash')
+  expect(w.prompts.at(-1)).not.toContain('/pr-gate waive G2-1')
   expect(w.gh.labelled).toEqual([])
+})
+
+test('R92: Codex agreeing with a P2 deferral leaves it deferred, awaiting the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2' })
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
 })
 
 test('R85: a finding whose advisory label is not at the start, lowered to P3, settles once Codex agrees (final review C1)', async ($, on) => {
@@ -3561,6 +3596,8 @@ test('R85: a mixed comment guessed P3 from a "nit" in its middle, kept P3 and de
   const w = world(on)
   await toTriage($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'tracked', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(labelled(w, 9, 'P3')).toBe(true)
 })
@@ -3570,6 +3607,8 @@ test('R85: an issue the gate could not label holds the merge, and the next pass 
   w.gh.labelAnswer = 'fail'
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: '#12', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const held = await recordOf(w)
   expect(held.phase).not.toBe('ready')
   expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('Could not resolve to an issue')
@@ -3588,6 +3627,8 @@ test('R85: /pr-gate status names the follow-up of a settled deferral and its lab
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}, labelled severity:P3`)
 })
 
@@ -4053,6 +4094,8 @@ test('M1: a post waiver given while the standing is gathered is not followed by 
   }
   const prompts = w.prompts.length
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isWaiving).toBe(true)
   const sent = w.prompts.slice(prompts)
@@ -4072,6 +4115,8 @@ for (const action of ['reset'] as const) {
     }
     const prompts = w.prompts.length
     await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+    // Codex checks the deferral first, in the round's free check (R92 M2).
+    await done($, accept('r2-verify', w))
     await w.clock.advance(1000)
     expect(isActing).toBe(true)
     const sent = w.prompts.slice(prompts)
@@ -4695,6 +4740,31 @@ test('A8: a discretionary round whose P3 the agent fixes is charged; the clean r
   expect((await recordOf(w)).phase).toBe('ready')
 })
 
+/** Round 4, discretionary: a new P3 the agent defers, and Codex's ruling on the deferral (R92 M2). */
+const toDeferralRuling = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, said: true | string) => {
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, 'nit: this helper name is unclear', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'deferred', severity: 'P3', note: 'a rename touches the public API', replyId: '994' }]))
+  expect((await runOf(w)).rechecks).toEqual(['G4-1'])
+  await done($, accept('r4-verify', w, { 'G4-1': said }))
+}
+
+test('R92: in a discretionary round, Codex agreeing with a deferral charges nothing', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, true)
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', false])
+})
+
+test('R92: in a discretionary round, Codex refusing a deferral charges the round, and the agent is sent to fix it', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, 'a one-line rename fixes it')
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+  expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: a one-line rename fixes it')
+})
+
 test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
   const w = world(on)
   w.git.roster = roster
@@ -4712,6 +4782,9 @@ test('R90: a reviewer\'s second comment on the same problem is linked, answered 
     { id: 'G2-1', action: 'deferred', note: 'needs a store change', replyId: '901' },
     { id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' },
   ]))
+  // Codex checks the deferral of the original alone; the gate's link is no answer of its own (R92 M2).
+  expect((await runOf(w)).rechecks).toEqual(['G2-1'])
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
   expect(rec.replies['inline:12']).toBe('902')

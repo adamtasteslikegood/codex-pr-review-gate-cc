@@ -21,7 +21,6 @@ import {
   holdText,
   isReverifyOwed,
   isSettledDeferral,
-  loweringRefusal,
   peakOf,
   mergeHolds,
   reverifyOwed,
@@ -826,7 +825,6 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const settled = rec.findings
     .filter(isSettledDeferral)
     .map(one => ` ${one.id} deferred, follow-up at ${one.followUp}, labelled severity:${peakOf(one)}.`)
-    .concat(rec.findings.flatMap(one => (loweringRefusal(one) === undefined || one.status !== 'deferred' ? [] : [` ${loweringRefusal(one) ?? ''}.`])))
     .join('')
   return (
     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
