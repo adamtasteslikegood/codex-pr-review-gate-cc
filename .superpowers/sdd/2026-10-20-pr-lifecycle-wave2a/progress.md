@@ -86,3 +86,7 @@ Ruling: spec §1's 'late-feedback' Blocker kind and standingOf's late param are 
 Task 6: implementer dispatched (sonnet), BASE bb3615b
 Ruling: added Task 12 (R87, spec §5a) from Adam's forwarded live report (cookbook #3732/#3741: a held chained create also dropped the body-file write) — run order 10, 12, 11 so Task 11 records R87 — cost if wrong: one small task of scope in 1.4.0; rewriting the command to run only part of it was rejected
 Task 6: implementer DONE_WITH_CONCERNS, commit 1290918 (443 pass); test $ has no process → w.engine fake; brief test bug (classicAnswer reset); cache cleared in setup; review dispatched
+Task 6: review Approved (spec ✅)
+Task 6: complete (commits 7efabdb..1290918, review clean)
+Task 6: minor (deferred): required cache keyed slug:base, cleared only in setup; classic 404 regex reads all of stderr
+Task 7: implementer dispatched (sonnet), BASE 5dc0b21
