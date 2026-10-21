@@ -214,6 +214,7 @@ export function readTriage(answer: string): TriageAnswer[] {
       ...(text(row.evidence) === undefined ? {} : { evidence: text(row.evidence)?.slice(0, 2000) }),
       ...(SEVERITIES.includes(severity) ? { severity } : {}),
       ...(typeof row.isSecurity === 'boolean' ? { isSecurity: row.isSecurity } : {}),
+      ...(text(row.followUp) === undefined ? {} : { followUp: text(row.followUp)?.slice(0, 500) }),
       ...(replyId === undefined ? {} : { replyId }),
       ...(text(row.duplicateOf) === undefined ? {} : { duplicateOf: text(row.duplicateOf) }),
     })
@@ -684,7 +685,7 @@ export function triagePrompt(
     '',
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
-    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason, or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason (only what the person must rule on; a P3 with followUp, the issue or comment URL where it is tracked, needs no waiver), or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
@@ -696,7 +697,7 @@ export function triagePrompt(
     '',
     trailerRule(
       stepOf(run, 'triage'),
-      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one"}]}',
+      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one","followUp":"https://… for a P3 deferral"}]}',
     ),
     '',
     'Then end your turn. /pr-gate collects the next reviews by itself.',

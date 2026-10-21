@@ -3378,3 +3378,29 @@ test('R82: Codex rejecting an acknowledgement reopens the item with its reason',
   expect(found?.status).toBe('open')
   expect(found?.history.at(-1)?.note).toContain('never stops')
 })
+
+const ISSUE = 'https://github.com/me/repo/issues/9'
+
+test('R85: a P3 deferred with a recorded follow-up settles without a waiver', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUp).toBe(ISSUE)
+})
+
+test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2', followUp: ISSUE })
+})
+
+test('R85: a P3 deferral without a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+})
+
+test('R85: a security P3 deferral with a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
+})

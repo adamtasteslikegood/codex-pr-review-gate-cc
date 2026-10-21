@@ -13,6 +13,7 @@ import {
   mayAcknowledge,
   mayStartRound,
   isDisputed,
+  isSettledDeferral,
   mergeHolds,
   mergeFindings,
   moveLine,
@@ -748,4 +749,13 @@ test('R82: only an untagged-or-P3, non-security GitHub finding may be acknowledg
   expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'tag' }))).toBe(false)
   expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'hint', isSecurity: true }))).toBe(false)
   expect(mayAcknowledge(finding())).toBe(false)
+})
+
+test('R85: isSettledDeferral needs deferred, P3, a follow-up and no security flag', async () => {
+  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://x/issues/1' })
+  expect(isSettledDeferral(base)).toBe(true)
+  expect(isSettledDeferral({ ...base, severity: 'P2' })).toBe(false)
+  expect(isSettledDeferral({ ...base, followUp: undefined })).toBe(false)
+  expect(isSettledDeferral({ ...base, isSecurity: true })).toBe(false)
+  expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
 })

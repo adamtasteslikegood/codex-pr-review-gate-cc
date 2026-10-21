@@ -120,6 +120,7 @@ export type Answer = {
   evidence?: string
   severity?: Severity
   isSecurity?: boolean
+  followUp?: string
 }
 
 const moved = (f: Finding, status: FindingStatus, round: number, by: string, at: number, note?: string, evidence?: string): Finding => ({
@@ -144,7 +145,8 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
   const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
   const security = f.isSecurity === true || a.isSecurity === true
   const history = severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity } : one))
-  return { ...next, severity, history, ...(security ? { isSecurity: true } : {}) }
+  return { ...next, severity, history, ...(security ? { isSecurity: true } : {}),
+    ...(a.action === 'deferred' && a.followUp !== undefined ? { followUp: a.followUp } : {}) }
 }
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
@@ -385,6 +387,10 @@ const disputeOf = (f: Finding): string => {
   return `${f.id} is disputed: the agent says "${argued}"; Codex said "${codex}"`
 }
 
+/** A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). */
+export const isSettledDeferral = (f: Finding): boolean =>
+  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && f.followUp !== undefined && f.followUp.trim() !== ''
+
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
  * reported fixed without verification, verified fixed but its file changed since (R58), or rebutted without Codex
@@ -392,7 +398,7 @@ const disputeOf = (f: Finding): string => {
  */
 export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one))
+  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledDeferral(one))
 }
 
 /** A held verified fix in words, as the merge refusal and the texts name it (R58). */

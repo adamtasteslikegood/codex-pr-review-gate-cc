@@ -30,6 +30,8 @@ export type Finding = {
   headSeen: string
   status: FindingStatus
   note?: string
+  /** Where a P3 deferral's follow-up is recorded (R85): an issue or comment URL, or #<n>. */
+  followUp?: string
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
