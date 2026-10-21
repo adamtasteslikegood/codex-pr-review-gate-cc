@@ -6,6 +6,7 @@ import {
   isBlocking,
   isDisputed,
   isReverifyOwed,
+  isSettledDeferral,
   mergeHolds,
   raisedIn,
   rejections,
@@ -757,7 +758,7 @@ export function readyPrompt(rec: LifecycleRecord): string {
   const summary = [
     `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
     `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
-    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}`).join('; ')}`,
+    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp})` : ''}`).join('; ')}`,
   ].join('; ')
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }

@@ -759,3 +759,12 @@ test('R85: isSettledDeferral needs deferred, P3, a follow-up and no security fla
   expect(isSettledDeferral({ ...base, isSecurity: true })).toBe(false)
   expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
 })
+
+test('R85: the ready prompt names the follow-up of a settled deferral and not of a plain one', async () => {
+  const settled = finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://github.com/me/repo/issues/9' })
+  const plain = finding({ id: 'G2-2', source: 'github', status: 'deferred', severity: 'P3' })
+  const said = readyPrompt({ ...fresh(), pr: 7, findings: [settled, plain] })
+  expect(said).toContain('G2-1')
+  expect(said).toContain('(follow-up at https://github.com/me/repo/issues/9)')
+  expect(said.match(/follow-up at/g)).toHaveLength(1)
+})

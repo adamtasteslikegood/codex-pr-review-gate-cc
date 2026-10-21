@@ -3404,3 +3404,10 @@ test('R85: a security P3 deferral with a follow-up still waits for the person', 
   const w = world(on)
   await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
 })
+
+test('R85: /pr-gate status names the follow-up of a settled deferral', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}`)
+})
