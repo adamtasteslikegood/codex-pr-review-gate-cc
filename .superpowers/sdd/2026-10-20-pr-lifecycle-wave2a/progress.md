@@ -117,3 +117,4 @@ Task 9: fix round 1/5 (3 addressed, 0 open; commits f1beb67..c986d23)
 Task 9: complete (commits 35ec60e..c986d23, review clean)
 Task 9: minor (deferred): waive <finding> live-head test doesn't observe the head used; reset-before-flush test checks the waive-pre note marker, not the open-PR body; reset text hard-codes /pr-gate
 Task 10: implementer dispatched (sonnet), BASE 158400a
+Task 10: implementer DONE, commit 03df5e2 (470 pass); review dispatched
