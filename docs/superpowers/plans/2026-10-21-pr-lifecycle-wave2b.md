@@ -32,8 +32,10 @@
           fileIssues: 1) a held blocker first raised in the last completed post
           round or the last charged round, gate grants < 2, and the grant
           starts a round → grant by 'gate'; else 2) file or label an issue for
-          every held finding Codex has ruled on, except security → settle →
-          decide again (ready → the agent merges)
+          every held finding Codex has ruled on, except security (a lost
+          severity files as P1) → settle → decide again (ready → the agent
+          merges → closeLifecycle checks every follow-up issue, reopening or
+          refiling it, then archives)
   ```
 - Charging (R88) is post-PR only: a pre-PR round is always charged, as in 1.4.0.
 - A triage turn during collection reuses `beginTriage`/`afterTriage`. `afterTriage` tells it by `run.collect !== undefined` and skips the round's ending (Task 8).
@@ -44,7 +46,7 @@
 - Tests run through `claude plugin test` with the fakes in `pr-lifecycle/tests/world.ts`.
 - ESLint with `@stylistic`.
 
-**Spec:** `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`, including the M2 amendment and §7.4 (#24). Read it first. Then read `CLAUDE.md` (repo rules) and the rulings doc `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md` (R1-R87). This plan adds R88-R94.
+**Spec:** `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`, including the M2 and M3 amendments (§5.10-5.12) and §7.4 (#24). Read it first. Then read `CLAUDE.md` (repo rules) and the rulings doc `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md` (R1-R87). This plan adds R88-R94.
 
 ## Global Constraints
 
@@ -83,11 +85,11 @@
 | `pr-lifecycle/hooks/github.ts` | `severityHint` tag forms (Task 1); `Check.startedAt` (Task 4); `collectionDone` signals and `readRequested` (Task 5) |
 | `pr-lifecycle/hooks/lifecycle.ts` | `isAcknowledged` (Task 2); charging (Task 6); linking (Task 7); deferral check (Task 11); settling by issue, the late-blocker grant, `issueTitle`/`issueBody`, `planIssues` (Task 12) |
 | `pr-lifecycle/hooks/core.ts` | `replyIdsOf` (Task 3); `readLinks`, triage and verify prompts (Tasks 7, 8, 11, 12); `readyPrompt`, `personPost`, `reportPrompt` (Task 12); `mergeStep`, `readyPrompt(rec, method)` (Task 13) |
-| `pr-lifecycle/hooks/round.ts` | `fetchFeedback` (Tasks 3, 4, 5); `pollOnce`, triage during collection, rollover (Tasks 8, 9); re-requests (Task 10); deferral check (Task 11); `fileIssues` replaces `labelDeferrals` (Task 12); `issueSpec`, `mergeMethod` settings (Tasks 12, 13) |
-| `pr-lifecycle/hooks/register.tsx` | status text (Tasks 11, 12); the waiver notes tell the agent to merge (Task 13) |
-| `pr-lifecycle/tests/world.ts` | knobs: `commitDate` (Task 4), `requested`, `requests` (Task 5), `issueAnswer`, `issueNumber`, `filed`, `onIssue` (Task 12) |
+| `pr-lifecycle/hooks/round.ts` | `fetchFeedback` (Tasks 3, 4, 5); `pollOnce`, triage during collection, rollover (Tasks 8, 9); re-requests (Task 10); deferral check (Task 11); `fileIssues` replaces `labelDeferrals` (Task 12); `checkIssuesAfterMerge`, `closeLifecycle` (Task 15); `issueSpec`, `mergeMethod` settings (Tasks 12, 13) |
+| `pr-lifecycle/hooks/register.tsx` | status text (Tasks 11, 12); the waiver notes tell the agent to merge (Task 13); `onMerged` after the agent's merge (Task 15) |
+| `pr-lifecycle/tests/world.ts` | knobs: `commitDate` (Task 4), `requested`, `requests` (Task 5), `issueAnswer`, `issueNumber`, `filed`, `onIssue` (Task 12); `issueStates`, `reopenAnswer`, `reopened`, `mergeAnswer` (Task 15) |
 | `pr-lifecycle/tests/*.test.ts` | the tests in each task |
-| docs | rulings R88-R94, LIFECYCLE_SPEC.md, ROADMAP.md, READMEs, CLAUDE.md (Task 15) |
+| docs | rulings R88-R94, LIFECYCLE_SPEC.md, ROADMAP.md, READMEs, CLAUDE.md (Task 16) |
 
 Run one test file while working on a task: `claude plugin test pr-lifecycle -- tests/github.test.ts` (from the repo root). Run the whole suite before each commit: `claude plugin test pr-lifecycle`.
 
@@ -1389,7 +1391,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 **Why:** In 1.4.0 the agent sees nothing until collection ends (roster covered, checks done, quiet window, or the 20-minute cap). In 1.5.0, feedback that arrives while collection is still waiting goes to the agent after one quiet poll, in a triage turn that does not end the round. A push in that turn ends the round when the turn ends.
 
-**Plan rulings (record them in Task 15's rulings):**
+**Plan rulings (record them in Task 16's rulings):**
 - A mid-collection turn runs in phase `'triage'` with `run.collect` kept. The ticker polls whenever `run.collect` is set, so polling goes on during the turn. The step timeout applies to the turn, because its phase is not `'collect'`. `afterTriage` tells a mid-collection turn by `run.collect !== undefined` (`endCollect` clears it). There is no `Run.isMidCollect` field.
 - While a turn is in flight a poll only notes arrivals. It never starts a turn, never ends collection and never acts on a head move; a failed poll is tried again at the next one. The turn's own end reads the head it pushed.
 - When collection is already done at the poll that sees new feedback, the end-of-head triage (1.4.0's) asks it, with no mid-collection turn first. The existing tests where feedback and coverage arrive together keep working.
@@ -2356,14 +2358,14 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 **Interfaces:**
 - Consumes: `isDeferralOwed`, `isDeferralAgreed`, `ruleDeferral` (Task 11); `isLinked`, `alsoOf`, `linkTo` (Task 7); `isChargedRound` and `RoundRecord.isCharged` (Task 6); `issueOf`, `isFollowUpRef`, `peakOf`, `isPeakUnknown`, `isDisputed`, `mergeHolds` (1.4.0).
-- Produces (Task 13 and Task 15 rely on these):
+- Produces (Task 13 and Task 16 rely on these):
   - Types: `Finding.issueError?: string`; `Grant.by?: 'gate'`; Blocker kinds `'issue-owed'` (owner `gate`) and `'issue-failed'` (owner `agent`) replace `'label-owed'`. `'label-failed'` stays. `Next`'s `blocked` gets `issues?: string[]`.
-  - In `lifecycle.ts`: `SEVERITY_NAMES`, `GATE_ROUNDS = 2`, `jiraKeyOf(branch)`, `isFileable(f)`, `isSettledByIssue(f)`, `issueLine(f)`, `issueTitle(f, rec, spec?)`, `issueBody(f, rec)`, `lateBlockers(rec)`, `gateGrant(rec, at)`, `scopeNote(rec)`, `isFilingPoint(next)`, `type IssueItem`, `type IssuePlan`, `planIssues(rec, at, spec?)`.
+  - In `lifecycle.ts`: `SEVERITY_NAMES`, `filingPeak(f)`, `GATE_ROUNDS = 2`, `jiraKeyOf(branch)`, `isFileable(f)`, `isSettledByIssue(f)`, `issueLine(f)`, `issueTitle(f, rec, spec?)`, `issueBody(f, rec)`, `lateBlockers(rec)`, `gateGrant(rec, at)`, `scopeNote(rec)`, `isFilingPoint(next)`, `type IssueItem`, `type IssuePlan`, `planIssues(rec, at, spec?)`.
   - In `round.ts`: `Config.issueSpec: string | undefined`; `export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined>`.
   - In `world.ts`: `gh.issueAnswer?: 'ok' | 'fail'`, `gh.issueNumber?: number` (default 21), `gh.filed: string[][]`, `gh.onIssue?: () => void | Promise<void>`.
 - Rulings for the plan:
   - The gate files what holds the merge and is not security: open findings (a fix Codex rejected is open), deferrals Codex agreed with, and disputes. It never files a fix only reported, a rebuttal or link Codex has not checked, or a deferral Codex has not checked: those are Codex's, and the check comes first.
-  - A record that lost a finding's peak (gate R7-6, `isPeakUnknown`) is not filed; it waits for the person, as in 1.4.0.
+  - A finding whose peak the record lost (gate R7-6, `isPeakUnknown`) is filed as **Critical [P1]**, and its body says the severity was lost. It does not wait for the person (Adam, 2026-10-21: "lost severity critical, not held for me"). `filingPeak(f)` gives the severity the gate files and labels with.
   - A finding settles by its issue only while it is `open`, `deferred` (with Codex's agreement) or `rebutted`. A fix reported later is verified as usual. `needsRecheck` (its file changed) does not unsettle it (spec §5.8).
   - A late blocker is a held blocker first raised in the last completed post round, or in the last charged discretionary round (the one that spent the allowance). The gate adds a round only when that grant would start one (`decideNext` with it is a round). Otherwise, or after two gate rounds, the late blocker gets its issue.
   - A new issue's `followUp` is `#<n>`. A follow-up the agent gave that names no issue (a ticket key) goes into the issue's body.
@@ -2435,7 +2437,7 @@ test('R92: a finding settles by its issue, labelled at its peak, unless it is se
   expect(decideNext(rec)).toEqual({ kind: 'ready' })
 })
 
-test('R92: the gate files open findings, deferrals Codex agreed with and disputes; never security, a link, an unchecked answer or a lost peak', async () => {
+test('R92: the gate files open findings, deferrals Codex agreed with and disputes; never security, a link or an unchecked answer', async () => {
   const open = finding({ id: 'R1-1', severity: 'P2', status: 'open' })
   const owed = applyAnswer(finding({ id: 'R1-2', severity: 'P2' }), { id: 'R1-2', action: 'deferred', note: 'later' }, 2, 'main', 5)
   expect(isFileable(open)).toBe(true)
@@ -2446,10 +2448,14 @@ test('R92: the gate files open findings, deferrals Codex agreed with and dispute
   expect(isFileable({ ...open, isSecurity: true })).toBe(false)
   expect(isFileable({ ...open, status: 'reported-fixed' })).toBe(false)
   expect(isFileable({ ...open, status: 'rebutted', history: [{ round: 2, status: 'rebutted', by: 'main', at: 1 }] })).toBe(false)
-  // Gate R7-6: a record that lost the peak waits for the person.
+  // Gate R7-6: a record that lost the peak is filed as Critical [P1], with the loss in its body (Adam, 2026-10-21).
   const legacy = agreedBy({ ...finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'hint' }), history: [{ round: 2, status: 'deferred' as const, severity: 'P3' as const, note: 'cosmetic', by: 'main', at: 5 }] })
-  expect(isFileable(legacy)).toBe(false)
-  expect(isFileable({ ...legacy, peakSeverity: 'P1' })).toBe(true)
+  expect(isFileable(legacy)).toBe(true)
+  expect(filingPeak(legacy)).toBe('P1')
+  expect(filingPeak({ ...legacy, peakSeverity: 'P2' })).toBe('P2')
+  expect(issueTitle(legacy, { pr: 20, branch: 'feat/x' })).toMatch(/^R1-1 Critical \[P1\] /)
+  expect(issueBody(legacy, { pr: 20, findings: [] })).toContain("Severity: Critical [P1], assigned because the gate lost this finding's severity (answered as P3).")
+  expect(isSettledByIssue({ ...legacy, followUp: '#21', followUpLabel: 'P1' })).toBe(true)
   // Review Focus 5: a duplicate linked to a security original holds with it and is never filed.
   const original = finding({ id: 'G2-1', source: 'github', severity: 'P1', isSecurity: true, status: 'open' })
   const dup = linkTo(finding({ id: 'G2-2', source: 'github', severity: 'P2' }), original, 'gate', 2, 5)
@@ -2508,7 +2514,7 @@ Update the tests from earlier tasks that this task changes:
 - Task 11's `'R92: every deferral waits on Codex; …'`: replace `expect(wouldSettle(p3)).toBe(false)` and `expect(isSettledDeferral(p3)).toBe(false)` with `expect(isSettledByIssue(p3)).toBe(false)`, and `expect(isSettledDeferral(agreedBy(p3))).toBe(true)` with `expect(isSettledByIssue(agreedBy(p3))).toBe(true)`.
 - Task 11's standing test `'R92: a deferral owed Codex holds as Codex\'s; …'`: in `pending`, expect `[['G2-1', 'issue-owed', 'gate']]`. Make its last line `expect(decideNext(postRec({ findings: [p2] }))).toMatchObject({ kind: 'blocked', issues: ['G2-1'] })`, with the comment `// Agreed: the gate files its issue (R92).`
 - Delete `'R85: isSettledDeferral needs deferred, P3, an issue follow-up, its label and no security flag'` (the settle test above replaces it).
-- Replace `'gate R7-6: …'` with the `legacy` lines now in the `isFileable` test above: delete the old test.
+- Replace `'gate R7-6: …'` with the `legacy` lines now in the `isFileable` test above: delete the old test. Add `filingPeak` to the import from `'../hooks/lifecycle'`.
 - `'R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)'`: replace each `isSettledDeferral` with `isSettledByIssue`; `base` stays `agreedBy(finding({ ... }))`.
 - `'R85: a deferral without a follow-up clears the earlier one and its label (final review T4)'`: replace each `isSettledDeferral` with `isSettledByIssue`, and delete its `wouldSettle` line.
 - Replace `'R85: the ready prompt names the follow-up of a settled deferral and not of a plain one'` with:
@@ -2579,6 +2585,12 @@ export type Grant = { n: number; reason: string; head: string; at: number; by?: 
 /** Severity names in an issue's title (spec §5.6). */
 export const SEVERITY_NAMES: Record<Severity, string> = { P0: 'Blocker', P1: 'Critical', P2: 'Major', P3: 'Minor' }
 
+/**
+ * The severity the gate files and labels a finding's issue with (R92): its peak, or Critical [P1] when the record lost the peak
+ * (gate R7-6). Adam, 2026-10-21: "lost severity critical, not held for me".
+ */
+export const filingPeak = (f: Finding): Severity => (isPeakUnknown(f) ? 'P1' : peakOf(f))
+
 /** The most rounds the gate adds for late blockers in one lifecycle (R92, spec §5.3). */
 export const GATE_ROUNDS = 2
 
@@ -2588,10 +2600,10 @@ export const jiraKeyOf = (branch: string): string | undefined => branch.match(/[
 /**
  * What the filing pass files (R92, spec §5.2): a held finding that is not security, not a linked duplicate (it holds with its
  * original), and is open, deferred with Codex's agreement, or disputed. A fix only reported, a rebuttal, link or deferral Codex has
- * not checked are Codex's first. A record that lost the finding's peak (gate R7-6) waits for the person.
+ * not checked are Codex's first. A record that lost the finding's peak (gate R7-6) is filed as P1 (`filingPeak`).
  */
 export const isFileable = (f: Finding): boolean =>
-  f.isSecurity !== true && !isLinked(f) && !isPeakUnknown(f) && (f.status === 'open' || isDeferralAgreed(f) || isDisputed(f))
+  f.isSecurity !== true && !isLinked(f) && (f.status === 'open' || isDeferralAgreed(f) || isDisputed(f))
 
 /**
  * A finding settled by its GitHub issue (R92, spec §5.7): not security, open, deferred with Codex's agreement or rebutted, its
@@ -2602,14 +2614,14 @@ export const isSettledByIssue = (f: Finding): boolean =>
   f.isSecurity !== true &&
   (f.status === 'open' || f.status === 'rebutted' || (f.status === 'deferred' && !isDeferralOwed(f))) &&
   isFollowUpRef(f.followUp) &&
-  f.followUpLabel === peakOf(f)
+  f.followUpLabel === filingPeak(f)
 
 /** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
-export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[peakOf(f)]} [${peakOf(f)}]`
+export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
 
 /** A filed issue's title (spec §5.6): `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`. */
 export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string): string {
-  const peak = peakOf(f)
+  const peak = filingPeak(f)
   const jira = jiraKeyOf(rec.branch)
   const where = [`#${rec.pr ?? '?'}`, rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
   return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
@@ -2620,7 +2632,7 @@ export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch
  * was not fixed in the PR, and the findings linked to it.
  */
 export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>): string {
-  const peak = peakOf(f)
+  const peak = filingPeak(f)
   const at = f.file === undefined ? '' : `, at \`${f.file}${f.line === undefined ? '' : `:${f.line}`}\``
   const thread = f.url === undefined ? '' : ` ([thread](${f.url}))`
   const codex = f.history.filter(one => one.by === 'codex').at(-1)?.note
@@ -2633,7 +2645,9 @@ export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'finding
   const linked = alsoOf(rec.findings, f.id)
   return [
     `Raised by ${f.reviewer} in round ${f.round} of #${rec.pr ?? '?'}${at}${thread}.`,
-    `Severity: ${SEVERITY_NAMES[peak]} [${peak}]${f.severity === peak ? '' : `, answered as ${f.severity}`}${f.isSecurity === true ? ', security' : ''}.`,
+    isPeakUnknown(f)
+      ? `Severity: ${SEVERITY_NAMES[peak]} [${peak}], assigned because the gate lost this finding's severity (answered as ${f.severity}).`
+      : `Severity: ${SEVERITY_NAMES[peak]} [${peak}]${f.severity === peak ? '' : `, answered as ${f.severity}`}${f.isSecurity === true ? ', security' : ''}.`,
     '',
     '## Problem',
     '',
@@ -2680,8 +2694,8 @@ const issueFailure = (f: Finding): string => `could not file an issue for ${f.id
 ```ts
 /**
  * Only deferrals and disputes hold the merge. Each that is not security gets a GitHub issue from the filing pass (R92): until it has
- * one, the gate retries, and a failure is the agent's to check. Security ones, and a record that lost a peak, wait for the person's
- * waiver (R39, R40, gate R7-6).
+ * one, the gate retries, and a failure is the agent's to check. Security ones wait for the person's waiver (R39, R40); a finding
+ * whose peak was lost is filed as P1 (gate R7-6, Adam 2026-10-21).
  */
 function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = []): Next {
   const all = [...deferred, ...disputed]
@@ -2770,7 +2784,7 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string): Iss
       const reuse = issueOf(f.followUp, rec.slug)
       return {
         id: f.id,
-        peak: peakOf(f),
+        peak: filingPeak(f),
         ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
         ...(reuse === undefined ? {} : { reuse }),
         title: issueTitle(f, rec, spec),
@@ -2980,7 +2994,7 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
     if (isGone) return latest
     const findings = latest.findings.map(f => {
       const got = results.get(f.id)
-      if (got === undefined || got.was !== f.followUp || got.peak !== peakOf(f)) return f
+      if (got === undefined || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
       if (got.error !== undefined) return got.isLabel ? { ...f, followUpLabelError: got.error } : { ...f, issueError: got.error }
       return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
     })
@@ -3105,7 +3119,7 @@ test('R93: the ready prompt tells the agent to merge with the repository\'s meth
   expect(said).not.toContain('do not merge')
   expect(readyPrompt(rec, 'squash')).toContain('gh pr merge 7 --squash')
   expect(mergeStep(12, 'rebase')).toBe(
-    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is",
+    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, and the gate checks them after the merge; if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is",
   )
 })
 ```
@@ -3186,9 +3200,13 @@ In `pr-lifecycle/hooks/core.ts`:
 /**
  * What the agent does once nothing holds the merge (R93): it merges, with the repository's method, and reports the commit. A merge
  * GitHub refuses is reported in GitHub's words; the lifecycle stays where it is. The merge guard still checks the head (judgeMerge).
+ * A closing keyword (Closes, Fixes, Resolves #n) in the PR, a commit or the merge would close a follow-up issue on merge; the gate's
+ * own issue text never has one, and the agent is told not to write one. The post-merge check (Task 15) reopens any that closed anyway.
  */
 export const mergeStep = (pr: number | undefined, method: MergeMethod): string =>
   `merge it now with gh pr merge ${pr ?? '<n>'} --${method} and tell the person the merge commit; ` +
+  "never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, " +
+  'and the gate checks them after the merge; ' +
   "if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is"
 ```
 
@@ -3316,7 +3334,362 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
-### Task 15: Rulings, docs and version 1.5.0 (spec §8, §10)
+### Task 15: The gate checks the follow-up issues after the merge (spec §5.10-5.12, decision M3)
+
+**Why:** Adam (2026-10-21): "the important part is the gate checks that the issues are there after the PR merges before it stops running." GitHub closes an issue on merge only when the PR links it with a closing keyword (`Closes`, `Fixes`, `Resolves #n`) or through the Development sidebar. The gate's own text never uses one, and Task 13 tells the agent never to write one. An issue can still close another way, for example by a keyword in a commit or by hand, or it can be deleted or transferred. So when the gate sees the PR merged, and before it archives the record, it reads each follow-up issue:
+- open: logged as checked;
+- closed: reopened, with a comment;
+- missing, or the reopen fails: filed again.
+
+If any check fails, the record stays put and the agent gets gh's words. In 1.4.0 the gate notices a merge only at `/pr-gate`, at a session start or in a collection poll (R62). This task also notices the agent's own `gh pr merge` succeeding.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/round.ts` (new `checkIssuesAfterMerge`, `closeLifecycle`)
+- Modify: `pr-lifecycle/hooks/register.tsx` (the merge branch of the `tool.call` hook, new `onMerged`)
+- Modify: `pr-lifecycle/tests/world.ts` (issue view and reopen fakes; the Bash fake merges)
+- Test: `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes (Task 12): `isSettledByIssue`, `issueOf`, `issueTitle`, `issueBody`, `filingPeak`, `issueLine`, `LABEL_COLOURS`, `issueNumberOf`, `configFor(...).config.issueSpec`. Also (1.4.0) `closeLifecycle`, `archiveLifecycle`, `prStateOf`, `say`, `updateRecord`, `LOG_CAP`.
+- Produces: `export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Promise<{ failed: string[]; lines: LogEntry[]; findings: Finding[] }>` in `round.ts`. World knobs: `gh.issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing'>` (absent means OPEN), `gh.reopenAnswer?: 'ok' | 'fail'`, `gh.reopened: string[][]`, `gh.mergeAnswer?: 'ok' | 'fail'`.
+- Rulings for the plan:
+  - The check runs only for a PR that **merged**. A closed PR's issues are left as they are.
+  - It runs wherever `closeLifecycle(…, 'MERGED')` runs (`/pr-gate`, a session start, a collection poll), and after the agent's own `gh pr merge` that GitHub accepted and that reads back as MERGED. An auto-merge (`--auto`) that has not merged yet is checked at the next of those.
+  - A failed check leaves the record where it was, with `postStatus: 'blocked'` and the message, and does not archive it. `/pr-gate resume` reads the PR as MERGED and runs the check again (the start path already calls `closeLifecycle`).
+  - Findings the person waived (security) have no issue and are not checked.
+
+- [ ] **Step 1: Write the world fakes**
+
+In `pr-lifecycle/tests/world.ts`, add to the `gh` type:
+
+```ts
+    /** Each issue's state for `gh issue view` (spec §5.12); absent means OPEN, 'missing' answers as a deleted issue does. */
+    issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing'>
+    /** How `gh issue reopen` answers: 'ok' (default) or 'fail'. */
+    reopenAnswer?: 'ok' | 'fail'
+    /** Every reopen the gate ran: its argv after `gh`. */
+    reopened: string[][]
+    /** How the agent's `gh pr merge` answers in the Bash fake: 'ok' (default) merges the PR, 'fail' refuses as GitHub would. */
+    mergeAnswer?: 'ok' | 'fail'
+```
+
+Initialise `issueStates: {}` and `reopened: []` next to `filed: []`. In `fake`, next to Task 12's issue branch, add:
+
+```ts
+      // The post-merge check (spec §5.12): gh issue view <n> --repo <r> --json state, and gh issue reopen <n> --repo <r> --comment <text>.
+      if (e.argv[1] === 'issue' && e.argv[2] === 'view') {
+        const state = w.gh.issueStates[Number(e.argv[3])] ?? 'OPEN'
+        if (state === 'missing') {
+          return { value: { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${e.argv[3]}.`, isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        return out(JSON.stringify({ state }))
+      }
+      if (e.argv[1] === 'issue' && e.argv[2] === 'reopen') {
+        w.gh.reopened.push(e.argv.slice(1))
+        if (w.gh.reopenAnswer === 'fail') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        w.gh.issueStates[Number(e.argv[3])] = 'OPEN'
+        return out('')
+      }
+```
+
+In the Bash `tool.call` fake, before its `return`, add:
+
+```ts
+    // The agent's merge (R93): GitHub accepts it and the PR reads MERGED, or refuses it.
+    if (/\bgh\s+pr\s+merge\b/.test(e.command)) {
+      if (w.gh.mergeAnswer === 'fail') {
+        return { result: { stdout: '', stderr: 'GraphQL: Required status check "ci" is expected. (mergePullRequest)', interrupted: false }, isError: true } as never
+      }
+      w.gh.state = 'MERGED'
+      return { result: { stdout: `✓ Merged pull request #${w.gh.pr}`, stderr: '', interrupted: false } as never }
+    }
+```
+
+If the engine's tool result has a different field for a failed Bash call than `isError`, use the one `isHeld` already reads, and note it in your report.
+
+Existing tests that merge (`gh pr merge 1 --squash` in `'a clean first post-PR round does not force a second'`, Task 13's test and others: `grep -n "pr merge" pr-lifecycle/tests/*.ts`) now archive the record when the merge goes through. Where a test reads the record after the merge expecting `ready`, set `w.gh.mergeAnswer = 'fail'` before the merge if the test is about the guard, or assert `archived` if it is about the end state. List each change.
+
+- [ ] **Step 2: Write the failing flow tests**
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+/** A P2 deferral Codex agreed with, filed as #21 by the gate: the lifecycle is ready (Task 12). */
+const toFiled = async ($: Engine, w: ReturnType<typeof world>): Promise<void> => {
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+}
+
+const archivedOf = (w: ReturnType<typeof world>): LifecycleRecord | undefined => {
+  const key = [...w.store.keys()].find(one => one.startsWith(`${KEY}:archived:`))
+  return key === undefined ? undefined : (w.stored(key) as LifecycleRecord)
+}
+
+test('spec §5.12: after the agent merges, the gate finds each follow-up issue open, logs it, archives the record and says what stays open', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' }))).toBe(false)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('PR #1 merged. Follow-up issues still open: G2-1 → #21 Major [P2].')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a follow-up issue the merge closed is reopened with a comment', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.reopened[0]?.slice(0, 5)).toEqual(['issue', 'reopen', '21', '--repo', 'me/repo'])
+  expect(w.gh.reopened[0]?.at(-1)).toContain('PR #1 merged without fixing G2-1')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge')).toBe(true)
+})
+
+test('spec §5.12: a follow-up issue that is gone is filed again, and the finding names the new one', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(w.gh.filed[1]).toContain(`title=G2-1 Major [P2] Consider renaming this (#${w.gh.pr}, feat/x)`)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.followUp).toBe('#22')
+  expect(w.prompts.at(-1)).toContain('G2-1 → #22 Major [P2]')
+})
+
+test('spec §5.12: when an issue cannot be reopened or filed again, the record is not archived, and resume checks again', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'fail'
+  w.gh.issueAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate could not confirm the follow-up issue of G2-1')
+  expect(w.prompts.at(-1)).toContain('HTTP 403: Resource not accessible by integration')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  w.gh.reopenAnswer = 'ok'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.issueStates[21]).toBe('OPEN')
+})
+
+test('spec §6.4: a merge GitHub refuses leaves the lifecycle where it was', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.mergeAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a merge the session finds at its start runs the check before it archives', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+```
+
+Import `Engine` and `LifecycleRecord` types and `KEY` if the file does not already have them. The session-start test needs the start path to reach a `ready` record. If the session-start hook only looks at `post` records (it checks `rec.phase === 'post'`), widen that one check to `post` or `ready` for the MERGED read alone, and keep the rest as it is.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/flow.test.ts`
+Expected: the new tests FAIL. The merge leaves the record `ready`, because nothing notices it.
+
+- [ ] **Step 4: Implement the check in `round.ts`**
+
+Next to `closeLifecycle`, add:
+
+```ts
+/**
+ * After a merge (spec §5.12, decision M3): each finding settled by its issue still has an open issue. A closed one is reopened with a
+ * comment; a missing one, or one gh cannot reopen, is filed again with its title and body. `failed` names each finding whose issue
+ * the gate could not confirm, with gh's words; the caller then leaves the record where it is.
+ */
+export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Promise<{ failed: string[]; lines: LogEntry[]; findings: Finding[] }> {
+  const failed: string[] = []
+  const lines: LogEntry[] = []
+  const settled = rec.findings.filter(isSettledByIssue)
+  if (settled.length === 0 || rec.slug === undefined) return { failed, lines, findings: rec.findings }
+  const { config: c } = await configFor($, rec.root, rec.base)
+  const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  const words = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
+  const log = async (text: string): Promise<void> => {
+    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
+  }
+  const moved = new Map<string, string>()
+  for (const f of settled) {
+    const ref = issueOf(f.followUp, rec.slug)
+    if (ref === undefined) continue
+    const where = `${ref.repo}#${ref.number}`
+    const view = await gh(['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'state'])
+    let state: unknown
+    try {
+      state = view.exitCode === 0 ? (JSON.parse(view.stdout) as { state?: unknown }).state : undefined
+    } catch {
+      state = undefined
+    }
+    if (state === 'OPEN') {
+      await log(`${f.id}: ${where} open after the merge`)
+      continue
+    }
+    let why = view.exitCode === 0 ? `gh read the issue's state as ${String(state)}` : words(view)
+    if (state === 'CLOSED') {
+      const comment = `Reopened by pr-gate: PR #${rec.pr ?? '?'} merged without fixing ${f.id}. It stays open as the follow-up.`
+      const reopen = await gh(['issue', 'reopen', String(ref.number), '--repo', ref.repo, '--comment', comment])
+      if (reopen.exitCode === 0) {
+        await log(`${f.id}: reopened ${where} after the merge`)
+        continue
+      }
+      why = words(reopen)
+    }
+    // Gone, or not reopened: file it again in this repository, labelled as before.
+    const label = `severity:${filingPeak(f)}`
+    await gh(['label', 'create', label, '--repo', rec.slug, '--color', LABEL_COLOURS[filingPeak(f)]])
+    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${issueTitle(f, rec, c.issueSpec)}`, '-f', `body=${issueBody(f, rec)}`, '-f', `labels[]=${label}`])
+    const number = post.exitCode === 0 ? issueNumberOf(post.stdout) : undefined
+    if (number !== undefined) {
+      moved.set(f.id, `#${number}`)
+      await log(`${f.id}: ${where} ${state === 'CLOSED' ? 'could not be reopened' : 'is gone'}; filed ${rec.slug}#${number} ${label}`)
+      continue
+    }
+    failed.push(`${f.id} (${why}; filing it again: ${post.exitCode === 0 ? "GitHub did not give the new issue's number" : words(post)})`)
+    await log(`${f.id}: could not confirm ${where} after the merge`)
+  }
+  const findings = rec.findings.map(f => (moved.has(f.id) ? { ...f, followUp: moved.get(f.id), issueError: undefined } : f))
+  return { failed, lines, findings }
+}
+```
+
+`issueNumberOf` and `LABEL_COLOURS` are defined in `round.ts` (Task 12 and R85). If `LABEL_COLOURS` sits at the end of the file as a `const`, that is fine, because the function runs later.
+
+Replace `closeLifecycle` with:
+
+```ts
+/**
+ * The PR was merged or closed (R62): the branch's live run ends with a short message, and its record is archived. After a merge the
+ * follow-up issues are checked first (spec §5.12): if one cannot be confirmed, the record stays, blocked, the agent gets gh's words,
+ * and `/pr-gate resume` checks again.
+ */
+export async function closeLifecycle($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+  const rec = await loadRecord($, root, branch)
+  if (state === 'MERGED' && rec !== undefined && rec.phase !== 'archived') {
+    const checked = await checkIssuesAfterMerge($, rec)
+    if (checked.failed.length > 0) {
+      const why = `PR #${pr ?? '?'} merged, but the gate could not confirm the follow-up issue of ${checked.failed.join('; ')}`
+      const saved = await updateRecord($, root, branch, one => ({
+        ...one,
+        findings: checked.findings,
+        postStatus: 'blocked',
+        message: why,
+        log: [...(one.log ?? []), ...checked.lines].slice(-LOG_CAP),
+      }))
+      if (saved !== undefined) {
+        await say($, saved, `pr-gate: ${why}. Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again.`)
+      }
+      return why
+    }
+    if (checked.lines.length > 0) {
+      const saved = await updateRecord($, root, branch, one => ({ ...one, findings: checked.findings, log: [...(one.log ?? []), ...checked.lines].slice(-LOG_CAP) }))
+      const open = (saved ?? rec).findings.filter(isSettledByIssue)
+      if (saved !== undefined && open.length > 0) await say($, saved, `pr-gate: PR #${pr ?? '?'} merged. Follow-up issues still open: ${open.map(issueLine).join('; ')}.`)
+    }
+  }
+  const said = `PR #${pr ?? '?'} from ${branch} was ${state === 'MERGED' ? 'merged' : 'closed'}: its lifecycle is archived, its history kept`
+  const run = await getRun($)
+  if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'stopped', `${said}.`)
+  await archiveLifecycle($, root, branch, await $.clock.now())
+  return said
+}
+```
+
+The prompt says "/pr-gate resume" because the person types it. It is not the agent's own step (R42): the agent fixes gh, then tells the person. If a test of R42/R49 flags the wording, use "then tell the person to run /pr-gate resume" instead and update the test string.
+
+Add `isSettledByIssue`, `issueOf`, `issueTitle`, `issueBody`, `filingPeak` and `issueLine` to the import from `'./lifecycle'` where they are not already imported.
+
+- [ ] **Step 5: Notice the agent's merge in `register.tsx`**
+
+Add, near `onOpened`:
+
+```ts
+/** The agent's merge went through (R93): once GitHub reads the PR as merged, the lifecycle closes, after the issue check (spec §5.12). */
+const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
+  const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.isOk) return
+  const view = await $.process.run(
+    ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'number,headRefName,state'],
+    { cwd: top.out, timeoutMs: 30_000 },
+  )
+  let pr: { number?: unknown; headRefName?: unknown; state?: unknown } | undefined
+  try {
+    pr = view.exitCode === 0 ? JSON.parse(view.stdout) : undefined
+  } catch {
+    pr = undefined
+  }
+  if (pr?.state !== 'MERGED' || typeof pr.headRefName !== 'string' || typeof pr.number !== 'number') return
+  const rec = await loadRecord($, top.out, pr.headRefName)
+  if (rec === undefined || rec.phase === 'archived' || rec.pr !== pr.number) return
+  await closeLifecycle($, top.out, pr.headRefName, pr.number, 'MERGED')
+}
+```
+
+In the `tool.call` hook's merge branch, replace `return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)` with:
+
+```ts
+      if (refusal !== undefined) return { deny: asHold(refusal) + tail }
+      const ran = await next(e)
+      // A merge GitHub refused leaves the lifecycle where it was (spec §6.4); one that went through closes it (spec §5.12).
+      if (ran.deny === undefined && ran.isError !== true) await onMerged($, target).catch(() => undefined)
+      return ran
+```
+
+Import `closeLifecycle` from `'./round'` if it is not imported. Check that the `.catch(($, e, next) => …)` fallback still replays the tool's result, not a hold, once `next` was called (it reads `next.called`).
+
+- [ ] **Step 6: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS, including the R62 tests (no settled findings, so nothing changes for them). Then run `npm run lint` and `npm run typecheck` from the repo root.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/register.tsx pr-lifecycle/tests/world.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: the gate checks the follow-up issues after the merge, reopening or refiling them (spec §5.12)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
+
+### Task 16: Rulings, docs and version 1.5.0 (spec §8, §10)
 
 **Why:** the repo keeps every ruling with its cost if wrong, so a later change can tell a decision from an accident (CLAUDE.md). The README, the roadmap and CLAUDE.md must say what 1.5.0 does. When a component's version changes, its `plugin.json`, its README version line and the root README table change together.
 
@@ -3326,7 +3699,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 - Modify: `LIFECYCLE_SPEC.md`, `ROADMAP.md`, `CLAUDE.md`
 
 **Interfaces:**
-- Consumes: Tasks 1-14 as built. Read each task's report in the SDD workspace for any ruling the implementer or the controller made, and add it.
+- Consumes: Tasks 1-15 as built. Read each task's report in the SDD workspace for any ruling the implementer or the controller made, and add it.
 - Produces: nothing code uses.
 
 - [ ] **Step 1: Record the rulings**
@@ -3342,7 +3715,7 @@ Spec: `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`. Plan: `
 - Ruling R89 (Adam, decision S): collection ends on GitHub's signals: the base's required check runs, the PR's pending review requests and the roster. Check suites are never read. The quiet window applies only when none of the three exists. A review requested from this machine's own login is never waited for — cost if wrong: a reviewer GitHub does not list as requested, outside the roster, is not waited for.
 - Ruling R90 (Adam, decision O): a finding that names a problem already raised is linked to the earlier one and follows its status; the gate links an exact repeat, and a link the agent gives is checked by Codex. Links do not chain, a link takes the higher peak severity, and a linked finding is never filed on its own — cost if wrong: two separate problems linked in error settle together until Codex refuses the link.
 - Ruling R91 (PR #20, G7-4, G7-9, G11-2): every reply id the agent reports is the gate's own, whatever its answer, and is never read back as feedback — cost if wrong: a reviewer comment whose id the agent misreports is dropped.
-- Ruling R92 (amends R39, R40, R55 and R85; Adam, decisions M and M2, 2026-10-21): a finding goes through a Codex review round and a fix attempt before any issue. Every deferral, at any severity, goes to Codex's free check: refused, it is open again and the round is charged; agreed, it waits. When the review can do no more (exhausted, or only deferrals and disputes hold), the gate files a GitHub issue for each finding still holding the merge, except security, labelled `severity:<peak>` and titled `<id> <Name> [P<n>] <title> (#<pr>, <branch>, <Jira key>, <spec>)`; an issue the agent's follow-up names is labelled instead. The issue settles the finding, and a change to its file does not unsettle it. Before filing, a blocker first raised in the round that spent the allowance, or in the last round, adds one round, at most twice per lifecycle, and the report tells the person the PR's scope may be too wide. Security findings, and a record that lost a finding's peak, wait for the person's waiver — cost if wrong: an issue is filed for a finding the person would have waived, and closing it is theirs.
+- Ruling R92 (amends R39, R40, R55 and R85; Adam, decisions M and M2, 2026-10-21): a finding goes through a Codex review round and a fix attempt before any issue. Every deferral, at any severity, goes to Codex's free check: refused, it is open again and the round is charged; agreed, it waits. When the review can do no more (exhausted, or only deferrals and disputes hold), the gate files a GitHub issue for each finding still holding the merge, except security, labelled `severity:<peak>` and titled `<id> <Name> [P<n>] <title> (#<pr>, <branch>, <Jira key>, <spec>)`; an issue the agent's follow-up names is labelled instead. The issue settles the finding, and a change to its file does not unsettle it. Before filing, a blocker first raised in the round that spent the allowance, or in the last round, adds one round, at most twice per lifecycle, and the report tells the person the PR's scope may be too wide. A finding whose severity the record lost is filed as Critical [P1], with the loss in its body. Security findings wait for the person's waiver. After the merge, and before it archives the record, the gate checks each follow-up issue: an open one is logged, a closed one is reopened with a comment, and a missing one is filed again. A check gh cannot complete leaves the record blocked until `/pr-gate resume` (decision M3, spec §5.12) — cost if wrong: an issue is filed for a finding the person would have waived, and closing it is theirs.
 - Ruling R93 (Adam, decision N, 2026-10-21: "once the gate allows a merge the agent should merge"): when nothing holds the merge, the agent merges with `gh pr merge <n> --<mergeMethod>` (`merge` by default, from the base's `.github/pr-gate.json` only) and reports the merge commit; a merge GitHub refuses is reported in GitHub's words and the lifecycle stays where it was. The merge guard does not change. The release train still protects production — cost if wrong: a PR merges without the person reading it last.
 - Ruling R94 (PR #20, G7-2, G7-4): a severity tag is only a token standing alone (`[P2]`, `(P2)`, `**P2**`, `P2:` or `P2 -` at the start of a line, or a badge image named for it); any other mention is a hint. An acknowledgement is stored with `answer: 'acknowledged'` and named as one in holds — cost if wrong: a reviewer's tag written another way reads as a hint, which triage may lower.
 
@@ -3357,6 +3730,7 @@ Spec: `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`. Plan: `
 - The prompts no longer list "commits since" a round began — cost if wrong: the agent reads the log itself.
 - The exhaustion paths are tested on `planIssues` (no store in the test engine), and the gh side through the awaiting path, which runs the same `fileIssues`. A dispute is tested at the unit level — cost if wrong: a flow-only bug at exhaustion is caught later.
 - A deferral settled under R85 before 1.5.0 has no Codex ruling, so Codex checks it once after the upgrade — cost if wrong: one extra free check per such deferral.
+- When issues are filed (spec §5.11): Adam asked for blockers to be filed at once and advisories before the PR opens, with leave to do better. The gate keeps M2's fix-first order and adds the post-merge check, so the issue queue holds only what the PR left unfixed — cost if wrong: a finding is visible as an issue only once the rounds end, not as it is raised.
 - Flaky tests (spec §7.3): the limit is raised only for a test whose cost is machine load, with a comment beside it; a test that loses a hook under load is fixed or recorded instead.
 ```
 
@@ -3388,8 +3762,10 @@ holding it, except security ones:
 - body: who raised it and where, the problem, and why it was not fixed here.
 
 If the agent's follow-up names an issue that already tracks it, the gate
-labels that one instead. The issue settles the finding; a change to its file
-does not unsettle it. A failure to file holds the merge with gh's words, and
+labels that one instead. A finding whose severity was lost is filed as
+Critical [P1]. The issue settles the finding; a change to its file does not
+unsettle it. After the merge, before the gate archives the record, it checks
+each follow-up issue: it reopens a closed one and files a missing one again. A failure to file holds the merge with gh's words, and
 the next pass retries. Security findings wait for `/pr-gate waive <id>`.
 
 Before filing, a blocker first raised in the round that spent the allowance
@@ -3398,7 +3774,7 @@ PR's scope may be too wide.
 ```
 
 5. Under **Waivers lapse**, add: "A finding settled by its issue does not lapse (R92)."
-6. Under **Who decides**, replace the second paragraph's list with: "It names the person only for security findings, and for a record that lost a finding's severity. Everything else ends in a fix, Codex's check, or an issue (R92). When nothing holds the merge, the agent merges (R93)."
+6. Under **Who decides**, replace the second paragraph's list with: "It names the person only for security findings. Everything else ends in a fix, Codex's check, or an issue (R92). When nothing holds the merge, the agent merges (R93)."
 7. Add a section after **Who decides**:
 
 ```markdown
@@ -3426,7 +3802,7 @@ In `LIFECYCLE_SPEC.md`, append:
 - **One round is one head (R88).** A post-PR round reviews one head. A push ends it at the end of the turn that pushed. Only a round with a new blocking finding or a Codex rejection draws on the allowance.
 - **Collection (R89).** It waits for the base's required checks, the PR's requested reviews and the roster; the quiet window only when none exists.
 - **Settling (R92).** Deferrals get Codex's check. When the review can do no more, findings still holding the merge get GitHub issues, except security; the issue settles them.
-- **The merge (R93).** When nothing holds the merge, the agent merges with the repository's `mergeMethod`.
+- **The merge (R93).** When nothing holds the merge, the agent merges with the repository's `mergeMethod`. The gate then checks that every follow-up issue is open (reopening or refiling it) before it archives the record.
 
 See `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`.
 ```

@@ -37,6 +37,7 @@ comes back as a new item.
 | O | A new item that names a problem already on the list is linked to it and follows its status | Adam, 2026-10-21 |
 | M | Where the gate would ask the person to waive a finding, it files a GitHub issue instead, and the issue settles it; security still needs the person | Adam, 2026-10-21 |
 | M2 | Only after the rounds: deferrals get Codex's check, issues are filed when the gate can do nothing more, a late blocker adds a round (at most two per lifecycle) | Adam, 2026-10-21 (amendment) |
+| M3 | A lost severity is filed as Critical; the gate checks every follow-up issue after the merge, reopening or refiling it, before it archives the record (§5.10-5.12) | Adam, 2026-10-21 (amendment) |
 | N | When nothing holds the merge, the agent merges with a merge commit | Adam, 2026-10-21 |
 | L2 | 2b (this, 1.5.0) then 2c (parallel fixer lanes, 1.6.0) | Adam, 2026-10-21 |
 
@@ -233,6 +234,35 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
 9. **Bash text.** The gate files issues through `gh api -X POST
    repos/<slug>/issues`, never a command line the PR-create guards read.
 
+10. **A lost severity is filed as Critical (Adam, 2026-10-21).** A finding
+    whose peak the record lost (gate R7-6) is filed as Critical [P1], and
+    its body says the gate lost the severity. It does not wait for the
+    person: "lost severity critical, not held for me".
+11. **When issues are filed (Adam, 2026-10-21, and his "if you have a
+    better way, go with that").** Adam asked for blocking findings to be
+    filed at once, and advisory ones before the PR opens. The gate keeps
+    M2's order instead: fix first, file only what the rounds could not
+    settle. Filing at once would fill the fix queue with findings the agent
+    fixes minutes later, and an issue that merge closes for a fixed finding
+    carries no work. Adam's requirement is that every finding still unfixed at
+    merge has an open issue, and that the gate checks this. §5.12 does that.
+12. **The gate checks the issues after the merge.** Auto-close on merge
+    applies only to issues the PR links with a closing keyword (`Closes`,
+    `Fixes`, `Resolves #n`) or through the Development sidebar. The gate's
+    own text never uses one, and the merge prompt tells the agent never to
+    write one for a follow-up issue (§6). Still, when the gate sees the PR
+    merged (the agent's `gh pr merge` succeeded, a poll, a session start or
+    `/pr-gate`), before it archives the record it reads the issue of each
+    finding settled by an issue:
+    - open: logged as checked;
+    - closed: reopened, with a comment that #<pr> merged without fixing it;
+    - missing (deleted or transferred), or the reopen fails: filed again,
+      with the same title and body, and the finding's follow-up updated.
+    If gh cannot read, reopen or file one, the record is not archived. The
+    agent gets gh's words and runs `/pr-gate resume` once gh works; the
+    check runs again then. Only after every issue checks out is the record
+    archived, and the agent is told the issues that stay open.
+
 ## 6. The agent merges (decision N)
 
 1. When the standing has nothing that holds the merge (ready, or a post
@@ -246,6 +276,9 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
 4. A merge GitHub refuses (a required check the gate didn't know of, R4-3) is
    reported to the agent with GitHub's words, and the lifecycle stays where it
    was.
+5. The prompt tells the agent never to write `Closes`, `Fixes` or `Resolves`
+   before a follow-up issue's number in the PR, a commit or the merge: those
+   issues stay open. The gate checks them after the merge (§5.12).
 
 ## 7. Bugs from PR #20
 
