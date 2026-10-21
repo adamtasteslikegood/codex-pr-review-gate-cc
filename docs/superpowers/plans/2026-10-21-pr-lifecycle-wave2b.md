@@ -3311,3 +3311,143 @@ git commit -m "pr-lifecycle 1.5.0: flaky flow tests, cause found and fixed or bo
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
+
+---
+
+### Task 15: Rulings, docs and version 1.5.0 (spec §8, §10)
+
+**Why:** the repo keeps every ruling with its cost if wrong, so a later change can tell a decision from an accident (CLAUDE.md). The README, the roadmap and CLAUDE.md must say what 1.5.0 does. When a component's version changes, its `plugin.json`, its README version line and the root README table change together.
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`
+- Modify: `pr-lifecycle/README.md`, `README.md`, `pr-lifecycle/.claude-plugin/plugin.json`
+- Modify: `LIFECYCLE_SPEC.md`, `ROADMAP.md`, `CLAUDE.md`
+
+**Interfaces:**
+- Consumes: Tasks 1-14 as built. Read each task's report in the SDD workspace for any ruling the implementer or the controller made, and add it.
+- Produces: nothing code uses.
+
+- [ ] **Step 1: Record the rulings**
+
+Append to `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`:
+
+```markdown
+## Rulings in wave 2b (1.5.0)
+
+Spec: `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`. Plan: `docs/superpowers/plans/2026-10-21-pr-lifecycle-wave2b.md`.
+
+- Ruling R88 (amends R33, R42 and what `usedRounds` counts; Adam, decisions F, G, H, 2026-10-20 and 2026-10-21): a post-PR round is one head. Findings go to the agent while collection still waits for slow reviewers, and the agent pushes as it goes; a push ends the round on its head at the end of the turn that pushed, and the next round starts on the new head. A round is charged only when it brings a new blocking finding or Codex rejects a fix, rebuttal or deferral in it ("a rejected fix still uses a round"); a clean round is free. Reviewers are asked again once per turn that pushed, on its last head — cost if wrong: an agent that pushes often spends no allowance on clean pushes, and a slow reviewer's late finding lands in a later round.
+- Ruling R89 (Adam, decision S): collection ends on GitHub's signals: the base's required check runs, the PR's pending review requests and the roster. Check suites are never read. The quiet window applies only when none of the three exists. A review requested from this machine's own login is never waited for — cost if wrong: a reviewer GitHub does not list as requested, outside the roster, is not waited for.
+- Ruling R90 (Adam, decision O): a finding that names a problem already raised is linked to the earlier one and follows its status; the gate links an exact repeat, and a link the agent gives is checked by Codex. Links do not chain, a link takes the higher peak severity, and a linked finding is never filed on its own — cost if wrong: two separate problems linked in error settle together until Codex refuses the link.
+- Ruling R91 (PR #20, G7-4, G7-9, G11-2): every reply id the agent reports is the gate's own, whatever its answer, and is never read back as feedback — cost if wrong: a reviewer comment whose id the agent misreports is dropped.
+- Ruling R92 (amends R39, R40, R55 and R85; Adam, decisions M and M2, 2026-10-21): a finding goes through a Codex review round and a fix attempt before any issue. Every deferral, at any severity, goes to Codex's free check: refused, it is open again and the round is charged; agreed, it waits. When the review can do no more (exhausted, or only deferrals and disputes hold), the gate files a GitHub issue for each finding still holding the merge, except security, labelled `severity:<peak>` and titled `<id> <Name> [P<n>] <title> (#<pr>, <branch>, <Jira key>, <spec>)`; an issue the agent's follow-up names is labelled instead. The issue settles the finding, and a change to its file does not unsettle it. Before filing, a blocker first raised in the round that spent the allowance, or in the last round, adds one round, at most twice per lifecycle, and the report tells the person the PR's scope may be too wide. Security findings, and a record that lost a finding's peak, wait for the person's waiver — cost if wrong: an issue is filed for a finding the person would have waived, and closing it is theirs.
+- Ruling R93 (Adam, decision N, 2026-10-21: "once the gate allows a merge the agent should merge"): when nothing holds the merge, the agent merges with `gh pr merge <n> --<mergeMethod>` (`merge` by default, from the base's `.github/pr-gate.json` only) and reports the merge commit; a merge GitHub refuses is reported in GitHub's words and the lifecycle stays where it was. The merge guard does not change. The release train still protects production — cost if wrong: a PR merges without the person reading it last.
+- Ruling R94 (PR #20, G7-2, G7-4): a severity tag is only a token standing alone (`[P2]`, `(P2)`, `**P2**`, `P2:` or `P2 -` at the start of a line, or a badge image named for it); any other mention is a hint. An acknowledgement is stored with `answer: 'acknowledged'` and named as one in holds — cost if wrong: a reviewer's tag written another way reads as a hint, which triage may lower.
+
+### Rulings made while planning and building 1.5.0
+
+- Charging applies to post-PR rounds only; pre-PR rounds draw on the allowance as in 1.4.0 — cost if wrong: a clean pre-PR round still costs a round.
+- A rejection in an answer run (R37, no round recorded) charges nothing — cost if wrong: an answer run's rejected fix is free.
+- Codex refusing a link the agent gave is not charged; the finding is open again on its own — cost if wrong: a wrong link costs no round.
+- The deferral check replaces R85's lowering check: one check of the deferral covers a lowered severity too — cost if wrong: none known; the lowering is in the deferral's text Codex reads.
+- Triage at the end of a head keeps 1.4.0's ending: the final-head check is still free — cost if wrong: none known.
+- A push ends the round at the end of the turn that pushed, not at the push; polls pause the gate's actions during the agent's turn — cost if wrong: a long turn holds the next round until it ends.
+- The prompts no longer list "commits since" a round began — cost if wrong: the agent reads the log itself.
+- The exhaustion paths are tested on `planIssues` (no store in the test engine), and the gh side through the awaiting path, which runs the same `fileIssues`. A dispute is tested at the unit level — cost if wrong: a flow-only bug at exhaustion is caught later.
+- A deferral settled under R85 before 1.5.0 has no Codex ruling, so Codex checks it once after the upgrade — cost if wrong: one extra free check per such deferral.
+- Flaky tests (spec §7.3): the limit is raised only for a test whose cost is machine load, with a comment beside it; a test that loses a hook under load is fixed or recorded instead.
+```
+
+Then add one line for each ruling the controller recorded in the SDD ledger that is not above, in the same form: what was decided, why, and the cost if wrong.
+
+- [ ] **Step 2: Update the README**
+
+In `pr-lifecycle/README.md`:
+
+1. Change `Version 1.4.0.` to `Version 1.5.0.`
+2. Under **One round**, add: a post-PR round is one head, triage starts during collection, and a push ends the round at the end of the turn (R88).
+3. Under **The budget**, replace "Outside the allowance." with: "**Outside the allowance.** The post-PR baseline (rounds 1 and 2), the final-head check, Codex's checks (rebuttal, deferral, link), and any post-PR round that brings no new blocking finding and no Codex rejection (R88). Up to two rounds the gate adds for late blockers (R92) are named in the report." Change the `allow` line to "It is the person's alone." (drop "It settles no deferral or dispute" only if it is no longer true; it still is).
+4. Replace **Deferrals** with:
+
+```markdown
+### Deferrals and issues
+
+A deferral is an answer, not a release. Codex checks every deferral at the end
+of the round, at no cost: if it says the finding can be fixed in this PR, the
+finding is open again and the round is charged (R92). If it agrees, the
+finding waits.
+
+When the review can do no more (the allowance is spent, or only deferrals and
+disputes hold the merge), the gate files a GitHub issue for each finding still
+holding it, except security ones:
+
+- title: `R4-3 Major [P2] <title> (#20, <branch>, <Jira key>, <issueSpec>)`;
+- label: `severity:<P>`, the highest severity the finding had;
+- body: who raised it and where, the problem, and why it was not fixed here.
+
+If the agent's follow-up names an issue that already tracks it, the gate
+labels that one instead. The issue settles the finding; a change to its file
+does not unsettle it. A failure to file holds the merge with gh's words, and
+the next pass retries. Security findings wait for `/pr-gate waive <id>`.
+
+Before filing, a blocker first raised in the round that spent the allowance
+gets one more round, at most twice per lifecycle. The report then says the
+PR's scope may be too wide.
+```
+
+5. Under **Waivers lapse**, add: "A finding settled by its issue does not lapse (R92)."
+6. Under **Who decides**, replace the second paragraph's list with: "It names the person only for security findings, and for a record that lost a finding's severity. Everything else ends in a fix, Codex's check, or an issue (R92). When nothing holds the merge, the agent merges (R93)."
+7. Add a section after **Who decides**:
+
+```markdown
+### The agent merges
+
+When nothing holds the merge, the ready prompt tells the agent to merge with
+`gh pr merge <n> --<mergeMethod>` and report the merge commit (R93). The guard
+still checks the head and CI. If GitHub refuses, the agent reports GitHub's
+words, and the lifecycle stays where it was.
+```
+
+8. Under **Settings per repository**, add `"mergeMethod": "merge"` and `"issueSpec": "docs/spec.md"` to the example, and add after the limits sentence: "`mergeMethod` is `merge` (default), `squash` or `rebase`. `issueSpec` is a spec handle of at most 80 characters, named in each filed issue's title. Both are read from the base's file only."
+9. Under **Commands**, change the `waive <findingId>` row's list to say a finding the gate cannot file (security) is the usual case, and the `allow` row to "add 1 to 5 review rounds".
+10. Read the README for any other text that says the person decides the merge, that a deferral waits for a waiver, or that collection waits a quiet window with a roster, and fix it to match. List each change in your report.
+
+In `pr-lifecycle/.claude-plugin/plugin.json`, set `"version": "1.5.0"`. In the root `README.md`, change the table's `1.4.0` to `1.5.0`, and the line "`pr-lifecycle` 1.4.0 is the plugin in daily use" to 1.5.0.
+
+- [ ] **Step 3: Update LIFECYCLE_SPEC.md and ROADMAP.md**
+
+In `LIFECYCLE_SPEC.md`, append:
+
+```markdown
+## Amended in pr-lifecycle 1.5.0 (wave 2b)
+
+- **One round is one head (R88).** A post-PR round reviews one head. A push ends it at the end of the turn that pushed. Only a round with a new blocking finding or a Codex rejection draws on the allowance.
+- **Collection (R89).** It waits for the base's required checks, the PR's requested reviews and the roster; the quiet window only when none exists.
+- **Settling (R92).** Deferrals get Codex's check. When the review can do no more, findings still holding the merge get GitHub issues, except security; the issue settles them.
+- **The merge (R93).** When nothing holds the merge, the agent merges with the repository's `mergeMethod`.
+
+See `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`.
+```
+
+In `ROADMAP.md`, under **Wave 2b**, mark items 1-4 done with "(done in 1.5.0)". Move item 5 (lanes) to a new `### Wave 2c: parallel fixers in lanes` section after it, unchanged. Replace the **Not yet placed: one finding per problem** section with one line under wave 2b: "6. **One finding per problem (done in 1.5.0, R90).**" Add "7. **Issues instead of waivers; the agent merges (done in 1.5.0, R92, R93).**". Update the wave 2 spec path in the intro if it names `2026-10-20-pr-lifecycle-wave2b-design.md`: the spec is `2026-10-21-pr-lifecycle-wave2b-design.md`.
+
+- [ ] **Step 4: Update CLAUDE.md**
+
+1. The state heading: `## Current state (<today's date>, after wave 2b)`.
+2. `pr-lifecycle/` **1.4.0** → **1.5.0**. Add to the ruling list: "R88–R94 in wave 2b".
+3. In **Checks**, set pr-lifecycle's test count to the number `npm run test` prints now.
+4. Add to the pr-lifecycle bullet: "When the review can do no more, it files a GitHub issue for each finding still holding the merge, except security (R92), and once nothing holds the merge, the agent merges (R93). The GitHub issue queue is Adam's list of what to fix, highest severity first."
+
+- [ ] **Step 5: Run the checks**
+
+Run `npm run check` from the repo root. Expected: PASS (lint, test, validate, typecheck).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md pr-lifecycle/README.md README.md pr-lifecycle/.claude-plugin/plugin.json LIFECYCLE_SPEC.md ROADMAP.md CLAUDE.md
+git commit -m "pr-lifecycle 1.5.0: rulings R88-R94, docs and version
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
