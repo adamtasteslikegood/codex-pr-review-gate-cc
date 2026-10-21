@@ -15,11 +15,12 @@
      │   │    → rollover: close round on H (isCharged computed), open the     │
      │   │      next round on H' (baseline / discretionary / final-head-check)│
      │   │      keep pending triage + run.findings, reset timers and cap ─────┘
-     │   ├─ fresh unasked feedback, one quiet poll since the last arrival,
-     │   │  no triage turn in flight → triage turn (phase stays 'collect',
-     │   │  pending role 'triage'); answers recorded by afterTriage without
-     │   │  ending the round; turn end re-requests roster reviewers once if the
-     │   │  head moved since the last request
+     │   ├─ fresh feedback no turn was handed, one quiet poll since the last
+     │   │  arrival, no turn in flight → mid-collection triage turn (phase
+     │   │  'triage', run.collect kept, so polls go on and only note arrivals);
+     │   │  afterTriage records the answers without ending the round; if the
+     │   │  turn pushed, its end closes the round on the new head and asks
+     │   │  roster reviewers again once (Tasks 8-10)
      │   └─ collectionDone(signals) && no pending && nothing fresh unasked
      │        → endCollect: Codex fallback from diffBase if the head is
      │          uncovered, then the end-of-head triage (1.4.0 ending: checks,
@@ -28,13 +29,14 @@
   advance → decideNext
      ├─ round / ready / blocked: as 1.4.0 (ready now says "merge now")
      └─ exhausted / awaiting-decision (post):
-          fileIssues: 1) a blocker first raised in the last completed round and
-          gate grants < 2 → grant by 'gate', start a round; else 2) file or
-          label an issue for every non-security held finding → settle → decide
-          again (ready → the agent merges)
+          fileIssues: 1) a held blocker first raised in the last completed post
+          round or the last charged round, gate grants < 2, and the grant
+          starts a round → grant by 'gate'; else 2) file or label an issue for
+          every held finding Codex has ruled on, except security → settle →
+          decide again (ready → the agent merges)
   ```
 - Charging (R88) is post-PR only: a pre-PR round is always charged, as in 1.4.0.
-- A triage turn during collection reuses `askTriage`/`afterTriage`. `afterTriage` gets a `midCollect` flag that skips the round's ending.
+- A triage turn during collection reuses `beginTriage`/`afterTriage`. `afterTriage` tells it by `run.collect !== undefined` and skips the round's ending (Task 8).
 - Everything else is additive. Where behaviour deliberately changes (R85's early P3 settle, the ready prompt, waivers for non-security findings, the quiet window), the old tests are updated in the task that changes it.
 
 **Tech Stack:**
@@ -77,13 +79,13 @@
 
 | File | What changes |
 | --- | --- |
-| `pr-lifecycle/types/index.d.ts` | `FindingEvent.answer`, `FindingEvent.deferral`, `FindingEvent.link`; `Finding.duplicateOf`, `Finding.issueError`; `RoundRecord.isCharged`; `Grant.by`; `LifecycleRecord.ownReplies`; `Run.requestedHead`, `Run.isMidCollect` |
+| `pr-lifecycle/types/index.d.ts` | `FindingEvent.answer` (Task 2), `FindingEvent.deferral` (Task 11); `Finding.duplicateOf`, `linkBy`, `isLinkChecked` (Task 7), `Finding.issueError` (Task 12); `RoundRecord.isCharged` (Task 6); `Grant.by` (Task 12); `LifecycleRecord.ownReplies` (Task 3); `Run.handed`, `Run.polled` (Task 8); `Blocker` kinds (Tasks 7, 11, 12); `MergeMethod` (Task 13) |
 | `pr-lifecycle/hooks/github.ts` | `severityHint` tag forms (Task 1); `Check.startedAt` (Task 4); `collectionDone` signals and `readRequested` (Task 5) |
-| `pr-lifecycle/hooks/lifecycle.ts` | `isAcknowledged` (Task 2); charging (Task 6); linking (Task 7); deferral check (Task 11); settling by issue, the late-blocker grant, `issueTitle`/`issueBody` (Task 12) |
-| `pr-lifecycle/hooks/core.ts` | `replyIdsOf` (Task 3); triage prompt wording (Tasks 7, 8); `readyPrompt(rec, method)` (Task 13) |
-| `pr-lifecycle/hooks/round.ts` | `fetchFeedback` (Tasks 3, 4, 5); `pollOnce`, triage during collection, rollover (Tasks 8, 9); re-requests (Task 10); `fileIssues` (Task 12); config (Tasks 12, 13) |
-| `pr-lifecycle/hooks/register.tsx` | status text for issues (Task 12) |
-| `pr-lifecycle/tests/world.ts` | knobs: `commitDate`, `requested`, `posted`, `issueAnswer`, `issueNumber` |
+| `pr-lifecycle/hooks/lifecycle.ts` | `isAcknowledged` (Task 2); charging (Task 6); linking (Task 7); deferral check (Task 11); settling by issue, the late-blocker grant, `issueTitle`/`issueBody`, `planIssues` (Task 12) |
+| `pr-lifecycle/hooks/core.ts` | `replyIdsOf` (Task 3); `readLinks`, triage and verify prompts (Tasks 7, 8, 11, 12); `readyPrompt`, `personPost`, `reportPrompt` (Task 12); `mergeStep`, `readyPrompt(rec, method)` (Task 13) |
+| `pr-lifecycle/hooks/round.ts` | `fetchFeedback` (Tasks 3, 4, 5); `pollOnce`, triage during collection, rollover (Tasks 8, 9); re-requests (Task 10); deferral check (Task 11); `fileIssues` replaces `labelDeferrals` (Task 12); `issueSpec`, `mergeMethod` settings (Tasks 12, 13) |
+| `pr-lifecycle/hooks/register.tsx` | status text (Tasks 11, 12); the waiver notes tell the agent to merge (Task 13) |
+| `pr-lifecycle/tests/world.ts` | knobs: `commitDate` (Task 4), `requested`, `requests` (Task 5), `issueAnswer`, `issueNumber`, `filed`, `onIssue` (Task 12) |
 | `pr-lifecycle/tests/*.test.ts` | the tests in each task |
 | docs | rulings R88-R94, LIFECYCLE_SPEC.md, ROADMAP.md, READMEs, CLAUDE.md (Task 15) |
 
@@ -2493,10 +2495,10 @@ test('R92: at exhaustion a blocker first raised in the round that spent the allo
 
 test('R92: a deferral the agent tied to an issue is filed by labelling that issue; any other gets a new one', async () => {
   const named = agreedBy(applyAnswer(finding({ id: 'G2-1', source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'G2-1', action: 'deferred', note: 'later', followUp: 'other/lib#7' }, 2, 'main', 5))
-  const fresh = agreedBy(applyAnswer(finding({ id: 'G2-2', source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'G2-2', action: 'deferred', note: 'later' }, 2, 'main', 5))
-  const next = decideNext(postRec({ findings: [named, fresh] }))
+  const unnamed = agreedBy(applyAnswer(finding({ id: 'G2-2', source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'G2-2', action: 'deferred', note: 'later' }, 2, 'main', 5))
+  const next = decideNext(postRec({ findings: [named, unnamed] }))
   expect(next).toMatchObject({ kind: 'blocked', issues: ['G2-1', 'G2-2'] })
-  const plan = planIssues(postRec({ findings: [named, fresh], slug: 'me/repo' }), 9)
+  const plan = planIssues(postRec({ findings: [named, unnamed], slug: 'me/repo' }), 9)
   expect(plan).toMatchObject({ kind: 'file', items: [{ id: 'G2-1', peak: 'P2', reuse: { repo: 'other/lib', number: 7 } }, { id: 'G2-2', peak: 'P3' }] })
   expect(plan.kind === 'file' ? plan.items[1] : undefined).not.toHaveProperty('reuse')
 })
