@@ -1937,3 +1937,402 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
 
 ---
+
+---
+
+### Task 11: Codex checks every deferral (R92 M2, spec §5.1)
+
+**Why:** in 1.4.0 a deferral after the PR opens goes straight to the person (R45), and only a P3 whose severity the agent lowered goes to Codex (R85's lowering check). Adam (2026-10-21): every blocking or advisory finding first goes through Codex and a fix attempt. A deferral at any severity goes to Codex in the round's free check, as a rebuttal does. If Codex says it can be fixed in this PR, the finding is open again, goes back to the agent, and the round is charged. If Codex agrees it is out of scope, it waits. This task replaces R85's lowering check with this deferral check. R85's early settle of a P3 with a labelled issue stays for now, but only after Codex agreed. Task 12 replaces that settle with the filing pass.
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`FindingEvent`, `Blocker`)
+- Modify: `pr-lifecycle/hooks/lifecycle.ts` (`checksOwed`, the R85 lowering functions, `wouldSettle`, `blockerOf`, `decidePost`, `awaiting`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`checkLabel` about line 1721, `afterRebuttalCheck` about line 1812, imports)
+- Modify: `pr-lifecycle/hooks/core.ts` (`verifyPrompt` about line 569, `triagePrompt` step 2 about line 707, imports)
+- Modify: `pr-lifecycle/hooks/register.tsx` (`statusText` about line 824, imports)
+- Test: `pr-lifecycle/tests/lifecycle.test.ts`, `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `isChargedRound` and `REJECTABLE` (Task 6; `'deferred'` is already in `REJECTABLE`, so a refusal charges the round with no change there). `markHeld` (`lifecycle.ts`).
+- Produces (Task 12 relies on these):
+  - `FindingEvent.deferral?: 'agreed' | 'refused'`: Codex's ruling on the agent's deferral.
+  - `export const isDeferralOwed = (f: Finding): boolean`: deferred, with no Codex ruling since the agent's last deferral. Any severity, security included.
+  - `export const isDeferralAgreed = (f: Finding): boolean`: deferred, and Codex's last ruling since the agent's last deferral is `'agreed'`.
+  - `export function ruleDeferral(f: Finding, holds: boolean, round: number, at: number, note?: string): Finding`.
+  - Blocker kind `'deferral-unchecked'` (owner `codex`) replaces `'lowering-unchecked'`.
+- Removed: `isLoweringOwed`, `loweringRefusal`, `ruleLowering` and the private `loweringRuling`. `loweringOf` stays: the deferral prompt still says when the agent lowered the severity. `FindingEvent.lowering` stays in the type, for records written by 1.4.0.
+- Rulings for the plan:
+  - The deferral check is post-PR only, like the rebuttal check (`checksOwed` is read only after the PR opens). Before the PR, the next Codex review already sees each deferral among the prior answers.
+  - A deferral from a 1.4.0 record, even one whose lowering Codex agreed with, has no `deferral` ruling, so Codex checks it once more. Cost: one free check per such finding.
+  - A deferral Codex refused is `open`. The agent may fix it, rebut it, or defer it again with a better reason. A new deferral is checked again, and each refusal charges its round, so the allowance bounds the loop.
+  - Codex's check also rules on a lowered severity: a deferral holds only when the finding cannot reasonably be fixed in this PR and its severity stands.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `pr-lifecycle/tests/lifecycle.test.ts`, in the import from `'../hooks/lifecycle'`, remove `isLoweringOwed`, `loweringRefusal` and `ruleLowering`, and add `isDeferralAgreed`, `isDeferralOwed` and `ruleDeferral`. Below the `finding` helper, add:
+
+```ts
+/** Codex agreed with the finding's deferral (R92 M2). */
+const agreedBy = (f: Finding): Finding => ruleDeferral(f, true, 9, 9)
+```
+
+Replace the test `'R85: a severity the agent lowered settles only once Codex agrees with the lowering (Adam, 2026-10-20)'` with:
+
+```ts
+test('R92: every deferral waits on Codex; agreed it waits, refused it is open again and charges the round (Adam, 2026-10-21)', async () => {
+  // A P2 deferral, a security deferral and a P3 deferred to an issue all go to Codex.
+  const p2 = applyAnswer(finding({ source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', note: 'needs a schema change' }, 2, 'main', 5)
+  expect(isDeferralOwed(p2)).toBe(true)
+  expect(isDeferralOwed({ ...p2, isSecurity: true })).toBe(true)
+  const p3 = { ...applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5), followUpLabel: 'P3' as const }
+  expect(isDeferralOwed(p3)).toBe(true)
+  expect(wouldSettle(p3)).toBe(false)
+  expect(isSettledDeferral(p3)).toBe(false)
+  expect(checksOwed([p2, p3]).map(one => one.id)).toEqual(['R1-1', 'R1-1'])
+  // Agreed: it stays deferred and waits; Codex is not asked again.
+  const agreed = ruleDeferral(p2, true, 2, 6)
+  expect(agreed.status).toBe('deferred')
+  expect(agreed.history.at(-1)).toMatchObject({ round: 2, status: 'deferred', deferral: 'agreed', by: 'codex', at: 6 })
+  expect(isDeferralOwed(agreed)).toBe(false)
+  expect(isDeferralAgreed(agreed)).toBe(true)
+  expect(checksOwed([agreed])).toEqual([])
+  expect(isSettledDeferral(agreedBy(p3))).toBe(true)
+  // Refused: open again with Codex's reason, back to the agent; the refusal charges the round it is in.
+  const refused = ruleDeferral(p2, false, 2, 6, 'a one-line guard fixes it')
+  expect(refused.status).toBe('open')
+  expect(refused.history.at(-1)).toMatchObject({ round: 2, status: 'open', note: 'a one-line guard fixes it', deferral: 'refused', by: 'codex' })
+  expect(isDeferralOwed(refused)).toBe(false)
+  expect(isChargedRound([refused], 2)).toBe(true)
+  expect(isChargedRound([agreed], 2)).toBe(false)
+  // Deferred again after the refusal: Codex checks the new deferral.
+  const again = applyAnswer(refused, { id: 'R1-1', action: 'deferred', note: 'the guard breaks the public API' }, 3, 'main', 7)
+  expect(isDeferralOwed(again)).toBe(true)
+  // A deferral from a 1.4.0 record, whose lowering Codex agreed with, is checked once more: a lowering ruling is not a deferral ruling.
+  const legacy = { ...p3, history: [...p3.history, { round: 2, status: 'deferred' as const, lowering: 'agreed' as const, by: 'codex', at: 6 }] }
+  expect(isDeferralOwed(legacy)).toBe(true)
+  // The agent's lowering is still read, for the prompt.
+  const lowered = applyAnswer(finding({ source: 'github', severity: 'P1', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', note: 'only a typo', followUp: '#12' }, 2, 'main', 5)
+  expect(loweringOf(lowered)).toMatchObject({ from: 'P1', to: 'P3' })
+  expect(isDeferralOwed(lowered)).toBe(true)
+})
+```
+
+Add `isChargedRound` to the imports if Task 6 did not. In the same file, update the other R85 tests so a deferral that should settle has Codex's agreement:
+- `'R85: isSettledDeferral needs deferred, P3, an issue follow-up, its label and no security flag'`: `const base = agreedBy(finding({ ... }))` (same fields as now). Add after the last line: `expect(isSettledDeferral({ ...base, history: [] })).toBe(false)`, with the comment `// Codex has not agreed with the deferral: it waits on the check (R92 M2).`
+- `'gate R7-6: ...'`: `const base = agreedBy(finding({ ... }))`. Replace the two `isLoweringOwed` lines with `expect(wouldSettle(agreedBy(legacy))).toBe(false)`, with the comment `// Even with Codex agreeing, the lost peak keeps it from settling on its own.` Make the last line `expect(wouldSettle(agreedBy({ ...again, followUpLabel: 'P3' }))).toBe(false)`.
+- `'R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)'`: `const base = agreedBy(finding({ ... }))`.
+- `'R85: a deferral without a follow-up clears the earlier one and its label (final review T4)'`: `const first = { ...agreedBy(applyAnswer(tagged, { ... }, 2, 'main', 5)), followUpLabel: 'P3' as const }`. Make the last line `expect(wouldSettle(agreedBy(moved))).toBe(true)`.
+- `'R85: the ready prompt names the follow-up of a settled deferral and not of a plain one'`: `const settled = agreedBy(finding({ ... }))`.
+
+Replace the test `'R85: a lowering owed Codex, one Codex refused, and an issue the gate could not label each hold with their own owner'` with:
+
+```ts
+test('R92: a deferral owed Codex holds as Codex\'s; one Codex refused is open; an issue the gate could not label holds as the agent\'s', async () => {
+  const deferred = applyAnswer(finding({ id: 'G2-1', source: 'github', reviewer: 'mallory', severity: 'P1', severitySource: 'hint' }), { id: 'G2-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5)
+  const owed = standingOf(postRec({ findings: [deferred] }), { head: 'a', base: 'dev' }).blockers
+  expect(owed.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'deferral-unchecked', 'codex']])
+  expect(owed[0]?.said).toBe('G2-1 [P3] comment from mallory: deferred, Codex has not checked the deferral')
+  const refused = ruleDeferral(deferred, false, 2, 6, 'it loses data')
+  const held = standingOf(postRec({ findings: [refused] }), { head: 'a', base: 'dev' }).blockers
+  expect(held.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'open', 'agent']])
+  const failed = { ...ruleDeferral(deferred, true, 2, 6), followUpLabelError: 'HTTP 404: Not Found' }
+  const label = standingOf(postRec({ findings: [failed] }), { head: 'a', base: 'dev' }).blockers
+  expect(label).toEqual([{
+    kind: 'label-failed', id: 'G2-1', said: 'could not label issue #12 severity:P1 (HTTP 404: Not Found)', owner: 'agent',
+    release: 'check the issue exists and gh can edit it; the gate retries on the next pass',
+  }])
+  const pending = standingOf(postRec({ findings: [ruleDeferral(deferred, true, 2, 6)] }), { head: 'a', base: 'dev' }).blockers
+  expect(pending.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'label-owed', 'gate']])
+  // The controller sends a deferral to Codex, never to the person; a refusal goes back to the agent.
+  const next = decideNext(postRec({ findings: [deferred] }))
+  expect(next).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  expect(next.kind === 'blocked' ? next.why : '').toBe('Codex has not checked the deferral of G2-1')
+  expect(next.kind === 'blocked' ? next.nextStep : '').toBe('run /pr-gate resume: Codex checks the deferral on this head, using no review round')
+  const back = decideNext(postRec({ findings: [refused] }))
+  expect(back).toMatchObject({ kind: 'blocked', answer: ['G2-1'] })
+  expect(back.kind === 'blocked' ? back.why : '').toBe('Codex says G2-1 can be fixed in this PR: it loses data')
+  // Agreed and not an issue P3: the person's, as in 1.4.0 (Task 12 files its issue instead).
+  const p2 = ruleDeferral(applyAnswer(finding({ id: 'G2-1', source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'G2-1', action: 'deferred', note: 'later' }, 2, 'main', 5), true, 2, 6)
+  expect(decideNext(postRec({ findings: [p2] })).kind).toBe('awaiting-decision')
+})
+```
+
+In `pr-lifecycle/tests/flow.test.ts`:
+
+1. In `toAwaiting`, after the `triaged` line, add the Codex check:
+   ```ts
+     // Codex checks the deferral first, in the round's free check (R92 M2).
+     await done($, accept('r2-verify', w))
+   ```
+2. Every other flow test where a triage answer defers a finding and the test then expects the lifecycle to move on (ready, awaiting-decision, a label call, a status line) now meets a verify step first. Add `await done($, accept('r<n>-verify', w))` right after that `triaged` call, where `<n>` is the round in the step name, unless the test already answers a verify step there. The R85 tests at about lines 3411-3600 and the gate R7-7, G7-8 and R8-2 tests are among them. Run `grep -n "action: 'deferred'" pr-lifecycle/tests/flow.test.ts` to find them all, and list each test you changed in your report.
+3. Replace the test `'R85: a guessed P1 the agent lowers to P3 waits on Codex; Codex agrees, and the issue carries severity:P1 (Adam, 2026-10-20)'` with:
+
+```ts
+test('R92: a deferral waits on Codex\'s check; a lowered P3 Codex agrees with carries severity:P1 on its issue (Adam, 2026-10-21)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: 'KAN-9 #12', replyId: '992' }]))
+  // Not ready: Codex checks the deferral in the round's own check, using no round.
+  expect((await runOf(w)).phase).toBe('verify')
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  const asked = w.spawned.at(-1)?.prompt ?? ''
+  expect(asked).toContain('The main agent deferred these findings instead of fixing them in this PR.')
+  expect(asked).toContain('The agent lowered it from P1 to P3. Follow-up: KAN-9 #12. Its reason: only the typo is real')
+  expect(asked).toContain('This is a critical bug.')
+  expect(asked).toContain('holds is true when it cannot reasonably be fixed in this PR and its severity stands')
+  expect(w.gh.labelled).toEqual([])
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
+  // The peak, not the lowered severity, goes on the issue.
+  expect(labelled(w, 12, 'P1')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('(follow-up at KAN-9 #12, labelled severity:P1)')
+})
+```
+
+4. Replace the test `'R85: Codex disagreeing with a lowering leaves the deferral to the person, with its reason (Adam, 2026-10-20)'` with:
+
+```ts
+test('R92: Codex refusing a deferral opens it again for the agent, with its reason, and charges the round (Adam, 2026-10-21)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: '#12', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'the comment reports a real crash' }))
+  const rec = await recordOf(w)
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', status: 'open', deferral: 'refused', note: 'the comment reports a real crash' })
+  expect(rec.rounds.filter(one => one.phase === 'post').at(-1)?.isCharged).toBe(true)
+  // The agent is told, with Codex's words; the person is not asked to waive anything.
+  expect(w.prompts.at(-1)).toContain('Codex says G2-1 can be fixed in this PR: the comment reports a real crash')
+  expect(w.prompts.at(-1)).not.toContain('/pr-gate waive G2-1')
+  expect(w.gh.labelled).toEqual([])
+})
+```
+
+5. Add:
+
+```ts
+test('R92: Codex agreeing with a P2 deferral leaves it deferred, using no round', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2' })
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
+  expect(rec.rounds.filter(one => one.phase === 'post').at(-1)?.isCharged).toBe(false)
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts`
+Expected: FAIL: `ruleDeferral`, `isDeferralOwed` and `isDeferralAgreed` are not exported.
+
+- [ ] **Step 3: Implement the types**
+
+In `pr-lifecycle/types/index.d.ts`, replace the `FindingEvent` doc comment and add `deferral`:
+
+```ts
+/**
+ * `severity`: the severity an answer set, with `from` the one before it (R85). `lowering`: Codex's ruling on the agent's lowering of
+ * the severity before it, on a record from 1.4.0 (R85, replaced by `deferral`). `deferral`: Codex's ruling on the agent's deferral
+ * (R92 M2): agreed, it cannot reasonably be fixed in this PR; refused, it can, and the finding is open again.
+ */
+export type FindingEvent = {
+  round: number
+  status: FindingStatus
+  note?: string
+  evidence?: string
+  severity?: Severity
+  from?: Severity
+  lowering?: 'agreed' | 'refused'
+  deferral?: 'agreed' | 'refused'
+  by: string
+  at: number
+}
+```
+
+(Keep any field an earlier task added to `FindingEvent`, such as `answer` from Task 2.) In `Blocker['kind']`, replace `'lowering-unchecked'` with `'deferral-unchecked'`.
+
+- [ ] **Step 4: Implement the deferral check in `lifecycle.ts`**
+
+1. Delete `loweringRuling`, `isLoweringOwed`, `loweringRefusal` and `ruleLowering` with their doc comments. Keep `loweringOf` and `isIssueDeferral`.
+2. After `isIssueDeferral`, add:
+
+```ts
+/** Where the agent last deferred the finding in its history, or -1 when the history records no deferral of the agent's. */
+const lastDeferral = (f: Pick<Finding, 'history'>): number =>
+  f.history.reduce((found, one, i) => (one.status === 'deferred' && one.by !== 'codex' ? i : found), -1)
+
+/** Codex's ruling on the agent's last deferral (R92 M2), if it gave one since. A 1.4.0 lowering ruling is not one. */
+const deferralRuling = (f: Finding): FindingEvent | undefined =>
+  f.history.slice(lastDeferral(f) + 1).filter(one => one.by === 'codex' && one.deferral !== undefined).at(-1)
+
+/**
+ * A deferral Codex has not ruled on (R92 M2, Adam 2026-10-21): at any severity, security included. The round's free check rules on
+ * it, as on a rebuttal; nothing settles by an issue, or waits for the person, before it.
+ */
+export const isDeferralOwed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f) === undefined
+
+/** A deferral Codex agreed cannot reasonably be fixed in this PR (R92 M2): it waits. */
+export const isDeferralAgreed = (f: Finding): boolean => f.status === 'deferred' && deferralRuling(f)?.deferral === 'agreed'
+
+/**
+ * Codex's ruling on a deferral (R92 M2): agreed, it stays deferred and waits; refused, it is open again with Codex's reason and goes
+ * back to the agent. The refusal is a Codex `open` right after a deferral, so `isChargedRound` charges the round it is in (R88).
+ */
+export function ruleDeferral(f: Finding, holds: boolean, round: number, at: number, note?: string): Finding {
+  if (holds) {
+    const said = note ?? 'Codex: it cannot reasonably be fixed in this PR'
+    return { ...f, history: [...f.history, { round, status: 'deferred', note: said, deferral: 'agreed', by: 'codex', at }] }
+  }
+  const held = markHeld(f, round, 'codex', at, note ?? 'Codex: it can be fixed in this PR')
+  const last = held.history.at(-1)
+  return last === undefined ? held : { ...held, history: [...held.history.slice(0, -1), { ...last, deferral: 'refused' }] }
+}
+```
+
+   Add `FindingEvent` to the type import from `'../types'` if it is not there.
+3. Replace `wouldSettle` and its doc comment with:
+
+```ts
+/**
+ * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-21): a P3, not security, deferred to a
+ * GitHub issue, that Codex agreed cannot reasonably be fixed in this PR (R92 M2). A guessed P3 settles as a tagged one.
+ */
+export const wouldSettle = (f: Finding): boolean => isIssueDeferral(f) && !isPeakUnknown(f) && isDeferralAgreed(f)
+```
+
+4. In `checksOwed`, replace `isLoweringOwed(one)` with `isDeferralOwed(one)`, and end its doc comment with: "and every deferral, at any severity, that Codex has not ruled on (R92 M2, Adam 2026-10-21; it replaces R85's lowering check)." Drop the sentence "Any other deferral is the person's to release (R45), never Codex's."
+5. In `blockerOf`, replace the start of the `if (f.status === 'deferred') {` block (the `low`, `isLoweringOwed` and `refusal` lines) with:
+
+```ts
+  if (f.status === 'deferred') {
+    if (isDeferralOwed(f)) {
+      return { kind: 'deferral-unchecked', id: f.id, said: `${tag}: deferred, Codex has not checked the deferral`, owner: 'codex', release: "the gate's Codex check rules on it" }
+    }
+```
+
+   Keep the `wouldSettle` branch after it as it is.
+6. In `decidePost`:
+   - In `unchecked`, replace `isLoweringOwed(one)` with `isDeferralOwed(one)`, and make the comment above it say "…as free as a rebuttal check (R58); so is every deferral Codex has not ruled on (R92 M2)."
+   - Make `deferred` `holding.filter(one => one.status === 'deferred' && !isDeferralOwed(one) && !wouldSettle(one))`.
+   - In the `if (!isChanged && open.length > 0)` block, after `refuted`, add:
+
+```ts
+    // A deferral Codex says can be fixed in this PR (R92 M2): the agent's to fix, or to rebut with evidence.
+    const undeferred = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-1)?.deferral === 'refused')
+```
+
+     Exclude it from `ignored` (`!rejected.includes(one) && !refuted.includes(one) && !undeferred.includes(one)`). Make `isFeedbackOnly` require `rejected.length + refuted.length + undeferred.length === 0`. In `said`, after the `refuted` line, add `...undeferred.map(one => \`Codex says ${one.id} can be fixed in this PR: ${codexSaid(one)}\`),`. In `steps`, make the first group `ignored.length + refuted.length + undeferred.length === 0 ? [] : [\`fix or rebut ${ids([...refuted, ...undeferred, ...ignored])}\`]`.
+   - Replace `recheck` with:
+
+```ts
+  const recheck = (): Next => {
+    const deferrals = unchecked.filter(isDeferralOwed)
+    const rebuttals = unchecked.filter(one => !isReverifyOwed(one) && !isDeferralOwed(one))
+    const reverify = unchecked.filter(isReverifyOwed)
+    const said = [
+      ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
+      ...(deferrals.length === 0 ? [] : [`Codex has not checked the deferral of ${ids(deferrals)}`]),
+      ...reverify.map(reverifyOwed),
+    ]
+    const what = reverify.length + deferrals.length === 0 ? 'the rebuttal' : rebuttals.length + reverify.length === 0 && deferrals.length === 1 ? 'the deferral' : 'them'
+    return {
+      kind: 'blocked',
+      why: said.join('; '),
+      nextStep: `run /pr-gate resume: Codex checks ${what} on this head, using no review round`,
+      recheck: unchecked.map(one => one.id),
+    }
+  }
+```
+
+7. In `awaiting`, delete `refused` and `plain`, and make `what` `[...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')`.
+
+- [ ] **Step 5: Implement the check in `round.ts`**
+
+1. In the import from `'./lifecycle'`, replace `isLoweringOwed` with `isDeferralOwed` and `ruleLowering` with `ruleDeferral`.
+2. Replace `checkLabel` with:
+
+```ts
+const checkLabel = (round: number, checked: readonly Finding[]): string => {
+  const fixes = checked.filter(one => isReverifyOwed(one) || one.status === 'reported-fixed').length
+  const deferrals = checked.filter(isDeferralOwed).length
+  const kinds = [
+    ...(checked.length - fixes - deferrals > 0 ? ['rebuttals'] : []),
+    ...(fixes > 0 ? ['fixes'] : []),
+    ...(deferrals > 0 ? ['deferrals'] : []),
+  ]
+  return `Round ${round} · codex ${fixes === checked.length ? 'verifies the fixes' : `checks the ${kinds.join(' and ')}`}`
+}
+```
+
+3. In `afterRebuttalCheck`, replace the two lines of the R85 lowering branch with:
+
+```ts
+      // A deferral (R92 M2): agreed, it waits; refused, it is open again with Codex's reason, back to the agent, and charges the round.
+      if (isDeferralOwed(f)) return ruleDeferral(f, verdict.holds, one.round, now, verdict.note)
+```
+
+- [ ] **Step 6: Implement the prompts in `core.ts` and the status in `register.tsx`**
+
+1. In `core.ts`, in the import from `'./lifecycle'`, replace `isLoweringOwed` with `isDeferralOwed` (keep `loweringOf`).
+2. In `verifyPrompt`, replace the `lowered`, `argued`, `what` and `lowerings` lines with:
+
+```ts
+    // Every deferral Codex has not ruled on (R92 M2): Codex rules on whether it can be fixed in this PR, not on a fix.
+    const deferrals = rebuttals.filter(isDeferralOwed)
+    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed' && !isDeferralOwed(one))
+    const kinds = [
+      ...(argued.length === 0 ? [] : ['rebuttals']),
+      ...(fixes.length + reported.length === 0 ? [] : ['fixes']),
+      ...(deferrals.length === 0 ? [] : ['deferrals']),
+    ]
+    const what = kinds.join(' and ')
+    const deferred = deferrals.map(one => {
+      const low = loweringOf(one)
+      const lowered = low === undefined ? '' : `The agent lowered it from ${low.from} to ${low.to}. `
+      const follow = one.followUp === undefined ? '' : `Follow-up: ${one.followUp}. `
+      return `${listFindings([one])}\n    ${lowered}${follow}Its reason: ${one.note ?? 'no reason given'}`
+    })
+```
+
+   Replace the `...(lowered.length === 0 ? [] : [ ... ])` section with:
+
+```ts
+      ...(deferrals.length === 0
+        ? []
+        : [
+            '',
+            'The main agent deferred these findings instead of fixing them in this PR. A deferral settles nothing until you agree with it:',
+            ...deferred,
+            '   For each one: given the finding and the code at HEAD, can it reasonably be fixed in this PR, and if the agent lowered its severity, ' +
+              'is the lower one right? holds is true when it cannot reasonably be fixed in this PR and its severity stands.',
+          ]),
+```
+
+   In step 1 of the same prompt, replace "and rule on each one: does the rebuttal, or the fix, still hold?" with "and rule on each one: does the rebuttal, the fix or the deferral hold?".
+3. In `triagePrompt` step 2, replace the sentence that starts `'   A deferral waits for the person, except a P3, …'` (both string pieces) with:
+
+```ts
+    '   Codex checks every deferral at the end of the round: if it says the finding can be fixed in this PR, the finding comes back to you open and the round is charged. ' +
+      'A P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it) needs no waiver once Codex agrees; ' +
+      'the gate labels the issue with the highest severity the finding had.',
+```
+
+4. In `register.tsx`, remove `loweringRefusal` from the import from `'./lifecycle'`, and delete the `.concat(...)` line in `statusText` that uses it (a refused deferral is open, and the hold list says why).
+
+- [ ] **Step 7: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. If a test outside the R85 group failed because a deferral now meets a verify step first, add the `accept` call as in Step 1 and list it in your report. Then run `npm run lint` and `npm run typecheck` from the repo root (typecheck needs the generated types; if they are missing, say so in your report).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/lifecycle.ts pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/core.ts pr-lifecycle/hooks/register.tsx pr-lifecycle/tests/lifecycle.test.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: Codex checks every deferral; a refusal reopens it and charges the round (R92 M2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
