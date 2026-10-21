@@ -2144,13 +2144,23 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   // A post waiver covering this head ends review work for it (R80): checked before any branch that starts triage, a recheck or a round
   // (PR #19 review), so a waived head gets what the waiver covers and what CI still holds, never the hold or more review.
   const posts = rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 ? rec.waivers.filter(one => one.scope === 'post') : []
-  // A waiver given while a round ran names the PR head, which the record's head may not have reached (the late round records
-  // nothing): GitHub's head, read once, decides then.
-  const isRead = rec.pr !== undefined && posts.length > 0 && !posts.some(one => one.head === rec.head)
-  const at = isRead && rec.pr !== undefined ? ((await prHeadOf($, root, rec.pr)) ?? rec.head) : rec.head
+  // GitHub's head, read once whenever a post waiver exists, decides: a waiver given while a round ran names the PR head, which the
+  // record's head may not have reached (the late round records nothing), and a push by someone else after the waiver is not covered
+  // by it (gate R1-1, R1-5). When gh cannot say, the record's head decides.
+  const at = rec.pr !== undefined && posts.length > 0 ? ((await prHeadOf($, root, rec.pr)) ?? rec.head) : rec.head
   if (rec.pr !== undefined && posts.some(one => one.head === at)) {
     const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: at })
     await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
+    return
+  }
+  // The waiver covers the checkout's head, but the PR moved past it: no review or waiver covers the PR's head yet.
+  if (rec.pr !== undefined && at !== rec.head && posts.some(one => one.head === rec.head)) {
+    await say(
+      $,
+      rec,
+      `pr-gate: the person's post waiver covers PR #${rec.pr} at ${rec.head.slice(0, 7)}, but the PR head is now ${at.slice(0, 7)}, ` +
+        `which no review or waiver covers. The local checkout ${rec.head.slice(0, 7)} is not the PR head: pull (or push), then run /pr-gate resume.`,
+    )
     return
   }
   const next = decideNext(rec)

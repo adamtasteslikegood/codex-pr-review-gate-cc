@@ -3581,6 +3581,22 @@ test('R80: after waive post, a resume says the waiver covers the head instead of
   expect(sent.at(-1)).toContain("the person's post waiver covers")
 })
 
+test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver names the new PR head, not the waiver', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  const moved = 'e'.repeat(40)
+  w.gh.prHead = moved
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const last = w.prompts.slice(prompts).at(-1) ?? ''
+  expect(last).toContain(`the PR head is now ${moved.slice(0, 7)}`)
+  expect(last).toContain('pull (or push), then run /pr-gate resume')
+  expect(last).not.toContain('Nothing else holds')
+})
+
 test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
   const w = world(on)
   w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
