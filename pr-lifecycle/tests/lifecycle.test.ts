@@ -25,6 +25,7 @@ import {
   ruleLowering,
   wouldSettle,
   mergeHolds,
+  isChargedRound,
   mergeFindings,
   moveLine,
   newRecord,
@@ -1059,4 +1060,31 @@ test('R94: an acknowledgement is named as one in the history, the standing and t
   const reopened = markHeld(ack, 2, 'codex', 6, 'it asks for a change')
   expect(isAcknowledged(reopened)).toBe(false)
   expect(isAcknowledged(applyAnswer(reopened, { id: 'G2-1', action: 'rebutted', note: 'see src/app.ts:9' }, 2, 'main', 7))).toBe(false)
+})
+
+test('R88: a post round is charged for a new blocker or a Codex rejection in it; a pre round and an older record always count', async () => {
+  const blocker = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P1' })
+  const advisory = finding({ id: 'G3-2', round: 3, source: 'github', severity: 'P3' })
+  expect(isChargedRound([blocker], 3)).toBe(true)
+  expect(isChargedRound([advisory], 3)).toBe(false)
+  expect(isChargedRound([blocker], 4)).toBe(false)
+  // A fix Codex rejects is charged to the round that rejects it.
+  const rejectedFix = finding({ id: 'R2-1', round: 2, severity: 'P2', history: [
+    { round: 2, status: 'open', by: 'codex', at: 1 },
+    { round: 3, status: 'reported-fixed', by: 'main', at: 2 },
+    { round: 3, status: 'open', note: 'still reachable', by: 'codex', at: 3 },
+  ] })
+  expect(isChargedRound([rejectedFix], 3)).toBe(true)
+  expect(isChargedRound([rejectedFix], 2)).toBe(false)
+  const upheld = finding({ id: 'R2-2', round: 2, status: 'verified-fixed', history: [
+    { round: 3, status: 'reported-fixed', by: 'main', at: 1 },
+    { round: 3, status: 'verified-fixed', by: 'codex', at: 2 },
+  ] })
+  expect(isChargedRound([upheld], 3)).toBe(false)
+  // A rejected rebuttal and a rejected acknowledgement charge too.
+  expect(isChargedRound([rejected()], 2)).toBe(true)
+  const d = (n: number, over: object = {}) => roundOf({ n, phase: 'post', kind: 'discretionary', ...over })
+  expect(usedRounds({ rounds: [pre(), d(2, { isCharged: false }), d(3, { isCharged: true }), d(4)] })).toBe(3)
+  expect(usedRounds({ rounds: [pre({ isCharged: false })] })).toBe(1)
+  expect(remaining({ allowance: 2, grants: [], rounds: [d(2, { isCharged: false }), d(3, { isCharged: false })] })).toBe(2)
 })

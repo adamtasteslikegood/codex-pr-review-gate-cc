@@ -119,6 +119,11 @@ export type RoundRecord = {
   /** The PR base the round reviewed against; a pre-PR round's verdict covers that base only. */
   base?: string
   isCompleted: boolean
+  /**
+   * Post only (R88): whether the round drew on the allowance, because a new blocker was raised in it or Codex rejected a fix,
+   * rebuttal or acknowledgement in it. Absent on a pre round and on a record from before 1.5.0, which count as charged.
+   */
+  isCharged?: boolean
   /** The Codex effort the round, or the attempt, ran at. Absent on a record from before 1.2.0. */
   effort?: Effort
   /** The Codex model that reviewed it, from the reviewer's `CODEX_MODEL:` line, else the model the gate named (R69). */

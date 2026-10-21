@@ -19,9 +19,12 @@ export function allowanceFor(tier: Tier, lane: Lane, a: Allowances): number {
   return tier === 'high' ? a.high : a.standard
 }
 
-/** Completed discretionary rounds: baseline rounds, final-head checks and incomplete attempts use nothing. */
+/**
+ * Rounds that drew on the allowance: completed discretionary ones. A post round from 1.5.0 counts only when it was charged (R88);
+ * a pre round, and a round from an older record, always count. Baseline rounds, final-head checks and incomplete attempts use nothing.
+ */
 export const usedRounds = (rec: Pick<LifecycleRecord, 'rounds'>): number =>
-  rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary').length
+  rec.rounds.filter(one => one.isCompleted && one.kind === 'discretionary' && (one.phase === 'pre' || one.isCharged !== false)).length
 
 type Budgeted = Pick<LifecycleRecord, 'rounds' | 'allowance' | 'grants'>
 
@@ -100,6 +103,21 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
 })
 
 export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
+
+/** The agent's answers Codex can reject. */
+const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
+
+/**
+ * Whether a post round costs one (R88): a blocking finding first raised in it, or Codex reopening, in it, a finding the agent had
+ * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does.
+ */
+export function isChargedRound(findings: readonly Finding[], round: number): boolean {
+  const isNewBlocker = findings.some(one => one.round === round && isBlocking(one))
+  const isRejected = findings.some(one =>
+    one.history.some((each, i) => each.round === round && each.by === 'codex' && each.status === 'open' && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open')),
+  )
+  return isNewBlocker || isRejected
+}
 
 const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 

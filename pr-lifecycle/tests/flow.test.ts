@@ -4613,3 +4613,20 @@ test('R89: a failed read of commit statuses is logged and collection falls back 
   expect((await recordOf(w)).phase).toBe('ready')
   expect((await logOf(w)).some(one => one.startsWith('could not read commit statuses: gh: Server Error (HTTP 502)'))).toBe(true)
 })
+
+test('R88: each post round records whether it was charged: a clean one is free, a new blocker charges it', async ($, on) => {
+  const clean = world(on)
+  clean.git.roster = roster
+  await toPost($, clean)
+  clean.gh.reviews = covers(clean.gh.prHead)
+  await clean.clock.advance(30_000)
+  expect((await recordOf(clean)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([false])
+})
+
+test('R88: a round that raises a new blocker is charged', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([true])
+})
