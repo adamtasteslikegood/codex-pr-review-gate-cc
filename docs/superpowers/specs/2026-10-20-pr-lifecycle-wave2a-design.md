@@ -275,9 +275,12 @@ the same on main.
 5. **Advisory markers (Adam, 2026-10-20).** `severityHint` (`github.ts:208`)
    reads a reviewer's own advisory label as P3. The labels are "advisory",
    "non-blocking", "nit", "optional" and "follow-up", when they label the
-   comment or its list of findings, not inside a quoted phrase. Its
-   `severitySource` is `'tag'`: it is the reviewer's own word, so the agent
-   can't raise it to blocking by itself, though Codex still can. A review
+   comment or its list of findings, not inside a quoted phrase. Only a label
+   at the start of the body counts (a heading mark, list marker or bold
+   allowed): "Nit:" on a later line labels that line, not the finding above
+   it (final review C1). Its `severitySource` is `'tag'`: it is the
+   reviewer's own word, so the agent may raise it but never lower it, as for
+   any reviewer tag (amended after the final review, M5). A review
    comment that lists several advisory findings stays one finding, P3, with
    the list in its detail. The agent answers it once: fixing what it fixes,
    `acknowledged`, or deferred with a follow-up (section 4). An explicit
@@ -289,9 +292,15 @@ the same on main.
   issue URL, `#<n>`, or a PR comment URL.
 - A `deferred` finding settles, so it is no longer in `mergeHolds` or
   `unresolvedBlockers`, when all of these hold:
-  - it has a `followUp`;
-  - its stored severity is `P3`;
+  - it has a `followUp` that names where it is tracked: an `https://` URL,
+    `#<n>`, or `owner/repo#<n>`; any other text keeps the deferral but
+    settles nothing (final review T4);
+  - its stored severity is `P3`, and the agent never lowered it: no answer
+    changed it to `P3` from a higher guess, in the deferring answer or an
+    earlier one (final review I2);
   - it is not security-flagged.
+
+  A deferral that comes without a `followUp` clears an earlier one.
 
   It shows in `/pr-gate status` and the log as "deferred, follow-up at …".
 - P0-P2, security, or no `followUp`: held for the person's waiver, as today
@@ -337,7 +346,7 @@ the same on main.
 | R82 | Triage carries open findings by the round raised in; `acknowledged` ("asks for no change") needs a reply and a Codex check, as a rebuttal does | R32, R34, R36, R40 |
 | R83 | A review is `isFinding: false` only on positive no-action evidence | readReviews' non-empty rule |
 | R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
-| R85 | A P3 deferral with a `followUp`, not security, settles without a waiver | R42 |
+| R85 | A P3 deferral with a `followUp` naming a URL or issue, not security, that the agent never lowered to P3, settles without a waiver | R42 |
 | R86 | Required checks come from rulesets and classic protection; `waive post` sets aside the rest | R1-9 |
 | R87 | A hold on a Bash command that does more than its PR action says that nothing in it ran (section 5a) | R77 wording |
 

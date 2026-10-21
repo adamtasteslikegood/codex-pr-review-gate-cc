@@ -157,7 +157,7 @@ Claude should:
 - Fix confirmed issues with appropriate checks.
 - Reply in the original inline thread where applicable.
 - Rebut incorrect findings with code/test/requirement evidence.
-- Explicitly record accepted nonblocking deferrals. A P3 deferral that names a `followUp`, and is not security, settles without a waiver (R85).
+- Explicitly record accepted nonblocking deferrals. A P3 deferral whose `followUp` names where it is tracked (a URL, `#<n>` or `owner/repo#<n>`), is not security, and was not lowered to P3 by the agent, settles without a waiver (R85).
 - Mark a finding `acknowledged` when it asks for no change: it needs a reply in the thread, applies only to a GitHub finding with no security flag and no explicit P0-P2, is stored as a rebuttal, and Codex checks it (R82).
 - A review settles with no finding only on positive no-action evidence, such as a plain approval; an unclear one goes to triage (R83).
 
