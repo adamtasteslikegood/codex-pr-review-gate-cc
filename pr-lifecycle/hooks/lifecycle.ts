@@ -453,7 +453,11 @@ function blockerOf(f: Finding): Blocker {
  * Everything between this head and its merge (R79): findings, the head's own review, and CI, with nothing short-circuited. A post
  * waiver for this head and base leaves only a security P1 and CI; CI a waiver covers is only what GitHub does not require (R86).
  */
-export function standingOf(rec: LifecycleRecord, at: { head: string; base: string }, ci?: readonly CheckState[] | 'unreadable' | { unreadable: string }): Standing {
+export function standingOf(
+  rec: LifecycleRecord,
+  at: { head: string; base: string },
+  ci?: readonly CheckState[] | 'unreadable' | { unreadable: string; checks?: readonly CheckState[] },
+): Standing {
   // A post waiver for this head means a PR exists, even on a record never adopted into post review (a waiver-only or a hand-opened
   // PR's record): its standing is the merge's, as judgeMerge already reads it (gate R1-2).
   const isPostNamed = rec.waivers.some(one => one.scope === 'post' && one.head === at.head)
@@ -482,22 +486,23 @@ export function standingOf(rec: LifecycleRecord, at: { head: string; base: strin
   if (ci === 'unreadable' || (ci !== undefined && 'unreadable' in ci)) {
     const why = typeof ci === 'object' && 'unreadable' in ci ? ci.unreadable : ''
     blockers.push({ kind: 'ci-unreadable', ...(why === '' ? {} : { detail: why }), said: `the CI checks on ${short(at.head)} could not be read${why === '' ? '' : ` (${why})`}`, owner: 'agent', release: 'check gh auth status and the network, then try again' })
-  } else {
-    for (const one of ci ?? []) {
-      const isBad = one.bucket === 'fail' || one.bucket === 'cancel'
-      if (!isBad && (one.bucket === 'pass' || one.bucket === 'skipping')) continue
-      if (isWaived && !one.isRequired) {
-        setAside.push(one.name)
-        continue
-      }
-      blockers.push(
-        isBad
-          ? { kind: 'ci-failing', id: one.name, said: `check ${one.name} ${one.bucket === 'cancel' ? 'cancelled' : 'failing'}`, owner: 'agent', release: 'fix what it reports and push, or rerun it (gh run rerun <run-id> --failed)' }
-          : one.bucket === 'missing'
-            ? { kind: 'ci-running', id: one.name, said: `required check ${one.name} has not reported`, owner: 'gate', release: 'wait for it to start, or check why it does not run on this head' }
-            : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
-      )
+  }
+  // Checks read while what the base requires could not be: each still holds as if required (R86, gate R3-1).
+  const listed = ci === 'unreadable' ? [] : ci === undefined || !('unreadable' in ci) ? (ci ?? []) : (ci.checks ?? [])
+  for (const one of listed) {
+    const isBad = one.bucket === 'fail' || one.bucket === 'cancel'
+    if (!isBad && (one.bucket === 'pass' || one.bucket === 'skipping')) continue
+    if (isWaived && !one.isRequired) {
+      setAside.push(one.name)
+      continue
     }
+    blockers.push(
+      isBad
+        ? { kind: 'ci-failing', id: one.name, said: `check ${one.name} ${one.bucket === 'cancel' ? 'cancelled' : 'failing'}`, owner: 'agent', release: 'fix what it reports and push, or rerun it (gh run rerun <run-id> --failed)' }
+        : one.bucket === 'missing'
+          ? { kind: 'ci-running', id: one.name, said: `required check ${one.name} has not reported`, owner: 'gate', release: 'wait for it to start, or check why it does not run on this head' }
+          : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
+    )
   }
   return { phase, head: at.head, ...(waiver === undefined ? {} : { waiver }), setAside, mayProceed: blockers.length === 0, blockers }
 }

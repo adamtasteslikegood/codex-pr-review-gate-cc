@@ -209,6 +209,22 @@ test('a stop and resume keeps the earlier findings under their ids, and records 
   ])
 })
 
+test('gate R3-3: a stop given while a round ends awaits the head records no round and opens no PR', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  let stopped = false
+  w.git.onHead = async () => {
+    if (stopped) return
+    stopped = true
+    await $.command.run(run$('stop'))
+  }
+  const prompts = w.prompts.length
+  await done($, turn(review('r1-review', 'PASS')))
+  expect(stopped).toBe(true)
+  expect((await recordOf(w)).rounds.filter(one => one.isCompleted)).toHaveLength(0)
+  expect(w.prompts.slice(prompts).some(one => /open the PR|gh pr create/i.test(one))).toBe(false)
+})
+
 test('a fix step that times out records an attempt', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
@@ -2893,7 +2909,10 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
 test('R1-9: a post waiver does not let a head with failing CI merge', async ($, on) => {
   const w = world(on)
   w.gh.hasPr = true
+  // A post waiver sets aside only what the base does not require (R86): this check is required.
+  w.gh.required = ['ci']
   await $.command.run(cmd('waive post shipping it'))
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
   expect(isHeld(await $.tool.call(merge))).toBe(false)
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'cancelled' }]
   const held = (await $.tool.call(merge)).deny ?? ''
@@ -3454,12 +3473,12 @@ test('R86: the required set is known only when both sources are established (PR 
     w.gh.rulesAnswer = rules
     w.gh.classicAnswer = classic
     const got = await requiredChecksOf(w.engine, '/repo', 'me/repo', `base${i}`)
-    expect(got === 'unknown' ? 'unknown' : [...got]).toEqual(want)
+    expect(got instanceof Set ? [...got] : 'unknown').toEqual(want)
   }
   // An unknown answer is not cached: once GitHub answers, the same base reads.
   w.gh.classicAnswer = 'none'
   w.gh.rulesAnswer = 500
-  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toBe('unknown')
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual({ unknown: 'gh api repos/me/repo/rules/branches/later: gh: HTTP 500' })
   w.gh.rulesAnswer = 'ok'
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
   // A known answer is reused for a while, then read again: a check made required since counts (gate R1-4).
@@ -3532,6 +3551,26 @@ test('gate R1-3: a required check that never reported holds a waived merge until
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
 
+test('gate R3-1, R3-2: a base whose required checks cannot be read holds the merge, quoting gh, with passing or no checks', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.classicAnswer = 403
+  await say($, 'waive post reviewed by hand')
+  for (const checks of [[{ name: 'check', status: 'completed', conclusion: 'success' }], []]) {
+    w.gh.checks = checks
+    const held = await $.tool.call(merge)
+    expect(isHeld(held)).toBe(true)
+    expect(held.deny ?? '').toContain('the required checks of dev could not be read')
+    expect(held.deny ?? '').toContain('protection/required_status_checks: gh: HTTP 403')
+  }
+  // Once GitHub answers, the passing check lets the merge through.
+  w.gh.classicAnswer = 'none'
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
 test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
   const w = world(on)
   w.git.roster = roster
@@ -3579,6 +3618,21 @@ test('R80: after waive post, a resume says the waiver covers the head instead of
   const sent = w.prompts.slice(prompts)
   expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
   expect(sent.at(-1)).toContain("the person's post waiver covers")
+})
+
+test('gate R3-4: a resume after the PR was retargeted under a post waiver reads the new base, and says the review was for the old one', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  w.gh.base = 'main'
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+  expect(sent.at(-1)).toContain('the PR now targets main')
+  expect(w.gh.calls.some(one => one.includes('rules/branches/main'))).toBe(true)
 })
 
 test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver names the new PR head, not the waiver', async ($, on) => {
@@ -3823,7 +3877,7 @@ test('a PR head read that throws does not fail the controller: the record\'s hea
   w.gh.isHeadReadBroken = true
   const calls = w.gh.calls.length
   const said = await say($, 'resume')
-  expect(w.gh.calls.slice(calls)).toContain('pr view 1 --json headRefOid')
+  expect(w.gh.calls.slice(calls)).toContain('pr view 1 --json headRefOid,baseRefName')
   expect(said.text).not.toContain('gh broke')
   expect((await recordOf(w)).waivers.some(one => one.scope === 'post')).toBe(true)
 })

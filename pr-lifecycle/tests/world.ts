@@ -57,6 +57,8 @@ export type World = {
     fetches: string[]
     /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
     onFetch?: () => void | Promise<void>
+    /** Called on each `git rev-parse HEAD`, before it answers: a test acts while a step awaits the head. */
+    onHead?: () => void | Promise<void>
     /** `git log --format=%h %an %s <a>..<b>`: the commits on the PR since the record's head, one per line. */
     newCommits?: string
     /** The branch's head on origin, as `git ls-remote` prints it; undefined prints nothing. */
@@ -265,7 +267,7 @@ export function world(on: On): World {
         return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
       }
       if (args.startsWith('pr view')) {
-        if (w.gh.isHeadReadBroken === true && args.endsWith('--json headRefOid')) throw new Error('spawn failed')
+        if (w.gh.isHeadReadBroken === true && /--json headRefOid(,baseRefName)?$/.test(args)) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
         return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
@@ -325,7 +327,10 @@ export function world(on: On): World {
       return out('', name === w.git.branch || w.git.locals.includes(name) ? 0 : 1)
     }
     if (args.startsWith('rev-parse --verify')) return out('b\n')
-    if (args.startsWith('rev-parse HEAD')) return out(`${w.git.head}\n`)
+    if (args.startsWith('rev-parse HEAD')) {
+      await w.git.onHead?.()
+      return out(`${w.git.head}\n`)
+    }
     if (args.startsWith('status')) return out(w.git.dirty)
     if (args.startsWith('diff --numstat origin/')) return out(w.git.numstat)
     if (args.startsWith('diff --raw')) return out(w.git.raw)

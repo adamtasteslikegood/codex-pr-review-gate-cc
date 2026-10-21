@@ -777,13 +777,19 @@ export const prStateIn = (json: unknown): PrState | undefined => {
   return state === 'OPEN' || state === 'MERGED' || state === 'CLOSED' ? state : undefined
 }
 
-/** The head of PR `pr`, as gh reports it; undefined when gh cannot say, a failed spawn included (final review T8). */
-async function prHeadOf($: Engine, root: string, pr: number): Promise<string | undefined> {
+/**
+ * The head and base of PR `pr`, as gh reports them; undefined when gh cannot say, a failed spawn included (final review T8). The base
+ * is read with the head, so a PR retargeted since is judged against its new base (gate R3-4).
+ */
+async function prTipOf($: Engine, root: string, pr: number): Promise<{ head: string; base?: string } | undefined> {
   try {
-    const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: root, timeoutMs: 30_000 })
+    const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid,baseRefName'], { cwd: root, timeoutMs: 30_000 })
     if (view.exitCode !== 0) return undefined
-    const read = (JSON.parse(view.stdout) as { headRefOid?: unknown } | null)?.headRefOid
-    return typeof read === 'string' && read !== '' ? read : undefined
+    const read = JSON.parse(view.stdout) as { headRefOid?: unknown; baseRefName?: unknown } | null
+    const head = read?.headRefOid
+    const base = read?.baseRefName
+    if (typeof head !== 'string' || head === '') return undefined
+    return { head, ...(typeof base === 'string' && base !== '' ? { base } : {}) }
   } catch {
     return undefined
   }
@@ -1028,24 +1034,32 @@ const REQUIRED_TTL_MS = 5 * 60_000
 /**
  * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for REQUIRED_TTL_MS.
  * Each source must be parsed, or authoritatively absent (classic's 404 "not protected"); a throw, a 403 or 500, or a payload that
- * doesn't parse from either makes it 'unknown', which fails closed (every check required) and is not cached (PR #19 review).
+ * doesn't parse from either makes it unknown, with the reason in gh's own words where it gave one: that holds the merge (R86, gate
+ * R3-1, R3-2) and is not cached (PR #19 review).
  */
-export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | 'unknown'> {
-  if (slug === undefined) return 'unknown'
-  const key = `${slug}:${base}`
+export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | { unknown: string }> {
+  // Without a known slug (a waiver-only record), gh fills {owner}/{repo} from the checkout's own remote.
+  const repo = slug ?? '{owner}/{repo}'
+  const key = `${slug ?? root}:${base}`
   const now = await $.clock.now()
   const seen = required.get(key)
   if (seen !== undefined && now - seen.at < REQUIRED_TTL_MS) return seen.found
-  const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
+  const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch((err: unknown) => String(err).slice(0, 160))
   // One page holds every rule a branch is likely to have (final review M3): GitHub's default of 30 could cut a required-checks rule.
-  const rules = await api(`repos/${slug}/rules/branches/${base}?per_page=100`)
-  const classic = await api(`repos/${slug}/branches/${base}/protection/required_status_checks`)
-  if (rules === undefined || rules.exitCode !== 0 || classic === undefined) return 'unknown'
+  const rulesAt = `repos/${repo}/rules/branches/${base}`
+  const classicAt = `repos/${repo}/branches/${base}/protection/required_status_checks`
+  const rules = await api(`${rulesAt}?per_page=100`)
+  const classic = await api(classicAt)
+  // The endpoint is named, so the person knows what the gh login must be able to read.
+  const failed = (at: string, ran: string | { exitCode: number; stderr: string }) =>
+    ({ unknown: `gh api ${at}: ${typeof ran === 'string' ? ran : ran.stderr.trim().slice(0, 160) || `exit ${ran.exitCode}`}` })
+  if (typeof rules === 'string' || rules.exitCode !== 0) return failed(rulesAt, rules)
+  if (typeof classic === 'string') return failed(classicAt, classic)
   // Only GitHub's own words are an authoritative none: a 404 for any other reason (a missing branch or token scope) is unknown (M3).
   const isClassicNone = classic.exitCode !== 0 && /Branch not protected/i.test(classic.stderr)
-  if (classic.exitCode !== 0 && !isClassicNone) return 'unknown'
+  if (classic.exitCode !== 0 && !isClassicNone) return failed(classicAt, classic)
   const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
-  if (listed === undefined) return 'unknown'
+  if (listed === undefined) return { unknown: `gh api ${rulesAt} or ${classicAt} returned a payload that does not parse` }
   const found = new Set(listed)
   required.set(key, { found, at: now })
   return found
@@ -1062,9 +1076,15 @@ export async function gatherStanding(
   const needed = !Array.isArray(checks) ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
   // A required check that never reported holds the merge too, as GitHub's ruleset does (gate R1-3).
   const reported = new Set(Array.isArray(checks) ? checks.map(one => one.name) : [])
-  const missing = needed === 'unknown' ? [] : [...needed].filter(name => !reported.has(name)).map(name => ({ name, bucket: 'missing', isRequired: true }))
+  // A base whose required checks can't be read holds the merge (R86, gate R3-1, R3-2): a required check may never have run.
+  if (!(needed instanceof Set)) {
+    const why = `the required checks of ${pr.baseRefName} could not be read: ${needed.unknown}`
+    const all = (checks as CheckState[]).map(one => ({ ...one, isRequired: true }))
+    return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, { unreadable: why, checks: all })
+  }
+  const missing = [...needed].filter(name => !reported.has(name)).map(name => ({ name, bucket: 'missing', isRequired: true }))
   const ci: CheckState[] | { unreadable: string } =
-    !Array.isArray(checks) ? checks : [...checks.map(one => ({ ...one, isRequired: needed === 'unknown' || needed.has(one.name) })), ...missing]
+    !Array.isArray(checks) ? checks : [...checks.map(one => ({ ...one, isRequired: needed.has(one.name) })), ...missing]
   return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, ci)
 }
 
@@ -2035,13 +2055,16 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     const findings = live !== null && live.id === run.id ? live.findings : run.findings
     // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
     // The carry, never the check's capped effort: advance may start a round at once, before finish could restore it.
-    await updateRecord($, run.root, run.branch, rec => ({
-      ...rec,
-      head: endHead,
-      findings: mergeFindings(rec.findings, findings),
-      effort: run.carriedEffort ?? run.effort,
-    }))
-    if (isCompleted) await advance($, run.root, run.branch)
+    let isGone = false
+    await updateRecord($, run.root, run.branch, async rec => {
+      // Read again under the record's lock: a stop or waiver given while this step awaited writes nothing (gate R3-3).
+      if (!(await isRunning($, run.id))) {
+        isGone = true
+        return rec
+      }
+      return { ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.carriedEffort ?? run.effort }
+    })
+    if (isCompleted && !isGone) await advance($, run.root, run.branch)
     return
   }
   const current = run.findings.filter(one => raisedIn(one, run.round))
@@ -2074,7 +2097,13 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer' && run.headSha === endHead
   }
   // The head move is read from the record under its lock (R1-6), so a waiver given meanwhile is lapsed or kept, never lost.
+  let isGone = false
   await updateRecord($, run.root, run.branch, async rec => {
+    // Read again under the record's lock: a stop or waiver given while this step awaited the clock or git records no round (gate R3-3).
+    if (!(await isRunning($, run.id))) {
+      isGone = true
+      return rec
+    }
     const moved = isMoved
       ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
       : undefined
@@ -2098,7 +2127,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       effort: run.carriedEffort ?? run.effort,
     }
   })
-  if (isCompleted) await advance($, run.root, run.branch)
+  if (isCompleted && !isGone) await advance($, run.root, run.branch)
 }
 
 /** The effort and Codex model a round ran at (R69), when Codex ran in it: what the reviewers reported, else what the gate named. */
@@ -2154,9 +2183,10 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   // GitHub's head, read once whenever a post waiver exists, decides: a waiver given while a round ran names the PR head, which the
   // record's head may not have reached (the late round records nothing), and a push by someone else after the waiver is not covered
   // by it (gate R1-1, R1-5). When gh cannot say, the record's head decides.
-  const at = rec.pr !== undefined && posts.length > 0 ? ((await prHeadOf($, root, rec.pr)) ?? rec.head) : rec.head
+  const tip = rec.pr !== undefined && posts.length > 0 ? await prTipOf($, root, rec.pr) : undefined
+  const at = tip?.head ?? rec.head
   if (rec.pr !== undefined && posts.some(one => one.head === at)) {
-    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: at })
+    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: tip?.base ?? rec.base, headRefOid: at })
     await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
     return
   }

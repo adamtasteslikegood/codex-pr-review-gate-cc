@@ -623,13 +623,6 @@ const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | un
   if (ci.length === 0) return undefined
   const head = `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held`
   const short = pr.headRefOid.slice(0, 7)
-  const unreadable = ci.find(one => one.kind === 'ci-unreadable')
-  if (unreadable !== undefined) {
-    return [
-      `${head}: the CI checks on ${short} could not be read${unreadable.detail === undefined ? '' : ` (${unreadable.detail})`}, and a merge waits until they can.`,
-      'Do not merge another way. Check gh auth status and the network, then try the merge again.',
-    ].join('\n') + unknownNote(action)
-  }
   const failing = ci.filter(one => one.kind === 'ci-failing').map(one => one.id ?? '?')
   // A required check that never reported (gate R1-3) is held like a running one, and named as what it is.
   const isMissing = (one: Standing['blockers'][number]): boolean => one.said.endsWith('has not reported')
@@ -640,6 +633,15 @@ const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | un
     ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`]),
     ...(missing.length === 0 ? [] : [`required but not reported: ${missing.join(', ')}`]),
   ]
+  const unreadable = ci.find(one => one.kind === 'ci-unreadable')
+  if (unreadable !== undefined) {
+    // Checks read while the base's required ones could not be are named too (gate R3-1): each holds as required.
+    return [
+      `${head}: the CI checks on ${short} could not be read${unreadable.detail === undefined ? '' : ` (${unreadable.detail})`}, and a merge waits until they can.`,
+      ...(said.length === 0 ? [] : [`CI on ${short} is not green either (${said.join('; ')}).`]),
+      'Do not merge another way. Check gh auth status and the network, then try the merge again.',
+    ].join('\n') + unknownNote(action)
+  }
   return [
     `${head}: CI on ${short} is not green (${said.join('; ')}).`,
     ...(standing.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${standing.setAside.join(', ')}.`]),
