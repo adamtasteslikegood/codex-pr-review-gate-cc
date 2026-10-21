@@ -52,3 +52,7 @@ Task 1: fix round 1/5 (1 addressed, 1 open — SETTLES[0] tail accepts trailing 
 Task 1: fix round 2/5 dispatched (FIX_BASE 641236d)
 Ruling: Task 1 "Nit-picking aside…" stays an untagged P3 (the existing nit/minor word guess), not P2 — it is a guess (severitySource 'hint'), so triage can raise it after Task 2 — costs: a guessed P3 shows until triaged.
 Task 1: fix round 2 implementer DONE, commit 1135e23 (421 pass); re-review dispatched
+Task 1: fix round 2/5 (2 addressed, 0 open; commits 641236d..1135e23)
+Task 1: complete (commits 095f040..1135e23, review clean)
+Task 2: dispatched (BASE 723724c, sonnet)
+Task 2: implementer DONE, commit 2226a7d (424 pass); review dispatched
