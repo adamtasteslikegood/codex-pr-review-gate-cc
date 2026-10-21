@@ -303,6 +303,8 @@ export type Run = {
    * arrivals; a flag older than the step timeout is stale, and a poll clears it.
    */
   isSettling?: number
+  /** Post-PR: how many triage turns taken while collecting timed out this round (R88). The first goes back to collecting; a second stops the run. */
+  midTurnTimeouts?: number
   /** Post-PR: the finding ids the triage step was asked to answer (fresh, Codex's, carried). */
   asked?: string[]
   /** Post-PR: the security rebuttals Codex is checking (R36). */

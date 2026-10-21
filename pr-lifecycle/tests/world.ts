@@ -65,6 +65,8 @@ export type World = {
     remoteHead?: string
     /** `git log --not --remotes=origin`: the local commits no origin branch has, one `<sha> by <author>` per line. */
     unpushed: string
+    /** Called on each `git log --not --remotes=origin`, before it answers: a test acts while a step lists the unpushed commits. */
+    onUnpushed?: () => void | Promise<void>
   }
   /** The fake `gh`: the PR of the checked-out branch, its feedback and checks, and every call made. */
   gh: {
@@ -423,7 +425,10 @@ export function world(on: On): World {
       return out(w.git.hunks ?? whole.join('\n'))
     }
     if (args.startsWith('ls-remote origin')) return out(w.git.remoteHead === undefined ? '' : `${w.git.remoteHead}\trefs/heads/${w.git.branch}\n`)
-    if (args.startsWith('log --format=%h by %an')) return out(w.git.unpushed)
+    if (args.startsWith('log --format=%h by %an')) {
+      await w.git.onUnpushed?.()
+      return out(w.git.unpushed)
+    }
     if (args.startsWith('log --format=%h %an %s')) return out(w.git.newCommits ?? '')
     // A fast-forward to a commit the local head is an ancestor of moves the head there.
     const ff = args.match(/^merge --ff-only --quiet (\S+)$/)?.[1]

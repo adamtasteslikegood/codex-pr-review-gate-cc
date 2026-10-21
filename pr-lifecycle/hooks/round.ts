@@ -699,6 +699,12 @@ export function startTicker($: Engine): void {
         if (run.isSettling !== undefined && run.pending.length === 0) return
       }
       if (now - run.phaseStartedAt > config.stepTimeoutMs) {
+        // The first turn taken while collecting that times out in a round goes back to collecting and is asked again (R88): the gate
+        // runs on without the person. Only a second one stops the run.
+        if (run.phase === 'triage' && run.collect !== undefined && run.pending.length > 0 && (run.midTurnTimeouts ?? 0) === 0) {
+          await requeueMidTurn($, run, now)
+          return
+        }
         // A main-agent step whose prompt's turn never started could not have been answered: say so, not only that it ran long.
         const isUnseen = run.pending.some(one => one.isMain === true && one.answer === undefined && one.turnId === undefined)
         const why =
@@ -720,6 +726,47 @@ export function startTicker($: Engine): void {
       }
     })().catch(() => undefined)
   })
+}
+
+/**
+ * A turn taken while collecting ran past the step timeout, the first time this round (R88): the round goes back to collecting, with
+ * no attempt noted. The feedback it left unanswered leaves `handed`, so the next poll asks it again in a turn of its own; a late answer
+ * to this turn matches nothing pending (`isTurnOf` knows a turn by its id).
+ */
+async function requeueMidTurn($: Engine, run: Run, now: number): Promise<void> {
+  const rec = await loadRecord($, run.root, run.branch)
+  const unanswered = (run.triaged ?? []).filter(id => !(rec?.processed ?? []).includes(id))
+  const step = run.pending[0]
+  let isBack = false
+  await patch($, run.id, one => {
+    const live = one.pending[0]
+    const isSame = one.round === run.round && one.phase === 'triage' && one.collect !== undefined && live !== undefined && step !== undefined &&
+      live.step === step.step && live.turnId === step.turnId && live.answer === undefined
+    if (!isSame) return one
+    isBack = true
+    return {
+      ...one,
+      phase: 'collect',
+      phaseStartedAt: now,
+      activeMs: one.activeMs + (now - one.phaseStartedAt),
+      pending: [],
+      isSettling: undefined,
+      hasReprompted: false,
+      midTurnTimeouts: 1,
+      handed: (one.handed ?? []).filter(id => !unanswered.includes(id)),
+      activity: 'waiting on reviewers…',
+      steps: withStep(one.steps, {
+        id: `r${one.round}-triage`,
+        label: `Round ${one.round} · answer the reviews (main agent)`,
+        state: 'done',
+        detail: `timed out after ${elapsed(config.stepTimeoutMs)}; asked again`,
+      }),
+    }
+  })
+  if (!isBack) return
+  const what = unanswered.length === 0 ? 'nothing was left unanswered' : `${unanswered.length} unanswered item${unanswered.length === 1 ? '' : 's'} will be asked again`
+  await logEvent($, run.root, run.branch, 'head', `post-PR round ${run.round}: a turn taken while collecting timed out after ${elapsed(config.stepTimeoutMs)}; collection goes on, ${what}`)
+  $.ui.status(`pr-gate r${run.round}: waiting on reviewers`)
 }
 
 // ------------------------------------------------------------- the end
@@ -1444,7 +1491,9 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   // write. The gate never gets stuck: the flag is cleared, the round goes back to collecting, and the log says so. The answers it
   // recorded stand; what it did not record is asked again.
   const settling = read.isSettling
-  if (settling !== undefined && read.pending.length === 0 && now - settling > config.stepTimeoutMs) {
+  // At least five minutes: a slow but healthy afterTriage is not stale (a fetch alone can take two).
+  const staleMs = Math.max(config.stepTimeoutMs, 5 * 60_000)
+  if (settling !== undefined && read.pending.length === 0 && now - settling > staleMs) {
     const cleared = await patch($, read.id, one =>
       one.isSettling !== settling || one.round !== read.round
         ? one
@@ -1464,7 +1513,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
       read.root,
       read.branch,
       'head',
-      `post-PR round ${read.round}: the answers to a turn taken while collecting were not settled within ${elapsed(config.stepTimeoutMs)}; ` +
+      `post-PR round ${read.round}: the answers to a turn taken while collecting were not settled within ${elapsed(staleMs)}; ` +
         'settling flag cleared, collection goes on',
     )
     run = cleared
@@ -2003,7 +2052,16 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
       ),
     },
   }))
-  if (rec === undefined) return
+  if (rec === undefined) {
+    // The record went while the answers were read (A4): stop with the reason, never leave a settling turn to freeze collection. Only
+    // the run this turn settles is stopped; there is no record left whose generation could say more.
+    const live = await getRun($)
+    const isSame = live !== null && live.id === run.id && live.status === 'running' && live.round === run.round && (!isMid || live.isSettling === now)
+    if (isSame) {
+      await finish($, run.id, 'error', `The lifecycle record of ${run.branch} is gone, so post-PR round ${run.round} cannot go on. Run /pr-gate to start it again.`)
+    }
+    return
+  }
   // An item left without an answer is asked about once more, as the fix step does (R34); one the person waived meanwhile is not.
   const waived = waivedIds(rec)
   const unanswered = (after.asked ?? []).filter(
@@ -2073,6 +2131,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   if (!(await isOwn())) return
   if (!isContained) {
     const by = await unpushedBy($, run.root)
+    if (!(await isOwn())) return
     await failPost($, after, `commits on ${run.branch} are not on the PR${by}: pull or push, then /pr-gate resume`)
     return
   }
@@ -2108,7 +2167,9 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     await patch($, run.id, one => ({ ...one, findings: exempt(one.findings) }))
   }
   const ended = await getRun($)
-  if (ended === null || ended.id !== run.id || ended.status !== 'running') return
+  // After `closeCollect` no settling flag guards the tail (no poll runs for the round): the run, its round and the record's generation do.
+  if (ended === null || ended.id !== run.id || ended.status !== 'running' || ended.round !== run.round) return
+  if (((await loadRecord($, run.root, run.branch))?.generation ?? 0) !== generation) return
   // Codex checks the fixes and rebuttals on the head the round ends on (R72): a reported fix is about that head, and syncToHead
   // brings a clean checkout to it. No round is spent, and no full Codex review is needed only to verify a fix.
   const rebuttals = rebuttalsOwed(ended)

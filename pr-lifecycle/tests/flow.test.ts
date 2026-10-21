@@ -4920,9 +4920,22 @@ test('R88: a head pushed during a mid-collection turn gets its arrival noted by 
   expect((await recordOf(w)).headArrival).toMatchObject({ head: 'e'.repeat(40), at: seenAt })
 })
 
-test('R88: a mid-collection turn that never answers times out with an attempt, never a stuck triage', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+test('R88: a mid-collection turn that never answers goes back to collecting once; a second timeout in the round stops it', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await toMidTurn($, w)
+  await w.clock.advance(62_000)
+  // The first timeout in the round: back to collecting, no attempt, and the turn's step says why.
+  const back = await runOf(w)
+  expect([back.status, back.phase, back.midTurnTimeouts, back.pending, back.isSettling]).toEqual(['running', 'collect', 1, [], undefined])
+  expect(back.steps.find(one => one.id === 'r2-triage')).toMatchObject({ state: 'done', detail: expect.stringContaining('timed out') })
+  expect((await recordOf(w)).attempts).toBe(0)
+  expect(await logOf(w)).toEqual(expect.arrayContaining([expect.stringContaining('timed out')]))
+  // The next poll asks G2-1 again, in a turn of its own.
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(2)
+  expect(triageTurns(w, 'r2-triage').at(-1)).toContain('G2-1')
+  expect((await runOf(w)).phase).toBe('triage')
+  // A second timeout in the same round stops the run, saying how to go on.
   await w.clock.advance(62_000)
   const run = await runOf(w)
   expect([run.status, run.phase]).toEqual(['error', 'done'])
@@ -4932,14 +4945,70 @@ test('R88: a mid-collection turn that never answers times out with an attempt, n
   // As the message says: a resume collects again on the same head, and the unanswered feedback is asked again.
   await say($, 'resume')
   const again = await runOf(w)
-  expect([again.status, again.phase, again.round]).toEqual(['running', 'collect', 2])
+  expect([again.status, again.phase, again.round, again.midTurnTimeouts]).toEqual(['running', 'collect', 2, undefined])
   const asked = triageTurns(w, 'r2-triage').length
   await w.clock.advance(90_000)
   expect(triageTurns(w, 'r2-triage').length).toBe(asked + 1)
   expect(triageTurns(w, 'r2-triage').at(-1)).toContain('SQL injection')
 })
 
-test('R88: a settling flag older than the step timeout is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+test('R88: a late answer to a timed-out mid-collection turn is not read as the answer to the turn that asks again', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  await $.turn.start({ text: triageTurns(w, 'r2-triage')[0] ?? '', turnId: 'turn-old' })
+  await w.clock.advance(62_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('triage')
+  // The timed-out turn ends now, answering G2-1: the turn that asks again has not started, and this is not it.
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'late', replyId: '990' }]), turnId: 'turn-old' })
+  const still = await runOf(w)
+  expect([still.phase, still.pending.length, still.pending[0]?.answer]).toEqual(['triage', 1, undefined])
+  expect(still.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
+  // The new turn's own answer is the one recorded.
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+})
+
+test('R88 (A4): a reset while afterTriage lists the unpushed commits writes no stop over it', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  // A local commit the PR does not have.
+  w.git.head = 'e'.repeat(40)
+  w.git.unpushed = 'eeeeeee by me'
+  let isReset = false
+  w.git.onUnpushed = () => {
+    if (isReset) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.message ?? '').not.toContain('are not on the PR')
+  expect((await recordOf(w)).attempts).toBe(0)
+})
+
+test('R88 (A4): a record gone when afterTriage settles a turn while collecting stops the run with a clear message, never a frozen collection', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let isGone = false
+  w.afterRead = key => {
+    if (key !== KEY || isGone || w.run?.isSettling === undefined) return
+    isGone = true
+    w.store.delete(KEY)
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect(isGone).toBe(true)
+  const run = await runOf(w)
+  expect([run.status, run.isSettling]).toEqual(['error', undefined])
+  expect(run.message).toContain('The lifecycle record of feat/x is gone')
+})
+
+test('R88: a settling flag older than the step timeout (at least five minutes) is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await toMidTurn($, w)
   let held = false
@@ -4955,8 +5024,12 @@ test('R88: a settling flag older than the step timeout is cleared and collection
   }
   const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
   await isReached
-  // afterTriage never gets past its head read: past the step timeout, a poll clears the flag and collection goes on.
+  // A slow afterTriage is not stale at the step timeout: the threshold is at least five minutes (a fetch alone can take two).
   await w.clock.advance(62_000)
+  const slow = await runOf(w)
+  expect([slow.phase, typeof slow.isSettling]).toEqual(['triage', 'number'])
+  // afterTriage never gets past its head read: past five minutes, a poll clears the flag and collection goes on.
+  await w.clock.advance(4 * 60_000)
   const back = await runOf(w)
   expect([back.status, back.phase, back.isSettling, back.pending]).toEqual(['running', 'collect', undefined, []])
   expect(await logOf(w)).toEqual(expect.arrayContaining([expect.stringContaining('settling flag')]))
