@@ -9,7 +9,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Effort, Finding, LifecycleRecord, Run } from '../types'
+import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
 import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { readPrAction } from './github'
 import type { PrAction } from './github'
@@ -18,6 +18,7 @@ import {
   isAcceptedRebuttal,
   isDisputed,
   lastReviewedHead,
+  holdText,
   isReverifyOwed,
   isSettledDeferral,
   mergeHolds,
@@ -42,6 +43,7 @@ import {
   defaultEffort,
   fetchTwice,
   finish,
+  gatherStanding,
   getRun,
   git,
   hasSecurityBlocker,
@@ -597,47 +599,29 @@ const owedOf = (rec: LifecycleRecord): string => {
   return 'review in progress'
 }
 
-/**
- * The CI hold on a merge the review lets through (R1-9): the PR head's checks, from `gh pr checks`. A failing, cancelled or running
- * check holds it, and so do checks gh cannot read (fail closed); none at all, or every one passed or skipped, lets it merge. This hold is
- * the agent's to clear, never the person's: no waiver releases it.
- */
 type MergedPr = { number: number; baseRefName: string; headRefOid: string }
 
-const ciHold = async ($: Engine, root: string, action: PrAction, pr: MergedPr): Promise<string | undefined> => {
+/**
+ * The CI hold on a merge the review lets through (R1-9, narrowed by R86): the standing's CI blockers. A required check that fails, is
+ * cancelled or runs holds it, and so do checks gh can't read; under a post waiver a check GitHub does not require is set aside, named.
+ */
+const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | undefined => {
+  const ci = standing.blockers.filter(one => one.kind.startsWith('ci-'))
+  if (ci.length === 0) return undefined
   const head = `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held`
-  let ran: { exitCode: number; stdout: string; stderr: string }
-  try {
-    ran = await $.process.run(
-      ['gh', 'pr', 'checks', String(pr.number), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'name,state,bucket'],
-      { cwd: root, timeoutMs: 30_000 },
-    )
-  } catch (error) {
-    ran = { exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
-  }
-  let checks: { name: string; bucket: string }[] | undefined
-  try {
-    const read = JSON.parse(ran.stdout) as unknown
-    const row = (one: unknown): Record<string, unknown> => (typeof one === 'object' && one !== null ? (one as Record<string, unknown>) : {})
-    checks = Array.isArray(read) ? read.map(one => ({ name: String(row(one).name ?? '?'), bucket: String(row(one).bucket ?? '') })) : undefined
-  } catch {
-    checks = undefined
-  }
-  // gh reports a PR without checks as an error: nothing to wait for.
-  if (checks === undefined && /no checks reported/i.test(ran.stderr)) return undefined
-  if (checks === undefined) {
-    const said = ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}`
+  const short = pr.headRefOid.slice(0, 7)
+  if (ci.some(one => one.kind === 'ci-unreadable')) {
     return [
-      `${head}: the CI checks on ${pr.headRefOid.slice(0, 7)} could not be read (${said}), and a merge waits until they can.`,
+      `${head}: the CI checks on ${short} could not be read, and a merge waits until they can.`,
       'Do not merge another way. Check gh auth status and the network, then try the merge again.',
-    ].join('\n')
+    ].join('\n') + unknownNote(action)
   }
-  const failing = checks.filter(one => one.bucket === 'fail' || one.bucket === 'cancel').map(one => one.name)
-  const running = checks.filter(one => one.bucket === 'pending' || !['pass', 'skipping', 'fail', 'cancel'].includes(one.bucket)).map(one => one.name)
-  if (failing.length === 0 && running.length === 0) return undefined
+  const failing = ci.filter(one => one.kind === 'ci-failing').map(one => one.id ?? '?')
+  const running = ci.filter(one => one.kind === 'ci-running').map(one => one.id ?? '?')
   const said = [...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]), ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`])]
   return [
-    `${head}: CI on ${pr.headRefOid.slice(0, 7)} is not green (${said.join('; ')}).`,
+    `${head}: CI on ${short} is not green (${said.join('; ')}).`,
+    ...(standing.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${standing.setAside.join(', ')}.`]),
     'Do not merge another way.',
     ...(failing.length === 0
       ? []
@@ -703,8 +687,9 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // not applied; gate R2-3, R4-1).
   const isOnBase = rec !== undefined && rec.base === pr.baseRefName
   const isWaived = isOnBase && rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
-  // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a red check.
-  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
+  const standing = rec === undefined ? undefined : await gatherStanding($, rec, pr, action.repo)
+  // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a required check (R86).
+  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return standing === undefined ? undefined : ciHold(action, pr, standing)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
   if (rec !== undefined && rec.phase === 'ready' && isOnBase && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) {
     // A trusted reviewer is never waited for (R76): what it posted after ready is triaged before the merge, never merged past.
@@ -724,7 +709,7 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
         `Your next step: run /${COMMAND} resume, which triages ${late.length === 1 ? 'it' : 'them'} on this head and uses no review round. Then try the merge again.`,
       ].join('\n')
     }
-    return ciHold($, root, action, pr)
+    return standing === undefined ? undefined : ciHold(action, pr, standing)
   }
   const short = pr.headRefOid.slice(0, 7)
   const missing =
@@ -756,11 +741,14 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
           ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
             `or /${COMMAND} allow 1 <reason> for one more review round.`
           : `Your next step: check out ${pr.headRefName} and run /${COMMAND} resume, which reviews ${short} and says when the PR is ready to merge.`
+  const named = new Set(missing.match(/\b[RG]\d+-\d+\b/g) ?? [])
+  const rest = standing === undefined ? '' : holdText(standing, named)
   return (
     [
       `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held: the lifecycle review is not complete for ${short}: ${missing}.`,
       'Do not merge another way.',
       next,
+      ...(rest === '' ? [] : ['', rest]),
     ].join('\n') + unknownNote(action)
   )
 }
@@ -1048,7 +1036,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   })
   // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
-  return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.`
+  const after = await loadRecord($, root, branch)
+  const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
+  const aside = standing === undefined || standing.setAside.length === 0 ? '' : ` Set aside (GitHub does not require them): ${standing.setAside.join(', ')}.`
+  return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.${aside}`
 }
 
 export const register: Register = (on, options) => {

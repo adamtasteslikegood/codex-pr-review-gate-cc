@@ -2883,7 +2883,7 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
   w.gh.isChecksUnreadable = true
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('could not be read')
-  expect(held).toContain('HTTP 502')
+  expect(held).toContain('gh auth status')
   expect(held).not.toContain('waive')
 })
 
@@ -3441,4 +3441,49 @@ test('R86: the required set is known only when both sources are established (PR 
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toBe('unknown')
   w.gh.rulesAnswer = 'ok'
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+})
+
+// ------------------------------------------------- task 7: the merge guard renders from the standing
+
+test('R86: waive post sets aside a cancelled check GitHub does not require, and names it; a running required check still holds', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.checks = [
+    { name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' },
+    { name: 'check', status: 'in_progress', conclusion: null },
+  ]
+  const said = await say($, 'waive post reviewed by hand')
+  expect(said.text).toContain('Set aside')
+  expect(said.text).toContain('Independent Claude review')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('check')
+  expect(held.deny ?? '').not.toContain('failing: Independent Claude review')
+  w.gh.checks = [
+    { name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' },
+    { name: 'check', status: 'completed', conclusion: 'success' },
+  ]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R79: one merge refusal names every blocker: findings and CI', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  const held = await $.tool.call(merge)
+  const text = held.deny ?? ''
+  expect(text).toContain('G2-1')
+  expect(text).toContain('check check running')
+})
+
+test('R86: with the required checks unreadable, a waiver sets nothing aside', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.garbage = '<html>proxy error</html>'
+  w.gh.checks = [{ name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' }]
+  await say($, 'waive post reviewed by hand')
+  expect(isHeld(await $.tool.call(merge))).toBe(true)
 })
