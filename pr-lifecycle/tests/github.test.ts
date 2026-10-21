@@ -478,6 +478,10 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   // Classic entries that name no check are malformed too (gate R5-4).
   expect(readRequired(rules, JSON.stringify({ contexts: [1], checks: [] }))).toBeUndefined()
   expect(readRequired(rules, JSON.stringify({ contexts: [], checks: [{}] }))).toBeUndefined()
+  // A field that is there but not a list is malformed, even beside a valid one (gate R1-7, R5-4 at 3116e17).
+  expect(readRequired(rules, JSON.stringify({ contexts: 42, checks: [] }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: [], checks: 'bad' }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
 })
 
 test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {

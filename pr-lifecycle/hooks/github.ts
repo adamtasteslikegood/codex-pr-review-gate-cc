@@ -750,6 +750,8 @@ export function readRequired(rules: string, protection: string | undefined): str
     // Classic protection always lists contexts and checks: a body with neither (an error message) is not the set (gate R1-7).
     const body = (typeof read === 'object' && read !== null ? read : {}) as { contexts?: unknown; checks?: unknown }
     if (!Array.isArray(body.contexts) && !Array.isArray(body.checks)) return undefined
+    // A field that is there but not a list is malformed too, even beside a valid one (gate R1-7, R5-4).
+    if ((body.contexts !== undefined && !Array.isArray(body.contexts)) || (body.checks !== undefined && !Array.isArray(body.checks))) return undefined
     // An entry that names no check is malformed, as in a ruleset (gate R5-4).
     for (const one of Array.isArray(body.contexts) ? (body.contexts as unknown[]) : []) {
       if (typeof one !== 'string') return undefined
