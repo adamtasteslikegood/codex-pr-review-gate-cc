@@ -135,3 +135,7 @@ Final review: dispatched (opus), BASE 7ab6b64, HEAD 7619966, package review-fina
 Final review: With fixes. Critical 1 (C1 ADVISORY m-flag tags mixed bodies P3), Important 2 (I1 live head unreviewed not in standing; I2 spec gap), Minor 8. Report review-final-report.md
 Ruling: I2 — an R85 deferral settles only if the agent never lowered the finding's severity; otherwise it holds as before R85 — closes the agent-alone path to settling a guessed P1 — cost if wrong: a sincere lower-and-defer of a misguessed P2 needs Codex or a person
 Final fix: dispatched (opus), BASE ac9a91d, brief final-fix-brief.md (C1, followUp shape, stale followUp, I2, I1, M1, M2, M3, prHeadOf try, docs)
+Final fix: DONE_WITH_CONCERNS, commits bcf5e59..28e5083 (482 pass, check green). Report final-fix-report.md
+Ruling: a guessed P3 (severitySource 'hint') never settles under R85 — fix-round concern 3: a mixed comment with "nit"/"minor" anywhere guessed P3 could settle on the agent's word — cost if wrong: true nits from untagged comments wait for the person; controller commit e5d1cb6, 483 pass
+Ruling: accept fix-round residuals (I1 blocker skipped when a round is owed/exhausted; waive <id> skips advance on a moved head; 1.3.0 histories can't show lowering; M1 covers rec.head only; M4 unverified live) — none opens a merge path — cost if wrong: an extra message or turn
+Final re-review: dispatched (sonnet), range 1da0af7..HEAD
