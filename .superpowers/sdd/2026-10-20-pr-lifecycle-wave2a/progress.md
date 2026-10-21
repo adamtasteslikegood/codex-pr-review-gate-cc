@@ -107,3 +107,5 @@ Task 8: fix round 1 implementer DONE, commit bcdf6dc (458 pass); isRunning re-ch
 Task 8: fix round 1/5 (3 addressed, 0 open; commits ba79873..bcdf6dc)
 Task 8: complete (commits 9fc314f..bcdf6dc, review clean)
 Task 8: minor (deferred): advance reads gh pr view each pass while an unmatched post waiver exists; prHeadOf's process.run not try-wrapped (same as prStateOf); a waiver matching rec.head while the PR head moved on still sends the waiver message
+Task 9: implementer dispatched (sonnet), BASE 35ec60e; ruling carried: one waive post = one agent message (note merges into advance's waiver prompt, or advance skips it in that batch, spec §1)
+Task 9: implementer DONE, commit f1beb67 (466 pass); waive post never calls advance → one note; R80 test assertion adapted; review dispatched
