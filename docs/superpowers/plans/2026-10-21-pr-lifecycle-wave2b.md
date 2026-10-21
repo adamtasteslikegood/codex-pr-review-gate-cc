@@ -1288,22 +1288,38 @@ export function readLinks(answer: string): LinkAnswer[] {
 
 In `pr-lifecycle/hooks/round.ts`:
 
-1. In `beginTriage`, link a fresh finding the gate matched. Before the loop, add `const raised: Finding[] = []`. After `const finding: Finding = { ... }` is built, replace `fresh.push(finding)` with:
+1. In `beginTriage`, link a fresh finding the gate matched, including one that matches another item of the same batch (a review summary and its own inline comment arrive together). Before the loop, add `const raised: Finding[] = []`. In the loop, compare with the batch so far too: change
 
 ```ts
-    const original = cls === 'duplicate' && matchId !== undefined ? ledger.find(one => one.id === matchId) : undefined
+    const placed = triage({ file: feedback.file, line: feedback.line, title, at: feedback.at }, others, new Set())
+```
+
+   to
+
+```ts
+    const placed = triage({ file: feedback.file, line: feedback.line, title, at: feedback.at }, [...others, ...fresh], new Set())
+```
+
+   After `const finding: Finding = { ... }` is built, replace `fresh.push(finding)` with:
+
+```ts
+    // The gate's match is a link (R90): the original's peak rises to the new item's, wherever the original is kept.
+    const original = cls === 'duplicate' && matchId !== undefined ? [...ledger, ...fresh].find(one => one.id === matchId) : undefined
     if (original === undefined) fresh.push(finding)
     else {
       const linked = linkTo(finding, original, 'gate', run.round, now)
+      const inBatch = fresh.findIndex(one => one.id === original.id)
+      if (inBatch !== -1) fresh[inBatch] = withLinkedPeak(fresh[inBatch] as Finding, linked)
+      else {
+        const at = raised.findIndex(one => one.id === original.id)
+        if (at === -1) raised.push(withLinkedPeak(original, linked))
+        else raised[at] = withLinkedPeak(raised[at] as Finding, linked)
+      }
       fresh.push(linked)
-      const prior = raised.find(one => one.id === original.id) ?? original
-      raised.splice(raised.indexOf(prior) >>> 0, prior === original ? 0 : 1, withLinkedPeak(prior, linked))
     }
 ```
 
-   and in the `patch` that opens triage change `findings: mergeFindings(one.findings, fresh)` to `findings: mergeFindings(one.findings, [...fresh, ...raised])`. Also change the `carried` line's `mergeFindings(ledger, fresh)` to `mergeFindings(ledger, [...fresh, ...raised])`.
-
-   (`raised.splice(raised.indexOf(prior) >>> 0, ...)`: when `prior` is the original, nothing is removed and the raised copy is appended; when it is an earlier raised copy, that copy is replaced. If you find that line hard to read, write it as an `if`; the behaviour is what matters.)
+   In the `patch` that opens triage change `findings: mergeFindings(one.findings, fresh)` to `findings: mergeFindings(one.findings, [...fresh, ...raised])`, and change the `carried` line's `mergeFindings(ledger, fresh)` to `mergeFindings(ledger, [...fresh, ...raised])`.
 
 2. In `afterTriage`, read links beside answers and apply them. After `const said = ...`, add:
 
