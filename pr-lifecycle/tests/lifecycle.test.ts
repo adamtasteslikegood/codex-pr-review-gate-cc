@@ -1087,15 +1087,16 @@ test('R88: a post round is charged for a new blocker or a Codex rejection in it;
   const rejectedFix = finding({ id: 'R2-1', round: 2, severity: 'P2', history: [
     { round: 2, status: 'open', by: 'codex', at: 1 },
     { round: 3, status: 'reported-fixed', by: 'main', at: 2 },
-    { round: 3, status: 'open', note: 'still reachable', by: 'codex', at: 3 },
+    { round: 4, status: 'open', note: 'still reachable', by: 'codex', at: 3 },
   ] })
-  expect(isChargedRound([rejectedFix], 3)).toBe(true)
+  // Round 4 is charged by the rejection alone (round 3, by the fix reported in it: A8).
+  expect(isChargedRound([rejectedFix], 4)).toBe(true)
   expect(isChargedRound([rejectedFix], 2)).toBe(false)
   const upheld = finding({ id: 'R2-2', round: 2, status: 'verified-fixed', history: [
     { round: 3, status: 'reported-fixed', by: 'main', at: 1 },
-    { round: 3, status: 'verified-fixed', by: 'codex', at: 2 },
+    { round: 4, status: 'verified-fixed', by: 'codex', at: 2 },
   ] })
-  expect(isChargedRound([upheld], 3)).toBe(false)
+  expect(isChargedRound([upheld], 4)).toBe(false)
   // A rejected rebuttal and a rejected acknowledgement charge too.
   expect(isChargedRound([rejected()], 2)).toBe(true)
   const d = (n: number, over: object = {}) => roundOf({ n, phase: 'post', kind: 'discretionary', ...over })
@@ -1312,7 +1313,7 @@ test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
 
 // ------------------------------------------------------------- A8 (task 6b)
 
-test('A8: a post round is charged when the agent fixes a finding raised in it, of any severity; once, and only for its own findings', async () => {
+test('A8: a post round is charged when the agent reports a fix in it, for any finding at any severity; once, never for a duplicate', async () => {
   const p3 = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P3' })
   // The triage answer is stamped with the round that asked, the one that raised it (afterTriage, before the push ends the round).
   expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action: 'fixed', note: 'renamed' }, 3, 'main', 5)], 3)).toBe(true)
@@ -1320,10 +1321,13 @@ test('A8: a post round is charged when the agent fixes a finding raised in it, o
   for (const action of ['rebutted', 'deferred', 'acknowledged'] as const) {
     expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action, note: 'no' }, 3, 'main', 5)], 3)).toBe(false)
   }
-  // A finding raised in round 2 and fixed in round 3 does not charge round 3 by this rule (nor round 2, whose record is written).
+  // A8 as ruled ("charge the push that fixes last round's findings"): a fix in round 3 of a finding raised in round 2 charges round 3,
+  // the round the fix was reported in, and not round 2, whose record is written.
   const earlier = applyAnswer({ ...p3, id: 'G2-1', round: 2 }, { id: 'G2-1', action: 'fixed' }, 3, 'main', 5)
-  expect(isChargedRound([earlier], 3)).toBe(false)
+  expect(isChargedRound([earlier], 3)).toBe(true)
   expect(isChargedRound([earlier], 2)).toBe(false)
+  // An earlier finding rebutted, deferred or acknowledged in round 3 stays free.
+  expect(isChargedRound([applyAnswer({ ...p3, id: 'G2-1', round: 2 }, { id: 'G2-1', action: 'deferred', note: 'later' }, 3, 'main', 5)], 3)).toBe(false)
   // Only the agent's fix: the gate's or Codex's event with a reported-fixed status is none.
   expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'gate', at: 5 }] }], 3)).toBe(false)
   expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'codex', at: 5 }] }], 3)).toBe(false)
@@ -1392,4 +1396,31 @@ test('A9: a link\'s severity raise moves no status reader: the rebuttal\'s time 
   const once = withLinkedPeak(markHeld(rebutted, 2, 'codex', 5, 'still reachable'), dup)
   expect(rejections(once)).toBe(1)
   expect(isChargedRound([once], 2)).toBe(true)
+})
+
+test('6b fix 1: a re-check a link raised names the link, its severity and its report; a file change keeps its own label', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', title: 'cache never cleared' })
+  const accepted = acceptRebuttal(applyAnswer(p3, { id: 'G2-1', action: 'rebutted', note: 'cleared on restart' }, 2, 'main', 4), 2, 5)
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', reviewer: 'bot', severity: 'P1', isSecurity: true, title: 'session cache leaks tokens',
+    detail: 'tokens stay readable after logout', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), accepted, 'gate', 3, 9)
+  const raised = withLinkedPeak(accepted, dup)
+  const text = verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [raised, dup] }), 'abcdef0', [raised])
+  expect(text).toContain('G2-1 [P1] comment from bot (src/app.ts:12) (raised to P1, security, by its linked item G3-1: re-check)')
+  expect(text).not.toContain('file changed since')
+  expect(text).toContain('G3-1, linked to G2-1 as the same problem, raised it to P1, security. Its report:\n    <reviewer-comment from="bot">')
+  expect(text).toContain('tokens stay readable after logout')
+  expect(text).toContain('does the rebuttal still hold at P1, given that report?')
+  // The flag from a file change keeps its label, and so does a raise Codex already ruled on, then a file change.
+  const changed = { ...accepted, needsRecheck: true }
+  expect(verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [changed] }), 'abcdef0', [changed])).toContain('(file changed since: re-verify)')
+  const ruled = { ...acceptRebuttal(raised, 3, 10), needsRecheck: true }
+  const later = verifyPrompt(runOf({ lifecycle: 'post', round: 4, findings: [ruled, dup] }), 'abcdef0', [ruled])
+  expect(later).toContain('(file changed since: re-verify)')
+  expect(later).not.toContain('by its linked item')
+  // A security link with no severity change is named the same way.
+  const p1 = acceptRebuttal(applyAnswer({ ...p3, severity: 'P1', peakSeverity: 'P1' }, { id: 'G2-1', action: 'rebutted', note: 'n' }, 2, 'main', 4), 2, 5)
+  const secured = withLinkedPeak(p1, dup)
+  expect(secured.needsRecheck).toBe(true)
+  expect(verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [secured, dup] }), 'abcdef0', [secured])).toContain('(raised to P1, security, by its linked item G3-1: re-check)')
+  expect(loweringOf(secured)).toBeUndefined()
 })

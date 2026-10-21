@@ -113,22 +113,37 @@ export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => findi
  */
 export const answersOf = (f: Pick<Finding, 'history'>): FindingEvent[] => f.history.filter(one => one.raisedBy === undefined)
 
+/**
+ * The link's raise a rebuttal's re-check is owed for (6b fix 1): the newest raise entry, when it comes after Codex's last ruling.
+ * Otherwise the re-check, if any, is for a file change (R58).
+ */
+export function raiseOf(f: Pick<Finding, 'history' | 'status' | 'needsRecheck'>): FindingEvent | undefined {
+  if (f.needsRecheck !== true || f.status !== 'rebutted') return undefined
+  let raise = -1
+  let ruled = -1
+  f.history.forEach((one, i) => {
+    if (one.raisedBy !== undefined) raise = i
+    else if (one.by === 'codex') ruled = i
+  })
+  return raise > ruled ? f.history[raise] : undefined
+}
+
 /** The agent's answers Codex can reject. */
 const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
 
 /**
  * Whether a post round costs one (R88): a blocking finding first raised in it, or Codex reopening, in it, a finding the agent had
- * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does. Or the agent fixed,
- * in it, a finding raised in it, at any severity (A8: "charge the push that fixes last round's findings"); a triage answer is stamped
- * with the round that asked, which the push then ends. A rebuttal, deferral or acknowledgement of a non-blocking finding stays free,
- * and a round is charged once, whatever the reasons.
+ * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does. Or the agent
+ * reported a fix in it, of any finding at any severity, raised in it or earlier (A8: "charge the push that fixes last round's
+ * findings"); a triage answer is stamped with the round that asked, which the push then ends. A linked duplicate's fix charges
+ * nothing. A rebuttal, deferral or acknowledgement of a non-blocking finding stays free, and a round is charged once, whatever the reasons.
  */
 export function isChargedRound(findings: readonly Finding[], round: number): boolean {
   // A linked duplicate is not new (R90): it holds through its original.
   const isNewBlocker = findings.some(one => one.round === round && isBlocking(one) && one.duplicateOf === undefined)
-  // The agent's fix (main's, or the fixer's), never a gate or Codex entry; a linked duplicate's fix is its original's to charge.
+  // The agent's fix (main's, or the fixer's) of any finding, whenever raised; never a gate or Codex entry, nor a linked duplicate's fix.
   const isFixed = findings.some(one =>
-    one.round === round && one.duplicateOf === undefined &&
+    one.duplicateOf === undefined &&
     answersOf(one).some(each => each.round === round && each.status === 'reported-fixed' && each.by !== 'codex' && each.by !== 'gate'),
   )
   // Codex refusing the agent's link rejects no answer (R90): the item was never answered.
@@ -270,25 +285,27 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   const security = original.isSecurity === true || linked.isSecurity === true ? { isSecurity: true } : {}
   const severity = higher(original.severity, linked.severity)
   const when = linked.history.at(-1)
+  // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
+  // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
+  // raise: Codex's ruling clears it, and only a further raise sets it again. The raise entry says why (`raiseOf`), even for security alone.
+  const isRaisedToBlocking = severity !== original.severity && isBlocking({ severity })
+  const isMadeSecurity = linked.isSecurity === true && original.isSecurity !== true
+  const isRecheck = (isRaisedToBlocking || isMadeSecurity) && isAcceptedRebuttal(original)
+  const recheck = isRecheck ? { needsRecheck: true } : {}
   const raised =
-    severity === original.severity
+    severity === original.severity && !isRecheck
       ? {}
       : {
           severity,
-          ...(linked.severitySource === 'tag' ? { severitySource: 'tag' as const } : {}),
+          ...(linked.severitySource === 'tag' && severity !== original.severity ? { severitySource: 'tag' as const } : {}),
           history: [
             ...original.history,
             // Marked as the link's raise, so no status reader takes it for an answer or a ruling (`answersOf`).
-            { round: when?.round ?? linked.round, status: original.status, severity, from: original.severity, note: `raised by its link ${linked.id}`,
+            { round: when?.round ?? linked.round, status: original.status, severity, from: original.severity,
+              note: severity === original.severity ? `made security by its link ${linked.id}` : `raised by its link ${linked.id}`,
               raisedBy: linked.id, by: 'gate', at: when?.at ?? 0 },
           ],
         }
-  // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
-  // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
-  // raise: Codex's ruling clears it, and only a further raise sets it again.
-  const isRaisedToBlocking = severity !== original.severity && isBlocking({ severity })
-  const isMadeSecurity = linked.isSecurity === true && original.isSecurity !== true
-  const recheck = (isRaisedToBlocking || isMadeSecurity) && isAcceptedRebuttal(original) ? { needsRecheck: true } : {}
   return isPeakUnknown(original) || isPeakUnknown(linked)
     ? { ...original, ...security, ...raised, ...recheck }
     : { ...original, ...security, ...raised, ...recheck, peakSeverity: higher(peakOf(original), peakOf(linked)) }
@@ -975,7 +992,10 @@ function decidePost(rec: LifecycleRecord): Next {
     // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding; it may be fixed or deferred, not rebutted again (R40).
     const rejected = open.filter(one => rejections(one) > 0)
     // A fix Codex re-verified after its file changed and found no longer holds (R58): the agent's to fix or rebut again.
-    const refuted = open.filter(one => answersOf(one).at(-1)?.by === 'codex' && answersOf(one).at(-2)?.status === 'verified-fixed')
+    const refuted = open.filter(one => {
+      const answers = answersOf(one)
+      return answers.at(-1)?.by === 'codex' && answers.at(-2)?.status === 'verified-fixed'
+    })
     const ignored = open.filter(one => !rejected.includes(one) && !refuted.includes(one))
     const isFeedbackOnly =
       ignored.length > 0 && rejected.length + refuted.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))

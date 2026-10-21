@@ -2308,6 +2308,8 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
       paneFinding('B1', { status: 'deferred', severity: 'P3' }),
       paneFinding('B2', { status: 'rebutted', severity: 'P3', history: [agentAcked, codexSaid('rebutted')] }),
       paneFinding('B3', { status: 'rebutted', severity: 'P3', history: [agentAcked] }),
+      paneFinding('B4', { status: 'rebutted', severity: 'P1', needsRecheck: true, history: [agentRebutted, codexSaid('rebutted'),
+        { round: 3, status: 'rebutted', severity: 'P1', from: 'P3', raisedBy: 'G3-1', note: 'raised by its link G3-1', by: 'gate', at: 2 }] }),
     ],
     waivers: [
       { scope: 'finding', findingId: 'A8', head, reason: 'tracked in KAN-9', by: 'composer', at: 1 },
@@ -2317,9 +2319,9 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   w.store.set(key, next)
   const holds = mergeHolds(next).map(one => one.id)
   // A2 and A4 settled, A8 waived; the rest hold.
-  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1', 'B3'])
+  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1', 'B3', 'B4'])
   const ui = await mountPane($)
-  expect(await ui.find({ type: 'Text', text: 'Findings (12, 8 holding the merge' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Findings (13, 9 holding the merge' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A1 [P1] Title of A1 — re-verify owed (file changed)' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A2 [P2] Title of A2 — verified fixed' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A3 [P1] Title of A3 — reported fixed, unverified' })).toBeDefined()
@@ -2331,6 +2333,8 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   expect(await ui.find({ type: 'Text', text: 'A9 [P2] Title of A9 — deferred (waiver lapsed)' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'B2 [P3] Title of B2 — acknowledgement confirmed' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'B3 [P3] Title of B3 — acknowledgement awaiting Codex' })).toBeDefined()
+  // A link's raise is its own cause, not a file change (6b fix 1).
+  expect(await ui.find({ type: 'Text', text: 'B4 [P1] Title of B4 — re-check owed (raised to P1 by G3-1)' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -4750,5 +4754,23 @@ test('R90: the agent\'s link goes to Codex at no round\'s cost; a self-link is n
   expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', isLinkChecked: true })
   expect(rec.replies['inline:12']).toBe('902')
   expect(mergeHolds(rec)).toEqual([])
-  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCharged === true)).toEqual([])
+  // Round 2 is the baseline, which carries no isCharged; the charge is tested on a discretionary round below.
+  expect(rec.rounds.filter(one => one.phase === 'post').map(one => one.kind)).toEqual(['baseline'])
+})
+
+test('R90: in a discretionary round, Codex agreeing the agent\'s link, beside an accepted rebuttal, charges nothing', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, '**P2** the cache is never cleared on logout', w.gh.prHead, 40), inline(14, '**P2** stale entries survive a sign-out', w.gh.prHead, 60)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [
+    { id: 'G4-1', action: 'rebutted', note: 'logout clears it in session.ts', replyId: '901' },
+    { id: 'G4-2', duplicateOf: 'G4-1', replyId: '902' },
+  ]))
+  expect((await runOf(w)).rechecks).toEqual(['G4-1', 'G4-2'])
+  await done($, accept('r4-verify', w, { 'G4-1': true, 'G4-2': true }))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G4-2')).toMatchObject({ duplicateOf: 'G4-1', isLinkChecked: true })
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', false])
 })

@@ -4,6 +4,8 @@
 import {
   answersOf,
   holdText,
+  isAcknowledged,
+  raiseOf,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
@@ -436,7 +438,13 @@ const listFindings = (findings: readonly Finding[]): string =>
       const said =
         one.status === 'reported-fixed' ? 'reported-fixed, verification owed' : isReverifyOwed(one) ? 'fixed, re-verify owed (file changed)' : one.status
       const note = one.status === 'open' && one.note === undefined ? '' : `\n    ${said}${one.note === undefined || one.note === '' ? '' : `: ${one.note}`}`
-      const recheck = one.needsRecheck === true && !isReverifyOwed(one) ? ' (file changed since: re-verify)' : ''
+      const raise = raiseOf(one)
+      const recheck =
+        raise !== undefined
+          ? ` (raised to ${one.severity}${one.isSecurity === true ? ', security,' : ''} by its linked item ${raise.raisedBy ?? '?'}: re-check)`
+          : one.needsRecheck === true && !isReverifyOwed(one)
+            ? ' (file changed since: re-verify)'
+            : ''
       return `- ${one.id} [${one.severity}] ${titleOf(one)}${at}${recheck}${detail}${note}`
     })
     .join('\n')
@@ -596,6 +604,28 @@ export function fixPrompt(run: Run, notes: string | undefined, isMain: boolean):
   return noted(lines.join('\n'))
 }
 
+/**
+ * For a rebuttal Codex accepted before a linked item raised it (6b fix 1): the link, the new severity and the linked item's own report,
+ * so Codex rules on the rebuttal at that severity.
+ */
+const raisedBy = (run: Run, argued: readonly Finding[]): string[] =>
+  argued.flatMap(one => {
+    const raise = raiseOf(one)
+    if (raise === undefined) return []
+    const at = `${one.severity}${one.isSecurity === true ? ', security' : ''}`
+    const by = run.findings.find(each => each.id === raise.raisedBy)
+    const report =
+      by === undefined
+        ? ' not on this run'
+        : by.source === 'github'
+          ? `\n${fence(by.reviewer, by.detail ?? by.title)}`
+          : `\n    ${titleOf(by)}${by.detail === undefined ? '' : `\n    ${by.detail.replace(/\n/g, '\n    ')}`}`
+    return [
+      `   ${raise.raisedBy ?? '?'}, linked to ${one.id} as the same problem, raised it to ${at}. Its report:${report}`,
+      `   You accepted ${one.id}'s ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} before: does the rebuttal still hold at ${one.severity}, given that report?`,
+    ]
+  })
+
 export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Finding[]): string {
   if (rebuttals !== undefined) {
     // The same check re-verifies a verified fix whose file changed since (R58), and verifies a fix only reported (R72).
@@ -622,6 +652,7 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
             '',
             'The main agent rebutted these findings instead of fixing them. After the PR opens, a rebuttal settles nothing until you accept it:',
             listFindings(argued),
+            ...raisedBy(run, argued),
           ]),
       ...(reported.length === 0
         ? []
