@@ -88,8 +88,16 @@ export type World = {
     isBroken: boolean
     /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
     garbage?: string
+    /** Checks the base requires; undefined requires every check in `checks` (as before R86). */
+    required?: string[]
+    /** How the rules endpoint answers: 'ok' (default), 'garbage', 'throw', or an HTTP status. */
+    rulesAnswer?: 'ok' | 'garbage' | 'throw' | number
+    /** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */
+    classicAnswer?: 'none' | 'ok' | 'garbage' | 'throw' | number
     calls: string[]
   }
+  /** A stand-in engine for calling the mod's async helpers directly: its `process.run` is the fake `gh` and `git`. */
+  engine: never
   /** The run as the mod last wrote it. */
   run?: Run
   /** The plugin's store, as the mod wrote it. */
@@ -130,6 +138,7 @@ export async function done($: Dispatch, t: Ended): Promise<unknown> {
 export function world(on: On): World {
   const clock = mock.clock(on, { now: 1_000 })
   const w: World = {
+    engine: undefined as never,
     spawned: [],
     prompts: [],
     opened: [],
@@ -212,7 +221,7 @@ export function world(on: On): World {
     w.run = e.value as Run
     return next(e)
   })
-  on('process.run', (_$, e) => {
+  const fake = (e: { argv: readonly string[]; init?: { cwd?: string } }) => {
     const args = e.argv.slice(1).join(' ')
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -229,6 +238,23 @@ export function world(on: On): World {
         return out(JSON.stringify({ defaultBranchRef: { name: w.gh.defaultBranch } }))
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
+      const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+      if (/^api repos\/\S+\/rules\/branches\//.test(args)) {
+        const how = w.gh.rulesAnswer ?? 'ok'
+        if (how === 'throw') throw new Error('network down')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
+        const names = w.gh.required ?? (w.gh.checks as { name?: string }[]).map(one => String(one.name))
+        return out(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: names.map(context => ({ context })) } }]))
+      }
+      if (/^api repos\/\S+\/branches\/\S+\/protection/.test(args)) {
+        const how = w.gh.classicAnswer ?? 'none'
+        if (how === 'throw') throw new Error('network down')
+        if (how === 'none') return failed('gh: Branch not protected (HTTP 404)')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
+        return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
+      }
       if (args.startsWith('pr view')) {
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
@@ -314,7 +340,10 @@ export function world(on: On): World {
     }
     if (args.startsWith('remote get-url')) return out('https://github.com/me/repo.git\n')
     return out('')
-  })
+  }
+  on('process.run', (_$, e) => fake(e))
+  // The tests' own `$` has no `process`, and the host refuses it to a module that never calls it: this engine stand-in runs the same fake.
+  w.engine = { process: { run: async (argv: readonly string[], init?: { cwd?: string }) => fake({ argv, init }).value } } as never
   on('agent.spawn', (_$, e) => {
     w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })
     return { model: 'test', agentId: `agent-${w.spawned.length}` }

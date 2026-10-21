@@ -9,6 +9,7 @@ import {
   readIssueComments,
   readJsonList,
   readPrAction,
+  readRequired,
   readReviews,
   readRoster,
   severityHint,
@@ -440,4 +441,18 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   expect(severityHint('Optional-chaining crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
   expect(severityHint('Advisory - rename it')).toMatchObject({ severity: 'P3', isTagged: true })
   expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+})
+
+test('R86: required checks come from the ruleset and classic protection; anything unreadable is undefined', async () => {
+  const rules = JSON.stringify([
+    { type: 'pull_request', parameters: {} },
+    { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'check' }, { context: 'analyze (actions)' }] } },
+  ])
+  expect(readRequired(rules, undefined)).toEqual(['check', 'analyze (actions)'])
+  expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'], checks: [{ context: 'check' }] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
+  expect(readRequired('[]', undefined)).toEqual([])
+  expect(readRequired('<html>proxy error</html>', undefined)).toBeUndefined()
+  expect(readRequired('', undefined)).toBeUndefined()
+  // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
+  expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
 })

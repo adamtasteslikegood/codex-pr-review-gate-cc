@@ -2,6 +2,8 @@ import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import type { World } from './world'
+import { requiredChecksOf } from '../hooks/round'
 import { invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
@@ -3410,4 +3412,33 @@ test('R85: /pr-gate status names the follow-up of a settled deferral', async ($,
   await toTriage($, w, 'Consider renaming this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
   expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}`)
+})
+
+test('R86: the required set is known only when both sources are established (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  const cases: [World['gh']['rulesAnswer'], World['gh']['classicAnswer'], string[] | 'unknown'][] = [
+    ['ok', 'none', ['check']],
+    ['ok', 'ok', ['check', 'legacy']],
+    ['ok', 403, 'unknown'],
+    ['ok', 500, 'unknown'],
+    [403, 'none', 'unknown'],
+    [500, 'ok', 'unknown'],
+    ['throw', 'none', 'unknown'],
+    ['ok', 'throw', 'unknown'],
+    ['garbage', 'none', 'unknown'],
+    ['ok', 'garbage', 'unknown'],
+  ]
+  w.gh.required = ['check']
+  for (const [i, [rules, classic, want]] of cases.entries()) {
+    w.gh.rulesAnswer = rules
+    w.gh.classicAnswer = classic
+    const got = await requiredChecksOf(w.engine, '/repo', 'me/repo', `base${i}`)
+    expect(got === 'unknown' ? 'unknown' : [...got]).toEqual(want)
+  }
+  // An unknown answer is not cached: once GitHub answers, the same base reads.
+  w.gh.classicAnswer = 'none'
+  w.gh.rulesAnswer = 500
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toBe('unknown')
+  w.gh.rulesAnswer = 'ok'
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
 })

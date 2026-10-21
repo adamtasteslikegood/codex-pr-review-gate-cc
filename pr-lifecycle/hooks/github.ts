@@ -695,3 +695,35 @@ export function readPrAction(tool: string, input: Record<string, unknown>): PrAc
   if (!tool.startsWith('mcp__') || !/github/i.test(tool)) return undefined
   return readUnknownTool(tool, input, repo)
 }
+
+/**
+ * The checks a base requires (R86): each `required_status_checks` rule of `gh api repos/<slug>/rules/branches/<base>`, plus classic
+ * protection's `contexts` and `checks[].context` when given. undefined when either payload can't be parsed: every check then counts as required.
+ */
+export function readRequired(rules: string, protection: string | undefined): string[] | undefined {
+  let listed: unknown
+  try {
+    listed = JSON.parse(rules)
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(listed)) return undefined
+  const out: string[] = []
+  for (const rule of listed) {
+    const row = typeof rule === 'object' && rule !== null ? (rule as Record<string, unknown>) : {}
+    if (row.type !== 'required_status_checks') continue
+    const params = (row.parameters ?? {}) as { required_status_checks?: { context?: unknown }[] }
+    for (const one of params.required_status_checks ?? []) if (typeof one.context === 'string') out.push(one.context)
+  }
+  if (protection !== undefined) {
+    try {
+      const read = JSON.parse(protection) as { contexts?: unknown[]; checks?: { context?: unknown }[] }
+      for (const one of read.contexts ?? []) if (typeof one === 'string') out.push(one)
+      for (const one of read.checks ?? []) if (typeof one.context === 'string') out.push(one.context)
+    } catch {
+      // Rulesets and classic protection apply together: half a set is not the set (PR #19 review).
+      return undefined
+    }
+  }
+  return [...new Set(out)]
+}

@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Step, Waiver } from '../types'
+import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Standing, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -32,7 +32,17 @@ import {
   triagePrompt,
   verifyPrompt,
 } from './core'
-import { collectionDone, isTrusted, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
+import {
+  collectionDone,
+  isTrusted,
+  readCheckRuns,
+  readInlineComments,
+  readIssueComments,
+  readRequired,
+  readReviews,
+  readRoster,
+  severityHint,
+} from './github'
 import type { Check, Feedback, Roster } from './github'
 import {
   acceptRebuttal,
@@ -57,6 +67,7 @@ import {
   rejections,
   relocate,
   roundOf,
+  standingOf,
   triage,
   unresolvedBlockers,
   usedRounds,
@@ -301,6 +312,7 @@ let isPolling = false
 export function setup(c: Config): void {
   config = c
   queued = []
+  required.clear()
 }
 
 // This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
@@ -923,6 +935,66 @@ type Fetched = {
   prHead: string
   /** Feedback id to the id of this machine's own reply in its thread, posted after it (R35). */
   ownReplies?: Record<string, string>
+}
+
+/** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, 'unreadable' when it can't say. */
+export async function readChecks($: Engine, root: string, pr: number, repo?: string): Promise<{ name: string; bucket: string }[] | 'unreadable'> {
+  let ran: { exitCode: number; stdout: string; stderr: string }
+  try {
+    ran = await $.process.run(['gh', 'pr', 'checks', String(pr), ...(repo === undefined ? [] : ['--repo', repo]), '--json', 'name,state,bucket'], {
+      cwd: root,
+      timeoutMs: 30_000,
+    })
+  } catch (error) {
+    ran = { exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
+  }
+  try {
+    const read = JSON.parse(ran.stdout) as unknown
+    const row = (one: unknown): Record<string, unknown> => (typeof one === 'object' && one !== null ? (one as Record<string, unknown>) : {})
+    if (Array.isArray(read)) return read.map(one => ({ name: String(row(one).name ?? '?'), bucket: String(row(one).bucket ?? '') }))
+  } catch {
+    // Not JSON: read stderr below.
+  }
+  return /no checks reported/i.test(ran.stderr) ? [] : 'unreadable'
+}
+
+const required = new Map<string, Set<string>>()
+
+/**
+ * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for the session.
+ * Each source must be parsed, or authoritatively absent (classic's 404 "not protected"); a throw, a 403 or 500, or a payload that
+ * doesn't parse from either makes it 'unknown', which fails closed (every check required) and is not cached (PR #19 review).
+ */
+export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | 'unknown'> {
+  if (slug === undefined) return 'unknown'
+  const key = `${slug}:${base}`
+  const seen = required.get(key)
+  if (seen !== undefined) return seen
+  const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
+  const rules = await api(`repos/${slug}/rules/branches/${base}`)
+  const classic = await api(`repos/${slug}/branches/${base}/protection/required_status_checks`)
+  if (rules === undefined || rules.exitCode !== 0 || classic === undefined) return 'unknown'
+  const isClassicNone = classic.exitCode !== 0 && /\b404\b|not protected/i.test(classic.stderr)
+  if (classic.exitCode !== 0 && !isClassicNone) return 'unknown'
+  const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
+  if (listed === undefined) return 'unknown'
+  const found = new Set(listed)
+  required.set(key, found)
+  return found
+}
+
+/** The standing of a PR head (R79): the record's findings and review, its checks, and which of them its base requires. */
+export async function gatherStanding(
+  $: Engine,
+  rec: LifecycleRecord,
+  pr: { number: number; baseRefName: string; headRefOid: string },
+  repo?: string,
+): Promise<Standing> {
+  const checks = await readChecks($, rec.root, pr.number, repo)
+  const needed = checks === 'unreadable' || checks.length === 0 ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
+  const ci: CheckState[] | 'unreadable' =
+    checks === 'unreadable' ? 'unreadable' : checks.map(one => ({ ...one, isRequired: needed === 'unknown' || needed.has(one.name) }))
+  return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, ci)
 }
 
 /** Everything GitHub holds for the PR now. Only these polls establish that feedback arrived. */
