@@ -2336,3 +2336,735 @@ git commit -m "pr-lifecycle 1.5.0: Codex checks every deferral; a refusal reopen
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
+
+---
+
+### Task 12: The gate files issues instead of asking for waivers (R92, spec §5)
+
+**Why:** on PR #20 Adam waived six findings by hand, and two of them again after a fix touched their file (R55). Where 1.4.0 ends `exhausted` or `awaiting-decision`, the gate can do no more on the head. 1.5.0 files a GitHub issue there for each finding still holding the merge, except security, and the issue settles the finding. Before filing, a blocker first raised in the round that spent the allowance gets one more round, at most twice per lifecycle, and the report says the scope may be too wide. This task removes R85's early settle: an issue the agent names is labelled in the filing pass, like a new one.
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`Finding`, `Grant`, `Blocker`)
+- Modify: `pr-lifecycle/hooks/lifecycle.ts` (new filing helpers; `mergeHolds`, `unresolvedBlockers`, `blockerOf`, `decidePost`, `awaiting`, `Next`; removes `isIssueDeferral`, `wouldSettle`, `isSettledDeferral`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`Config`, `configOf`, `overrideConfig`, `advance`, new `fileIssues` replacing `labelDeferrals`)
+- Modify: `pr-lifecycle/hooks/core.ts` (`readyPrompt`, `personPost`, `reportPrompt`, `triagePrompt` step 2)
+- Modify: `pr-lifecycle/hooks/register.tsx` (`statusText`)
+- Modify: `pr-lifecycle/tests/world.ts` (issue filing fake)
+- Test: `pr-lifecycle/tests/lifecycle.test.ts`, `pr-lifecycle/tests/flow.test.ts`, `pr-lifecycle/tests/settings.test.ts`
+
+**Interfaces:**
+- Consumes: `isDeferralOwed`, `isDeferralAgreed`, `ruleDeferral` (Task 11); `isLinked`, `alsoOf`, `linkTo` (Task 7); `isChargedRound` and `RoundRecord.isCharged` (Task 6); `issueOf`, `isFollowUpRef`, `peakOf`, `isPeakUnknown`, `isDisputed`, `mergeHolds` (1.4.0).
+- Produces (Task 13 and Task 15 rely on these):
+  - Types: `Finding.issueError?: string`; `Grant.by?: 'gate'`; Blocker kinds `'issue-owed'` (owner `gate`) and `'issue-failed'` (owner `agent`) replace `'label-owed'`. `'label-failed'` stays. `Next`'s `blocked` gets `issues?: string[]`.
+  - In `lifecycle.ts`: `SEVERITY_NAMES`, `GATE_ROUNDS = 2`, `jiraKeyOf(branch)`, `isFileable(f)`, `isSettledByIssue(f)`, `issueLine(f)`, `issueTitle(f, rec, spec?)`, `issueBody(f, rec)`, `lateBlockers(rec)`, `gateGrant(rec, at)`, `scopeNote(rec)`, `isFilingPoint(next)`, `type IssueItem`, `type IssuePlan`, `planIssues(rec, at, spec?)`.
+  - In `round.ts`: `Config.issueSpec: string | undefined`; `export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined>`.
+  - In `world.ts`: `gh.issueAnswer?: 'ok' | 'fail'`, `gh.issueNumber?: number` (default 21), `gh.filed: string[][]`, `gh.onIssue?: () => void | Promise<void>`.
+- Rulings for the plan:
+  - The gate files what holds the merge and is not security: open findings (a fix Codex rejected is open), deferrals Codex agreed with, and disputes. It never files a fix only reported, a rebuttal or link Codex has not checked, or a deferral Codex has not checked: those are Codex's, and the check comes first.
+  - A record that lost a finding's peak (gate R7-6, `isPeakUnknown`) is not filed; it waits for the person, as in 1.4.0.
+  - A finding settles by its issue only while it is `open`, `deferred` (with Codex's agreement) or `rebutted`. A fix reported later is verified as usual. `needsRecheck` (its file changed) does not unsettle it (spec §5.8).
+  - A late blocker is a held blocker first raised in the last completed post round, or in the last charged discretionary round (the one that spent the allowance). The gate adds a round only when that grant would start one (`decideNext` with it is a round). Otherwise, or after two gate rounds, the late blocker gets its issue.
+  - A new issue's `followUp` is `#<n>`. A follow-up the agent gave that names no issue (a ticket key) goes into the issue's body.
+  - The exhaustion paths (late-blocker rounds, an open finding filed at exhaustion) are tested on `planIssues` in `lifecycle.test.ts`. The gh side is tested through the awaiting path in `flow.test.ts`, which runs the same `fileIssues`. A dispute is tested at the unit level (`isFileable`, `issueBody`).
+
+- [ ] **Step 1: Write the failing unit tests**
+
+In `pr-lifecycle/tests/lifecycle.test.ts`, add to the import from `'../hooks/lifecycle'`: `gateGrant`, `isFileable`, `isSettledByIssue`, `issueBody`, `issueTitle`, `jiraKeyOf`, `planIssues`, `scopeNote`. Remove `isSettledDeferral` and `wouldSettle` from it. Append:
+
+```ts
+/** A post lifecycle with the allowance spent: four charged rounds, then a final-head check that moved the head from a to b. */
+const spent = (over: object = {}) =>
+  postRec({
+    head: 'b',
+    rounds: [
+      post({ n: 2 }),
+      ...[3, 4, 5, 6].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true })),
+      roundOf({ n: 7, phase: 'post', kind: 'final-head-check', endHead: 'b' }),
+    ],
+    ...over,
+  })
+
+test('R92: the issue title names the finding, its peak severity, the PR, the branch, a Jira key and the spec handle', async () => {
+  const f = finding({ id: 'R4-3', severity: 'P2', title: 'Workflows rules ignored when reading required checks' })
+  expect(issueTitle(f, { pr: 20, branch: 'wave2a/pr-lifecycle-1.4.0' })).toBe(
+    'R4-3 Major [P2] Workflows rules ignored when reading required checks (#20, wave2a/pr-lifecycle-1.4.0)',
+  )
+  expect(issueTitle({ ...f, severity: 'P3', peakSeverity: 'P1' }, { pr: 20, branch: 'feat/KAN-12-cache' }, 'docs/spec.md')).toBe(
+    'R4-3 Critical [P1] Workflows rules ignored when reading required checks (#20, feat/KAN-12-cache, KAN-12, docs/spec.md)',
+  )
+  expect(jiraKeyOf('feat/x')).toBeUndefined()
+  expect(jiraKeyOf('fix/ABC2-77-retry')).toBe('ABC2-77')
+})
+
+test('R92: the issue body says who raised it and where, its severity, the problem, why it waits, and what is linked', async () => {
+  const f = agreedBy(finding({
+    id: 'G4-3', source: 'github', reviewer: 'mallory', severity: 'P2', title: 'cache never cleared', detail: 'Logging out keeps the cache.',
+    url: 'https://github.com/me/repo/pull/20#discussion_r5', file: 'src/cache.ts', line: 10, round: 4, status: 'deferred', note: 'needs a schema change', followUp: 'KAN-9',
+  }))
+  const dup = { ...finding({ id: 'G5-1', source: 'github' }), duplicateOf: 'G4-3', linkBy: 'gate' as const }
+  const body = issueBody(f, { pr: 20, findings: [f, dup] })
+  expect(body).toContain('Raised by mallory in round 4 of #20, at `src/cache.ts:10` ([thread](https://github.com/me/repo/pull/20#discussion_r5)).')
+  expect(body).toContain('Severity: Major [P2].')
+  expect(body).toContain('## Problem\n\nLogging out keeps the cache.')
+  expect(body).toContain('Deferred by the agent: needs a schema change. Codex agreed it cannot reasonably be fixed in this PR.')
+  expect(body).toContain('Follow-up named by the agent: KAN-9.')
+  expect(body).toContain('- G5-1: the same problem, raised again')
+  // A lowered severity says so; a dispute gives both sides; an open finding says the rounds ran out.
+  expect(issueBody({ ...f, severity: 'P3', peakSeverity: 'P1' }, { pr: 20, findings: [] })).toContain('Severity: Critical [P1], answered as P3.')
+  expect(issueBody(disputed(), { pr: 20, findings: [] })).toContain('is disputed: the agent says')
+  const left = finding({ id: 'R7-1', status: 'open', history: [{ round: 7, status: 'open', note: 'still reachable from /login', by: 'codex', at: 1 }] })
+  expect(issueBody(left, { pr: 20, findings: [] })).toContain("Still open when the review rounds ran out. Codex's last word: still reachable from /login.")
+})
+
+test('R92: a finding settles by its issue, labelled at its peak, unless it is security; its file changing does not unsettle it', async () => {
+  const filed = { ...agreedBy(finding({ id: 'G2-1', source: 'github', severity: 'P2', status: 'deferred' })), followUp: '#21', followUpLabel: 'P2' as const }
+  expect(isSettledByIssue(filed)).toBe(true)
+  expect(isSettledByIssue({ ...filed, followUpLabel: undefined })).toBe(false)
+  expect(isSettledByIssue({ ...filed, peakSeverity: 'P1' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, isSecurity: true })).toBe(false)
+  expect(isSettledByIssue({ ...filed, followUp: 'KAN-9' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, status: 'open' })).toBe(true)
+  expect(isSettledByIssue({ ...filed, status: 'reported-fixed' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, needsRecheck: true })).toBe(true)
+  // A deferral Codex has not checked never settles, whatever its label says.
+  expect(isSettledByIssue({ ...filed, history: [] })).toBe(false)
+  const rec = postRec({ findings: [filed] })
+  expect(mergeHolds(rec)).toEqual([])
+  expect(decideNext(rec)).toEqual({ kind: 'ready' })
+})
+
+test('R92: the gate files open findings, deferrals Codex agreed with and disputes; never security, a link, an unchecked answer or a lost peak', async () => {
+  const open = finding({ id: 'R1-1', severity: 'P2', status: 'open' })
+  const owed = applyAnswer(finding({ id: 'R1-2', severity: 'P2' }), { id: 'R1-2', action: 'deferred', note: 'later' }, 2, 'main', 5)
+  expect(isFileable(open)).toBe(true)
+  expect(isFileable(owed)).toBe(false)
+  expect(isFileable(agreedBy(owed))).toBe(true)
+  expect(isFileable(disputed())).toBe(true)
+  expect(isFileable(rejected())).toBe(true)
+  expect(isFileable({ ...open, isSecurity: true })).toBe(false)
+  expect(isFileable({ ...open, status: 'reported-fixed' })).toBe(false)
+  expect(isFileable({ ...open, status: 'rebutted', history: [{ round: 2, status: 'rebutted', by: 'main', at: 1 }] })).toBe(false)
+  // Gate R7-6: a record that lost the peak waits for the person.
+  const legacy = agreedBy({ ...finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'hint' }), history: [{ round: 2, status: 'deferred' as const, severity: 'P3' as const, note: 'cosmetic', by: 'main', at: 5 }] })
+  expect(isFileable(legacy)).toBe(false)
+  expect(isFileable({ ...legacy, peakSeverity: 'P1' })).toBe(true)
+  // Review Focus 5: a duplicate linked to a security original holds with it and is never filed.
+  const original = finding({ id: 'G2-1', source: 'github', severity: 'P1', isSecurity: true, status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', severity: 'P2' }), original, 'gate', 2, 5)
+  expect(isFileable(dup)).toBe(false)
+  expect(planIssues(spent({ findings: [original, dup] }), 9)).toEqual({ kind: 'none' })
+})
+
+test('R92: at exhaustion a blocker first raised in the round that spent the allowance, or the last one, adds a round, twice at most', async () => {
+  const late = finding({ id: 'R7-1', round: 7, severity: 'P1', status: 'open' })
+  const rec = spent({ findings: [late] })
+  expect(decideNext(rec).kind).toBe('exhausted')
+  const grant = { n: 1, reason: "late blocker R7-1: the PR's scope may be too wide", head: 'b', at: 50, by: 'gate' }
+  expect(gateGrant(rec, 50)).toEqual(grant)
+  expect(planIssues(rec, 50)).toEqual({ kind: 'grant', grant, late: ['R7-1'] })
+  // Raised in the last charged round (6) is late too; an earlier one, or a late advisory, gets its issue.
+  expect(planIssues(spent({ findings: [{ ...late, id: 'R6-1', round: 6 }] }), 50).kind).toBe('grant')
+  expect(planIssues(spent({ findings: [{ ...late, id: 'R5-1', round: 5 }] }), 50)).toMatchObject({ kind: 'file', items: [{ id: 'R5-1', peak: 'P1' }] })
+  expect(planIssues(spent({ findings: [{ ...late, severity: 'P2' }] }), 50)).toMatchObject({ kind: 'file', items: [{ id: 'R7-1', peak: 'P2' }] })
+  // Two gate rounds used: the third late blocker gets its issue. A person's grant does not count against them.
+  const twice = spent({
+    rounds: [
+      post({ n: 2 }),
+      ...[3, 4, 5, 6, 7, 8].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true })),
+      roundOf({ n: 9, phase: 'post', kind: 'final-head-check', endHead: 'b' }),
+    ],
+    grants: [
+      { n: 1, reason: 'late blocker R6-1', head: 'a', at: 1, by: 'gate' },
+      { n: 1, reason: 'late blocker R8-1', head: 'a', at: 2, by: 'gate' },
+    ],
+    findings: [{ ...late, id: 'R9-1', round: 9 }],
+  })
+  expect(decideNext(twice).kind).toBe('exhausted')
+  expect(gateGrant(twice, 50)).toBeUndefined()
+  expect(planIssues(twice, 50)).toMatchObject({ kind: 'file', items: [{ id: 'R9-1', peak: 'P1' }] })
+  expect(scopeNote(twice)).toBe(
+    "The gate added 2 rounds for blockers first raised after the allowance was spent (late blocker R6-1; late blocker R8-1): tell the person the PR's scope may be too wide.",
+  )
+  expect(scopeNote(rec)).toBeUndefined()
+  // Before the PR, or with nothing to file, there is no plan.
+  expect(planIssues({ ...rec, phase: 'pre' }, 50)).toEqual({ kind: 'none' })
+  expect(planIssues(postRec(), 50)).toEqual({ kind: 'none' })
+})
+
+test('R92: a deferral the agent tied to an issue is filed by labelling that issue; any other gets a new one', async () => {
+  const named = agreedBy(applyAnswer(finding({ id: 'G2-1', source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'G2-1', action: 'deferred', note: 'later', followUp: 'other/lib#7' }, 2, 'main', 5))
+  const fresh = agreedBy(applyAnswer(finding({ id: 'G2-2', source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'G2-2', action: 'deferred', note: 'later' }, 2, 'main', 5))
+  const next = decideNext(postRec({ findings: [named, fresh] }))
+  expect(next).toMatchObject({ kind: 'blocked', issues: ['G2-1', 'G2-2'] })
+  const plan = planIssues(postRec({ findings: [named, fresh], slug: 'me/repo' }), 9)
+  expect(plan).toMatchObject({ kind: 'file', items: [{ id: 'G2-1', peak: 'P2', reuse: { repo: 'other/lib', number: 7 } }, { id: 'G2-2', peak: 'P3' }] })
+  expect(plan.kind === 'file' ? plan.items[1] : undefined).not.toHaveProperty('reuse')
+})
+```
+
+Update the tests from earlier tasks that this task changes:
+- Task 11's `'R92: every deferral waits on Codex; …'`: replace `expect(wouldSettle(p3)).toBe(false)` and `expect(isSettledDeferral(p3)).toBe(false)` with `expect(isSettledByIssue(p3)).toBe(false)`, and `expect(isSettledDeferral(agreedBy(p3))).toBe(true)` with `expect(isSettledByIssue(agreedBy(p3))).toBe(true)`.
+- Task 11's standing test `'R92: a deferral owed Codex holds as Codex\'s; …'`: in `pending`, expect `[['G2-1', 'issue-owed', 'gate']]`. Make its last line `expect(decideNext(postRec({ findings: [p2] }))).toMatchObject({ kind: 'blocked', issues: ['G2-1'] })`, with the comment `// Agreed: the gate files its issue (R92).`
+- Delete `'R85: isSettledDeferral needs deferred, P3, an issue follow-up, its label and no security flag'` (the settle test above replaces it).
+- Replace `'gate R7-6: …'` with the `legacy` lines now in the `isFileable` test above: delete the old test.
+- `'R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)'`: replace each `isSettledDeferral` with `isSettledByIssue`; `base` stays `agreedBy(finding({ ... }))`.
+- `'R85: a deferral without a follow-up clears the earlier one and its label (final review T4)'`: replace each `isSettledDeferral` with `isSettledByIssue`, and delete its `wouldSettle` line.
+- Replace `'R85: the ready prompt names the follow-up of a settled deferral and not of a plain one'` with:
+
+```ts
+test('R92: the ready prompt lists each finding settled by its issue', async () => {
+  const settled = { ...agreedBy(finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', peakSeverity: 'P1' })), followUp: '#21', followUpLabel: 'P1' as const }
+  const plain = finding({ id: 'G2-2', source: 'github', status: 'verified-fixed', severity: 'P3' })
+  const said = readyPrompt({ ...fresh(), pr: 7, findings: [settled, plain] })
+  expect(said).toContain('follow-up issues: G2-1 → #21 Critical [P1]')
+  expect(said).not.toContain('G2-2 →')
+})
+```
+
+In `pr-lifecycle/tests/settings.test.ts`, append:
+
+```ts
+test('R92: issueSpec names the spec in each issue title; a blank or non-string one is ignored', async () => {
+  expect(configOf({}).issueSpec).toBeUndefined()
+  expect(overrideConfig(configOf({}), '{"issueSpec":"docs/spec.md"}').config.issueSpec).toBe('docs/spec.md')
+  const bad = overrideConfig(configOf({}), '{"issueSpec":7}')
+  expect(bad.config.issueSpec).toBeUndefined()
+  expect(bad.ignored).toEqual(['issueSpec (not a non-empty string)'])
+})
+```
+
+- [ ] **Step 2: Run the unit tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts`
+Expected: FAIL: `issueTitle`, `planIssues` and the other new helpers are not exported.
+
+- [ ] **Step 3: Implement the types**
+
+In `pr-lifecycle/types/index.d.ts`:
+
+1. In `Finding`, replace the doc comments of `followUp`, `followUpLabel` and `followUpLabelError`, and add `issueError` after them:
+
+```ts
+  /** The GitHub issue that tracks it: named by the agent's answer (R85) or filed by the gate (R92). `#<n>`, `owner/repo#<n>` or its URL, other text around it. */
+  followUp?: string
+  /** The highest severity the finding had during the gate (R85): what its issue is labelled with. */
+  peakSeverity?: Severity
+  /** The `severity:<P>` label the gate put on that issue; the finding settles once it is the peak's (R92). */
+  followUpLabel?: Severity
+  /** gh's error when the gate last failed to label the issue the agent named: the finding holds until a pass labels it. */
+  followUpLabelError?: string
+  /** gh's error when the gate last failed to file the finding's issue (R92): the finding holds until a pass files it. */
+  issueError?: string
+```
+
+   (`peakSeverity` keeps its place; only its comment changes.)
+2. Replace `Grant` with:
+
+```ts
+/** A round added to the allowance: the person's `/pr-gate allow`, or the gate's own for a late blocker (`by: 'gate'`, R92, at most two). */
+export type Grant = { n: number; reason: string; head: string; at: number; by?: 'gate' }
+```
+
+3. In `Blocker['kind']`, replace `'label-owed'` with `'issue-owed' | 'issue-failed'`.
+
+- [ ] **Step 4: Implement the filing helpers in `lifecycle.ts`**
+
+1. Add `Grant` to the type import from `'../types'` if it is not there.
+2. Delete `isIssueDeferral`, `wouldSettle` and `isSettledDeferral` with their doc comments. Keep `issueOf`, `isFollowUpRef`, `labelFailure` and `LABEL_RELEASE`.
+3. After `ruleDeferral` (Task 11), add:
+
+```ts
+/** Severity names in an issue's title (spec §5.6). */
+export const SEVERITY_NAMES: Record<Severity, string> = { P0: 'Blocker', P1: 'Critical', P2: 'Major', P3: 'Minor' }
+
+/** The most rounds the gate adds for late blockers in one lifecycle (R92, spec §5.3). */
+export const GATE_ROUNDS = 2
+
+/** The Jira key in a branch name, if any: its first `[A-Z][A-Z0-9]+-\d+`. */
+export const jiraKeyOf = (branch: string): string | undefined => branch.match(/[A-Z][A-Z0-9]+-\d+/)?.[0]
+
+/**
+ * What the filing pass files (R92, spec §5.2): a held finding that is not security, not a linked duplicate (it holds with its
+ * original), and is open, deferred with Codex's agreement, or disputed. A fix only reported, a rebuttal, link or deferral Codex has
+ * not checked are Codex's first. A record that lost the finding's peak (gate R7-6) waits for the person.
+ */
+export const isFileable = (f: Finding): boolean =>
+  f.isSecurity !== true && !isLinked(f) && !isPeakUnknown(f) && (f.status === 'open' || isDeferralAgreed(f) || isDisputed(f))
+
+/**
+ * A finding settled by its GitHub issue (R92, spec §5.7): not security, open, deferred with Codex's agreement or rebutted, its
+ * follow-up names an issue, and that issue carries the label of the highest severity the finding had. Its file changing does not
+ * unsettle it (unlike a waiver, R55): the issue stays open for the person.
+ */
+export const isSettledByIssue = (f: Finding): boolean =>
+  f.isSecurity !== true &&
+  (f.status === 'open' || f.status === 'rebutted' || (f.status === 'deferred' && !isDeferralOwed(f))) &&
+  isFollowUpRef(f.followUp) &&
+  f.followUpLabel === peakOf(f)
+
+/** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
+export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[peakOf(f)]} [${peakOf(f)}]`
+
+/** A filed issue's title (spec §5.6): `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`. */
+export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string): string {
+  const peak = peakOf(f)
+  const jira = jiraKeyOf(rec.branch)
+  const where = [`#${rec.pr ?? '?'}`, rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
+  return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
+}
+
+/**
+ * A filed issue's body (spec §5.6; issues #21-#23 are the model): who raised it and where, its peak severity, the problem, why it
+ * was not fixed in the PR, and the findings linked to it.
+ */
+export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>): string {
+  const peak = peakOf(f)
+  const at = f.file === undefined ? '' : `, at \`${f.file}${f.line === undefined ? '' : `:${f.line}`}\``
+  const thread = f.url === undefined ? '' : ` ([thread](${f.url}))`
+  const codex = f.history.filter(one => one.by === 'codex').at(-1)?.note
+  const why = isDisputed(f)
+    ? `${disputeOf(f)}.`
+    : f.status === 'deferred'
+      ? `Deferred by the agent: ${f.note ?? 'no reason given'}. Codex agreed it cannot reasonably be fixed in this PR.`
+      : `Still open when the review rounds ran out.${codex === undefined ? '' : ` Codex's last word: ${codex}.`}`
+  const named = f.followUp !== undefined && !isFollowUpRef(f.followUp) ? [`Follow-up named by the agent: ${f.followUp}.`] : []
+  const linked = alsoOf(rec.findings, f.id)
+  return [
+    `Raised by ${f.reviewer} in round ${f.round} of #${rec.pr ?? '?'}${at}${thread}.`,
+    `Severity: ${SEVERITY_NAMES[peak]} [${peak}]${f.severity === peak ? '' : `, answered as ${f.severity}`}${f.isSecurity === true ? ', security' : ''}.`,
+    '',
+    '## Problem',
+    '',
+    f.detail ?? f.title,
+    '',
+    '## Impact, and why it was not fixed in this PR',
+    '',
+    why,
+    ...named,
+    ...(linked.length === 0 ? [] : ['', '## Linked findings', '', ...linked.map(id => `- ${id}: the same problem, raised again`)]),
+    '',
+    `Filed by pr-gate when the review of #${rec.pr ?? '?'} could do no more.`,
+  ].join('\n')
+}
+```
+
+   `disputeOf` is defined earlier in the file; if it is below `issueBody`, move `issueBody` below it. Place these helpers after `isBlocking`, `isLinked`, `isDeferralAgreed` and `alsoOf` are defined (`const`s are not hoisted for use at load time, but these are only called later, so a function body may refer to a `const` defined further down; keep the order readable).
+
+4. Replace `!isSettledDeferral(one)` with `!isSettledByIssue(one)` in `mergeHolds`, and end its doc comment with "A finding settled by its issue no longer holds it (R92)." In `unresolvedBlockers`, add `&& !isSettledByIssue(one)` to the filter.
+5. In `blockerOf`, at its top (after `isSecurityP1`), add:
+
+```ts
+  // The filing pass failed for it (R92): the agent checks gh; the gate retries on its next pass.
+  if (isFileable(f) && f.issueError !== undefined) return { kind: 'issue-failed', id: f.id, said: issueFailure(f), owner: 'agent', release: ISSUE_RELEASE }
+  if (isFileable(f) && f.followUpLabelError !== undefined) return { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: LABEL_RELEASE }
+  const issueOwed = (what: string): Blocker =>
+    ({ kind: 'issue-owed', id: f.id, said: `${tag}: ${what}; the gate files its GitHub issue when the review can do no more`, owner: 'gate', release: 'nothing: the gate files it' })
+```
+
+   Make the `isDisputed` line `if (isDisputed(f)) return isFileable(f) ? issueOwed('disputed') : { kind: 'disputed', id: f.id, said: \`${tag}: disputed\`, owner: 'person', release: waive }`. In the `if (f.status === 'deferred') {` block, replace the `wouldSettle` branch with `if (isFileable(f)) return issueOwed('deferred, and Codex agreed it cannot reasonably be fixed in this PR')`.
+6. Next to `LABEL_RELEASE`, add:
+
+```ts
+const ISSUE_RELEASE = 'check that gh can create issues in the repository (gh auth status); the gate retries on the next pass'
+
+/** A failed filing in words (R92). */
+const issueFailure = (f: Finding): string => `could not file an issue for ${f.id} (${f.issueError ?? 'no error recorded'})`
+```
+
+7. In `Next`, make the `blocked` member `{ kind: 'blocked'; why: string; nextStep: string; answer?: string[]; recheck?: string[]; issues?: string[] }`, and add to its doc comment: "issues: findings the filing pass still owes an issue (R92); the next pass files them."
+8. In `decidePost`, delete `unlabelled`. Make `deferred` `holding.filter(one => one.status === 'deferred' && !isDeferralOwed(one))`. In the final-head-check branch, make the awaiting line `if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)`. Make the last line `return awaiting(deferred, disputed)`.
+9. Replace `awaiting` and its doc comment with:
+
+```ts
+/**
+ * Only deferrals and disputes hold the merge. Each that is not security gets a GitHub issue from the filing pass (R92): until it has
+ * one, the gate retries, and a failure is the agent's to check. Security ones, and a record that lost a peak, wait for the person's
+ * waiver (R39, R40, gate R7-6).
+ */
+function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = []): Next {
+  const all = [...deferred, ...disputed]
+  const toFile = all.filter(isFileable)
+  if (toFile.length > 0) {
+    const failed = toFile.filter(each => each.issueError !== undefined || each.followUpLabelError !== undefined)
+    const waiting = toFile.filter(each => !failed.includes(each))
+    const said = [
+      ...failed.map(each => (each.issueError !== undefined ? issueFailure(each) : labelFailure(each))),
+      ...(waiting.length === 0 ? [] : [`${ids(waiting)} ${waiting.length === 1 ? 'waits for its' : 'wait for their'} GitHub issue`]),
+    ]
+    const releases = [...new Set(failed.map(each => (each.issueError !== undefined ? ISSUE_RELEASE : LABEL_RELEASE)))]
+    return {
+      kind: 'blocked',
+      why: said.join('; '),
+      nextStep: `${releases.length === 0 ? 'nothing to change: the gate files them' : releases.join('; ')} (/pr-gate resume)`,
+      issues: toFile.map(each => each.id),
+    }
+  }
+  const one = all.length === 1
+  const are = (list: readonly Finding[], word: string): string[] => (list.length === 0 ? [] : [`${ids(list)} ${list.length === 1 ? 'is' : 'are'} ${word}`])
+  const what = [...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')
+  const told = [...are(deferred, 'deferred'), ...are(disputed, 'disputed')]
+  return {
+    kind: 'awaiting-decision',
+    why: `${what}; only the person's waiver lets ${one ? 'it' : 'them'} into the merge`,
+    nextStep: `tell the person ${told.join(' and ')} and why, then stop: only their waiver settles ${one ? 'it' : 'them'}`,
+  }
+}
+```
+
+10. After `decideNext`, add:
+
+```ts
+/**
+ * Blockers the gate may add a round for at exhaustion (R92, spec §5.3): held, blocking, first raised in the last completed post round
+ * or in the last charged discretionary round, the one that spent the allowance.
+ */
+export function lateBlockers(rec: LifecycleRecord): Finding[] {
+  const done = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
+  const late = new Set([done.at(-1)?.n, done.filter(one => one.kind === 'discretionary' && one.isCharged !== false).at(-1)?.n])
+  return mergeHolds(rec).filter(one => isBlocking(one) && late.has(one.round))
+}
+
+/**
+ * The round the gate adds for late blockers at exhaustion (R92): under GATE_ROUNDS per lifecycle, and only when it starts a round.
+ * Each one is a sign to the person that the PR's scope is too wide; `scopeNote` says so.
+ */
+export function gateGrant(rec: LifecycleRecord, at: number): Grant | undefined {
+  if (decideNext(rec).kind !== 'exhausted') return undefined
+  if (rec.grants.filter(one => one.by === 'gate').length >= GATE_ROUNDS) return undefined
+  const late = lateBlockers(rec)
+  if (late.length === 0) return undefined
+  const grant: Grant = { n: 1, reason: `late blocker${late.length === 1 ? '' : 's'} ${ids(late)}: the PR's scope may be too wide`, head: rec.head, at, by: 'gate' }
+  return decideNext({ ...rec, grants: [...rec.grants, grant] }).kind === 'round' ? grant : undefined
+}
+
+/** The rounds the gate added, in words for the person (R92); undefined when it added none. */
+export function scopeNote(rec: Pick<LifecycleRecord, 'grants'>): string | undefined {
+  const added = rec.grants.filter(one => one.by === 'gate')
+  if (added.length === 0) return undefined
+  const rounds = `${added.length} round${added.length === 1 ? '' : 's'}`
+  return `The gate added ${rounds} for blockers first raised after the allowance was spent (${added.map(one => one.reason.replace(/: the PR's scope may be too wide$/, '')).join('; ')}): tell the person the PR's scope may be too wide.`
+}
+
+/** Where the filing pass runs (R92): where 1.4.0 ended exhausted or awaiting the person, and while an issue is still owed. */
+export const isFilingPoint = (next: Next): boolean =>
+  next.kind === 'exhausted' || next.kind === 'awaiting-decision' || (next.kind === 'blocked' && (next.issues ?? []).length > 0)
+
+/** One issue the filing pass owes: a new one, or the one the agent named (`reuse`), labelled `severity:<peak>`. */
+export type IssueItem = { id: string; peak: Severity; followUp?: string; reuse?: { repo: string; number: number }; title: string; body: string }
+
+export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[] }
+
+/**
+ * What the filing pass does (R92, spec §5): nothing before the PR or short of a filing point; else a round for a late blocker
+ * (`gateGrant`); else an issue for each held finding it files (`isFileable`).
+ */
+export function planIssues(rec: LifecycleRecord, at: number, spec?: string): IssuePlan {
+  if (rec.phase === 'pre' || rec.pr === undefined || !isFilingPoint(decideNext(rec))) return { kind: 'none' }
+  const grant = gateGrant(rec, at)
+  if (grant !== undefined) return { kind: 'grant', grant, late: lateBlockers(rec).map(one => one.id) }
+  const items = mergeHolds(rec)
+    .filter(isFileable)
+    .map((f): IssueItem => {
+      const reuse = issueOf(f.followUp, rec.slug)
+      return {
+        id: f.id,
+        peak: peakOf(f),
+        ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
+        ...(reuse === undefined ? {} : { reuse }),
+        title: issueTitle(f, rec, spec),
+        body: issueBody(f, rec),
+      }
+    })
+  return items.length === 0 ? { kind: 'none' } : { kind: 'file', items }
+}
+```
+
+- [ ] **Step 5: Run the unit tests**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts`
+Expected: the new tests PASS. Failures left in `round.ts`, `core.ts` and `register.tsx` imports are fixed next.
+
+- [ ] **Step 6: Write the failing flow tests and the world fake**
+
+In `pr-lifecycle/tests/world.ts`, add to the `gh` type, after `labelled`:
+
+```ts
+    /** How `gh api -X POST repos/<slug>/issues` answers when the gate files an issue (R92): 'ok' (default) or 'fail'. */
+    issueAnswer?: 'ok' | 'fail'
+    /** The number the next filed issue gets (default 21); each filing adds one. */
+    issueNumber?: number
+    /** Every issue the gate filed: its argv after `gh`, in order. */
+    filed: string[][]
+    /** Called on each issue filing, before it answers: a test acts while the gate files an issue. */
+    onIssue?: () => void | Promise<void>
+```
+
+Add `filed: [],` next to `labelled: [],` where the world is built. In `fake`, before the line `if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)`, add:
+
+```ts
+      // The gate's issue filing (R92): a POST to repos/<slug>/issues; the answer carries the new issue's number.
+      if (e.argv[1] === 'api' && e.argv[2] === '-X' && e.argv[3] === 'POST' && /^repos\/[^/\s]+\/[^/\s]+\/issues$/.test(e.argv[4] ?? '')) {
+        w.gh.filed.push(e.argv.slice(1))
+        await w.gh.onIssue?.()
+        if (w.gh.issueAnswer === 'fail') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 410: Issues are disabled for this repo', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        const number = w.gh.issueNumber ?? 21
+        w.gh.issueNumber = number + 1
+        const repo = (e.argv[4] ?? '').split('/').slice(1, 3).join('/')
+        return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}` }))
+      }
+```
+
+In `pr-lifecycle/tests/flow.test.ts`:
+
+1. Make `toAwaiting` defer a **security** finding by default, since only security waits for the person now. Its disposition becomes `{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', isSecurity: true, ...extra }`.
+2. Append:
+
+```ts
+test('R92: when the review can do no more, a P2 deferral Codex agreed with gets its GitHub issue, settles, and the lifecycle is ready', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.filed).toHaveLength(1)
+  const argv = w.gh.filed[0] ?? []
+  expect(argv.slice(0, 4)).toEqual(['api', '-X', 'POST', 'repos/me/repo/issues'])
+  expect(argv).toContain(`title=G2-1 Major [P2] Consider renaming this (#${w.gh.pr}, feat/x)`)
+  expect(argv).toContain('labels[]=severity:P2')
+  expect(argv.find(one => one.startsWith('body='))).toContain('Deferred by the agent: needs a schema change.')
+  expect(w.gh.labelled).toContain('label create severity:P2 --repo me/repo --color fbca04')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: filed me/repo#21 severity:P2')).toBe(true)
+  expect((await say($, 'status')).text).toContain('G2-1 → #21 Major [P2].')
+})
+
+test('R92: an issue the gate could not file holds the merge with gh\'s words, and the next pass files it', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'fail'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toBe('HTTP 410: Issues are disabled for this repo')
+  expect(w.prompts.at(-1)).toContain('could not file an issue for G2-1 (HTTP 410: Issues are disabled for this repo)')
+  expect(w.prompts.at(-1)).toContain('check that gh can create issues in the repository (gh auth status)')
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(rec.phase).toBe('ready')
+})
+
+test('R92: a reset while an issue is filed writes nothing for the archived lifecycle (G7-8)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isResetting = false
+  w.gh.onIssue = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('filed')
+  expect((await runOf(w)).status).not.toBe('running')
+})
+```
+
+3. Update the R85 flow tests to the filing pass:
+   - `'R85: a P3 deferred with a recorded follow-up settles without a waiver, once its issue is labelled'`: rename it `'R92: a P3 deferral whose follow-up names an issue gets that issue labelled, not a new one'`, and add `expect(w.gh.filed).toEqual([])`.
+   - Replace `'R85: a P2 deferral with a follow-up still waits for the person'` with a test named `'R92: a P2 deferral whose follow-up names an issue gets it labelled severity:P2 and settles'`. It runs `toTriage($, w, 'Consider renaming this')`, a P2 deferral with `followUp: ISSUE`, and `accept('r2-verify', w)`. It expects `labelled(w, 9, 'P2')`, `w.gh.filed` empty and phase `'ready'`.
+   - Replace `'R85: a P3 deferral without a follow-up still waits for the person'` with `'R92: a P3 deferral with no follow-up gets a new issue labelled severity:P3'`. Expect one filing with `labels[]=severity:P3`, and phase `'ready'`.
+   - Replace `'R85: a P3 deferral whose follow-up is a ticket key alone still waits for the person'` with `'R92: a ticket key alone is no issue: the gate files one and keeps the key in its body'`. Expect one filing whose `body=` argument contains `Follow-up named by the agent: KAN-9.`, and the finding's `followUp` to be `'#21'`.
+   - `'R85: a security P3 deferral with a follow-up still waits for the person'`: add `expect(w.gh.filed).toEqual([])`.
+   - Task 11's `'R92: a deferral waits on Codex\'s check; a lowered P3 …'`: replace its last line with `expect(w.prompts.at(-1)).toContain('follow-up issues: G2-1 → KAN-9 #12 Critical [P1]')`.
+   - `'R85: an issue the gate could not label holds the merge, and the next pass labels it (fail closed)'`: add the verify step (Task 11 did) and keep the rest. The hold still says `could not label issue #12 severity:P3 (…` and the label release.
+   - `'R85: /pr-gate status names the follow-up of a settled deferral and its label'`: rename it `'R92: /pr-gate status names each finding settled by its issue'`, and expect the status text to contain `` `G2-1 → ${ISSUE} Minor [P3].` ``.
+4. Any other flow test that expected `awaiting-decision` for a deferral or dispute that is not security now sees the filing pass. Where the test is about the person's waiver, make the finding security (`isSecurity: true`). Where it is about the end state, assert the issue instead. List each change in your report.
+
+- [ ] **Step 7: Implement `fileIssues`, the setting and the controller in `round.ts`**
+
+1. Add `issueSpec: string | undefined` to `Config`, with the doc comment `/** The spec handle each filed issue's title names (R92); undefined names none. Repository file only. */`. In `configOf`, add `issueSpec: undefined,`. In `overrideConfig`, after `onExhausted`, add:
+
+```ts
+  const issueSpec =
+    r.issueSpec === undefined ? undefined : typeof r.issueSpec === 'string' && r.issueSpec.trim() !== '' ? r.issueSpec.trim().slice(0, 80) : bad('issueSpec', 'not a non-empty string')
+```
+
+   and in the returned config `issueSpec: issueSpec ?? c.issueSpec,`. Add `issueSpec` to the list of keys in `overrideConfig`'s doc comment.
+2. In the import from `'./lifecycle'`, remove `wouldSettle` and add `planIssues` and `GATE_ROUNDS`.
+3. Replace `labelDeferrals` and its doc comment with:
+
+```ts
+/**
+ * The filing pass (R92, spec §5): where the review can do no more, it first adds a round for a late blocker (`gateGrant`); else it
+ * files a GitHub issue for each held finding but security, or labels the issue the agent's follow-up names, with `severity:<peak>`.
+ * A failure is recorded on the finding, which holds, and the next pass retries. Undefined when the lifecycle was reset, replaced or
+ * stopped while gh ran: the caller decides nothing for it (gate G7-8, R8-2). Never through a PR-create command line (spec §5.9).
+ */
+export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+  if (rec.phase === 'pre' || rec.pr === undefined) return rec
+  const now = await $.clock.now()
+  const { config: c } = await configFor($, rec.root, rec.base)
+  const plan = planIssues(rec, now, c.issueSpec)
+  if (plan.kind === 'none') return rec
+  // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and after its
+  // gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
+  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
+    latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
+  if (plan.kind === 'grant') {
+    const n = rec.grants.filter(one => one.by === 'gate').length + 1
+    const text = `the gate added a round for ${plan.late.join(', ')}, first raised after the allowance was spent (${n} of ${GATE_ROUNDS}): the PR's scope may be too wide`
+    let isGone = false
+    const saved = await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = isMoved(latest)
+      if (isGone) return latest
+      return { ...latest, grants: [...latest.grants, plan.grant], log: [...(latest.log ?? []), { at: now, kind: 'check' as const, text }].slice(-LOG_CAP) }
+    })
+    if (isGone) return undefined
+    $.ui.toast(`pr-gate: ${text}.`)
+    return saved ?? rec
+  }
+  if (rec.slug === undefined) return rec
+  const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  const failure = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
+  const results = new Map<string, { peak: Severity; was: string | undefined; followUp: string | undefined; isLabel: boolean; error?: string }>()
+  // Logged with the results, in the same guarded write (gate R9-1).
+  const lines: LogEntry[] = []
+  for (const item of plan.items) {
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const label = `severity:${item.peak}`
+    const repo = item.reuse?.repo ?? rec.slug
+    // Made only when missing: an existing label's colour and description are the repository's (gate R7-7).
+    await gh(['label', 'create', label, '--repo', repo, '--color', LABEL_COLOURS[item.peak]])
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    let text: string
+    if (item.reuse !== undefined) {
+      const edit = await gh(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
+      const error = edit.exitCode === 0 ? undefined : failure(edit)
+      results.set(item.id, { peak: item.peak, was: item.followUp, followUp: item.followUp, isLabel: true, ...(error === undefined ? {} : { error }) })
+      text = error === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
+    } else {
+      const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
+      const number = post.exitCode === 0 ? issueNumberOf(post.stdout) : undefined
+      const error = number !== undefined ? undefined : post.exitCode === 0 ? "GitHub did not give the new issue's number" : failure(post)
+      results.set(item.id, { peak: item.peak, was: item.followUp, followUp: number === undefined ? undefined : `#${number}`, isLabel: false, ...(error === undefined ? {} : { error }) })
+      text = error === undefined ? `${item.id}: filed ${rec.slug}#${number ?? '?'} ${label}` : `${item.id}: could not file an issue in ${rec.slug}`
+    }
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
+  }
+  let isGone = false
+  // Written only where the follow-up and peak are still the ones filed for: a later answer that moved either is filed anew.
+  const saved = await updateRecord($, rec.root, rec.branch, latest => {
+    isGone = isMoved(latest)
+    if (isGone) return latest
+    const findings = latest.findings.map(f => {
+      const got = results.get(f.id)
+      if (got === undefined || got.was !== f.followUp || got.peak !== peakOf(f)) return f
+      if (got.error !== undefined) return got.isLabel ? { ...f, followUpLabelError: got.error } : { ...f, issueError: got.error }
+      return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
+    })
+    return { ...latest, findings, log: [...(latest.log ?? []), ...lines].slice(-LOG_CAP) }
+  })
+  return isGone ? undefined : (saved ?? rec)
+}
+
+/** The number in GitHub's answer to an issue POST; undefined when it gave none. */
+const issueNumberOf = (stdout: string): number | undefined => {
+  try {
+    const n = (JSON.parse(stdout) as { number?: unknown }).number
+    return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : undefined
+  } catch {
+    return undefined
+  }
+}
+```
+
+4. In `advance`, replace the three `labelDeferrals` lines (and their comment) with:
+
+```ts
+  // Where the review can do no more, the gate first adds a round for a late blocker, else files an issue for each held finding but
+  // security; it then decides again from what it wrote (R92).
+  const filed = await fileIssues($, rec)
+  if (filed === undefined) return
+  rec = filed
+```
+
+   Check nothing else calls `labelDeferrals` (`grep -n labelDeferrals pr-lifecycle`), and that no Bash text the gate builds contains the PR-create command line.
+
+- [ ] **Step 8: Implement the prompts and the status**
+
+In `pr-lifecycle/hooks/core.ts`:
+
+1. In the import from `'./lifecycle'`, replace `isSettledDeferral` with `isFileable`, `isSettledByIssue`, `issueLine` and `scopeNote`.
+2. In `readyPrompt`, replace the `deferred.length === 0 ? 'no deferrals' : …` element of `summary` with:
+
+```ts
+    settled.length === 0 ? 'no follow-up issues' : `follow-up issues: ${settled.map(issueLine).join('; ')}`,
+```
+
+   where `const settled = rec.findings.filter(isSettledByIssue)` replaces `const deferred = …`. Add `scopeNote(rec)` after the sentence, when defined: `${note === undefined ? '' : ` ${note}`}` with `const note = scopeNote(rec)`. (Task 13 rewrites the last sentence.)
+3. In `personPost`, make `theirs` `mergeHolds(rec).filter(one => (one.status === 'deferred' || isDisputed(one)) && !isFileable(one))`, and make its doc comment say "the waiver of each security deferral or dispute, or one the gate cannot file (R92), and `waive post`."
+4. In `reportPrompt`, right after `lines.push('', \`Your next step: ${next.nextStep}.\`)`, add:
+
+```ts
+  const note = scopeNote(rec)
+  if (note !== undefined) lines.push(note)
+  // The gate still owes an issue (R92): nothing in the code to change; the agent checks gh when filing failed.
+  if (next.kind === 'blocked' && (next.issues ?? []).length > 0) {
+    lines.push('Do not merge, and do not merge another way: the guard holds the merge until each issue is filed and labelled.')
+    return noted(lines.join('\n'))
+  }
+```
+
+5. In `triagePrompt` step 2, replace the deferral sentence from Task 11 with:
+
+```ts
+    '   Codex checks every deferral at the end of the round: if it says the finding can be fixed in this PR, the finding comes back to you open and the round is charged. ' +
+      'When the review can do no more, the gate files a GitHub issue for each finding still held, except security ones, which wait for the person; ' +
+      'if your followUp names the issue that already tracks it (#<n>, owner/repo#<n> or its URL), the gate labels that one instead.',
+```
+
+In `pr-lifecycle/hooks/register.tsx`, in the import from `'./lifecycle'`, replace `isSettledDeferral` with `isSettledByIssue`, `issueLine` and `scopeNote`. In `statusText`, replace `settled` with:
+
+```ts
+  const note = scopeNote(rec)
+  const settled = rec.findings
+    .filter(isSettledByIssue)
+    .map(one => ` ${issueLine(one)}.`)
+    .concat(note === undefined ? [] : [` ${note}`])
+    .join('')
+```
+
+- [ ] **Step 9: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. Then `npm run lint` and `npm run typecheck` from the repo root.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/lifecycle.ts pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/core.ts pr-lifecycle/hooks/register.tsx pr-lifecycle/tests/world.ts pr-lifecycle/tests/lifecycle.test.ts pr-lifecycle/tests/flow.test.ts pr-lifecycle/tests/settings.test.ts
+git commit -m "pr-lifecycle 1.5.0: the gate files issues instead of asking for waivers; late blockers add up to two rounds (R92)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
