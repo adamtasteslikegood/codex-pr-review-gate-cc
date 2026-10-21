@@ -1101,11 +1101,10 @@ export async function gatherStanding(
   const needed = !Array.isArray(checks) ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
   // A required check that never reported holds the merge too, as GitHub's ruleset does (gate R1-3).
   const reported = new Set(Array.isArray(checks) ? checks.map(one => one.name) : [])
-  // A base whose required checks can't be read holds the merge (R86, gate R3-1, R3-2): a required check may never have run.
+  // A base whose required checks can't be read makes every reported check required, so a waiver sets none aside (R86, PR19-2).
+  // It adds no hold of its own: GitHub's ruleset still enforces required checks at merge (Adam's ruling on gate R2-2, option B).
   if (!(needed instanceof Set)) {
-    const why = `the required checks of ${pr.baseRefName} could not be read: ${needed.unknown}`
-    const all = (checks as CheckState[]).map(one => ({ ...one, isRequired: true }))
-    return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, { unreadable: why, checks: all })
+    return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, (checks as CheckState[]).map(one => ({ ...one, isRequired: true })))
   }
   const missing = [...needed].filter(name => !reported.has(name)).map(name => ({ name, bucket: 'missing', isRequired: true }))
   const ci: CheckState[] | { unreadable: string } =

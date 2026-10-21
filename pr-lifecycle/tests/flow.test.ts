@@ -3567,23 +3567,25 @@ test('gate R1-3: a required check that never reported holds a waived merge until
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
 
-test('gate R3-1, R3-2: a base whose required checks cannot be read holds the merge, quoting gh, with passing or no checks', async ($, on) => {
+test('R86, gate R2-2 option B: unreadable required checks make every reported check required, with no hold of their own', async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.gh.hasPr = true
   w.gh.required = ['check']
   w.gh.classicAnswer = 403
   await say($, 'waive post reviewed by hand')
+  // Passing or no checks: nothing holds (GitHub's ruleset still enforces required checks at merge).
   for (const checks of [[{ name: 'check', status: 'completed', conclusion: 'success' }], []]) {
     w.gh.checks = checks
-    const held = await $.tool.call(merge)
-    expect(isHeld(held)).toBe(true)
-    expect(held.deny ?? '').toContain('the required checks of dev could not be read')
-    expect(held.deny ?? '').toContain('protection/required_status_checks: gh: HTTP 403')
+    expect(isHeld(await $.tool.call(merge))).toBe(false)
   }
-  // Once GitHub answers, the passing check lets the merge through.
+  // A failing check the base may not require still holds: the waiver can't set it aside while the policy is unknown.
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }, { name: 'lint', status: 'completed', conclusion: 'failure' }]
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('lint')
+  // Once GitHub answers, the optional failure is set aside by the waiver.
   w.gh.classicAnswer = 'none'
-  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
 
