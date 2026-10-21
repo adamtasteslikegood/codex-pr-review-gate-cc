@@ -56,3 +56,9 @@ Task 1: fix round 2/5 (2 addressed, 0 open; commits 641236d..1135e23)
 Task 1: complete (commits 095f040..1135e23, review clean)
 Task 2: dispatched (BASE 723724c, sonnet)
 Task 2: implementer DONE, commit 2226a7d (424 pass); review dispatched
+Task 2: review Approved; ⚠️ readTriage widening is Task 3 step 5 (checked in plan)
+Task 2: minor (deferred): severitySource stays 'hint' after triage, so a later answer can move it again
+Task 2: minor (deferred): no test that a hint finding keeps its severity when the answer carries none
+Task 2: complete (commits 723724c..2226a7d, review clean)
+Task 3: dispatched (BASE 675fdb0, sonnet)
+Task 3: implementer DONE_WITH_CONCERNS, commit dd58e14 (430 pass); concern: tagged-P2 acknowledged test may not exercise mayAcknowledge; reprompt prose still 'fix, rebut or defer'
