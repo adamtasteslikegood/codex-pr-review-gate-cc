@@ -167,8 +167,12 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
   const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
   const security = f.isSecurity === true || a.isSecurity === true
   // A changed severity is recorded with the one before it, so a lowering is known for what it was (R85).
-  const history =
-    severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity, from: f.severity } : one))
+  const last = next.history.length - 1
+  const history = next.history.map((one, i) =>
+    i !== last
+      ? one
+      : { ...one, ...(severity === f.severity ? {} : { severity, from: f.severity }), ...(a.action === 'acknowledged' ? { answer: 'acknowledged' as const } : {}) },
+  )
   // Another follow-up, or none, was never labelled: the label was the old issue's.
   const isNewFollowUp = a.action === 'deferred' && a.followUp !== f.followUp
   // A lost peak stays unknown: a peak read from the incomplete history would let a lowered legacy finding settle (gate R8-1).
@@ -178,6 +182,9 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
     ...(a.action === 'deferred' ? { followUp: a.followUp } : {}),
     ...(isNewFollowUp ? { followUpLabel: undefined, followUpLabelError: undefined } : {}) }
 }
+
+/** A rebuttal that is the agent's acknowledgement of a comment asking for no change (R82): named as such in every text (R94). */
+export const isAcknowledged = (f: Finding): boolean => f.status === 'rebutted' && f.history.filter(one => one.by !== 'codex').at(-1)?.answer === 'acknowledged'
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
 export const markVerified = (f: Finding, round: number, by: string, at: number, note?: string): Finding =>
@@ -550,7 +557,8 @@ function blockerOf(f: Finding): Blocker {
     return { kind: 'verify-owed', id: f.id, said: `${tag}: fixed, verification owed`, owner: 'codex', release: "the gate's Codex check verifies it" }
   }
   if (f.status === 'rebutted') {
-    return { kind: 'rebuttal-unchecked', id: f.id, said: `${tag}: rebuttal not yet accepted`, owner: 'codex', release: "the gate's Codex check rules on it" }
+    const what = isAcknowledged(f) ? 'acknowledgement not yet confirmed' : 'rebuttal not yet accepted'
+    return { kind: 'rebuttal-unchecked', id: f.id, said: `${tag}: ${what}`, owner: 'codex', release: "the gate's Codex check rules on it" }
   }
   return { kind: isSecurityP1 ? 'security-p1' : 'open', id: f.id, said: `${tag}: open`, owner: 'agent', release: 'fix it, or rebut it with file:line evidence' }
 }
@@ -805,14 +813,19 @@ function decidePost(rec: LifecycleRecord): Next {
   // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
   const recheck = (): Next => {
     const lowered = unchecked.filter(isLoweringOwed)
-    const rebuttals = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one))
+    const answered = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one))
+    const acks = answered.filter(isAcknowledged)
+    const rebuttals = answered.filter(one => !isAcknowledged(one))
     const reverify = unchecked.filter(isReverifyOwed)
     const said = [
       ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
+      ...(acks.length === 0 ? [] : [`Codex has not checked the acknowledgement of ${ids(acks)} on ${last.endHead.slice(0, 7)}`]),
       ...(lowered.length === 0 ? [] : [`Codex has not checked the lowered severity of ${ids(lowered)}`]),
       ...reverify.map(reverifyOwed),
     ]
-    const what = reverify.length + lowered.length === 0 ? 'the rebuttal' : rebuttals.length + reverify.length === 0 && lowered.length === 1 ? 'the lowering' : 'them'
+    const kinds = [rebuttals, acks, lowered, reverify].filter(one => one.length > 0)
+    const what =
+      kinds.length !== 1 ? 'them' : rebuttals.length > 0 ? 'the rebuttal' : acks.length > 0 ? 'the acknowledgement' : lowered.length === 1 ? 'the lowering' : 'them'
     return {
       kind: 'blocked',
       why: said.join('; '),

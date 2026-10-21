@@ -7,6 +7,7 @@ import {
   decideNext,
   changedLines,
   invalidate,
+  isAcknowledged,
   lastReviewedHead,
   markHeld,
   markVerified,
@@ -1038,4 +1039,24 @@ test('R79: an exhausted post report states its reason once, not again under the 
   })
   expect(report.split(why)).toHaveLength(2)
   expect(report).toContain('Also holding:\n- check check running')
+})
+
+test('R94: an acknowledgement is named as one in the history, the standing and the recheck', async () => {
+  const comment = (id: string, severity: 'P2' | 'P3') => finding({ id, round: 2, source: 'github', reviewer: 'bot', severity, severitySource: 'hint' })
+  const ack = applyAnswer(comment('G2-1', 'P3'), { id: 'G2-1', action: 'acknowledged', note: 'No change requested: a status note' }, 2, 'main', 5)
+  expect(ack.status).toBe('rebutted')
+  expect(ack.history.at(-1)).toMatchObject({ status: 'rebutted', answer: 'acknowledged' })
+  expect(isAcknowledged(ack)).toBe(true)
+  const argued = applyAnswer(comment('G2-2', 'P2'), { id: 'G2-2', action: 'rebutted', note: 'see src/app.ts:3' }, 2, 'main', 5)
+  expect(isAcknowledged(argued)).toBe(false)
+  const blockers = standingOf(postRec({ findings: [ack, argued] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.find(one => one.id === 'G2-1')?.said).toBe('G2-1 [P3] comment from bot: acknowledgement not yet confirmed')
+  expect(blockers.find(one => one.id === 'G2-2')?.said).toBe('G2-2 [P2] comment from bot: rebuttal not yet accepted')
+  const next = decideNext(postRec({ findings: [ack] }))
+  expect(next).toMatchObject({ kind: 'blocked', recheck: ['G2-1'], nextStep: 'run /pr-gate resume: Codex checks the acknowledgement on this head, using no review round' })
+  expect((next as { why: string }).why).toBe('Codex has not checked the acknowledgement of G2-1 on a')
+  // Codex reopening it ends the acknowledgement; a later rebuttal is a rebuttal.
+  const reopened = markHeld(ack, 2, 'codex', 6, 'it asks for a change')
+  expect(isAcknowledged(reopened)).toBe(false)
+  expect(isAcknowledged(applyAnswer(reopened, { id: 'G2-1', action: 'rebutted', note: 'see src/app.ts:9' }, 2, 'main', 7))).toBe(false)
 })

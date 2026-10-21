@@ -6,8 +6,8 @@ export type FindingStatus = 'open' | 'reported-fixed' | 'verified-fixed' | 'rebu
 export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
 /**
- * `severity`: the severity an answer set, with `from` the one before it (R85). `lowering`: Codex's ruling on the agent's lowering of
- * the severity before it (Adam, 2026-10-20).
+ * `answer`: an acknowledgement, stored as a rebuttal (R94). `severity`: the severity an answer set, with `from` the one before it (R85).
+ * `lowering`: Codex's ruling on the agent's lowering of the severity before it (Adam, 2026-10-20).
  */
 export type FindingEvent = {
   round: number
@@ -17,6 +17,8 @@ export type FindingEvent = {
   severity?: Severity
   from?: Severity
   lowering?: 'agreed' | 'refused'
+  /** The answer as the agent gave it, when the status alone does not say: an acknowledgement is stored as a rebuttal (R82, R94). */
+  answer?: 'acknowledged'
   by: string
   at: number
 }
