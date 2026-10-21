@@ -223,7 +223,8 @@ export const isLinkOwed = (f: Finding): boolean => f.duplicateOf !== undefined &
 
 /** Links a finding to its original, never to a linked one (no chains, R90). Its status is its own; its holds are the original's. */
 export function linkTo(f: Finding, original: Finding, by: 'gate' | 'agent', round: number, at: number): Finding {
-  const to = original.duplicateOf ?? original.id
+  // Never through the agent's link Codex has not checked (A9): a later refusal would leave this one on the wrong original.
+  const to = isLinked(original) ? (original.duplicateOf ?? original.id) : original.id
   return { ...f, duplicateOf: to, linkBy: by, isLinkChecked: undefined, history: [...f.history, { round, status: f.status, note: `linked to ${to}`, by: by === 'gate' ? 'gate' : 'main', at }] }
 }
 
@@ -243,12 +244,27 @@ export function refuseLink(f: Finding, round: number, at: number, note: string):
 /**
  * A link never lowers anything (R90): the original's peak becomes the higher of the two, so its issue carries it (R85), and it is
  * security when either one is (PR #25 review A1), even when a peak is unknown, so a link never lets a security problem past the person.
+ * Its severity rises the same way (A9), since every hold reads it, recorded as the gate's change with the one before it (R85); only
+ * R85's Codex-checked lowering takes it down again. A reviewer's tag on the link keeps it from being re-guessed lower (R84).
  */
 export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   const security = original.isSecurity === true || linked.isSecurity === true ? { isSecurity: true } : {}
+  const severity = higher(original.severity, linked.severity)
+  const when = linked.history.at(-1)
+  const raised =
+    severity === original.severity
+      ? {}
+      : {
+          severity,
+          ...(linked.severitySource === 'tag' ? { severitySource: 'tag' as const } : {}),
+          history: [
+            ...original.history,
+            { round: when?.round ?? linked.round, status: original.status, severity, from: original.severity, note: `raised by its link ${linked.id}`, by: 'gate', at: when?.at ?? 0 },
+          ],
+        }
   return isPeakUnknown(original) || isPeakUnknown(linked)
-    ? { ...original, ...security }
-    : { ...original, ...security, peakSeverity: higher(peakOf(original), peakOf(linked)) }
+    ? { ...original, ...security, ...raised }
+    : { ...original, ...security, ...raised, peakSeverity: higher(peakOf(original), peakOf(linked)) }
 }
 
 /** The ids linked to a finding, for "G2-1 (also G2-2)". */
@@ -364,7 +380,9 @@ export function triage(
   // Every finding on the list, open ones included (R90). A linked one stands for its original, so the link goes there, and R33 and
   // a recheck are read on both: an open alias never reopens a settled rebuttal (PR #25 review A3).
   const byId = new Map(findings.map(one => [one.id, one]))
+  // Never through the agent's link Codex has not checked (A9): the new item stands alone, so a refusal cannot leave it on the wrong original.
   const isCandidate = (one: Finding): boolean => {
+    if (isLinkOwed(one)) return false
     const original = one.duplicateOf === undefined ? one : (byId.get(one.duplicateOf) ?? one)
     return [one, original].every(each => each.needsRecheck !== true && !isAnswerTo(each)) && isSame(one, item)
   }
@@ -532,7 +550,8 @@ export const acceptRebuttal = (f: Finding, round: number, at: number, note = 'Co
 
 /** How many times Codex rejected a rebuttal of this finding: a Codex `open` entry right after a `rebutted` one. */
 export const rejections = (f: Pick<Finding, 'history'>): number =>
-  f.history.filter((one, i) => one.by === 'codex' && one.status === 'open' && f.history[i - 1]?.status === 'rebutted').length
+  // Codex refusing the agent's link (R90) rejects no rebuttal.
+  f.history.filter((one, i) => one.by === 'codex' && one.status === 'open' && one.refusedLink === undefined && f.history[i - 1]?.status === 'rebutted').length
 
 /** Rebutted again after Codex rejected a rebuttal: a dispute only the person settles; it never goes to Codex again (R40). */
 export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !isAcceptedRebuttal(f) && rejections(f) > 0

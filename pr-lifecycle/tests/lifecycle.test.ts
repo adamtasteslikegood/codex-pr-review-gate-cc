@@ -44,6 +44,7 @@ import {
   holdText,
   rescope,
   roundOf,
+  securityHolds,
   standingOf,
   triage,
   unresolvedBlockers,
@@ -1126,7 +1127,8 @@ test('R90: a linked finding holds and settles with its original, is listed besid
   const rec = postRec({ findings: [raised, dup] })
   expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
   expect(alsoOf(rec.findings, 'G2-1')).toEqual(['G2-2'])
-  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers[0]?.said).toBe('G2-1 (also G2-2) [P2] comment from bot: open')
+  // A9: the original's severity rises with its link's, so it is listed at P1.
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers[0]?.said).toBe('G2-1 (also G2-2) [P1] comment from bot: open')
   // The original settles: so does the link.
   expect(mergeHolds(postRec({ findings: [markVerified(raised, 2, 'codex', 6), dup] }))).toEqual([])
   // Never a chain: linking to a linked finding links to its original.
@@ -1246,4 +1248,60 @@ test('R90: a link Codex refused is recorded, charges nothing, and linking there 
   expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-3' }], 3, 7).linked).toEqual([])
   // A link to another problem is still an answer.
   expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-9' }], 3, 7).linked).toEqual(['G2-2'])
+})
+
+// ------------------------------------------------------- R90 fix round 1 (A9)
+
+test('R90 A9: new feedback never matches through the agent\'s unchecked link; it stands alone, and holds after a refusal', async () => {
+  const t = finding({ id: 'G2-1', source: 'github', title: 'retry loop has no backoff', file: 'src/net.ts', line: 50, severity: 'P3', status: 'deferred' })
+  const x = linkTo(finding({ id: 'G2-2', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, severity: 'P3' }), t, 'agent', 2, 5)
+  const n = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 6 }
+  expect(triage(n, [t, x], new Set()).cls).toBe('new-on-reviewed')
+  // linkTo never resolves through an owed link either.
+  const item = finding({ id: 'G3-1', source: 'github', severity: 'P1', round: 3 })
+  expect(linkTo(item, x, 'gate', 3, 7).duplicateOf).toBe('G2-2')
+  // Codex refuses X→T: N, standing alone, still holds as its own P1.
+  const refused = refuseLink(x, 3, 8, 'a different problem')
+  const rec = postRec({ findings: [t, refused, item] })
+  expect(mergeHolds(rec).map(one => one.id)).toContain('G3-1')
+  expect(unresolvedBlockers(rec).map(one => one.id)).toEqual(['G3-1'])
+})
+
+test('R90 A9: a link raises the original\'s severity, recorded as the gate\'s, and never lowers it', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', peakSeverity: 'P2', status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.severity).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2', by: 'gate' })
+  expect(loweringOf(raised)).toBeUndefined()
+  // A P1 security duplicate keeps its hold for the person, through its original.
+  const rec = postRec({ findings: [raised, dup] })
+  expect(securityHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  // Never lowered: a lower link leaves it as it was.
+  expect(withLinkedPeak(raised, finding({ id: 'G2-3', severity: 'P3' })).severity).toBe('P1')
+  // The original raised in an earlier round is no new blocker of this one.
+  expect(isChargedRound([{ ...raised, round: 1 }, dup], 2)).toBe(false)
+  // A P1 linked to a P3 issue deferral: it no longer settles without the person.
+  const deferral = finding({ id: 'G1-1', source: 'github', severity: 'P3', peakSeverity: 'P3', status: 'deferred', followUp: '#5', followUpLabel: 'P3' })
+  expect(isSettledDeferral(deferral)).toBe(true)
+  const held = withLinkedPeak(deferral, linkTo(finding({ id: 'G2-4', source: 'github', severity: 'P1' }), deferral, 'gate', 2, 5))
+  expect(isSettledDeferral(held)).toBe(false)
+  expect(mergeHolds(postRec({ findings: [held] })).map(one => one.id)).toEqual(['G1-1'])
+  // An agent's link raises it too, and Codex refusing the link leaves it raised.
+  const linked = applyLinks([original, finding({ id: 'G2-5', severity: 'P1' })], [{ id: 'G2-5', duplicateOf: 'G2-1' }], 2, 6).findings
+  expect(linked[0]?.severity).toBe('P1')
+  const after = [linked[0] as Finding, refuseLink(linked[1] as Finding, 2, 7, 'different')]
+  expect(after[0]?.severity).toBe('P1')
+})
+
+test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
+  const rebutted = finding({ id: 'G2-2', source: 'github', severity: 'P2', status: 'rebutted', history: [{ round: 2, status: 'rebutted', note: 'not a bug', by: 'main', at: 4 }] })
+  const refused = refuseLink(linkTo(rebutted, original, 'agent', 2, 5), 2, 6, 'a different problem')
+  expect(rejections(refused)).toBe(0)
+  expect(isDisputed(refused)).toBe(false)
+  const next = decideNext(postRec({ findings: [refused] }))
+  expect(next.kind).toBe('blocked')
+  expect(JSON.stringify(next)).not.toContain('did not accept the rebuttal')
 })
