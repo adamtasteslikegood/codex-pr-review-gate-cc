@@ -57,7 +57,9 @@ same round. Every completed discretionary round is charged (`usedRounds`,
    (§3)) goes to the agent in a triage turn without ending collection. The gate
    waits one poll after the last arrival before asking, so a reviewer's burst
    of inline comments arrives as one turn. While the agent works, polling
-   goes on; what arrives meanwhile waits for the next triage turn. Only one
+   goes on; what arrives meanwhile waits for the next triage turn. The turn
+   lasts until the gate has recorded its end, not only until the agent
+   answers, so a poll never starts the next round under it. Only one
    triage turn is in flight at a time.
 2. **A push ends the round on its head.** When the PR head moves, the round on
    the old head ends, completed, with what it collected and answered. The next
@@ -151,6 +153,13 @@ summary G2-1 stayed a separate blocker beside its own inline G2-2.
 5. **Severity.** A link never lowers anything: the original's `peakSeverity`
    becomes the higher of the two (R85), so its issue carries the highest
    severity either had.
+   Security travels the same way: the original is security when either one
+   is, so a link never lets a security problem be filed without the person.
+6. **Canonical ids (PR #25 review).** Links are checked on canonical ids: a
+   link that resolves to the finding itself is no answer, and linking an
+   original re-points its own linked findings, so nothing chains. R33 and the
+   changed-file rule apply to a candidate's original, so an open alias never
+   reopens a settled rebuttal.
 
 ## 4. The gate never reads its own replies as feedback
 
@@ -223,6 +232,10 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
    - Label: `severity:<peak>` (R85), created when missing with R85's colours.
 7. **Settling.** The finding settles once its issue exists and carries the
    label; the record keeps `followUp` and `followUpLabel` as for R85 today.
+   GitHub drops the labels of an issue filed by an account without push
+   access, so the label counts only when GitHub's answer shows it. Otherwise
+   the issue number is kept, the finding holds, and the next pass labels that
+   issue instead of filing another.
    `/pr-gate status` and the hold list name the issue ("R4-3 → #21 Major
    [P2]"). If filing or labelling fails, the finding holds with gh's error,
    and the next pass retries, as R85's labelling does. A reset, a fresh start
@@ -262,6 +275,9 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
     agent gets gh's words and runs `/pr-gate resume` once gh works; the
     check runs again then. Only after every issue checks out is the record
     archived, and the agent is told the issues that stay open.
+    A reset or a fresh start while gh runs ends the check with nothing
+    written, as for filing (§5.7): no update, no archive of the new
+    lifecycle.
 
 ## 6. The agent merges (decision N)
 
@@ -302,11 +318,13 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
    commit counts for the head only from then on. After `/pr-gate resume`, a
    roster reviewer's comment already on the head stops counting, and the round
    waits out the cap (PR 3749 in the cookbook repo, 2026-10-21). `headAt` is
-   now the time the head reached the PR. It is the earliest `started_at` of
-   the check runs on the head, which the poll already fetches. With no check
-   runs, it is the head commit's committer date. It is never later than now.
-   It must be no earlier than the push and no later than the first comment on
-   the head.
+   now the time the gate first saw the head on the PR, kept in the record
+   (`headArrival`) across stop, resume and another session. Commit and check
+   times are not used: a commit authored early and pushed late, or a check
+   that starts after a comment, gets coverage wrong (PR #25 review). A head
+   the gate never saw gets the time it is first seen, as in 1.4.0; reviews
+   still cover a head by their `commit_id`. A comment in the gap between a
+   push and the next poll errs toward waiting, never toward false coverage.
 
 ## 8. Rulings to record (from R88)
 
