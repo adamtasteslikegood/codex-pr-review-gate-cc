@@ -5652,6 +5652,9 @@ test('spec §5.12: when an issue cannot be reopened or filed again, the record i
   await w.clock.advance(1000)
   expect((await recordOf(w)).phase).toBe('archived')
   expect(w.gh.issueStates[21]).toBe('OPEN')
+  // The passed check clears the failed one's block and message before the archive (fix round 1, M2).
+  expect(archivedOf(w)?.postStatus).toBeUndefined()
+  expect(archivedOf(w)?.message).toBeUndefined()
 })
 
 test('spec §6.4: a merge GitHub refuses leaves the lifecycle where it was', async ($, on) => {
@@ -5765,4 +5768,65 @@ test('A6, A7: an issue filed again without its label holds the record blocked; r
   expect(labelled(w, 22, 'P2')).toBe(true)
   expect(w.gh.filed).toHaveLength(2)
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('spec §5.12 (I1): an issue gh cannot read is not filed again; the record is blocked with gh\'s words, and resume archives once it reads', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'unreadable'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.reopened).toEqual([])
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('could not read me/repo#21: HTTP 502: Bad Gateway')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  w.gh.issueStates[21] = 'OPEN'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('fix round 1 (I2): a failure after GitHub took the merge tells the agent, leaves the record, and resume closes it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  // The store fails once the gate has begun the check: its next read of the record throws.
+  w.gh.onIssueView = () => {
+    w.beforeRead = key => {
+      if (key === KEY) throw new Error('store down')
+    }
+  }
+  const ran = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  expect(isHeld(ran)).toBe(false)
+  w.beforeRead = undefined
+  w.gh.onIssueView = undefined
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  expect((await recordOf(w)).phase).toBe('ready')
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('fix round 1 (M1): a second close while the first checks the issues does nothing: one reopen, one archive', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  let second: string | undefined
+  w.gh.onIssueView = async () => {
+    if (second !== undefined) return
+    second = 'running'
+    // The person's resume reads the PR as merged and closes it too, while the agent's merge is still checking.
+    second = (await say($, 'resume')).text
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(second).toContain('the gate is already closing its lifecycle')
+  expect(w.gh.reopened).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivesOf(w)).toHaveLength(1)
 })

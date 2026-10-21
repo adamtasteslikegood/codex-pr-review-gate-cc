@@ -923,8 +923,28 @@ export async function prStateOf($: Engine, root: string, pr: number): Promise<Pr
  * said or archived (A6).
  */
 export async function closeLifecycle($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+  // One close of a branch's lifecycle at a time in this process (the agent's merge and a poll's R62 close can meet): a second one
+  // while the first runs does nothing, so no issue is reopened or filed twice. The first one archives the record or blocks it.
+  const key = `${root}\0${branch}`
+  if (closing.has(key)) return `PR #${pr ?? '?'} from ${branch}: the gate is already closing its lifecycle`
+  closing.add(key)
+  try {
+    return await closeOnce($, root, branch, pr, state)
+  } finally {
+    closing.delete(key)
+  }
+}
+
+/** The branches whose lifecycle `closeLifecycle` is closing now, as `<root>\0<branch>`. */
+const closing = new Set<string>()
+
+/** The message a failed post-merge check leaves on the record (spec §5.12); a check that passes later clears it before the archive. */
+const MERGE_UNCONFIRMED = 'merged, but the gate could not confirm the follow-up issue of'
+
+async function closeOnce($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
   const rec = await loadRecord($, root, branch)
-  const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was reset or replaced while the gate checked its follow-up issues: nothing was written for it`
+  const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was stopped, reset or replaced while the gate checked its follow-up issues: ` +
+    'nothing was written for it'
   let open: Finding[] = []
   if (state === 'MERGED' && rec !== undefined && rec.phase !== 'archived') {
     let checked: MergeCheck
@@ -946,7 +966,7 @@ export async function closeLifecycle($: Engine, root: string, branch: string, pr
       })
     let isGone = false
     if (done.failed.length > 0) {
-      const why = `PR #${pr ?? '?'} merged, but the gate could not confirm the follow-up issue of ${done.failed.join('; ')}`
+      const why = `PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${done.failed.join('; ')}`
       const saved = await updateRecord($, root, branch, latest => {
         isGone = isMovedFrom(rec, latest)
         if (isGone) return latest
@@ -960,11 +980,14 @@ export async function closeLifecycle($: Engine, root: string, branch: string, pr
       await say($, saved, `pr-gate: ${why}. Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again.`)
       return why
     }
-    if (done.lines.length > 0 || done.touched.length > 0) {
+    // A check that failed before and passes now: its block and message go, so the archive does not keep a stale failure.
+    const isUnblocked = rec.postStatus === 'blocked' && rec.message?.includes(MERGE_UNCONFIRMED) === true
+    if (done.lines.length > 0 || done.touched.length > 0 || isUnblocked) {
       const saved = await updateRecord($, root, branch, latest => {
         isGone = isMovedFrom(rec, latest)
         if (isGone) return latest
-        return { ...latest, findings: apply(latest), log: [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP) }
+        const cleared = isUnblocked ? { postStatus: undefined, message: undefined } : {}
+        return { ...latest, findings: apply(latest), log: [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP), ...cleared }
       })
       if (isGone || saved === undefined) return replaced
       open = saved.findings.filter(isSettledByIssue)
@@ -3224,6 +3247,14 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       state = view.exitCode === 0 ? (JSON.parse(view.stdout) as { state?: unknown } | null)?.state : undefined
     } catch {
       state = undefined
+    }
+    // Filed again only when GitHub says the issue does not exist (deleted, or moved away). Any other failed read (a 502, a rate
+    // limit, a timeout, a repository gh cannot see) is a failed check: the record is not archived, and resume reads it again.
+    const isGone = view.exitCode !== 0 && /Could not resolve to an issue or pull request/i.test(view.stderr)
+    if (state !== 'OPEN' && state !== 'CLOSED' && !isGone) {
+      failed.push(`${f.id} (could not read ${where}: ${view.exitCode === 0 ? `gh read its state as ${String(state)}` : words(view)})`)
+      await log(`${f.id}: could not read ${where} after the merge`)
+      continue
     }
     if (state === 'OPEN' && !isLabelOwed(f)) {
       await log(`${f.id}: ${where} open after the merge`)

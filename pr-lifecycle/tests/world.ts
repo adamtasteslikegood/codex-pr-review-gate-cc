@@ -134,8 +134,11 @@ export type World = {
     filed: string[][]
     /** Called on each issue filing, before it answers: a test acts while the gate files an issue. */
     onIssue?: () => void | Promise<void>
-    /** Each issue's state for `gh issue view` (spec §5.12); absent means OPEN, 'missing' answers as a deleted issue does. */
-    issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing'>
+    /**
+     * Each issue's state for `gh issue view` (spec §5.12); absent means OPEN, 'missing' answers as a deleted issue does, and
+     * 'unreadable' fails as a 502 does.
+     */
+    issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing' | 'unreadable'>
     /** How `gh issue reopen` answers: 'ok' (default) or 'fail'. */
     reopenAnswer?: 'ok' | 'fail'
     /** Every reopen the gate ran: its argv after `gh`. */
@@ -333,6 +336,9 @@ export function world(on: On): World {
       if (e.argv[1] === 'issue' && e.argv[2] === 'view') {
         await w.gh.onIssueView?.()
         const state = w.gh.issueStates[Number(e.argv[3])] ?? 'OPEN'
+        if (state === 'unreadable') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
         if (state === 'missing') {
           return { value: { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${e.argv[3]}.`, isStdoutTruncated: false, isStderrTruncated: false } }
         }

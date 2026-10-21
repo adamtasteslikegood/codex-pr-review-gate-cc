@@ -822,10 +822,21 @@ const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
     pr = undefined
   }
   if (pr?.state !== 'MERGED' || typeof pr.headRefName !== 'string' || typeof pr.number !== 'number') return
-  const rec = await loadRecord($, top.out, pr.headRefName)
-  if (rec === undefined || rec.phase === 'archived' || rec.pr !== pr.number) return
-  // closeLifecycle turns a failed issue check into a blocked record with gh's words, which /pr-gate resume runs again.
-  await closeLifecycle($, top.out, pr.headRefName, pr.number, 'MERGED')
+  const key = { root: top.out, branch: pr.headRefName }
+  const number = pr.number
+  try {
+    const rec = await loadRecord($, key.root, key.branch)
+    if (rec === undefined || rec.phase === 'archived' || rec.pr !== number) return
+    // closeLifecycle turns a failed issue check into a blocked record with gh's words, which /pr-gate resume runs again.
+    await closeLifecycle($, key.root, key.branch, number, 'MERGED')
+  } catch (error) {
+    // GitHub took the merge, but the gate failed closing it: the agent is told, never left with a toast alone (the gate can't go
+    // silent). The record, unarchived, is checked again by /pr-gate resume, or at the next session start.
+    const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+    await say($, key, `pr-gate: PR #${number} merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (${said}). ` +
+      'The follow-up issues are not confirmed yet. Run /pr-gate resume: the gate checks them again (a new session does too).')
+    throw error
+  }
 }
 
 // ------------------------------------------------------------ the command
