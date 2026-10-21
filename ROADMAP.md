@@ -132,6 +132,9 @@ Two PRs (decision L). Specs:
 
 ### Wave 2a: the person's actions and holds (pr-lifecycle 1.4.0)
 
+**Status:** built on `wave2a/pr-lifecycle-1.4.0` (rulings R79-R87). R87, added
+in live use, makes a hold on a chained command say nothing in it ran.
+
 1. **Every manual action tells the agent (decision E; finding 22).** Today
    `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
    stop button send the agent nothing, and `waive pre` sends something only
