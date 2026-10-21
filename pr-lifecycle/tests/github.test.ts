@@ -444,6 +444,20 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
 })
 
+test('R84: an advisory label counts only at the start of the body, or on every line (final review C1)', async () => {
+  // A label on a later line tags nothing: the body's real finding keeps the untagged guess.
+  expect(severityHint('This migration drops the users table on rollback, losing data.\n\nNit: the comment above has a typo.')).toMatchObject({ isTagged: false })
+  expect(severityHint('The reset path deletes pending findings.\n\n**Optional:** add a test.')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Race: the lock is released before the write.\n- nit: rename x')).toMatchObject({ isTagged: false })
+  expect(severityHint('This is a critical bug.\n\nNit: the comment has a typo.')).toMatchObject({ severity: 'P1', isTagged: false })
+  // At the start, with its heading, list marker or bold, it still tags the body.
+  expect(severityHint('Advisory, non-blocking:\n- a\n- b')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('**Nit:** x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('  - nit: rename x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('Nit\n- rename x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('nit: rename x\n\noptional: add a log line')).toMatchObject({ severity: 'P3', isTagged: true })
+})
+
 test('R86: required checks come from the ruleset and classic protection; anything unreadable is undefined', async () => {
   const rules = JSON.stringify([
     { type: 'pull_request', parameters: {} },

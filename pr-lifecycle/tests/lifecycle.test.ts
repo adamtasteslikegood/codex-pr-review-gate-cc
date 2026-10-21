@@ -762,6 +762,43 @@ test('R85: isSettledDeferral needs deferred, P3, a follow-up and no security fla
   expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
 })
 
+test('R85: a follow-up settles only when it names a URL, #<n> or owner/repo#<n> (final review T4)', async () => {
+  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag' })
+  for (const ok of ['https://github.com/me/repo/issues/9', '#12', 'me/repo#12', ' #12 ']) expect(isSettledDeferral({ ...base, followUp: ok })).toBe(true)
+  for (const bad of ['later', 'tracked', 'KAN-9', 'http://x/1', '#', 'issue #12 maybe', 'https://']) expect(isSettledDeferral({ ...base, followUp: bad })).toBe(false)
+  // The deferral is kept either way: an unshaped follow-up only leaves it to the person, as before R85.
+  const kept = applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: 'later' }, 2, 'main', 5)
+  expect(kept.status).toBe('deferred')
+  expect(isSettledDeferral(kept)).toBe(false)
+})
+
+test('R85: a deferral without a follow-up clears the earlier one (final review T4)', async () => {
+  const tagged = finding({ source: 'github', severity: 'P3', severitySource: 'tag' })
+  const first = applyAnswer(tagged, { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5)
+  expect(isSettledDeferral(first)).toBe(true)
+  const again = applyAnswer({ ...first, status: 'open' }, { id: 'R1-1', action: 'deferred', note: 'still later' }, 3, 'main', 6)
+  expect(again.followUp).toBeUndefined()
+  expect(isSettledDeferral(again)).toBe(false)
+})
+
+test('R85: a deferral settles only if the agent never lowered the severity (final review I2)', async () => {
+  // A P1 guessed from "critical", lowered to P3 and deferred in the same answer, holds.
+  const guessed = finding({ source: 'github', severity: 'P1', severitySource: 'hint' })
+  const lowered = applyAnswer(guessed, { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5)
+  expect(lowered.severity).toBe('P3')
+  expect(isSettledDeferral(lowered)).toBe(false)
+  // Lowered in one answer and deferred in a later one, it holds too.
+  const first = applyAnswer(guessed, { id: 'R1-1', action: 'rebutted', severity: 'P3', note: 'cosmetic' }, 2, 'main', 5)
+  const later = applyAnswer({ ...first, status: 'open' }, { id: 'R1-1', action: 'deferred', followUp: '#12' }, 3, 'main', 6)
+  expect(isSettledDeferral(later)).toBe(false)
+  // A guessed P2 raised to P1 and brought back down to P3 was lowered.
+  const raised = applyAnswer(finding({ source: 'github', severity: 'P2', severitySource: 'hint' }), { id: 'R1-1', action: 'rebutted', severity: 'P1' }, 2, 'main', 5)
+  expect(isSettledDeferral(applyAnswer({ ...raised, status: 'open' }, { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 6))).toBe(false)
+  // A reviewer-tagged P3, and a P3 guess the agent kept, settle.
+  expect(isSettledDeferral(applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5))).toBe(true)
+  expect(isSettledDeferral(applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5))).toBe(true)
+})
+
 test('R85: the ready prompt names the follow-up of a settled deferral and not of a plain one', async () => {
   const settled = finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://github.com/me/repo/issues/9' })
   const plain = finding({ id: 'G2-2', source: 'github', status: 'deferred', severity: 'P3' })

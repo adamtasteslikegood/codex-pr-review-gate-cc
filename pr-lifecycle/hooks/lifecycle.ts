@@ -146,7 +146,8 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
   const security = f.isSecurity === true || a.isSecurity === true
   const history = severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity } : one))
   return { ...next, severity, history, ...(security ? { isSecurity: true } : {}),
-    ...(a.action === 'deferred' && a.followUp !== undefined ? { followUp: a.followUp } : {}) }
+    // A deferral without a follow-up clears an earlier one: an old follow-up never settles a later deferral (final review T4).
+    ...(a.action === 'deferred' ? { followUp: a.followUp } : {}) }
 }
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
@@ -387,9 +388,23 @@ const disputeOf = (f: Finding): string => {
   return `${f.id} is disputed: the agent says "${argued}"; Codex said "${codex}"`
 }
 
-/** A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). */
+/** Where a follow-up can be found (R85): an https URL, `#<n>`, or `owner/repo#<n>`. Any other text is no follow-up. */
+export const isFollowUpRef = (text: string | undefined): boolean =>
+  text !== undefined && /^(?:https:\/\/\S+|#\d+|[\w.-]+\/[\w.-]+#\d+)$/.test(text.trim())
+
+/**
+ * Whether the agent ever lowered a finding's severity (I2). Only an answer (`applyAnswer`) writes a severity onto a history event, and
+ * only when it changed; a finding P3 now that has any such event was lowered to P3 at some point, a raise included, since P3 is the floor.
+ */
+const wasLowered = (f: Finding): boolean => f.history.some(one => one.severity !== undefined)
+
+/**
+ * A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). The follow-up must
+ * say where it is tracked (isFollowUpRef), and the P3 must be the reviewer's or Codex's, or a guess the agent kept: a severity the
+ * agent lowered settles nothing (I2), so the agent alone never settles a finding raised above P3.
+ */
 export const isSettledDeferral = (f: Finding): boolean =>
-  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && f.followUp !== undefined && f.followUp.trim() !== ''
+  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp) && !wasLowered(f)
 
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,

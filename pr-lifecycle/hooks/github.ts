@@ -204,8 +204,11 @@ const postsFor = (login: string, name: string): boolean => {
 
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 
-/** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|$)/im
+/**
+ * A reviewer's own advisory label at the start of the body (after a heading mark or list marker), never inside a sentence. Only the
+ * start counts (final review C1): "Nit:" on a later line labels that line, not the finding above it, so it tags nothing.
+ */
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|\n|$)/i
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
