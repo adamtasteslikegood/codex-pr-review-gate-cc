@@ -2258,6 +2258,7 @@ const paneFinding = (id: string, change: Partial<Finding>): Finding => ({
 
 const codexSaid = (status: 'rebutted' | 'open'): FindingEvent => ({ round: 2, status, note: 'checked', by: 'codex', at: 1 })
 const agentRebutted: FindingEvent = { round: 2, status: 'rebutted', note: 'not reachable', by: 'agent', at: 1 }
+const agentAcked: FindingEvent = { ...agentRebutted, note: 'No change requested', answer: 'acknowledged' }
 
 test('the pane shows the phase, the shared budget, who is awaited, and reported vs verified fixes', async ($, on) => {
   const w = world(on)
@@ -2304,6 +2305,8 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
       paneFinding('A8', { status: 'deferred' }),
       paneFinding('A9', { status: 'deferred' }),
       paneFinding('B1', { status: 'deferred', severity: 'P3' }),
+      paneFinding('B2', { status: 'rebutted', severity: 'P3', history: [agentAcked, codexSaid('rebutted')] }),
+      paneFinding('B3', { status: 'rebutted', severity: 'P3', history: [agentAcked] }),
     ],
     waivers: [
       { scope: 'finding', findingId: 'A8', head, reason: 'tracked in KAN-9', by: 'composer', at: 1 },
@@ -2313,9 +2316,9 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   w.store.set(key, next)
   const holds = mergeHolds(next).map(one => one.id)
   // A2 and A4 settled, A8 waived; the rest hold.
-  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1'])
+  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1', 'B3'])
   const ui = await mountPane($)
-  expect(await ui.find({ type: 'Text', text: 'Findings (10, 7 holding the merge' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Findings (12, 8 holding the merge' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A1 [P1] Title of A1 — re-verify owed (file changed)' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A2 [P2] Title of A2 — verified fixed' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A3 [P1] Title of A3 — reported fixed, unverified' })).toBeDefined()
@@ -2325,6 +2328,8 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   expect(await ui.find({ type: 'Text', text: 'A7 [P2] Title of A7 — disputed: awaiting the person' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A8 [P2] Title of A8 — waived: tracked in KAN-9' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A9 [P2] Title of A9 — deferred (waiver lapsed)' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'B2 [P3] Title of B2 — acknowledgement confirmed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'B3 [P3] Title of B3 — acknowledgement awaiting Codex' })).toBeDefined()
   await ui.unmount()
 })
 

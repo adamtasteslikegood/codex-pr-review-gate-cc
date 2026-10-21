@@ -688,10 +688,17 @@ export function triagePrompt(
   // After one rejection a finding is fixed or deferred (R40): a second rebuttal goes to the person, not to Codex.
   const rejected = [...(more.carried ?? []), ...(more.codex ?? [])].filter(one => one.status === 'open' && rejections(one) > 0)
   if (rejected.length > 0) {
-    const which = rejected.map(one => one.id).join(', ')
+    const isAck = (one: Finding) => one.history.filter(each => each.by !== 'codex').at(-1)?.answer === 'acknowledged'
+    const named = (list: readonly Finding[]) => list.map(one => one.id).join(', ')
+    const acked = rejected.filter(isAck)
+    const argued = rejected.filter(one => !isAck(one))
+    const said = [
+      ...(argued.length === 0 ? [] : [`rebuttal of ${named(argued)}`]),
+      ...(acked.length === 0 ? [] : [`acknowledgement of ${named(acked)}`]),
+    ].join(' and your ')
     lines.push(
       '',
-      `Codex did not accept your rebuttal of ${which}: fix it or defer it with the reason.`,
+      `Codex did not accept your ${said}: fix it or defer it with the reason.`,
       'Do not rebut it again: a second rebuttal is not sent to Codex, it goes to the person as a dispute.',
     )
   }

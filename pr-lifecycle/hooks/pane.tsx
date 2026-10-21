@@ -5,7 +5,7 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { Finding, LifecycleRecord, Run, Step } from '../types'
 import { isBlocking } from './core'
-import { isAcceptedRebuttal, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
+import { isAcceptedRebuttal, isAcknowledged, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
 import { elapsed, SPINNER } from './round'
 
 type Engine = EngineInterface
@@ -75,9 +75,9 @@ const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
     return { glyph: '✓', said: ` — reported fixed, unverified${lapse}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
   }
   if (one.status === 'rebutted') {
-    if (isAcceptedRebuttal(one)) return { glyph: '↩', said: ' — rebuttal accepted', isSettled: true, isOwed: false, isStruck: false }
+    if (isAcceptedRebuttal(one)) return { glyph: '↩', said: isAcknowledged(one) ? ' — acknowledgement confirmed' : ' — rebuttal accepted', isSettled: true, isOwed: false, isStruck: false }
     if (isDisputed(one)) return { glyph: '↩', said: ` — disputed: awaiting the person${lapse}`, isSettled: false, isOwed: true, isStruck: false }
-    return { glyph: '↩', said: ` — rebuttal awaiting Codex${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+    return { glyph: '↩', said: ` — ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} awaiting Codex${lapse}`, isSettled: false, isOwed: false, isStruck: false }
   }
   if (one.status === 'deferred') return { glyph: '⏸', said: ` — deferred${lapse}`, isSettled: false, isOwed: false, isStruck: false }
   return { glyph: isBlocking(one) ? '●' : '·', said: lapse, isSettled: false, isOwed: false, isStruck: false }
