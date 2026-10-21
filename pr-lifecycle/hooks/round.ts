@@ -439,9 +439,13 @@ export function mergeNotes(held: readonly Queued[]): Queued[] {
   })
 }
 
-/** Drops what earlier commands queued about `key`'s record and haven't sent: a stop or reset supersedes it (R81, PR #19 review). */
+/**
+ * Drops everything queued about `key`'s record and not yet sent: a stop or reset supersedes it (R81, PR #19 review). Every batch, the
+ * caller's own too: a stop run while another command holds the turn shares that command's batch (gate R4-5), and stop and reset
+ * call this before they queue their own note.
+ */
 export function dropQueued(key: RecordKey): void {
-  queued = queued.filter(one => one.batch === batch || !sameRecord(one.key, key))
+  queued = queued.filter(one => !sameRecord(one.key, key))
 }
 
 /** Runs `body` with the prompts it decides held back; once it has returned, its own batch is sent one second later, in order. */
@@ -1033,9 +1037,9 @@ const REQUIRED_TTL_MS = 5 * 60_000
 
 /**
  * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for REQUIRED_TTL_MS.
- * Each source must be parsed, or authoritatively absent (classic's 404 "not protected"); a throw, a 403 or 500, or a payload that
- * doesn't parse from either makes it unknown, with the reason in gh's own words where it gave one: that holds the merge (R86, gate
- * R3-1, R3-2) and is not cached (PR #19 review).
+ * Each source must be parsed, or authoritatively absent (classic's 404 "not protected" or "status checks not enabled"); a throw,
+ * a 403 or 500, or a payload that doesn't parse from either makes it unknown, with the reason in gh's own words where it gave one:
+ * that holds the merge (R86, gate R3-1, R3-2) and is not cached (PR #19 review).
  */
 export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | { unknown: string }> {
   // Without a known slug (a waiver-only record), gh fills {owner}/{repo} from the checkout's own remote.
@@ -1045,10 +1049,29 @@ export async function requiredChecksOf($: Engine, root: string, slug: string | u
   const seen = required.get(key)
   if (seen !== undefined && now - seen.at < REQUIRED_TTL_MS) return seen.found
   const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch((err: unknown) => String(err).slice(0, 160))
-  // One page holds every rule a branch is likely to have (final review M3): GitHub's default of 30 could cut a required-checks rule.
+  // Pages of 100 (final review M3): GitHub's default of 30 could cut a required-checks rule, and a full page means another may
+  // follow, read until one is short (gate R4-4).
   const rulesAt = `repos/${repo}/rules/branches/${base}`
   const classicAt = `repos/${repo}/branches/${base}/protection/required_status_checks`
-  const rules = await api(`${rulesAt}?per_page=100`)
+  const readRules = async (): Promise<string | { exitCode: number; stdout: string; stderr: string }> => {
+    const all: unknown[] = []
+    for (let page = 1; page <= 20; page += 1) {
+      const got = await api(`${rulesAt}?per_page=100${page === 1 ? '' : `&page=${page}`}`)
+      if (typeof got === 'string' || got.exitCode !== 0) return got
+      let rows: unknown
+      try {
+        rows = JSON.parse(got.stdout)
+      } catch {
+        return got
+      }
+      // A payload that isn't a list goes to readRequired as it came, which reads it as unknown.
+      if (!Array.isArray(rows)) return got
+      all.push(...(rows as unknown[]))
+      if (rows.length < 100) return { ...got, stdout: JSON.stringify(all) }
+    }
+    return 'more than 20 pages of rules'
+  }
+  const rules = await readRules()
   const classic = await api(classicAt)
   // The endpoint is named, so the person knows what the gh login must be able to read.
   const failed = (at: string, ran: string | { exitCode: number; stderr: string }) =>
@@ -1056,7 +1079,8 @@ export async function requiredChecksOf($: Engine, root: string, slug: string | u
   if (typeof rules === 'string' || rules.exitCode !== 0) return failed(rulesAt, rules)
   if (typeof classic === 'string') return failed(classicAt, classic)
   // Only GitHub's own words are an authoritative none: a 404 for any other reason (a missing branch or token scope) is unknown (M3).
-  const isClassicNone = classic.exitCode !== 0 && /Branch not protected/i.test(classic.stderr)
+  // A protected branch that requires no status checks (reviews only, say) answers "Required status checks not enabled" (gate R4-1, R4-2).
+  const isClassicNone = classic.exitCode !== 0 && /Branch not protected|Required status checks not enabled/i.test(classic.stderr)
   if (classic.exitCode !== 0 && !isClassicNone) return failed(classicAt, classic)
   const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
   if (listed === undefined) return { unknown: `gh api ${rulesAt} or ${classicAt} returned a payload that does not parse` }
@@ -2064,7 +2088,8 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       }
       return { ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.carriedEffort ?? run.effort }
     })
-    if (isCompleted && !isGone) await advance($, run.root, run.branch)
+    // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
+    if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
     return
   }
   const current = run.findings.filter(one => raisedIn(one, run.round))
@@ -2127,7 +2152,8 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       effort: run.carriedEffort ?? run.effort,
     }
   })
-  if (isCompleted && !isGone) await advance($, run.root, run.branch)
+  // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
+  if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
 }
 
 /** The effort and Codex model a round ran at (R69), when Codex ran in it: what the reviewers reported, else what the gate named. */

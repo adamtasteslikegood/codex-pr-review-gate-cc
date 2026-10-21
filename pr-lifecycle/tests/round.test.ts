@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { mergeNotes, patch } from '../hooks/round'
+import { dropQueued, holdingPrompts, mergeNotes, patch, say } from '../hooks/round'
 
 test('R81: a note merges into a prompt of the same batch and record only', async () => {
   const a = { root: '/repo', branch: 'feat/x' }
@@ -54,4 +54,31 @@ test('M2: patch changes only the running run it names, and returns null for any 
   const other = holding({ id: 'r2', status: 'running', activity: 'a' })
   expect(await patch(other.$, 'r1', one => ({ ...one, activity: 'b' }))).toBeNull()
   expect(other.read().activity).toBe('a')
+})
+
+test('gate R4-5: a stop run during another command\'s hold drops that command\'s queued prompt', async () => {
+  const key = { root: '/repo', branch: 'feat/x' }
+  const timers: (() => void)[] = []
+  const sent: string[] = []
+  const $ = {
+    clock: { now: async () => 0, after: (_ms: number, fn: () => void) => void timers.push(fn) },
+    session: { id: async () => 'session-1' },
+    store: { get: async () => undefined },
+    prompt: { submit: async (e: { text: string }) => void sent.push(e.text) },
+  } as never
+  const flush = async () => {
+    for (const fn of timers.splice(0)) fn()
+    for (let i = 0; i < 50; i += 1) await Promise.resolve()
+  }
+  await holdingPrompts($, async () => {
+    await say($, key, 'pr-gate: a stale prompt')
+    // The stop shares the outer command's batch: what that command queued is dropped all the same.
+    await holdingPrompts($, async () => dropQueued(key))
+  })
+  await flush()
+  expect(sent).toEqual([])
+  // A prompt queued after the drop is still sent.
+  await holdingPrompts($, async () => say($, key, 'pr-gate: a fresh prompt'))
+  await flush()
+  expect(sent).toEqual(['pr-gate: a fresh prompt'])
 })

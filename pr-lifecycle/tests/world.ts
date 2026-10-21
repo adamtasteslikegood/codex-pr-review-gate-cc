@@ -95,9 +95,9 @@ export type World = {
     /** Checks the base requires; undefined requires every check in `checks` (as before R86). */
     required?: string[]
     /** How the rules endpoint answers: 'ok' (default), 'garbage', 'throw', or an HTTP status. */
-    rulesAnswer?: 'ok' | 'garbage' | 'throw' | number
+    rulesAnswer?: 'ok' | 'paged' | 'garbage' | 'throw' | number
     /** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */
-    classicAnswer?: 'none' | 'ok' | 'garbage' | 'throw' | number
+    classicAnswer?: 'none' | 'off' | 'ok' | 'garbage' | 'throw' | number
     calls: string[]
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
@@ -250,18 +250,21 @@ export function world(on: On): World {
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
-      if (/^api repos\/\S+\/rules\/branches\/[^\s?]+\?per_page=100$/.test(args)) {
+      if (/^api repos\/\S+\/rules\/branches\/[^\s?]+\?per_page=100(&page=\d+)?$/.test(args)) {
         const how = w.gh.rulesAnswer ?? 'ok'
         if (how === 'throw') throw new Error('network down')
         if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
         if (how === 'garbage') return out('<html>proxy error</html>')
         const names = w.gh.required ?? (w.gh.checks as { name?: string }[]).map(one => String(one.name))
+        // 'paged': a full first page of other rules, the required-checks rule on the second.
+        if (how === 'paged' && !args.includes('&page=')) return out(JSON.stringify(Array.from({ length: 100 }, () => ({ type: 'deletion' }))))
         return out(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: names.map(context => ({ context })) } }]))
       }
       if (/^api repos\/\S+\/branches\/\S+\/protection/.test(args)) {
         const how = w.gh.classicAnswer ?? 'none'
         if (how === 'throw') throw new Error('network down')
         if (how === 'none') return failed('gh: Branch not protected (HTTP 404)')
+        if (how === 'off') return failed('gh: Required status checks not enabled (HTTP 404)')
         if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
         if (how === 'garbage') return out('<html>proxy error</html>')
         return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))

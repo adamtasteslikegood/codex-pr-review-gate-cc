@@ -3467,6 +3467,10 @@ test('R86: the required set is known only when both sources are established (PR 
     ['ok', 'garbage', 'unknown'],
     // Only "Branch not protected" is classic's authoritative none: any other 404 is unknown (final review M3).
     ['ok', 404, 'unknown'],
+    // A protected branch that requires no status checks is a none too (gate R4-1, R4-2).
+    ['ok', 'off', ['check']],
+    // A required-checks rule past a full first page still counts (gate R4-4).
+    ['paged', 'none', ['check']],
   ]
   w.gh.required = ['check']
   for (const [i, [rules, classic, want]] of cases.entries()) {
