@@ -2369,8 +2369,13 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
       return { exitCode: 1, stderr: e instanceof Error ? e.message : String(e) }
     }
   }
+  // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and after its
+  // gh calls, so no later issue is labelled and no log line lands in another lifecycle's log.
+  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
+    latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
   const results = new Map<string, { followUp: string | undefined; peak: Severity; error?: string }>()
   for (const one of owed) {
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
     const peak = peakOf(one)
     const issue = issueOf(one.followUp, rec.slug)
     if (issue === undefined) {
@@ -2383,13 +2388,14 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
     await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak]])
     const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
     results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
     await logEvent($, rec.root, rec.branch, 'check', edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`)
   }
-  // A reset, a fresh lifecycle or a stop while gh ran ends this pass: nothing is written, and nothing is decided (gate G7-8, R7-4).
+  // And on the write itself: nothing is written, and nothing is decided (gate G7-8, R7-4).
   let isSuperseded = false
   // Written only where the follow-up and peak are still the ones labelled: a later answer that moved either is labelled anew.
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
-    isSuperseded = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
+    isSuperseded = isMoved(latest)
     if (isSuperseded) return latest
     const findings = latest.findings.map(f => {
       const got = results.get(f.id)

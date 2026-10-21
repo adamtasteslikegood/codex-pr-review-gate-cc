@@ -115,6 +115,16 @@ export const peakOf = (f: Pick<Finding, 'severity' | 'peakSeverity' | 'history'>
     higher(f.peakSeverity ?? f.severity, f.severity),
   )
 
+/**
+ * A record from before peakSeverity whose first severity entry the agent set, naming none before it: the severity the finding was
+ * raised at is lost, so its peak, and the label its issue would carry, are unknown (gate R7-6). It waits for the person, and no
+ * later answer makes it known (gate R8-1).
+ */
+export const isPeakUnknown = (f: Pick<Finding, 'peakSeverity' | 'history'>): boolean => {
+  const first = f.history.find(one => one.severity !== undefined)
+  return f.peakSeverity === undefined && first !== undefined && first.by !== 'codex' && first.from === undefined
+}
+
 /** A GitHub item the agent may answer "no change requested" (R82): no security flag, and no explicit P0-P2 from the reviewer. */
 export const mayAcknowledge = (f: Finding): boolean =>
   f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2)
@@ -161,7 +171,9 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
     severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity, from: f.severity } : one))
   // Another follow-up, or none, was never labelled: the label was the old issue's.
   const isNewFollowUp = a.action === 'deferred' && a.followUp !== f.followUp
-  return { ...next, severity, history, peakSeverity: higher(peakOf(f), severity), ...(security ? { isSecurity: true } : {}),
+  // A lost peak stays unknown: a peak read from the incomplete history would let a lowered legacy finding settle (gate R8-1).
+  const peak = isPeakUnknown(f) ? {} : { peakSeverity: higher(peakOf(f), severity) }
+  return { ...next, severity, history, ...peak, ...(security ? { isSecurity: true } : {}),
     // A deferral without a follow-up clears an earlier one: an old follow-up never settles a later deferral (final review T4).
     ...(a.action === 'deferred' ? { followUp: a.followUp } : {}),
     ...(isNewFollowUp ? { followUpLabel: undefined, followUpLabelError: undefined } : {}) }
@@ -450,14 +462,6 @@ const loweringRuling = (f: Finding): Finding['history'][number] | undefined => {
 /** A P3 deferred to a GitHub issue, not security: what may settle without the person (R85). */
 const isIssueDeferral = (f: Finding): boolean => f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp)
 
-/**
- * A record from before peakSeverity whose first severity entry the agent set, naming none before it: the severity the finding was
- * raised at is lost, so its peak, and the label its issue would carry, are unknown (gate R7-6). It waits for the person.
- */
-const isPeakUnknown = (f: Finding): boolean => {
-  const first = f.history.find(one => one.severity !== undefined)
-  return f.peakSeverity === undefined && first !== undefined && first.by !== 'codex' && first.from === undefined
-}
 
 /** A deferral that would settle but for the agent's lowering of its severity: Codex rules on the lowering first (Adam, 2026-10-20). */
 export const isLoweringOwed = (f: Finding): boolean =>

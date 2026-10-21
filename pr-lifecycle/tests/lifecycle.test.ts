@@ -791,6 +791,10 @@ test('gate R7-6: a record from before peakSeverity whose severity the agent set,
   expect(isLoweringOwed({ ...legacy, peakSeverity: 'P1' })).toBe(true)
   // A legacy record whose history names no severity has nothing unknown: its severity is its peak.
   expect(isSettledDeferral(base)).toBe(true)
+  // A later answer does not make the lost peak known (gate R8-1): it still waits for the person.
+  const again = applyAnswer(legacy, { id: 'R1-1', action: 'deferred', severity: 'P3', note: 'still cosmetic', followUp: '#1' }, 3, 'main', 6)
+  expect(again.peakSeverity).toBeUndefined()
+  expect(wouldSettle({ ...again, followUpLabel: 'P3' })).toBe(false)
 })
 
 test('R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)', async () => {

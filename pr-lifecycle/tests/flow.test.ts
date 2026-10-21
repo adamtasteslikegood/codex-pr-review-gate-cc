@@ -3449,6 +3449,8 @@ test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing f
   expect(rec.findings).toEqual([])
   // No round was started on the archived seed: the person ended this review.
   expect(rec.rounds).toEqual([])
+  // Nor does the old pass's log line land in the archived seed's log (gate R8-2).
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('labelled')
   expect((await runOf(w)).status).not.toBe('running')
 })
 
