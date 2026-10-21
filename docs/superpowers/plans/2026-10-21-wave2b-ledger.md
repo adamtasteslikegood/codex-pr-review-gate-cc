@@ -45,3 +45,8 @@ Task 3: implemented a575cdf (BASE 63ac5a9), 507/507
 Task 3: review Changes needed (Important: archive seed dropped ownReplies) → fix round 1 d5b8dfe (seed + fresh-start carry in register.tsx, afterFix order, tests), controller re-review clean, 509/509
 Task 3: complete (commits 63ac5a9..d5b8dfe, review clean)
 Ruling: A5 amended again (39b06cb, 7a04661): push time = latest activity-log push into the head; ambiguous comment → re-request or count, never a cap wait (Adam: gate can't get stuck).
+Task 4: implemented 67899a6 (BASE 5457a09), 523/523, DONE_WITH_CONCERNS (no lower bound when activity+commit-date both fail; fork lookups in beginCollect/onOpened use base repo; 100-entry page; headArrival.asked/counted extra fields)
+Task 4: review Needs fixes (Important: no lower bound when both lookups fail → false coverage from round 2; owner/name/fork path untested) → fix round 1 sent with minors 1-6
+Ruling: A5's plan rulings (activity-log push time; first-seen fallback; re-request or count, never a cap wait; latest/newest push re-reads) are recorded in Task 16's rulings text with R88-R94 — no task owned them — cost if wrong: a missing doc line
+Task 4: fix round 1 9a8cac5, re-review Approved, 527/527. Minors deferred to final review: toMatchObject weakens #24 (7)/(12) asserts; beginCollect records asks but doesn't read them; noteArrival same-head concurrent overwrite (narrow)
+Task 4: complete (commits 5457a09..9a8cac5, review clean)
