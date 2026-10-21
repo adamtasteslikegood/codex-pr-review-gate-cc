@@ -70,7 +70,7 @@
 
 ## Review Focus
 
-1. **Resume after a reviewer already commented (#24).** A roster reviewer's issue comment (no `commit_id`) posted after the gate first saw the head but before `/pr-gate resume` still covers the head (the time is the record's `headArrival`, not a commit or check time; PR #25 review). The round must not wait out the cap. Test in Task 4.
+1. **Resume after a reviewer already commented (#24).** A roster reviewer's issue comment (no `commit_id`) posted after the gate first saw the head but before `/pr-gate resume` still covers the head (the time is GitHub's push time from the activity log, kept as the record's `headArrival`; never a commit or check time; PR #25 review). The round must not wait out the cap. Test in Task 4.
 2. **This machine's login in `requested_reviewers`.** The person may request a review from themselves (the same gh login as `self`). The gate must not wait for that review. Test in Task 5.
 3. **Two pushes between two polls.** The gate sees only the last head. It must close one round on the old head and open one on the newest, never one round per commit, and must not crash on the commit it never saw. Test in Task 9.
 4. **An answer that names a finding raised in a round that has since rolled over.** The agent answers G3-2 after its push ended round 3. The answer applies to G3-2, and it is not dropped as unasked. Test in Task 9.
@@ -621,17 +621,46 @@ Expected: PASS. An existing test that set check runs without `started_at` is una
 
 This step **replaces** the timestamp source in Steps 1-3. Codex showed that commit and check timestamps break the invariant: a commit authored before an earlier comment and pushed later makes that comment cover the new head, and a check that starts after a reviewer's comment makes a valid comment miss it (#24 again). Do not add `Check.startedAt`, `headArrival` or the `commitDate` knob. Instead:
 
-- Add to `LifecycleRecord` (`types/index.d.ts`): `/** When the gate first saw the PR's head (#24), kept across stop, resume and another session: a comment on the head counts from then. */ headArrival?: { head: string; at: number }`.
-- Wherever the gate first sees a PR head (`onOpened`, `beginCollect`, and `pollOnce` when `isNewHead`), write `headArrival: { head, at: now }` to the record, but only when `rec.headArrival?.head !== head`. A known head's time never moves later.
-- `beginCollect` and `pollOnce` take `collect.headAt` from it: `rec.headArrival?.head === head ? rec.headArrival.at : now`. With no record of the head (pushed while no session ran), the fallback stays `now`, the conservative 1.4.0 rule. Reviews still cover a head by `commit_id`, whatever their time.
-- No recovery from GitHub's timeline: only force-pushes carry an event time there, and an ordinary push has none. Record this as a plan ruling.
-- A comment posted between the push and the gate's first poll (at most `POLL_MS`) does not count. It errs toward waiting, never toward false coverage.
+- Add to `LifecycleRecord` (`types/index.d.ts`): `/** When the PR's head reached the PR (#24), kept across stop, resume and another session: GitHub's push time, else when the gate first saw it. */ headArrival?: { head: string; at: number; isPushTime: boolean }`.
+- **The push time comes from GitHub (Adam: "the gate can't get stuck").** GitHub's repository activity log records each push with the
+  head it moved the branch to: `gh api 'repos/<head repo>/activity?ref=refs/heads/<branch>&per_page=100' --jq '.[] | select(.after == "<head>") | .timestamp'`
+  (`activity_type` `push` or `force_push`; for a PR from a fork, the head repo is the fork's). Checked live on this repo, 2026-10-21:
+  the push of a47400f reads 13:57:14Z. Add `pushTimeOf($, rec, head): Promise<number | undefined>` in `round.ts` (30 s timeout;
+  undefined on any failure or no match). It returns the **latest** transition into the head, never the earliest: a branch can revisit a
+  sha (A at 10, B at 20, a comment on B at 30, a force-push back to A at 40), and only the last arrival of A is A's arrival now (PR #25
+  review, A→B→A).
+- When the gate first sees a PR head (`onOpened`, `beginCollect`, and `pollOnce` when `isNewHead`) and `rec.headArrival?.head !== head`,
+  it reads `pushTimeOf`. It writes `headArrival: { head, at, isPushTime }`: `at` is the push time when GitHub gave it (never later
+  than now), else `now` with `isPushTime: false`. Each `beginCollect` reads `pushTimeOf` again even when the stored head matches: a
+  latest transition later than the stored time means the branch left the head and came back while no session saw it, and the later time
+  replaces the stored one. Within one collection, a known head's time never moves later. When a later poll finds the push time for a
+  head stored with `isPushTime: false`, it replaces `at` with it (it is earlier) and sets `isPushTime: true`; try once per poll, at most
+  until collection ends.
+- `beginCollect` and `pollOnce` take `collect.headAt` from `rec.headArrival` for that head, else `now`. Reviews still cover a head by
+  `commit_id`, whatever their time.
+- **No silent wait on a guess.** If the push time is still unknown and a roster reviewer has an issue comment on the PR created after the
+  head commit's committer date but before `headArrival.at` (it may or may not be about this head), the gate never waits out the cap for it:
+  - the reviewer is in `requestReview`: the gate asks again at once, with the POST to `requested_reviewers` that `beginCollect` already
+    makes (1.4.0), once per head, and logs `<login>: comment at <time> may predate <head7>; asked again`. Its reply covers the head.
+  - otherwise (it cannot be asked): the comment counts as covering the head, and the gate logs
+    `<login>: comment at <time> counted for <head7>; GitHub gave no push time`. A rare false coverage is the cost; a stuck gate is not
+    accepted (Adam, 2026-10-21).
+- Never commit or check-run times as the arrival (PR #25 review).
 
-Tests (flow), replacing Step 1's check-run fixtures:
-1. #24: the gate sees the head at T, `/pr-gate stop`, a roster reviewer's issue comment at T+60 s, the clock moves on, `/pr-gate resume`: the comment covers the head and the phase reaches `ready`.
-2. Push seen at 100 s, comment created at 50 s, commit dated 10 s: the comment does not cover the head; collection keeps waiting.
-3. Push seen at 100 s, comment at 120 s, a check run that starts at 200 s: the comment covers the head.
-4. A record whose `headArrival` names an older head: the new head gets `now`, and the old time is not reused.
+Record as plan rulings: the push time is GitHub's activity log; first-seen is only the fallback, and an ambiguous comment gets a
+re-request, or counts when the reviewer cannot be asked, never a 20-minute wait.
+
+Tests (flow), replacing Step 1's check-run fixtures. Add a world knob `w.gh.pushes: { after: string; timestamp: string }[]` answering the activity call (an unknown ref or `undefined` answers `[]`; a knob to make it fail):
+1. #24: the head was pushed at T (in `pushes`), the gate is stopped, a roster reviewer's issue comment comes at T+60 s, `/pr-gate resume` much later: the comment covers the head and the phase reaches `ready`.
+2. A push the gate never saw: pushed at 100 s (in `pushes`), comment at 120 s, the gate first sees the head at 600 s: the comment covers it.
+3. Push at 100 s, comment at 50 s, commit dated 10 s: the comment does not cover the head.
+4. Push at 100 s, comment at 120 s, a check run starting at 200 s: the comment covers it.
+5. The activity call fails, a `requestReview` reviewer's comment falls between the commit date and first-seen: one re-request POST and its log line, no 20-minute wait; the reviewer's later reply covers the head.
+5b. Same, for a roster reviewer not in `requestReview`: the comment counts at once, with the "counted" log line, and collection ends without the cap.
+6. The activity call fails at first sight and works at the next poll: `headArrival.at` moves earlier to the push time, `isPushTime` becomes true.
+7. A record whose `headArrival` names an older head: the new head is looked up afresh; the old time is never reused.
+8. A→B→A: pushes A at 10, B at 20, a roster comment at 30, a force-push to A at 40 (all in `pushes`), the gate first sees A at 50: `headArrival.at` is 40 and the comment does not cover A.
+9. The record holds A at 10 (`isPushTime: true`); the branch went to B and back to A at 40 while no session ran; `/pr-gate resume`: `beginCollect` moves A's time to 40.
 
 Use the most capable model for this task: the code is prose here, not given.
 
@@ -1402,6 +1431,8 @@ Three holes Codex reproduced with the planned helpers. Fix each one and pin it w
 - **A2 (no self-links).** Validate an agent's link on canonical ids. In `afterTriage`, `const canon = (id: string) => byId.get(id)?.duplicateOf ?? id` over the round's ledger and the record. A link is no answer when `canon(link.duplicateOf) === link.id`, or when either id is not on the list. When the finding being linked is itself an original with linked findings, point those at the new canonical target in the same patch, so links never chain. Tests:
   - B is linked to A, and the agent answers `A duplicateOf B`: no answer. A still holds and is asked again, and B still holds through A.
   - B is linked to A, and the agent answers `A duplicateOf C`: A and B both point at C.
+  - Validate the whole proposed link graph before applying the batch, not just each link against the pre-update ledger. Reject every proposed link participating in a self-link or cycle as no answer; leave those findings holding and ask again. Only commit the remaining acyclic links, canonicalize their targets and re-point existing aliases in the same patch. Codex agreeing that two reports concern the same problem must never be enough to accept a cyclic ownership graph.
+  - Two previously unlinked findings A and B are answered in one trailer with `A duplicateOf B` and `B duplicateOf A`: neither link is applied, both findings remain held, and no finding disappears after a later link-check result. Also test a three-finding cycle and an acyclic A→B→C batch; the latter ends with A and B pointing at C.
 - **A3 (R33 on the original).** In `triage`, resolve each candidate to its canonical original before the R33 (`isAnswerTo`) and `needsRecheck` predicates. Skip the candidate if the original or the alias fails either predicate. Test: A is rebutted and the rebuttal accepted; B is linked to A and still has status `open`; a later objection C matching B is `new-on-reviewed`, not a duplicate of A.
 
 - [ ] **Step 6: Commit**

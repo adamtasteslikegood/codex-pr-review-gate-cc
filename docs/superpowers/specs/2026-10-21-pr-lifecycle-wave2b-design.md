@@ -318,13 +318,19 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
    commit counts for the head only from then on. After `/pr-gate resume`, a
    roster reviewer's comment already on the head stops counting, and the round
    waits out the cap (PR 3749 in the cookbook repo, 2026-10-21). `headAt` is
-   now the time the gate first saw the head on the PR, kept in the record
-   (`headArrival`) across stop, resume and another session. Commit and check
-   times are not used: a commit authored early and pushed late, or a check
-   that starts after a comment, gets coverage wrong (PR #25 review). A head
-   the gate never saw gets the time it is first seen, as in 1.4.0; reviews
-   still cover a head by their `commit_id`. A comment in the gap between a
-   push and the next poll errs toward waiting, never toward false coverage.
+   now the time the head was pushed, from GitHub's repository activity log
+   (`GET repos/<repo>/activity`, the latest push into the head sha, since a
+   branch can return to a sha), kept in the record
+   (`headArrival`) across stop, resume and another session. If GitHub has
+   no entry, it is when the gate first saw the head, replaced by the push
+   time once GitHub has it. Commit and check times are never used: a commit
+   authored early and pushed late, or a check that starts after a comment,
+   gets coverage wrong (PR #25 review). Reviews still cover a head by their
+   `commit_id`. The gate never waits out the cap on a guess (Adam,
+   2026-10-21: "the gate can't get stuck"): while the push time is unknown,
+   a roster reviewer whose comment may predate the head is asked again at
+   once, or, if the gate cannot ask that reviewer, the comment counts and
+   the log says so.
 
 ## 8. Rulings to record (from R88)
 
