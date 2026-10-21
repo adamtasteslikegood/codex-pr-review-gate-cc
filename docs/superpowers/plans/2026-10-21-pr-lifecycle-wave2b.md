@@ -633,10 +633,14 @@ This step **replaces** the timestamp source in Steps 1-3. Codex showed that comm
   it reads `pushTimeOf`. It writes `headArrival: { head, at, isPushTime }`: `at` is the push time when GitHub gave it (never later
   than now), else `now` with `isPushTime: false`. Each `beginCollect` reads `pushTimeOf` again even when the stored head matches: a
   latest transition later than the stored time means the branch left the head and came back while no session saw it, and the later time
-  replaces the stored one. The same holds within a collection (PR #25 review, A→B→A between two polls): before a poll ends
-  collection on coverage that rests on an issue comment (no `commit_id`), it reads `pushTimeOf` again; a later transition moves
-  `headArrival.at` and `collect.headAt` to it, and coverage is computed again on that poll. A failed read keeps the stored time and
-  does not hold the end of collection (the gate can't get stuck). Reviews by `commit_id` need no re-read. When a later poll finds the push time for a
+  replaces the stored one. The same holds within a collection (PR #25 review, A→B→A between two polls, and a push racing the
+  poll): before a poll ends collection on coverage that rests on an issue comment (no `commit_id`), it reads the branch's **newest**
+  push (`latestPushOf($, rec): Promise<{ after: string; at: number } | undefined>`, the first activity entry for the ref), and it
+  does so **after** the poll has read the comments. Collection may end on that coverage only when the newest push's `after` is the
+  head: its time becomes `headArrival.at` and `collect.headAt` (it never moves earlier), and coverage is computed again. A newest
+  push to another sha means the head moved during the poll: collection does not end, and the next poll handles the new head. A push
+  after this read happens after every comment the poll read, so none of them can be about it. A failed read keeps the stored time and
+  does not hold the end of collection (the gate can't get stuck); the log notes it. Reviews by `commit_id` need no re-read. When a later poll finds the push time for a
   head stored with `isPushTime: false`, it replaces `at` with it (it is earlier) and sets `isPushTime: true`; try once per poll, at most
   until collection ends.
 - `beginCollect` and `pollOnce` take `collect.headAt` from `rec.headArrival` for that head, else `now`. Reviews still cover a head by
@@ -666,6 +670,8 @@ Tests (flow), replacing Step 1's check-run fixtures. Add a world knob `w.gh.push
 9. The record holds A at 10 (`isPushTime: true`); the branch went to B and back to A at 40 while no session ran; `/pr-gate resume`: `beginCollect` moves A's time to 40.
 10. During one collection: A stored at 10; between two polls the branch goes to B at 20, a roster issue comment arrives at 25, and the branch returns to A at 30. The next poll sees the same sha: it re-reads the push time before ending, moves `headAt` to 30, and the comment at 25 does not cover A; collection keeps waiting.
 11. Same, with the re-read failing: collection ends on the comment as before (no hold on a failed read), and the log notes the failed check.
+12. A push racing the poll: the poll reads head A and a roster comment at 25; the newest push the re-read finds is to B at 26 (the PR head moved during the poll): collection does not end on that comment, and the next poll opens on B.
+13. The newest push is A at 30 after the comment at 25 was read: headAt is 30 and the comment does not cover A.
 
 Use the most capable model for this task: the code is prose here, not given.
 
