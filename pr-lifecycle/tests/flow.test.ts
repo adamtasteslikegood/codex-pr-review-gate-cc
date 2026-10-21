@@ -3522,7 +3522,9 @@ test('R80: a waive post given while a round is finishing is followed by no hold 
   expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
   expect(sent.some(one => one.includes('post-PR round'))).toBe(false)
   // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
-  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  // The only message is the waive's own note (R81), sent once.
+  expect(sent.filter(one => one.includes('ready for the merge decision') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
   expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
 })
 
@@ -3643,4 +3645,94 @@ test('R80: allow after a mid-round waiver reads the PR head, so the waived head 
   expect(w.spawned).toHaveLength(spawned)
   expect((await runOf(w)).status).not.toBe('running')
   expect(w.prompts.slice(prompts).at(-1)).toContain("the person's post waiver covers PR #1 at fffffff")
+})
+
+test('R81: waive post tells the agent what it covers and what still holds', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('pr-gate: the person waived post-PR review of PR #1')
+  expect(said).toContain('Nothing else holds the merge')
+  expect(said).toContain("the merge decision, which is the person's")
+})
+
+test('R81: waive post sends the agent one message, not a note and a second waiver message', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(5000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+})
+
+test('R81: the person\'s stop tells the agent to stop waiting; an agent\'s stop says nothing', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const prompts = w.prompts.length
+  await say($, 'stop', { ...asPerson, origin: { kind: 'sdk' } })
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const before = w.prompts.length
+  await say($, 'stop')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(before + 1)
+  expect(w.prompts.at(-1)).toContain('the person stopped the gate')
+  expect(w.prompts.at(-1)).toContain('stop waiting on it')
+})
+
+test('R81: an allow that leads to a prompt sends one message, the action line first', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'allow 2 more review')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+  expect(w.prompts.at(-1)?.startsWith('pr-gate: the person allowed 2 more rounds')).toBe(true)
+})
+
+test('R81: waiving a finding tells the agent what still holds; a refused waiver sends nothing', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'waive G9-9 because')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+  expect(w.prompts.at(-1)?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
+})
+
+test('R81: waive pre tells the agent to open the PR even with openPr off', { options: { openPr: false } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await say($, 'waive pre hotfix for the outage')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the person waived the pre-PR review')
+  expect(w.prompts.at(-1)).toContain('open the pull request')
+})
+
+test('R81: reset tells the agent the lifecycle was archived', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the person reset the lifecycle of feat/x')
+})
+
+test('R81: a reset before the flush drops the earlier command\'s open-PR prompt and keeps its own note (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const prompts = w.prompts.length
+  await say($, 'waive pre hotfix for the outage')
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('open the pull request'))).toBe(false)
+  expect(sent.at(-1)).toContain('the person reset the lifecycle')
 })

@@ -41,6 +41,7 @@ import {
   configFor,
   configOf,
   defaultEffort,
+  dropQueued,
   fetchTwice,
   finish,
   gatherStanding,
@@ -65,6 +66,7 @@ import {
   setSession,
   setup,
   startTicker,
+  tellAgent,
   untriagedFeedback,
 } from './round'
 import type { Config } from './round'
@@ -825,13 +827,16 @@ async function logText($: Engine): Promise<string> {
 }
 
 /** The person's commands that change a lifecycle, for its run log. */
+/** Whether a command came from the person: the composer, the bridge or the pane. */
+const isPerson = (origin: string): boolean => origin === 'composer' || origin === 'bridge' || origin === 'pane'
+
 const LOGGED = ['resume', 'stop', 'waive', 'allow', 'reset']
 
 /** Logs a person's command and the first line of its reply on the branch's record (`/pr-gate log`). */
 async function logCommand($: Engine, args: string, reply: string, origin: string): Promise<void> {
   const verb = args.trim().split(/\s+/)[0] ?? ''
   // Only the person's own: an agent's run of a person-only command is refused, and is no step of theirs.
-  if (!LOGGED.includes(verb) || (origin !== 'composer' && origin !== 'bridge')) return
+  if (!LOGGED.includes(verb) || !isPerson(origin)) return
   const here = await hereOf($)
   if (here === undefined) return
   const said = reply.split('\n')[0]?.replace(/^\/pr-gate:?\s*/, '') ?? ''
@@ -849,7 +854,12 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (verb === 'log') return logText($)
   if (verb === 'stop') {
     if (run === null || run.status !== 'running') return `/${COMMAND} is not running.`
+    if (isPerson(origin)) await claimRecord($, run.root, run.branch)
+    dropQueued(run)
     await finish($, run.id, 'stopped', 'Stopped by the person.')
+    if (isPerson(origin)) {
+      await tellAgent($, run, 'stopped the gate', 'stop waiting on it. Opening and merging stay held; /pr-gate resume continues it.')
+    }
     return `/${COMMAND} stopped. The record stays: /${COMMAND} resume continues it. Opening and merging stay held.`
   }
   const isPersons = verb === 'waive' || verb === 'allow' || verb === 'reset'
@@ -886,6 +896,9 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
     // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
     await archiveLifecycle($, root, branch, now)
+    dropQueued({ root, branch })
+    await tellAgent($, { root, branch }, `reset the lifecycle of ${branch}: it is archived, its history kept`,
+      `nothing for the old review. /${COMMAND} starts a fresh one; opening and merging stay held until it completes.`)
     return `/${COMMAND}: the lifecycle for ${branch} is archived under its own key, its history kept. /${COMMAND} starts a fresh one.`
   }
   if (verb === 'allow') {
@@ -895,6 +908,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (rec === undefined) return none
     await take()
     await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
+    await tellAgent($, { root, branch }, `allowed ${n} more round${n === 1 ? '' : 's'}: ${reason}`,
+      'the gate continues the review. Leave the branch alone until it sends you what needs an answer.')
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
     const after = (await loadRecord($, root, branch)) ?? rec
@@ -942,6 +957,16 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {
       await sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
     }
+    const now2 = await loadRecord($, root, branch)
+    const pr = now2?.phase !== 'pre' && now2?.pr !== undefined ? { number: now2.pr, baseRefName: now2.base, headRefOid: now2.head } : undefined
+    const standing = now2 !== undefined && pr !== undefined ? await gatherStanding($, now2, pr) : undefined
+    await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`,
+      standing === undefined
+        ? 'the pre-PR review continues.'
+        : standing.mayProceed
+          ? "nothing holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          : 'answer what is yours in the list above, and leave the rest to who it names.',
+      standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
   if (scope === 'pre') {
@@ -998,6 +1023,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     await take()
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     await sayOpenPr($, waived, 'waived', now)
+    await tellAgent($, waived, `waived the pre-PR review of ${branch} at ${head.slice(0, 7)}: ${reason}`,
+      `open the pull request for ${branch} → ${waived.base}; the guard lets it through, and post-PR review runs once it opens.`)
     return (
       `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +
       `The PR may open; this waiver covers ${waived.base} only, and post-PR review still runs.`
@@ -1039,6 +1066,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
   const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
+  await tellAgent($, { root, branch }, `waived post-PR review of PR #${pr?.number ?? '?'} at ${at.slice(0, 7)}: ${reason}`,
+    standing === undefined || standing.mayProceed
+      ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+      : 'the waiver covers the review only: wait for what is listed, then tell the person.',
+    standing)
   const aside = standing === undefined || standing.setAside.length === 0 ? '' : ` Set aside (GitHub does not require them): ${standing.setAside.join(', ')}.`
   return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.${aside}`
 }

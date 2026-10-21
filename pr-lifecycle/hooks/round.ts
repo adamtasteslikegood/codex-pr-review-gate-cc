@@ -471,6 +471,15 @@ export async function say($: Engine, key: RecordKey, text: string, isNote = fals
   await deliver($, key, text)
 }
 
+/** The person's action, told to the agent (R81): what they did, what still holds, and the agent's next step. Queued as a note. */
+export async function tellAgent($: Engine, key: RecordKey, did: string, next: string, standing?: Standing): Promise<void> {
+  const lines = [`pr-gate: the person ${did}.`]
+  const holds = standing === undefined ? '' : holdText(standing)
+  if (holds !== '') lines.push('', holds)
+  lines.push('', `Your next step: ${next}`)
+  await say($, key, lines.join('\n'), true)
+}
+
 export async function getRun($: Engine): Promise<Run | null> {
   return (await $.state.get(RUN)).value ?? null
 }
