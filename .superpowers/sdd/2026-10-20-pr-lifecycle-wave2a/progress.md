@@ -109,3 +109,7 @@ Task 8: complete (commits 9fc314f..bcdf6dc, review clean)
 Task 8: minor (deferred): advance reads gh pr view each pass while an unmatched post waiver exists; prHeadOf's process.run not try-wrapped (same as prStateOf); a waiver matching rec.head while the PR head moved on still sends the waiver message
 Task 9: implementer dispatched (sonnet), BASE 35ec60e; ruling carried: one waive post = one agent message (note merges into advance's waiver prompt, or advance skips it in that batch, spec §1)
 Task 9: implementer DONE, commit f1beb67 (466 pass); waive post never calls advance → one note; R80 test assertion adapted; review dispatched
+Task 9: review Needs fixes — Important: waive <finding> standing uses stale rec.head (can say ready on an unreviewed push); no-op reset still notes 'archived'; waive post with no PR says 'ready' (plan-mandated). Minors: R80 one-prompt count, pre wording, now2 name, reset next-step wording
+Task 9: fix round 1/5 dispatched (FIX_BASE f1beb67)
+Task 9: fix round 1 implementer DONE, commit c986d23 (469 pass); re-review dispatched
+Ruling: advance's own ready prompt after waive <finding> can name a stale rec.head as ready — pre-existing (1.3.0 does the same), the merge guard still refuses a head ≠ rec.head — left for the final review, not widened into Task 9 — cost if wrong: one misleading 'ready' line on a rare path

@@ -25,3 +25,12 @@ pr-lifecycle/hooks/round.ts, pr-lifecycle/hooks/register.tsx, pr-lifecycle/tests
 ## Concerns
 - The waive-post note's "nothing else holds the merge" wording is used when standing is undefined (no PR found) too, as the brief specifies.
 - `waive <finding>` with the PR phase relies on rec.head as the PR head for standing (per brief).
+
+## Fix round 1
+- waive <finding>: standing now uses openPrOf's headRefOid/baseRefName (fallback rec.head/rec.base), as waive post does; renamed now2 to settled.
+- reset: tellAgent only when archiveLifecycle returned true; dropQueued stays unconditional. Next-step text now says a fresh review starts when the person runs /pr-gate or when the agent next opens the PR (held create calls startGate, register.tsx ~536).
+- waive post with no PR from gh: separate "unknown, check gh pr view, do not merge" text, no "PR #?".
+- Pre-phase waive-finding text extended; R80 test now asserts exactly one prompt.
+- Tests added: second reset sends nothing; waive post with hasPr=false; waive finding after an unrecorded push sends one message. Reset-drop test now checks the waive-pre prompt text instead of "open the pull request" (the new reset note mentions opening the PR).
+- Suite 468 pass, 0 fail; lint and typecheck clean.
+- LIMITATION (finding 1 test): when the waive is not in a running round, `advance` also sends its ready prompt (built from the record's head, "complete at aaaaaaa ... ready for the merge decision"), and mergeNotes keeps only the note's first line, so the note's own standing is not observable and the test can't assert "not ready". The fix is in place but untested at that level. The stale "ready" text actually comes from advance's pre-existing ready path, which still judges the record's head: a concern for the coordinator.
