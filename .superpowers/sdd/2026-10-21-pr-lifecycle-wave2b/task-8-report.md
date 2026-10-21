@@ -137,3 +137,72 @@ Commit: `374a840` pr-lifecycle 1.5.0: the agent answers feedback while collectio
 - **`isOwn()` re-reads the record after each await.** That adds a few store reads per triage end. The generation check applies to every `afterTriage`, not only mid-collection turns. The full suite shows no behaviour change.
 - **The ticker skips the step timeout while a mid-collection turn settles.** The stale-flag check in `pollOnce` is the only backstop there. It runs on every tick (before the 30 s throttle), so it fires within a second of the threshold.
 - **The 5 s flaky tests** remain as before.
+
+## Fix round 1
+
+Commit: `72ef884` pr-lifecycle 1.5.0: a timed-out turn while collecting is asked again once; afterTriage guards every stop (R88, A4).
+This report section is a commit of its own.
+
+### Changes
+1. **The first timeout of a mid-collection turn goes back to collecting** (controller ruling).
+   - New `Run.midTurnTimeouts?: number`. `startRound` builds a new Run, so it resets each round.
+   - **Where it is handled:** the ticker handles `phase === 'triage' && collect !== undefined && pending.length > 0 && (midTurnTimeouts ?? 0) === 0` before the generic timeout branch, through the new `requeueMidTurn`.
+   - **When the patch applies:** only when the run is on the same round, still in `'triage'`, `collect` is still set, and the same pending step (same `step` and `turnId`, no answer yet) is in flight.
+   - **What the patch sets:**
+     - phase to `'collect'` and `phaseStartedAt` to now;
+     - `activeMs += now - phaseStartedAt`;
+     - `pending` to `[]`, `isSettling` to undefined and `hasReprompted` to false;
+     - `midTurnTimeouts` to 1;
+     - `r{n}-triage` to done, with the detail "timed out after …; asked again".
+   - **Asking again:** the turn's unanswered ids (`run.triaged` minus `rec.processed`) are removed from `handed`, so the next poll opens a new mid-collection turn that asks them again.
+   - **Logging:** kind `'head'`. `noteAttempt` is not called.
+   - **A second timeout in the same round:** unchanged, `noteAttempt` + `finish('error')` with the resume message.
+2. **A late answer to a timed-out turn (Minor 6):** no code change was needed. Instead I traced it and added a test.
+   - The main agent's answer matches a pending step only through `isTurnOf`, which requires the pending entry's `turnId` to equal the answering turn's id.
+   - That `turnId` is armed by `onTurnStart` for the turn that started with the step's prompt.
+   - After the timeout, `pending` is `[]`, so a late answer matches nothing.
+   - The re-ask's pending entry has no `turnId` until its own turn starts, and then gets that turn's id. The old turn's id never matches it.
+   - The new test checks this. The old turn (`turn-old`, started with the first prompt) ends after the re-ask was sent. Its answer is not applied: the run stays in triage with the answer unset and G2-1 open. The re-ask's own turn is then recorded.
+3. **Every stop in `afterTriage` is guarded after its awaits (Important 2):**
+   - Added `isOwn()` between `unpushedBy` and `failPost`.
+   - **Audit of every stop and write in `afterTriage`:**
+     - The record write: `isOwn` checked before it.
+     - The re-prompt: `isOwn` before it.
+     - The dirty `failPost`: `isOwn` after `git status`.
+     - `closeLifecycle` and the head-read `failPost`: `isOwn` after `rev-parse` and `gh pr view`.
+     - The `isPushed`/`fetchTwice`/`merge-base` awaits: followed by `isOwn` before the containment stop, and now again after `unpushedBy`.
+     - Back-to-collecting and `closeCollect`: only a clock read since the last `isOwn`.
+   - **The tail after `closeCollect`/`onNewHead`:** it now checks `round` and the record's `generation` as well as id and status.
+   - `checkRebuttals` and `endRound` keep their own `isRunning` checks.
+4. **Stale threshold (Minor 4):**
+   - It is now `Math.max(stepTimeoutMs, 5 * 60_000)`, and the log line names it.
+   - The stale test now first asserts that at 62 s, with a 1-minute step timeout, the flag is still set. It is cleared after 5 minutes.
+5. **A record that is gone after `afterTriage`'s write (Minor 5):**
+   - This is now a guarded `finish('error')`: "The lifecycle record of … is gone…".
+   - It is guarded by the same run id, `'running'`, the same round, and for a mid-collection turn its own `isSettling` token.
+   - The stop clears `isSettling`, so collection is never frozen.
+   - This applies to an end-of-head triage too, which used to return silently and wait for the step timeout.
+
+### Tests
+- **Updated:** "R88: a mid-collection turn that never answers goes back to collecting once; a second timeout in the round stops it" (formerly "…times out with an attempt…").
+  - The first timeout returns to collecting with no attempt and a log line, and the step is done with "timed out".
+  - The next turn asks G2-1 again.
+  - A second timeout stops the run with the attempt and the resume message.
+  - Resume collects again.
+- **New:**
+  - "R88: a late answer to a timed-out mid-collection turn is not read as the answer to the turn that asks again".
+  - "R88 (A4): a reset while afterTriage lists the unpushed commits writes no stop over it". The world gains a `git.onUnpushed` hook, and the test bumps the record's generation inside it.
+  - "R88 (A4): a record gone when afterTriage settles a turn while collecting stops the run with a clear message, never a frozen collection". It uses `w.afterRead`.
+- **Renamed and extended:** "R88: a settling flag older than the step timeout (at least five minutes) is cleared and collection goes on".
+- **Results:** `npm run test` passed codex-gate 22/22 and pr-lifecycle 573/573. A flow-only run before that had the known 5 s timeout in "#11 …rereviewEffort" once. `npm run lint` and `npm run typecheck` are clean.
+
+### Rulings to record (Task 16)
+- **`isTurn = phase === 'triage'`** in `pollOnce`, not `pending.length > 0 || isSettling`.
+  - With `collect` set, phase `'triage'` occurs only while a turn is in flight or `afterTriage` settles one, so the two tests are equivalent.
+  - It is fail-safe: a triage state with nothing pending and no flag still meets the ticker's step timeout.
+- **`endCollect` counts handed feedback:** `hasFindings` includes `run.handed`. Feedback a turn of the round answered while collecting counts as the round's feedback, as it did when it waited until collection ended. So a pass-through round 1 whose only comment was answered mid-collection goes on to the rebuttal check instead of ending in "No reviewer covered … within the wait cap".
+
+### Concerns
+- The "step timeout stops the run" concern above is resolved by item 1. A second mid-collection timeout in a round still needs `/pr-gate resume`, as ruled.
+- The re-ask after a timeout reuses the step id `r{n}-triage`. That is safe because answers match by turn id, not by step marker. If the engine's matching ever moved to step markers alone, the re-ask would need a distinct marker.
+- Minor 3 (the stale check sits behind the poll lock) is left alone, as directed.
