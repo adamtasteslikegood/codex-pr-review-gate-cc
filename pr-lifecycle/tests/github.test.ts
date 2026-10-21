@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   collectionDone,
+  hasOtherSteps,
   isNoAction,
   isTrusted,
   readCheckRuns,
@@ -455,4 +456,14 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   expect(readRequired('', undefined)).toBeUndefined()
   // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
   expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
+})
+
+test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
+  expect(hasOtherSteps('gh pr create --base dev --title "a; b && c"')).toBe(false)
+  expect(hasOtherSteps('gh pr create --base dev --body "$(cat body.md)"')).toBe(false)
+  expect(hasOtherSteps('cd /repo && gh pr create --base dev')).toBe(false)
+  expect(hasOtherSteps("gh pr create --base dev --body-file - <<'EOF'\nline one; two\nEOF")).toBe(false)
+  expect(hasOtherSteps("cat > body.md <<'EOF'\nSummary\nEOF\ngh pr create --base dev --body-file body.md")).toBe(true)
+  expect(hasOtherSteps('git push -u origin HEAD && gh pr create --base dev')).toBe(true)
+  expect(hasOtherSteps('gh pr merge 1 --squash; git checkout dev')).toBe(true)
 })

@@ -11,7 +11,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
 import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
-import { readPrAction } from './github'
+import { hasOtherSteps, readPrAction } from './github'
 import type { PrAction } from './github'
 import {
   allowanceFor,
@@ -577,6 +577,17 @@ function asHold(text: string): string {
   return text.startsWith('pr-gate: ') ? `pr-gate HOLD (not an error): ${text.slice('pr-gate: '.length)}` : `pr-gate HOLD (not an error): ${text}`
 }
 
+/** The line a hold on a chained Bash command ends with (R87): nothing in it ran, so the agent redoes the other steps on their own. */
+const CHAINED =
+  '\nNothing in this Bash command ran: a hold refuses the whole command, so the steps chained with the PR command did not run either. ' +
+  'Run those on their own (write a PR body file with the Write tool), and keep the PR command in a Bash call by itself.'
+
+/** What a refusal adds for this call: the R87 line when it is a Bash command with other steps. */
+const chainedOf = (tool: string, e: unknown): string => {
+  const command = (e as Record<string, unknown>).command
+  return tool === 'Bash' && typeof command === 'string' && hasOtherSteps(command) ? CHAINED : ''
+}
+
 /** What still stands between a record and ready, in a few words. */
 const HOLD: Record<string, string> = {
   open: 'unresolved',
@@ -1108,20 +1119,21 @@ export const register: Register = (on, options) => {
     }
     const action = readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
     if (action === undefined) return next(e)
+    const tail = chainedOf(String(e.tool), e)
     if (action.action === 'merge') {
       // A merge given by URL names its repository there: gh pr view reads that one, and another repo's PR is not intercepted.
       const command = (e as unknown as Record<string, unknown>).command
       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
-      return refusal !== undefined ? { deny: asHold(refusal) } : next(e)
+      return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)
     }
     const found = await gatedCreate($, action)
-    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) } : next(e)
-    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) } : next(e)
+    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
+    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
-    if (refusal !== undefined) return { deny: asHold(refusal) }
+    if (refusal !== undefined) return { deny: asHold(refusal) + tail }
     const ran = await next(e)
     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
     return ran
@@ -1133,7 +1145,7 @@ export const register: Register = (on, options) => {
       deny: asHold(
         'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
           `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
-      ),
+      ) + chainedOf(String(e.tool), e),
     }
   })
 

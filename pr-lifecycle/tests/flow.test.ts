@@ -3780,3 +3780,18 @@ test('R81: waive post with no PR from gh says the standing is unknown, not ready
   expect(sent[0]).not.toContain('PR #?')
   expect(sent[0]).not.toContain('ready for the merge decision')
 })
+
+test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
+  world(on)
+  const chained = { tool: 'Bash' as const, command: `cat > /tmp/body.md <<'EOF'\nSummary\nEOF\n${createPr.command} --body-file /tmp/body.md` }
+  const held = await $.tool.call(chained)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('Nothing in this Bash command ran')
+  expect(held.deny ?? '').toContain('Write tool')
+  const lone = await $.tool.call(createPr)
+  expect(isHeld(lone)).toBe(true)
+  expect(lone.deny ?? '').not.toContain('Nothing in this Bash command ran')
+  const chainedMerge = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash && git checkout dev' })
+  expect(isHeld(chainedMerge)).toBe(true)
+  expect(chainedMerge.deny ?? '').toContain('Nothing in this Bash command ran')
+})

@@ -560,6 +560,21 @@ function readBash(command: string): PrAction | undefined {
   return found.find((one) => one.action === 'merge') ?? found[0]
 }
 
+/**
+ * Whether a Bash command does more than its PR action (R87). A hook allows or refuses the whole command, so a held `gh pr create`
+ * also stops the file write or push chained with it. Quoted text, `$(…)` and heredoc bodies belong to their step; a bare `cd` is no step.
+ */
+export function hasOtherSteps(command: string): boolean {
+  const bare = dropHeredocs(command.replace(/\\\r?\n/g, ' '))
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, 'Q')
+    .replace(/\$\([^()]*\)/g, 'S')
+  const steps = bare
+    .split(/;|&&|\|\||\||\n/)
+    .map(one => one.trim())
+    .filter(one => one !== '' && !/^cd\s+\S+$/.test(one))
+  return steps.length > 1
+}
+
 // ------------------------------------------------------------------- MCP
 
 const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
