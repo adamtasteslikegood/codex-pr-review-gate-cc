@@ -79,3 +79,8 @@ Task 4: complete (commits 5c51b96..87c5c44, review clean)
 Task 4: minor (deferred): status puts the settled-deferral note before rec.message (cosmetic)
 Task 5: implementer dispatched (sonnet), BASE 14ddf6e
 Task 5: implementer DONE, commit d2a3afe (441 pass); review dispatched
+Task 5: review Approved (spec ✅); waiver+security P1 shows every hold, matching today's guard and spec §1
+Task 5: complete (commits 14ddf6e..d2a3afe, review clean)
+Task 5: minor (deferred): tests don't pin non-security holds under waiver+security P1, retargeted, round-owed, pre phase, disputed; holdText returns '' when all named
+Ruling: spec §1's 'late-feedback' Blocker kind and standingOf's late param are not built — the plan dropped them and judgeMerge's ready branch keeps today's untriagedFeedback hold (Task 7 leaves it), so a late review still blocks the merge — cost if wrong: late reviews aren't listed in the one standing text; final review can add it
+Task 6: implementer dispatched (sonnet), BASE bb3615b
