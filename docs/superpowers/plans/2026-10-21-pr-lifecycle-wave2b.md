@@ -3068,3 +3068,175 @@ git commit -m "pr-lifecycle 1.5.0: the gate files issues instead of asking for w
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
+
+---
+
+### Task 13: The agent merges when nothing holds the merge (R93, spec §6)
+
+**Why:** in 1.4.0, once nothing holds the merge, the ready prompt and the waiver notes say "ready for the merge decision, which is the person's: … do not merge unless they ask", and Adam has to send a follow-up message. Adam (2026-10-21): "once the gate allows a merge the agent should merge". The release train still protects production, so a merge does not ship code. The prompt now tells the agent to merge with `gh pr merge <n> --<method>` and report the merge commit. If GitHub refuses the merge, the agent reports GitHub's words and stops. The merge guard (`judgeMerge`) does not change: it still lets the command through only on a head whose standing allows it.
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`MergeMethod`)
+- Modify: `pr-lifecycle/hooks/core.ts` (`mergeStep`, `readyPrompt`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`Config`, `configOf`, `overrideConfig`, the ready branch of `advance`)
+- Modify: `pr-lifecycle/hooks/register.tsx` (the two waiver notes)
+- Test: `pr-lifecycle/tests/lifecycle.test.ts`, `pr-lifecycle/tests/settings.test.ts`, `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `readyPrompt` as Task 12 left it (its summary lists the follow-up issues and `scopeNote`). `configFor($, root, base)` from 1.4.0.
+- Produces: `export type MergeMethod = 'merge' | 'squash' | 'rebase'` in `types/index.d.ts`; `Config.mergeMethod: MergeMethod`; `export const mergeStep = (pr: number | undefined, method: MergeMethod): string` in `core.ts`; `readyPrompt(rec: LifecycleRecord, method: MergeMethod = 'merge'): string`.
+- Rulings for the plan:
+  - `mergeMethod` is read only from the base's `.github/pr-gate.json`, like `issueSpec`. There is no user setting for it.
+  - A refused merge is the agent's to report, and the gate sees no merge event. The lifecycle stays where it was. The next pass (a push, a new review, `/pr-gate resume`) reads the PR as usual.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `pr-lifecycle/tests/lifecycle.test.ts`, add `mergeStep` to the import from `'../hooks/core'`, and append:
+
+```ts
+test('R93: the ready prompt tells the agent to merge with the repository\'s method and report the merge commit', async () => {
+  const rec = { ...fresh(), pr: 7 }
+  const said = readyPrompt(rec)
+  expect(said).toContain('Nothing holds the merge: merge it now with gh pr merge 7 --merge and tell the person the merge commit')
+  expect(said).toContain("if GitHub refuses the merge, tell the person GitHub's words and stop")
+  expect(said).not.toContain("the person's")
+  expect(said).not.toContain('do not merge')
+  expect(readyPrompt(rec, 'squash')).toContain('gh pr merge 7 --squash')
+  expect(mergeStep(12, 'rebase')).toBe(
+    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is",
+  )
+})
+```
+
+In `pr-lifecycle/tests/settings.test.ts`, append:
+
+```ts
+test('R93: mergeMethod picks how the agent merges; merge by default, anything else is ignored', async () => {
+  expect(configOf({}).mergeMethod).toBe('merge')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"squash"}').config.mergeMethod).toBe('squash')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"rebase"}').config.mergeMethod).toBe('rebase')
+  const bad = overrideConfig(configOf({}), '{"mergeMethod":"fast-forward"}')
+  expect(bad.config.mergeMethod).toBe('merge')
+  expect(bad.ignored).toEqual(['mergeMethod (not merge, squash or rebase)'])
+})
+```
+
+In `pr-lifecycle/tests/flow.test.ts`:
+
+1. In `'a clean first post-PR round does not force a second'`, replace `expect(w.prompts.at(-1)).toContain('ready for the merge decision')` with `expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')`. Do the same for the other `toContain('ready for the merge decision')` (near line 1548).
+2. In `'R81: waive post tells the agent what it covers and what still holds'`, replace `expect(said).toContain("the merge decision, which is the person's")` with `expect(said).toContain('merge it now with gh pr merge 1 --merge')`.
+3. Append:
+
+```ts
+test('R93: the base\'s mergeMethod reaches the ready prompt', async ($, on) => {
+  const w = world(on)
+  w.git.roster = JSON.stringify({ mergeMethod: 'squash' })
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --squash')
+  // The guard still lets the merge through on the ready head (spec §6.3).
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+```
+
+   If `w.git.roster` holding only `mergeMethod` changes the roster or collection of this flow (no `reviewers` key), add the keys the existing `toTriage` world uses to the JSON, and note it in your report.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts tests/settings.test.ts`
+Expected: FAIL: `mergeStep` is not exported, `mergeMethod` is undefined.
+
+- [ ] **Step 3: Implement the type and the setting**
+
+In `pr-lifecycle/types/index.d.ts`, after `Lane`, add:
+
+```ts
+/** How the agent merges a PR the gate let through (R93): `gh pr merge --merge`, `--squash` or `--rebase`. */
+export type MergeMethod = 'merge' | 'squash' | 'rebase'
+```
+
+In `pr-lifecycle/hooks/round.ts`:
+
+1. Add `MergeMethod` to the type import from `'../types'`.
+2. Add to `Config`, after `issueSpec`: `/** How the agent merges once nothing holds the merge (R93). Repository file only. */ mergeMethod: MergeMethod`.
+3. In `configOf`, add `mergeMethod: 'merge',`.
+4. In `overrideConfig`, after `issueSpec`, add:
+
+```ts
+  const mergeMethod =
+    r.mergeMethod === undefined || r.mergeMethod === 'merge' || r.mergeMethod === 'squash' || r.mergeMethod === 'rebase'
+      ? r.mergeMethod
+      : bad('mergeMethod', 'not merge, squash or rebase')
+```
+
+   and in the returned config, `mergeMethod: mergeMethod ?? c.mergeMethod,`. Add `mergeMethod` to the doc comment's list of keys.
+
+- [ ] **Step 4: Implement the prompts**
+
+In `pr-lifecycle/hooks/core.ts`:
+
+1. Add `MergeMethod` to the type import from `'../types'`.
+2. Before `readyPrompt`, add:
+
+```ts
+/**
+ * What the agent does once nothing holds the merge (R93): it merges, with the repository's method, and reports the commit. A merge
+ * GitHub refuses is reported in GitHub's words; the lifecycle stays where it is. The merge guard still checks the head (judgeMerge).
+ */
+export const mergeStep = (pr: number | undefined, method: MergeMethod): string =>
+  `merge it now with gh pr merge ${pr ?? '<n>'} --${method} and tell the person the merge commit; ` +
+  "if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is"
+```
+
+3. Make `readyPrompt` take `method: MergeMethod = 'merge'`, and make its returned sentence end:
+
+```ts
+  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}.${note === undefined ? '' : ` ${note}`} Nothing holds the merge: ${mergeStep(rec.pr, method)}.`
+```
+
+   (`note` is Task 12's `scopeNote(rec)`.)
+
+In `pr-lifecycle/hooks/round.ts`, in the ready branch of `advance`:
+
+```ts
+    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: nothing holds the merge.`)
+    else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready to merge at ${at}`)
+    if (saved !== undefined) await say($, saved, readyPrompt(saved, (await configFor($, saved.root, saved.base)).config.mergeMethod))
+```
+
+In `pr-lifecycle/hooks/register.tsx`:
+
+1. Import `mergeStep` from `'./core'`.
+2. In the finding-waiver note (the `tellAgent` after `const standing = settled !== undefined && pr !== undefined ? …`), replace the `standing.mayProceed` text with:
+
+```ts
+        : standing.mayProceed
+          ? `nothing holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? settled?.base ?? '')).config.mergeMethod)}.`
+```
+
+3. In the `waive post` note, replace its `standing.mayProceed` text with:
+
+```ts
+        : standing.mayProceed
+          ? `nothing else holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? after?.base ?? '')).config.mergeMethod)}.`
+```
+
+   If an `await` inside the conditional reads poorly, compute `const method = …` above the `tellAgent` call instead; the text is what the tests check.
+4. Search for any other "do not merge unless they ask" or "ready for the merge decision" text in `pr-lifecycle/hooks/` (`grep -rn "merge decision\|do not merge unless" pr-lifecycle/hooks`). The register.tsx guidance at about line 763 ("or says the PR is ready for the merge decision") becomes "or says to merge the PR". Report anything else you change.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. `round.test.ts` fixtures that quote "ready for the merge decision" as an input text are batching tests: leave them. Then run `npm run lint` and `npm run typecheck` from the repo root.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/core.ts pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/register.tsx pr-lifecycle/tests/lifecycle.test.ts pr-lifecycle/tests/settings.test.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: the agent merges when nothing holds the merge; mergeMethod (R93)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
