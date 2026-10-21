@@ -95,3 +95,7 @@ Task 7: review Approved (spec ✅, untriagedFeedback ruling intact, R77 intact)
 Task 7: fix round 1/5 dispatched (FIX_BASE ee94802): restore gh stderr on unreadable CI; tighten tests 1 and 3
 Task 7: minor (deferred): standing read before late-review check (extra gh calls); retargeted/round-owed may repeat what 'missing' says (no id to skip)
 Task 7: fix round 1 implementer DONE, commit e8b9dd3 (446 pass); Blocker gains optional detail; readChecks returns {unreadable}; re-review dispatched
+Task 7: fix round 1/5 (2 addressed, 0 open; commits ee94802..e8b9dd3)
+Task 7: complete (commits e853524..e8b9dd3, review clean)
+Task 7: minor (deferred): unreadable reason in both said and detail (harmless duplication)
+Task 8: implementer dispatched (opus — timing + queue), BASE d32640d
