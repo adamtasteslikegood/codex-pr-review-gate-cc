@@ -283,9 +283,15 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
               raisedBy: linked.id, by: 'gate', at: when?.at ?? 0 },
           ],
         }
+  // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
+  // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
+  // raise: Codex's ruling clears it, and only a further raise sets it again.
+  const isRaisedToBlocking = severity !== original.severity && isBlocking({ severity })
+  const isMadeSecurity = linked.isSecurity === true && original.isSecurity !== true
+  const recheck = (isRaisedToBlocking || isMadeSecurity) && isAcceptedRebuttal(original) ? { needsRecheck: true } : {}
   return isPeakUnknown(original) || isPeakUnknown(linked)
-    ? { ...original, ...security, ...raised }
-    : { ...original, ...security, ...raised, peakSeverity: higher(peakOf(original), peakOf(linked)) }
+    ? { ...original, ...security, ...raised, ...recheck }
+    : { ...original, ...security, ...raised, ...recheck, peakSeverity: higher(peakOf(original), peakOf(linked)) }
 }
 
 /** The ids linked to a finding, for "G2-1 (also G2-2)". */
@@ -382,7 +388,7 @@ function isSame(a: { file?: string; line?: number; title: string }, b: { file?: 
 }
 
 /** When a finding was last rebutted, or undefined. */
-const rebuttedAt = (f: Finding): number | undefined => answersOf(f).filter(one => one.status === 'rebutted').at(-1)?.at
+export const rebuttedAt = (f: Finding): number | undefined => answersOf(f).filter(one => one.status === 'rebutted').at(-1)?.at
 
 /**
  * Where incoming feedback stands against the ledger. Prior review can make it a duplicate, never dismiss a new claim.

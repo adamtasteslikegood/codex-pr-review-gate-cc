@@ -67,7 +67,10 @@ export type Finding = {
   linkBy?: 'gate' | 'agent'
   /** Codex agreed the agent's link names the same problem. */
   isLinkChecked?: boolean
-  /** A later change touched its file: the evidence behind its status needs checking again. */
+  /**
+   * A later change touched its file, or a link raised it into blocking range or made it security (A9): the evidence behind its
+   * status needs checking again. Codex's check clears it.
+   */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
   lineHead?: string

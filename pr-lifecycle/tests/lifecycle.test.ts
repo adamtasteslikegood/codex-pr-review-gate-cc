@@ -14,6 +14,7 @@ import {
   acceptRebuttal,
   isAcceptedRebuttal,
   raisedIn,
+  rebuttedAt,
   decideNext,
   changedLines,
   invalidate,
@@ -1338,7 +1339,7 @@ test('A8: a post round is charged when the agent fixes a finding raised in it, o
   expect(isChargedRound([blocker, applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'main', 5)], 3)).toBe(true)
 })
 
-test('A9: a link\'s severity raise moves no status reader: an accepted rebuttal stays accepted, rebutted when it was, acknowledged', async () => {
+test('A9: a link\'s severity raise moves no status reader: the rebuttal\'s time and the acknowledgement stay, rejections are read as before', async () => {
   const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', title: 'cache never cleared', file: 'src/cache.ts', line: 10 })
   const acked = acceptRebuttal(applyAnswer(p3, { id: 'G2-1', action: 'acknowledged', note: 'by design' }, 2, 'main', 4), 2, 5)
   expect(isAcceptedRebuttal(acked)).toBe(true)
@@ -1350,17 +1351,35 @@ test('A9: a link\'s severity raise moves no status reader: an accepted rebuttal 
   expect(raised.severity).toBe('P1')
   expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P3', by: 'gate', raisedBy: 'G3-1' })
   expect(loweringOf(raised)).toBeUndefined()
-  // Codex's acceptance still stands, and so does the acknowledgement.
-  expect(isAcceptedRebuttal(raised)).toBe(true)
+  // Raised into blocking range, the accepted acknowledgement goes back to Codex at P1 (ruling on 6b concern 1), still named as one.
+  expect(isAcceptedRebuttal(raised)).toBe(false)
   expect(isAcknowledged(raised)).toBe(true)
   expect(rejections(raised)).toBe(0)
   expect(isDisputed(raised)).toBe(false)
-  // An accepted rebuttal holds nothing at any severity (R39); the link holds through it, so neither holds.
-  expect(mergeHolds(postRec({ findings: [raised, dup] }))).toEqual([])
-  expect(checksOwed([raised])).toEqual([])
-  // R33: a reply posted between the rebuttal (4) and the link (9) still answers the rebuttal; the raise is no new rebuttal.
+  expect(checksOwed([raised]).map(one => one.id)).toEqual(['G2-1'])
+  const blockers = standingOf(postRec({ findings: [raised, dup] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'rebuttal-unchecked', 'codex']])
+  expect(blockers[0]?.said).toContain('acknowledgement not yet confirmed')
+  expect(decideNext(postRec({ findings: [raised, dup] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  // Codex accepting it again settles it at P1; refusing it reopens it. Either way, once: the same link raises nothing more.
+  const settled = acceptRebuttal(raised, 3, 10)
+  expect(isAcceptedRebuttal(settled)).toBe(true)
+  expect(mergeHolds(postRec({ findings: [settled, dup] }))).toEqual([])
+  expect(withLinkedPeak(settled, dup).needsRecheck).toBeUndefined()
+  expect(markHeld(raised, 3, 'codex', 10, 'reachable at P1').status).toBe('open')
+  // A further raise, P1 to P0, sends it back once more; so does a link that makes it security.
+  expect(isAcceptedRebuttal(withLinkedPeak(settled, { ...dup, id: 'G3-2', severity: 'P0' }))).toBe(false)
+  expect(isAcceptedRebuttal(withLinkedPeak(settled, { ...dup, id: 'G3-3', isSecurity: true }))).toBe(false)
+  // A raise that stays advisory, P3 to P2, does not reopen it.
+  const p2 = withLinkedPeak(acked, { ...dup, id: 'G3-4', severity: 'P2', peakSeverity: 'P2' })
+  expect(p2.severity).toBe('P2')
+  expect(isAcceptedRebuttal(p2)).toBe(true)
+  expect(mergeHolds(postRec({ findings: [p2] }))).toEqual([])
+  // R33: a reply posted between the rebuttal (4) and the link (9) still answers the rebuttal; the raise moves no rebuttal time.
   const reply = { file: 'src/cache.ts', line: 11, title: 'cache never cleared on logout', at: 7 }
-  expect(triage(reply, [raised], new Set()).cls).toBe('new-on-reviewed')
+  expect(triage(reply, [p2], new Set()).cls).toBe('new-on-reviewed')
+  expect(rebuttedAt(raised)).toBe(5)
+  expect(rebuttedAt(p2)).toBe(5)
   // Nothing in the link's round: no charge, and the original was not raised in it.
   expect(isChargedRound([raised], 3)).toBe(false)
   // A rebuttal Codex has not ruled on stays one, and an open original raised by a link is not "raised in" the link's round.
