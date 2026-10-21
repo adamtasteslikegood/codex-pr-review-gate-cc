@@ -132,3 +132,6 @@ Task 11: review Approved (spec ✅)
 Task 11: complete (commits 9a599da..bb4f037, review clean)
 Task 11: minor (deferred): waive-post reach wording differs (spec/ROADMAP/R86); CLAUDE.md heading still "after wave 1"; R82 long
 Final review: dispatched (opus), BASE 7ab6b64, HEAD 7619966, package review-final-7ab6b64..7619966.diff
+Final review: With fixes. Critical 1 (C1 ADVISORY m-flag tags mixed bodies P3), Important 2 (I1 live head unreviewed not in standing; I2 spec gap), Minor 8. Report review-final-report.md
+Ruling: I2 — an R85 deferral settles only if the agent never lowered the finding's severity; otherwise it holds as before R85 — closes the agent-alone path to settling a guessed P1 — cost if wrong: a sincere lower-and-defer of a misguessed P2 needs Codex or a person
+Final fix: dispatched (opus), BASE ac9a91d, brief final-fix-brief.md (C1, followUp shape, stale followUp, I2, I1, M1, M2, M3, prHeadOf try, docs)
