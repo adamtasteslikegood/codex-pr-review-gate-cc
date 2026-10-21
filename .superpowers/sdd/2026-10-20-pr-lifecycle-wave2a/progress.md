@@ -118,3 +118,7 @@ Task 9: complete (commits 35ec60e..c986d23, review clean)
 Task 9: minor (deferred): waive <finding> live-head test doesn't observe the head used; reset-before-flush test checks the waive-pre note marker, not the open-PR body; reset text hard-codes /pr-gate
 Task 10: implementer dispatched (sonnet), BASE 158400a
 Task 10: implementer DONE, commit 03df5e2 (470 pass); review dispatched
+Task 10: review Approved (spec ✅)
+Task 10: complete (commits f8d8e03..03df5e2, review clean)
+Task 10: minor (deferred): pane stop's runCommand rejection uncaught (same as old button)
+Task 12: implementer dispatched (sonnet), BASE 8a00832
