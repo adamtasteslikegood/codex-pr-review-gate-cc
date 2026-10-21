@@ -121,6 +121,9 @@ export type Effort = 'high' | 'medium' | 'low'
 /** full: the whole gate. light: a branch named by `lightBranches` (chore/), one round and no advisories. */
 export type Lane = 'full' | 'light'
 
+/** How the agent merges a PR the gate let through (R93): `gh pr merge --merge`, `--squash` or `--rebase`. */
+export type MergeMethod = 'merge' | 'squash' | 'rebase'
+
 export type LifecyclePhase = 'pre' | 'post' | 'ready' | 'archived'
 
 /** baseline rounds and the final-head check are free; discretionary ones draw on the allowance. */

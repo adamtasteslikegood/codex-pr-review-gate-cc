@@ -10,7 +10,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
-import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+import { activityOf, classify, isVersionOnly, lowerOf, mergeStep, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { hasOtherSteps, readPrAction } from './github'
 import type { PrAction } from './github'
 import {
@@ -764,7 +764,7 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
           `or type /${COMMAND} reset to review it again for ${pr.baseRefName}.`
       : isRunning
         ? `Next: the gate. /${COMMAND} is collecting the reviews now. Leave this branch alone until it sends you what needs an answer, ` +
-          'or says the PR is ready for the merge decision; other work is fine.'
+          'or says to merge the PR; other work is fine.'
         : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'
           ? `This needs the person's decision: tell them which findings are deferred or disputed and why, then stop. They can type ` +
             `/${COMMAND} waive <findingId> <reason> for each one, or /${COMMAND} waive post <reason> to let this head merge.`
@@ -1017,7 +1017,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       standing === undefined
         ? 'nothing more is needed from you for this finding; the pre-PR review continues.'
         : standing.mayProceed
-          ? "nothing holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          ? `nothing holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? settled?.base ?? '')).config.mergeMethod)}.`
           : 'answer what is yours in the list above, and leave the rest to who it names.',
       standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
@@ -1135,7 +1135,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
             'Check it with gh pr view before telling the person anything; do not merge.'
         : standing.mayProceed
-          ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          ? `nothing else holds the merge: ${mergeStep(pr?.number, (await configFor($, root, pr?.baseRefName ?? after?.base ?? '')).config.mergeMethod)}.`
           : 'the waiver covers the review only: wait for what is listed, then tell the person.',
       standing)
   }

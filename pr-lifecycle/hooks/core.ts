@@ -29,7 +29,7 @@ import {
 } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, Next, TriageClass } from './lifecycle'
-import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Standing, Tier } from '../types'
+import type { Effort, Finding, LifecycleRecord, MergeMethod, Role, Run, Severity, Standing, Tier } from '../types'
 
 export const TRAILER = 'PR_GATE_RESULT'
 
@@ -869,7 +869,19 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
   return noted(lines.join('\n'))
 }
 
-export function readyPrompt(rec: LifecycleRecord): string {
+/**
+ * What the agent does once nothing holds the merge (R93): it merges, with the repository's method, and reports the commit. A merge
+ * GitHub refuses is reported in GitHub's words; the lifecycle stays where it is. The merge guard still checks the head (judgeMerge).
+ * A closing keyword (Closes, Fixes, Resolves #n) in the PR, a commit or the merge would close a follow-up issue on merge; the gate's
+ * own issue text never has one, and the agent is told not to write one. The post-merge check (Task 15) reopens any that closed anyway.
+ */
+export const mergeStep = (pr: number | undefined, method: MergeMethod): string =>
+  `merge it now with gh pr merge ${pr ?? '<n>'} --${method} and tell the person the merge commit; ` +
+  "never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, " +
+  'and the gate checks them after the merge; ' +
+  "if GitHub refuses the merge, tell the person GitHub's words and stop: the lifecycle stays where it is"
+
+export function readyPrompt(rec: LifecycleRecord, method: MergeMethod = 'merge'): string {
   const done = rec.rounds.filter(one => one.isCompleted)
   const pre = done.filter(one => one.phase === 'pre').length
   const post = done.filter(one => one.phase === 'post').length
@@ -881,7 +893,7 @@ export function readyPrompt(rec: LifecycleRecord): string {
     settled.length === 0 ? 'no follow-up issues' : `follow-up issues: ${settled.map(issueLine).join('; ')}`,
   ].join('; ')
   const note = scopeNote(rec)
-  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.${note === undefined ? '' : ` ${note}`}`
+  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. ${note === undefined ? '' : `${note} `}Nothing holds the merge: ${mergeStep(rec.pr, method)}.`
 }
 
 /**

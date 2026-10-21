@@ -831,7 +831,7 @@ test('a clean first post-PR round does not force a second', async ($, on) => {
   // R39: Codex checks the rebuttal on the same head first.
   await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
-  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
 })
 
@@ -1563,7 +1563,7 @@ test('waiving the last deferral makes the record ready, delivers the ready promp
   expect(rec.postStatus).toBeUndefined()
   expect(rec.waivers.map(one => [one.scope, one.findingId, one.by])).toEqual([['finding', 'G2-1', 'composer']])
   await w.clock.advance(1000)
-  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
 
@@ -3823,7 +3823,7 @@ test('R80: a waive post given while a round is finishing is followed by no hold 
   // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
   expect(sent).toHaveLength(1)
   // The only message is the waive's own note (R81), sent once.
-  expect(sent.filter(one => one.includes('ready for the merge decision') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
+  expect(sent.filter(one => one.includes('gh pr merge') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
   expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
   expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
 })
@@ -3988,7 +3988,7 @@ test('R81: waive post tells the agent what it covers and what still holds', asyn
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('pr-gate: the person waived post-PR review of PR #1')
   expect(said).toContain('Nothing else holds the merge')
-  expect(said).toContain("the merge decision, which is the person's")
+  expect(said).toContain('merge it now with gh pr merge 1 --merge')
 })
 
 test('R81: waive post sends the agent one message, not a note and a second waiver message', async ($, on) => {
@@ -4085,7 +4085,7 @@ test('R81: waiving a finding after a push no round recorded sends one message', 
   expect(sent).toHaveLength(1)
   expect(sent[0]?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
   // The live head is not the reviewed one: nothing says ready, and the note names the push (final review I1).
-  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  expect(sent.some(one => one.includes('gh pr merge'))).toBe(false)
   expect(sent[0]).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
   expect(sent[0]).toContain('/pr-gate resume reviews it')
 })
@@ -4215,7 +4215,7 @@ test('R81: waive post with no PR from gh says the standing is unknown, not ready
   expect(sent).toHaveLength(1)
   expect(sent[0]).toContain('what else holds the merge is unknown')
   expect(sent[0]).not.toContain('PR #?')
-  expect(sent[0]).not.toContain('ready for the merge decision')
+  expect(sent[0]).not.toContain('gh pr merge 1 --merge')
 })
 
 test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
@@ -5530,4 +5530,17 @@ test('R92: an issue filed while the person stops the gate is kept, and the resum
   await w.clock.advance(1000)
   expect(w.gh.filed).toHaveLength(1)
   expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R93: the base\'s mergeMethod reaches the ready prompt', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  // toTriage sets the roster, so the file is replaced after it, with the same reviewer and checks plus the method.
+  w.git.roster = JSON.stringify({ reviewers: ['claude[bot]'], checks: [], mergeMethod: 'squash' })
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --squash')
+  // The guard still lets the merge through on the ready head (spec section 6.3).
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
 })

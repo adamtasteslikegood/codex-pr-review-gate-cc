@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, LogEntry, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
+import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, LogEntry, MergeMethod, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -141,6 +141,8 @@ export type Config = {
   codexModelHigh: string | undefined
   /** The spec handle each filed issue's title names (R92); undefined names none. Repository file only. */
   issueSpec: string | undefined
+  /** How the agent merges once nothing holds the merge (R93). Repository file only. */
+  mergeMethod: MergeMethod
   /** Plugin options whose value was invalid, each with why: the default applies to them. */
   badOptions: string[]
 }
@@ -219,6 +221,7 @@ export function configOf(options: PluginOptions): Config {
     codexModel: model('codexModel'),
     codexModelHigh: model('codexModelHigh'),
     issueSpec: undefined,
+    mergeMethod: 'merge',
     badOptions,
   }
 }
@@ -228,7 +231,7 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths and issueSpec (R92), and the models and efforts (R68, R69),
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths, issueSpec (R92) and mergeMethod (R93), and the models and efforts (R68, R69),
  * each read as configOf reads the option. A key whose value is invalid is left to the option and named in `ignored`; an empty
  * regular expression turns its match off, and an empty model names none, as the option does.
  */
@@ -270,6 +273,10 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
   const issueSpec =
     r.issueSpec === undefined ? undefined : typeof r.issueSpec === 'string' && r.issueSpec.trim() !== '' ? r.issueSpec.trim().slice(0, 80) : bad('issueSpec', 'not a non-empty string')
+  const mergeMethod =
+    r.mergeMethod === undefined || r.mergeMethod === 'merge' || r.mergeMethod === 'squash' || r.mergeMethod === 'rebase'
+      ? r.mergeMethod
+      : bad('mergeMethod', 'not merge, squash or rebase')
   const highRisk = pattern('highRiskPaths')
   // Set or not, and to what: an empty string sets "no model", which undefined alone cannot tell from unset.
   const model = (key: ModelKey): { model: string | undefined } | undefined =>
@@ -296,6 +303,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
       allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high, light: lightRounds ?? c.allowances.light },
       onExhausted: onExhausted ?? c.onExhausted,
       issueSpec: issueSpec ?? c.issueSpec,
+      mergeMethod: mergeMethod ?? c.mergeMethod,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
       effort: efforts.effort ?? c.effort,
@@ -2894,9 +2902,9 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
     if (isStale) return advance($, root, branch, isResume)
     const at = (saved ?? rec).head.slice(0, 7)
-    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: ready for the merge decision.`)
-    else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready for the merge decision at ${at}`)
-    if (saved !== undefined) await say($, saved, readyPrompt(saved))
+    if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: nothing holds the merge.`)
+    else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready to merge at ${at}`)
+    if (saved !== undefined) await say($, saved, readyPrompt(saved, (await configFor($, saved.root, saved.base)).config.mergeMethod))
     return
   }
   const isPre = rec.phase === 'pre'

@@ -414,3 +414,12 @@ test('R92: issueSpec names the spec in each issue title; a blank or non-string o
   expect(bad.config.issueSpec).toBeUndefined()
   expect(bad.ignored).toEqual(['issueSpec (not a non-empty string)'])
 })
+
+test('R93: mergeMethod picks how the agent merges; merge by default, anything else is ignored', async () => {
+  expect(configOf({}).mergeMethod).toBe('merge')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"squash"}').config.mergeMethod).toBe('squash')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"rebase"}').config.mergeMethod).toBe('rebase')
+  const bad = overrideConfig(configOf({}), '{"mergeMethod":"fast-forward"}')
+  expect(bad.config.mergeMethod).toBe('merge')
+  expect(bad.ignored).toEqual(['mergeMethod (not merge, squash or rebase)'])
+})
