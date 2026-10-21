@@ -187,3 +187,57 @@ See the first concern below.
    when it records a fix"). The A8 flow test asserts the stamp, so a change would show.
 4. Older records may hold raise events without `raisedBy`, written by the unreleased 1.5.0
    branch's Task 7. None were shipped, so no migration was added.
+
+## Ruling follow-up (concern 1)
+
+**The ruling (controller):** a link that raises a rebutted original into blocking range (P0/P1), or makes it security, sends a rebuttal or acknowledgement Codex already accepted back to Codex for a re-check at the new severity, at no cost to the round.
+
+Commit: ef95ecd.
+
+### Mechanism
+
+I used the existing `needsRecheck` flag, not a new gate event.
+- `needsRecheck` is already what "Codex must rule on this evidence again" means for an accepted rebuttal whose file changed (R58).
+- `isAcceptedRebuttal` reads false while it is set. `checksOwed` and `rebuttalsOwed` pick the finding up, and `decidePost` blocks with `recheck: [id]`, no round spent.
+- The standing list shows it as `rebuttal-unchecked`, owner codex. The acknowledgement keeps its wording ("acknowledgement not yet confirmed").
+- `acceptRebuttal` clears the flag, so an accepted verdict settles the finding at the new severity. A refusal (`markHeld`) reopens it.
+- No history entry is added, so `rebuttedAt` (R33), `isAcknowledged` and `rejections` are untouched.
+
+### What changed
+
+- `pr-lifecycle/hooks/lifecycle.ts`, `withLinkedPeak`: it sets `needsRecheck: true` when both of these hold:
+  - the original was an accepted rebuttal before the link;
+  - the link raised its severity to P0/P1, or made it security when it was not.
+- `rebuttedAt` is now exported, so a test can assert it is unchanged.
+- `pr-lifecycle/types/index.d.ts`: the `Finding.needsRecheck` doc names the new reason.
+
+### Why it can't loop
+
+- The flag is set once per raise, and Codex's ruling clears it.
+- The same link applied again raises nothing, because the severity is already equal, so it sets nothing.
+- Only a further raise sets it again: P1 to P0, or a newly security link.
+- Severity can only rise, and only as far as P0, and security is set only once. So the number of re-checks is bounded.
+
+### Tests
+
+The A9 unit test in `tests/lifecycle.test.ts` was rewritten to check:
+- A P1 duplicate linked to an accepted P3 acknowledgement makes the original hold as `rebuttal-unchecked` (owner codex, "acknowledgement not yet confirmed").
+  - It is owed to Codex: `checksOwed`, and `decideNext` returns blocked with `recheck: ['G2-1']`.
+  - `rebuttedAt` stays 5, and there are 0 rejections and no dispute.
+- Codex accepting it again settles it: `mergeHolds` is empty. Re-applying the same link sets nothing.
+- Codex refusing it reopens it.
+- P1 to P0, and a security link, each send it back again.
+- A P3-to-P2 raise stays accepted and holds nothing, and its `rebuttedAt` is unchanged, so R33 still treats a later reply as answering the rebuttal.
+- With the re-check disabled, the test fails, which was verified.
+
+### Results
+
+- `npm run test`: 562/562 pass.
+- `npm run lint`: clean.
+- `npm run typecheck`: clean.
+- The two known 5 s timeouts flaked again on one run and passed on the full run.
+
+### Concerns
+
+- The pane shows an accepted rebuttal with `needsRecheck` as "re-verify owed (file changed)", from `markOf` in pane.tsx. For a raise, the "(file changed)" part is inaccurate. This is display only; the standing list and the hold text are correct.
+- The re-check is triggered only for a rebuttal Codex had *accepted*. A rebuttal still awaiting Codex is checked anyway, at the severity it has when Codex runs.
