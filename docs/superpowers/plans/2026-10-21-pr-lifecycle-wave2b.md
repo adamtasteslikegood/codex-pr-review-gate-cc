@@ -633,7 +633,10 @@ This step **replaces** the timestamp source in Steps 1-3. Codex showed that comm
   it reads `pushTimeOf`. It writes `headArrival: { head, at, isPushTime }`: `at` is the push time when GitHub gave it (never later
   than now), else `now` with `isPushTime: false`. Each `beginCollect` reads `pushTimeOf` again even when the stored head matches: a
   latest transition later than the stored time means the branch left the head and came back while no session saw it, and the later time
-  replaces the stored one. Within one collection, a known head's time never moves later. When a later poll finds the push time for a
+  replaces the stored one. The same holds within a collection (PR #25 review, A→B→A between two polls): before a poll ends
+  collection on coverage that rests on an issue comment (no `commit_id`), it reads `pushTimeOf` again; a later transition moves
+  `headArrival.at` and `collect.headAt` to it, and coverage is computed again on that poll. A failed read keeps the stored time and
+  does not hold the end of collection (the gate can't get stuck). Reviews by `commit_id` need no re-read. When a later poll finds the push time for a
   head stored with `isPushTime: false`, it replaces `at` with it (it is earlier) and sets `isPushTime: true`; try once per poll, at most
   until collection ends.
 - `beginCollect` and `pollOnce` take `collect.headAt` from `rec.headArrival` for that head, else `now`. Reviews still cover a head by
@@ -661,6 +664,8 @@ Tests (flow), replacing Step 1's check-run fixtures. Add a world knob `w.gh.push
 7. A record whose `headArrival` names an older head: the new head is looked up afresh; the old time is never reused.
 8. A→B→A: pushes A at 10, B at 20, a roster comment at 30, a force-push to A at 40 (all in `pushes`), the gate first sees A at 50: `headArrival.at` is 40 and the comment does not cover A.
 9. The record holds A at 10 (`isPushTime: true`); the branch went to B and back to A at 40 while no session ran; `/pr-gate resume`: `beginCollect` moves A's time to 40.
+10. During one collection: A stored at 10; between two polls the branch goes to B at 20, a roster issue comment arrives at 25, and the branch returns to A at 30. The next poll sees the same sha: it re-reads the push time before ending, moves `headAt` to 30, and the comment at 25 does not cover A; collection keeps waiting.
+11. Same, with the re-read failing: collection ends on the comment as before (no hold on a failed read), and the log notes the failed check.
 
 Use the most capable model for this task: the code is prose here, not given.
 
