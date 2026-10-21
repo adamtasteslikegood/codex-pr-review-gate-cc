@@ -111,3 +111,4 @@ Task 10: implemented f92e52b (BASE 4e15c32), 581/581, lint/typecheck clean, DONE
 - Task 10 fix round 1: 0fe8857, 583/583, lint/typecheck clean (request below tail guard + per-POST run/generation re-check; tests for reset at roster read and first-round re-request). Scoped re-review (sonnet) dispatched.
 - Task 10 re-review: all findings addressed, no new breakage. Deferred nit: no test for a reset between isOwn() and the tail guard (tail guard's checks unchanged).
 Task 10: complete (f92e52b, 0fe8857)
+Task 11: dispatched (BASE 6fc860c, opus, implementer a26b1daa749137795). Told: reconcile lastDeferral/deferralRuling with 6b answersOf; check 6b needsRecheck for an agreed deferral raised by a link (report, don't build new); linked duplicates follow the rebuttal pattern; a deferral owed Codex must always reach a check.
