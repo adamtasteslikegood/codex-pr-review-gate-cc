@@ -107,3 +107,4 @@ Task 9 task review (opus) dispatched on fb8911a..058efbd.
 Task 9: complete (058efbd)
 Task 10: dispatched (BASE 38c02a8, sonnet, implementer af110854db272ab14). Told: place re-request after Task 8's isOwn/isReset stand-downs; a failed gh re-request logs and carries on (gate can't get stuck).
 Task 10: implemented f92e52b (BASE 4e15c32), 581/581, lint/typecheck clean, DONE_WITH_CONCERNS (headArrival.asked no longer written at the re-request → #24 may ask the same reviewer again). Task review (sonnet) dispatched.
+- Task 10 review: Approved. headArrival.asked claim verified (missing mark → only a duplicate POST + log line; never counted coverage, no cap wait). Fix round 1 sent: move re-request below afterTriage's tail ended/generation guard (a stopped/reset run must send none) + test; test that a first post round's pushing turn re-requests. Deferred minor: no test for a reviewer-less roster.
