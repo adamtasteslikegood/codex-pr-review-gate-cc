@@ -4614,21 +4614,79 @@ test('R89: a failed read of commit statuses is logged and collection falls back 
   expect((await logOf(w)).some(one => one.startsWith('could not read commit statuses: gh: Server Error (HTTP 502)'))).toBe(true)
 })
 
-test('R88: each post round records whether it was charged: a clean one is free, a new blocker charges it', async ($, on) => {
+/** Rounds 2 and 3, the protected baseline pair, each fix a finding and push: round 4, the first discretionary one, is collecting on g. */
+const toDiscretionary = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
+  await done($, accept('r3-verify', w, { 'G2-1': true, 'G3-1': true }))
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+}
+
+/** The post rounds' isCharged, round by round. */
+const chargedOf = async (w: ReturnType<typeof world>) =>
+  (await recordOf(w)).rounds.filter(one => one.phase === 'post' && one.isCompleted).map(one => [one.n, one.kind, one.isCharged])
+
+test('R88: only a discretionary post round says whether it was charged: a baseline round carries nothing', async ($, on) => {
   const clean = world(on)
   clean.git.roster = roster
   await toPost($, clean)
   clean.gh.reviews = covers(clean.gh.prHead)
   await clean.clock.advance(30_000)
-  expect((await recordOf(clean)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([false])
+  // A baseline round never draws on the allowance, so it carries no isCharged.
+  expect(await chargedOf(clean)).toEqual([[2, 'baseline', undefined]])
 })
 
-test('R88: a round that raises a new blocker is charged', async ($, on) => {
+test('R88: a clean discretionary round is free', async ($, on) => {
   const w = world(on)
-  await toTriage($, w)
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
-  await done($, accept('r2-verify', w))
-  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([true])
+  await toDiscretionary($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect(await chargedOf(w)).toEqual([[2, 'baseline', undefined], [3, 'baseline', undefined], [4, 'discretionary', false]])
+})
+
+test('R88: a discretionary round that raises a new blocker is charged', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'rebutted', note: 'not reachable', replyId: '994' }]))
+  await done($, accept('r4-verify', w, { 'G4-1': true }))
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+})
+
+test('A8: a discretionary round whose P3 the agent fixes is charged; the clean round after it is free', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, 'nit: this helper name is unclear', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  w.git.head = '9'.repeat(40)
+  w.gh.prHead = '9'.repeat(40)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'fixed', severity: 'P3', replyId: '994' }]))
+  await done($, accept('r4-verify', w, { 'G2-1': true, 'G3-1': true, 'G4-1': true }))
+  // The fix is stamped with the round that raised it and asked about it, and the push ended that round.
+  const fixed = (await recordOf(w)).findings.find(one => one.id === 'G4-1')
+  expect(fixed?.history.find(one => one.status === 'reported-fixed')).toMatchObject({ round: 4, by: 'main' })
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+  // Round 5 reviews the fix's head and finds nothing: free.
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await chargedOf(w)).at(-1)).toEqual([5, 'discretionary', false])
+  expect((await recordOf(w)).phase).toBe('ready')
 })
 
 test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {

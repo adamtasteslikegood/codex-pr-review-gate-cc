@@ -2429,7 +2429,8 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     endHead,
     base: run.base,
     isCompleted,
-    ...(run.lifecycle === 'post' ? { isCharged: isChargedRound(run.findings, run.round) } : {}),
+    // Only a round that could draw on the allowance says whether it did: baseline rounds, final-head checks and attempts never do.
+    ...(run.lifecycle === 'post' && run.roundKind === 'discretionary' && isCompleted ? { isCharged: isChargedRound(run.findings, run.round) } : {}),
     ...codexOf(run),
     evidence: run.evidence,
     raised: { blocking: current.filter(isBlocking).length, advisory: current.filter(one => !isBlocking(one)).length },

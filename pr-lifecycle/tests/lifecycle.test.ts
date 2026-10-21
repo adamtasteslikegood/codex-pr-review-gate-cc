@@ -1305,3 +1305,32 @@ test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
   expect(next.kind).toBe('blocked')
   expect(JSON.stringify(next)).not.toContain('did not accept the rebuttal')
 })
+
+// ------------------------------------------------------------- A8 (task 6b)
+
+test('A8: a post round is charged when the agent fixes a finding raised in it, of any severity; once, and only for its own findings', async () => {
+  const p3 = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P3' })
+  // The triage answer is stamped with the round that asked, the one that raised it (afterTriage, before the push ends the round).
+  expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action: 'fixed', note: 'renamed' }, 3, 'main', 5)], 3)).toBe(true)
+  // A rebuttal, a deferral or an acknowledgement of a non-blocking finding stays free.
+  for (const action of ['rebutted', 'deferred', 'acknowledged'] as const) {
+    expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action, note: 'no' }, 3, 'main', 5)], 3)).toBe(false)
+  }
+  // A finding raised in round 2 and fixed in round 3 does not charge round 3 by this rule (nor round 2, whose record is written).
+  const earlier = applyAnswer({ ...p3, id: 'G2-1', round: 2 }, { id: 'G2-1', action: 'fixed' }, 3, 'main', 5)
+  expect(isChargedRound([earlier], 3)).toBe(false)
+  expect(isChargedRound([earlier], 2)).toBe(false)
+  // Only the agent's fix: the gate's or Codex's event with a reported-fixed status is none.
+  expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'gate', at: 5 }] }], 3)).toBe(false)
+  expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'codex', at: 5 }] }], 3)).toBe(false)
+  // The pre-PR fixer is the agent too.
+  expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'fixer', 5)], 3)).toBe(true)
+  // A linked duplicate fixed charges nothing; its original carries the charge when it was raised in the round.
+  const original = finding({ id: 'G1-1', round: 1, source: 'github', severity: 'P3' })
+  const dup = linkTo(finding({ id: 'G3-2', round: 3, source: 'github', severity: 'P3' }), original, 'gate', 3, 4)
+  const fixedDup = { ...dup, status: 'reported-fixed' as const, history: [...dup.history, { round: 3, status: 'reported-fixed' as const, by: 'main', at: 5 }] }
+  expect(isChargedRound([original, fixedDup], 3)).toBe(false)
+  // A round with both a new blocker and a fix is charged once: a boolean.
+  const blocker = finding({ id: 'G3-3', round: 3, source: 'github', severity: 'P1' })
+  expect(isChargedRound([blocker, applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'main', 5)], 3)).toBe(true)
+})

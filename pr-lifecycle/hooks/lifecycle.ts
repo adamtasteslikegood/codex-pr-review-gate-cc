@@ -109,18 +109,26 @@ const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed'
 
 /**
  * Whether a post round costs one (R88): a blocking finding first raised in it, or Codex reopening, in it, a finding the agent had
- * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does.
+ * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does. Or the agent fixed,
+ * in it, a finding raised in it, at any severity (A8: "charge the push that fixes last round's findings"); a triage answer is stamped
+ * with the round that asked, which the push then ends. A rebuttal, deferral or acknowledgement of a non-blocking finding stays free,
+ * and a round is charged once, whatever the reasons.
  */
 export function isChargedRound(findings: readonly Finding[], round: number): boolean {
   // A linked duplicate is not new (R90): it holds through its original.
   const isNewBlocker = findings.some(one => one.round === round && isBlocking(one) && one.duplicateOf === undefined)
+  // The agent's fix (main's, or the fixer's), never a gate or Codex entry; a linked duplicate's fix is its original's to charge.
+  const isFixed = findings.some(one =>
+    one.round === round && one.duplicateOf === undefined &&
+    one.history.some(each => each.round === round && each.status === 'reported-fixed' && each.by !== 'codex' && each.by !== 'gate'),
+  )
   // Codex refusing the agent's link rejects no answer (R90): the item was never answered.
   const isRejected = findings.some(one =>
     one.history.some((each, i) =>
       each.round === round && each.by === 'codex' && each.status === 'open' && each.refusedLink === undefined && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open'),
     ),
   )
-  return isNewBlocker || isRejected
+  return isNewBlocker || isRejected || isFixed
 }
 
 const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }

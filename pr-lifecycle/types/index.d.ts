@@ -128,8 +128,9 @@ export type RoundRecord = {
   base?: string
   isCompleted: boolean
   /**
-   * Post only (R88): whether the round drew on the allowance, because a new blocker was raised in it or Codex rejected a fix,
-   * rebuttal or acknowledgement in it. Absent on a pre round and on a record from before 1.5.0, which count as charged.
+   * A completed discretionary post round only (R88): whether it drew on the allowance, because a new blocker was raised in it, Codex
+   * rejected a fix, rebuttal or acknowledgement in it, or the agent fixed a finding raised in it, at any severity (A8). Absent on a pre
+   * round and on a record from before 1.5.0, which count as charged, and on a baseline round, a final-head check or an attempt.
    */
   isCharged?: boolean
   /** The Codex effort the round, or the attempt, ran at. Absent on a record from before 1.2.0. */
