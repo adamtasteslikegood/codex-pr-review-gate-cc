@@ -631,8 +631,15 @@ const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | un
     ].join('\n') + unknownNote(action)
   }
   const failing = ci.filter(one => one.kind === 'ci-failing').map(one => one.id ?? '?')
-  const running = ci.filter(one => one.kind === 'ci-running').map(one => one.id ?? '?')
-  const said = [...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]), ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`])]
+  // A required check that never reported (gate R1-3) is held like a running one, and named as what it is.
+  const isMissing = (one: Standing['blockers'][number]): boolean => one.said.endsWith('has not reported')
+  const running = ci.filter(one => one.kind === 'ci-running' && !isMissing(one)).map(one => one.id ?? '?')
+  const missing = ci.filter(one => one.kind === 'ci-running' && isMissing(one)).map(one => one.id ?? '?')
+  const said = [
+    ...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]),
+    ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`]),
+    ...(missing.length === 0 ? [] : [`required but not reported: ${missing.join(', ')}`]),
+  ]
   return [
     `${head}: CI on ${short} is not green (${said.join('; ')}).`,
     ...(standing.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${standing.setAside.join(', ')}.`]),
@@ -643,6 +650,9 @@ const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | un
     ...(running.length === 0
       ? []
       : [`${failing.length === 0 ? 'Your next step: wait' : 'Wait'} for the running checks (gh pr checks ${pr.number} --watch), then try the merge again.`]),
+    ...(missing.length === 0
+      ? []
+      : ['A check the base requires has not reported on this head: wait for it to start, or find why its workflow does not run here, then try the merge again.']),
   ].join('\n') + unknownNote(action)
 }
 

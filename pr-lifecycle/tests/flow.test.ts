@@ -3518,6 +3518,20 @@ test('R86: with the required checks unreadable, a waiver sets nothing aside', as
   expect(held.deny ?? '').toContain('Independent Claude review')
 })
 
+test('gate R1-3: a required check that never reported holds a waived merge until it passes', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.checks = []
+  await say($, 'waive post reviewed by hand')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('required but not reported: check')
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
 test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
   const w = world(on)
   w.git.roster = roster

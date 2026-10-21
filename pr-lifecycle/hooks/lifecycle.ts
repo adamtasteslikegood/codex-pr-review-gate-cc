@@ -488,7 +488,9 @@ export function standingOf(rec: LifecycleRecord, at: { head: string; base: strin
       blockers.push(
         isBad
           ? { kind: 'ci-failing', id: one.name, said: `check ${one.name} ${one.bucket === 'cancel' ? 'cancelled' : 'failing'}`, owner: 'agent', release: 'fix what it reports and push, or rerun it (gh run rerun <run-id> --failed)' }
-          : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
+          : one.bucket === 'missing'
+            ? { kind: 'ci-running', id: one.name, said: `required check ${one.name} has not reported`, owner: 'gate', release: 'wait for it to start, or check why it does not run on this head' }
+            : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
       )
     }
   }
