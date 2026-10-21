@@ -780,6 +780,19 @@ test('R85: isSettledDeferral needs deferred, P3, an issue follow-up, its label a
   expect(isSettledDeferral({ ...base, peakSeverity: 'P1', followUpLabel: 'P1' })).toBe(true)
 })
 
+test('gate R7-6: a record from before peakSeverity whose severity the agent set, from an unknown one, never settles on its own', async () => {
+  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'hint', followUp: '#1', followUpLabel: 'P3' })
+  // The P1 it was raised at is not on the record: the agent's P3 answer names no severity before it.
+  const legacy = { ...base, history: [{ round: 2, status: 'deferred' as const, severity: 'P3' as const, note: 'cosmetic', by: 'main' as const, at: 5 }] }
+  expect(wouldSettle(legacy)).toBe(false)
+  expect(isSettledDeferral(legacy)).toBe(false)
+  expect(isLoweringOwed(legacy)).toBe(false)
+  // The same answer on a record that knows the peak goes to Codex, as any lowering does.
+  expect(isLoweringOwed({ ...legacy, peakSeverity: 'P1' })).toBe(true)
+  // A legacy record whose history names no severity has nothing unknown: its severity is its peak.
+  expect(isSettledDeferral(base)).toBe(true)
+})
+
 test('R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)', async () => {
   const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', followUpLabel: 'P3' })
   const ok = ['https://github.com/me/repo/issues/12', '#12', 'me/repo#12', ' #12 ', 'KAN-9 #12', 'tracked in issue #12 (KAN-9)']

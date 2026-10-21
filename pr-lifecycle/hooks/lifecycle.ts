@@ -450,8 +450,18 @@ const loweringRuling = (f: Finding): Finding['history'][number] | undefined => {
 /** A P3 deferred to a GitHub issue, not security: what may settle without the person (R85). */
 const isIssueDeferral = (f: Finding): boolean => f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp)
 
+/**
+ * A record from before peakSeverity whose first severity entry the agent set, naming none before it: the severity the finding was
+ * raised at is lost, so its peak, and the label its issue would carry, are unknown (gate R7-6). It waits for the person.
+ */
+const isPeakUnknown = (f: Finding): boolean => {
+  const first = f.history.find(one => one.severity !== undefined)
+  return f.peakSeverity === undefined && first !== undefined && first.by !== 'codex' && first.from === undefined
+}
+
 /** A deferral that would settle but for the agent's lowering of its severity: Codex rules on the lowering first (Adam, 2026-10-20). */
-export const isLoweringOwed = (f: Finding): boolean => isIssueDeferral(f) && loweringOf(f) !== undefined && loweringRuling(f) === undefined
+export const isLoweringOwed = (f: Finding): boolean =>
+  isIssueDeferral(f) && !isPeakUnknown(f) && loweringOf(f) !== undefined && loweringRuling(f) === undefined
 
 /** Codex disagreed with the last lowering, in words; undefined when it did not. */
 export function loweringRefusal(f: Finding): string | undefined {
@@ -471,7 +481,8 @@ export const ruleLowering = (f: Finding, holds: boolean, round: number, at: numb
  * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-20): a P3, not security, deferred to a
  * GitHub issue, whose severity the agent either never lowered or lowered with Codex agreeing since. A guessed P3 settles as a tagged one.
  */
-export const wouldSettle = (f: Finding): boolean => isIssueDeferral(f) && (loweringOf(f) === undefined || loweringRuling(f)?.lowering === 'agreed')
+export const wouldSettle = (f: Finding): boolean =>
+  isIssueDeferral(f) && !isPeakUnknown(f) && (loweringOf(f) === undefined || loweringRuling(f)?.lowering === 'agreed')
 
 /**
  * A P3 deferral settled without the person's waiver (R85, decision I): it would settle, and the gate labelled its issue with the

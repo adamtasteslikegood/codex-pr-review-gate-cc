@@ -188,6 +188,11 @@ export type LifecycleRecord = {
   replies: Record<string, string>
   waivers: Waiver[]
   phase: LifecyclePhase
+  /**
+   * Which lifecycle of the branch this is: a reset raises it, and a fresh start keeps the raised one, so work begun before a reset
+   * can tell the record replaced even when the new one has no rounds yet (gate G7-7). Absent means 0.
+   */
+  generation?: number
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string

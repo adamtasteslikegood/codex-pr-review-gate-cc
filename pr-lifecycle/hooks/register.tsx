@@ -305,7 +305,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         : {
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
             // After a reset: feedback already processed and replied to stays answered (R47).
-            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies }),
+            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, generation: prior.generation }),
             effort,
             ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
           }
@@ -1048,7 +1048,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       if (refusal !== undefined) return undefined
       const base =
         one?.phase === 'archived' || one === undefined
-          ? newRecord({
+          ? {
+            // A record started over a reset keeps the reset's generation (gate G7-7).
+            generation: one?.generation,
+            ...newRecord({
               root,
               branch,
               base: found?.name ?? one?.base ?? '',
@@ -1058,7 +1061,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
               lane: 'full',
               allowance: allowances.standard,
               at: now,
-            })
+            }),
+          }
           : one
       const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
@@ -1092,7 +1096,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   await upsertRecord($, root, branch, one => {
     const base =
       one === undefined || one.phase === 'archived'
-        ? newRecord({
+        ? {
+          // A record started over a reset keeps the reset's generation (gate G7-7).
+          generation: one?.generation,
+          ...newRecord({
             root,
             branch,
             base: pr?.baseRefName ?? fallback ?? config.bases[0] ?? 'dev',
@@ -1102,7 +1109,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
             lane: 'full',
             allowance: 0,
             at: now,
-          })
+          }),
+        }
         : one
     return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
   })

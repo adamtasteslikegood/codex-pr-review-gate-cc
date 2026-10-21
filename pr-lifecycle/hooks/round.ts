@@ -773,7 +773,7 @@ export async function archiveLifecycle($: Engine, root: string, branch: string, 
     await archiveRecord($, last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
+    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived', generation: (last.generation ?? 0) + 1 })
     return true
   })
 }
@@ -2239,7 +2239,9 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   // A deferral that settles once its issue carries the finding's peak severity is labelled first, every pass until it is (R85).
-  rec = await labelDeferrals($, rec)
+  const labelled = await labelDeferrals($, rec)
+  if (labelled === undefined) return
+  rec = labelled
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2352,10 +2354,11 @@ const LABEL_COLOURS: Record<Severity, string> = { P0: 'b60205', P1: 'd93f0b', P2
 
 /**
  * Labels the follow-up issue of each deferral that would settle with the highest severity its finding had (R85, Adam 2026-10-20),
- * once per peak: a peak that rose since adds the new label. The label is made first (`--force` keeps one that exists); a failed edit
- * is recorded on the finding, which holds the merge until a later pass labels it (fail closed). Only after the PR opens.
+ * once per peak: a peak that rose since adds the new label. The label is made first when the repository lacks it; a failed edit
+ * is recorded on the finding, which holds the merge until a later pass labels it (fail closed). Only after the PR opens. Undefined
+ * when the lifecycle was reset, replaced or stopped while gh ran: the caller decides nothing for it.
  */
-export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord> {
+export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
   if (rec.phase === 'pre') return rec
   const owed = rec.findings.filter(one => wouldSettle(one) && one.followUpLabel !== peakOf(one))
   if (owed.length === 0) return rec
@@ -2375,21 +2378,27 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
       continue
     }
     const label = `severity:${peak}`
-    await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak], '--force'])
+    // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). gh refuses one that
+    // exists; the edit below reports any real failure.
+    await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak]])
     const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
     results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
     await logEvent($, rec.root, rec.branch, 'check', edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`)
   }
+  // A reset, a fresh lifecycle or a stop while gh ran ends this pass: nothing is written, and nothing is decided (gate G7-8, R7-4).
+  let isSuperseded = false
   // Written only where the follow-up and peak are still the ones labelled: a later answer that moved either is labelled anew.
-  const saved = await updateRecord($, rec.root, rec.branch, latest => ({
-    ...latest,
-    findings: latest.findings.map(f => {
+  const saved = await updateRecord($, rec.root, rec.branch, latest => {
+    isSuperseded = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
+    if (isSuperseded) return latest
+    const findings = latest.findings.map(f => {
       const got = results.get(f.id)
       if (got === undefined || got.followUp !== f.followUp || got.peak !== peakOf(f)) return f
       return got.error === undefined ? { ...f, followUpLabel: got.peak, followUpLabelError: undefined } : { ...f, followUpLabelError: got.error }
-    }),
-  }))
-  return saved ?? rec
+    })
+    return { ...latest, findings }
+  })
+  return isSuperseded ? undefined : (saved ?? rec)
 }
 
 /** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */
@@ -2408,6 +2417,7 @@ export async function isStillCurrent($: Engine, rec: LifecycleRecord): Promise<b
   return (
     latest !== undefined &&
     latest.phase !== 'archived' &&
+    (latest.generation ?? 0) === (rec.generation ?? 0) &&
     latest.head === rec.head &&
     latest.pr === rec.pr &&
     latest.postStatus === rec.postStatus &&

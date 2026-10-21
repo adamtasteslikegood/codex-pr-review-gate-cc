@@ -311,12 +311,17 @@ the same on main.
     <reason>". A later lowering needs Codex again;
   - the gate labelled the issue `severity:<peak>`: `peakSeverity` is the
     highest severity the finding had (set at creation, raised by any
-    answer; older records read it from their history). `advance` labels
-    each such issue first (`gh label create … --force`, then
+    answer; older records read it from their history, and one whose
+    first severity entry the agent set with none before it has an unknown
+    peak and waits for the person, gate R7-6). `advance` labels each such
+    issue first (`gh label create`, only made when missing, so an existing
+    label keeps its colour, gate R7-7; then
     `gh issue edit <n> --repo <owner/repo> --add-label severity:<peak>`),
     once per peak, recording `followUpLabel`. A failure records gh's error
     and holds: "could not label issue #<n> severity:<peak> (<error>)",
-    owner agent, retried on the next pass;
+    owner agent, retried on the next pass. A reset, a fresh lifecycle or a
+    stop while gh runs ends that pass with nothing written or decided
+    (gate G7-8);
   - it is not security-flagged.
 
   A deferral that comes without a `followUp` clears an earlier one.

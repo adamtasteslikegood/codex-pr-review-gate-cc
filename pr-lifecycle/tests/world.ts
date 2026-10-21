@@ -101,6 +101,10 @@ export type World = {
     calls: string[]
     /** How `gh issue edit` answers when the gate labels a follow-up issue (R85): 'ok' (default) or 'fail'. */
     labelAnswer?: 'ok' | 'fail'
+    /** How `gh label create` answers: 'ok' (default) or 'exists', as gh does for a label the repository already has. */
+    labelCreateAnswer?: 'ok' | 'exists'
+    /** Called on each `gh issue edit`, before it answers: a test acts while the gate labels an issue. */
+    onLabel?: () => void | Promise<void>
     /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
     labelled: string[]
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
@@ -306,6 +310,8 @@ export function world(on: On): World {
       // The follow-up issue's severity label (R85): the label is made, then added to the issue, unless the test makes the edit fail.
       if (args.startsWith('label create') || args.startsWith('issue edit')) {
         w.gh.labelled.push(args)
+        if (args.startsWith('label create') && w.gh.labelCreateAnswer === 'exists') return failed(`label with name "${args.split(' ')[2]}" already exists; use \`--force\` to update its color and description`)
+        if (args.startsWith('issue edit')) await w.gh.onLabel?.()
         if (args.startsWith('issue edit') && w.gh.labelAnswer === 'fail') return failed('GraphQL: Could not resolve to an issue or pull request with the number of 12.')
         return out('')
       }

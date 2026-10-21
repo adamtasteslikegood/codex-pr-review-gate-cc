@@ -3418,8 +3418,38 @@ test('R85: a P3 deferred with a recorded follow-up settles without a waiver, onc
   const found = rec.findings.find(one => one.id === 'G2-1')
   expect(found?.followUp).toBe(ISSUE)
   expect(found?.followUpLabel).toBe('P3')
-  expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16 --force')
+  expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16')
   expect(labelled(w, 9, 'P3')).toBe(true)
+})
+
+test('gate R7-7: a severity label the repository already has is kept as it is, and the issue is still labelled', async ($, on) => {
+  const w = world(on)
+  w.gh.labelCreateAnswer = 'exists'
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  expect(w.gh.labelled.some(one => one.includes('--force'))).toBe(false)
+  expect(labelled(w, 9, 'P3')).toBe(true)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing for the archived lifecycle', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  let isResetting = false
+  w.gh.onLabel = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  // No round was started on the archived seed: the person ended this review.
+  expect(rec.rounds).toEqual([])
+  expect((await runOf(w)).status).not.toBe('running')
 })
 
 test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
@@ -4029,6 +4059,29 @@ test('gate G7-3: a reset while waive post gathers the standing is not followed b
   const sent = w.prompts.slice(prompts)
   expect(sent.some(one => one.startsWith('pr-gate: the person reset'))).toBe(true)
   expect(sent.some(one => one.startsWith('pr-gate: the person waived'))).toBe(false)
+})
+
+test('gate G7-7: a reset and a fresh start while waive post gathers the standing are not followed by the old waiver note', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isRestarting = false
+  w.gh.onChecks = async () => {
+    if (isRestarting) return
+    isRestarting = true
+    await say($, 'reset')
+    await say($, '')
+  }
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  expect(isRestarting).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  // The new lifecycle reports for itself; the old waiver's note, which the new record no longer carries, is not sent.
+  expect(sent.some(one => one.includes('waived post-PR review'))).toBe(false)
+  expect(sent.some(one => one.includes('Nothing else holds the merge') || one.includes('nothing else holds the merge'))).toBe(false)
+  expect((await recordOf(w)).waivers).toEqual([])
+  expect((await recordOf(w)).generation).toBe(1)
 })
 
 test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {
