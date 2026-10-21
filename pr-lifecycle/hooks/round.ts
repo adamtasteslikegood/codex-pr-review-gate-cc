@@ -2386,6 +2386,7 @@ export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<L
     // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). gh refuses one that
     // exists; the edit below reports any real failure.
     await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak]])
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
     const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
     results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
