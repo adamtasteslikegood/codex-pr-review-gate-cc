@@ -3522,6 +3522,7 @@ test('R80: a waive post given while a round is finishing is followed by no hold 
   expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
   expect(sent.some(one => one.includes('post-PR round'))).toBe(false)
   // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
+  expect(sent).toHaveLength(1)
   // The only message is the waive's own note (R81), sent once.
   expect(sent.filter(one => one.includes('ready for the merge decision') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
   expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
@@ -3733,6 +3734,49 @@ test('R81: a reset before the flush drops the earlier command\'s open-PR prompt 
   await say($, 'reset')
   await w.clock.advance(1000)
   const sent = w.prompts.slice(prompts)
-  expect(sent.some(one => one.includes('open the pull request'))).toBe(false)
+  expect(sent.some(one => one.includes('the person waived the pre-PR review'))).toBe(false)
   expect(sent.at(-1)).toContain('the person reset the lifecycle')
+})
+
+test('R81: waiving a finding after a push no round recorded sends one message', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.head = 'e'.repeat(40)
+  w.gh.reviews = []
+  await w.clock.advance(30_000)
+  const prompts = w.prompts.length
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived G2-1'))).toHaveLength(1)
+  // advance's own ready prompt, keyed on the record's head, merges behind the note here; the note's standing is not observable
+  // through the merge, so this pins one message and the lookup of the PR head (no crash, no second prompt).
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
+})
+
+test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+})
+
+test('R81: waive post with no PR from gh says the standing is unknown, not ready', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = false
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent).toHaveLength(1)
+  expect(sent[0]).toContain('what else holds the merge is unknown')
+  expect(sent[0]).not.toContain('PR #?')
+  expect(sent[0]).not.toContain('ready for the merge decision')
 })
