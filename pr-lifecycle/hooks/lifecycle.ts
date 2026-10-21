@@ -235,7 +235,9 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
   return { ...next, severity, history, ...peak, ...(security ? { isSecurity: true } : {}),
     // A deferral without a follow-up clears an earlier one: an old follow-up never settles a later deferral (final review T4).
     ...(a.action === 'deferred' ? { followUp: a.followUp } : {}),
-    ...(isNewFollowUp ? { followUpLabel: undefined, followUpLabelError: undefined } : {}) }
+    ...(isNewFollowUp ? { followUpLabel: undefined } : {}),
+    // A new answer makes an earlier filing failure stale: the next filing pass tries again and says what it finds (R92).
+    issueError: undefined, followUpLabelError: undefined }
 }
 
 /** A rebuttal that is the agent's acknowledgement of a comment asking for no change (R82): named as such in every text (R94). */
@@ -805,13 +807,16 @@ const short = (sha: string): string => sha.slice(0, 7)
 /** A finding's name in agent-facing text: a reviewer's comment is named by who wrote it, since its title is the reviewer's own first line. */
 export const titleOf = (one: Pick<Finding, 'source' | 'reviewer' | 'title'>): string => (one.source === 'github' ? `comment from ${one.reviewer}` : one.title)
 
-const LABEL_RELEASE = 'check the issue exists and gh can edit it; the gate retries on the next pass'
+/** A failed filing's release: the gate retries, and the person can always end it with a waiver, so it is never stuck (R92). */
+const labelRelease = (id = '<findingId>'): string =>
+  `check the issue exists and gh can edit it; the gate retries on the next pass, or the person can /pr-gate waive ${id} <reason>`
 
 /** A failed label on a finding's issue, in words (R85, R92). */
 const labelFailure = (f: Finding): string =>
   `could not label issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'} severity:${filingPeak(f)} (${f.followUpLabelError ?? 'no error recorded'})`
 
-const ISSUE_RELEASE = 'check that gh can create issues in the repository (gh auth status); the gate retries on the next pass'
+const issueRelease = (id = '<findingId>'): string =>
+  `check that gh can create issues in the repository (gh auth status); the gate retries on the next pass, or the person can /pr-gate waive ${id} <reason>`
 
 /** A failed filing in words (R92). */
 const issueFailure = (f: Finding): string => `could not file an issue for ${f.id} (${f.issueError ?? 'no error recorded'})`
@@ -822,8 +827,8 @@ function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
   const waive = `/pr-gate waive ${f.id} <reason>`
   const isSecurityP1 = isBlocking(f) && f.isSecurity === true
   // The filing pass failed for it (R92): the agent checks gh; the gate retries on its next pass.
-  if (isFileable(f) && f.issueError !== undefined) return { kind: 'issue-failed', id: f.id, said: issueFailure(f), owner: 'agent', release: ISSUE_RELEASE }
-  if (isFileable(f) && f.followUpLabelError !== undefined) return { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: LABEL_RELEASE }
+  if (isFileable(f) && f.issueError !== undefined) return { kind: 'issue-failed', id: f.id, said: issueFailure(f), owner: 'agent', release: issueRelease(f.id) }
+  if (isFileable(f) && f.followUpLabelError !== undefined) return { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: labelRelease(f.id) }
   const issueOwed = (what: string): Blocker =>
     ({ kind: 'issue-owed', id: f.id, said: `${tag}: ${what}; the gate files its GitHub issue when the review can do no more`, owner: 'gate', release: 'nothing: the gate files it' })
   if (isLinkOwed(f)) {
@@ -1153,9 +1158,14 @@ function decidePost(rec: LifecycleRecord): Next {
       return { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
     }
     if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)
+    // A filing that failed for a finding here is said, not hidden behind the fix step (R92).
+    const unfiled = holding
+      .filter(one => isFileable(one) && (one.issueError !== undefined || one.followUpLabelError !== undefined))
+      .map(one => `; ${one.issueError !== undefined ? issueFailure(one) : labelFailure(one)}`)
+      .join('')
     return {
       kind: 'exhausted',
-      why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
+      why: `${unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`}${unfiled}`,
       nextStep:
         unresolved.length > 0
           ? `fix ${ids(unresolved)} and push, then /pr-gate resume`
@@ -1187,7 +1197,7 @@ function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = [
       ...failed.map(each => (each.issueError !== undefined ? issueFailure(each) : labelFailure(each))),
       ...(waiting.length === 0 ? [] : [`${ids(waiting)} ${waiting.length === 1 ? 'waits for its' : 'wait for their'} GitHub issue`]),
     ]
-    const releases = [...new Set(failed.map(each => (each.issueError !== undefined ? ISSUE_RELEASE : LABEL_RELEASE)))]
+    const releases = failed.map(each => (each.issueError !== undefined ? issueRelease(each.id) : labelRelease(each.id)))
     return {
       kind: 'blocked',
       why: said.join('; '),

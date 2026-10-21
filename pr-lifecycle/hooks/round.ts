@@ -75,7 +75,9 @@ import {
   nextIds,
   mayAcknowledge,
   filingPeak,
+  gateGrant,
   GATE_ROUNDS,
+  lateBlockers,
   planIssues,
   raisedIn,
   readDiff,
@@ -2949,8 +2951,9 @@ type Filed = { peak: Severity; was: string | undefined; followUp: string | undef
  * files a GitHub issue for each held finding but security, or labels the issue the agent's follow-up names, with `severity:<peak>`.
  * A failure is recorded on the finding, which holds, and the next pass retries. An issue counts only once GitHub shows its label
  * (A7): GitHub drops the labels of a POST from an account without push access, so a filed issue without it holds as a failed label,
- * and the next pass labels that issue rather than filing another. Undefined when the lifecycle was reset, replaced, stopped or
- * waived while gh ran: the caller decides nothing for it (gate G7-8, R8-2). Never through a PR-create command line (spec §5.9).
+ * and the next pass labels that issue rather than filing another. Each result is saved as its gh call ends. Undefined when the
+ * lifecycle was reset, replaced or stopped while gh ran: the caller decides nothing for it (gate G7-8, R8-2). A waiver given
+ * meanwhile ends the filing too, and the record with it goes back to the caller. Never through a PR-create command line (spec §5.9).
  */
 export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
   if (rec.phase === 'pre' || rec.pr === undefined) return rec
@@ -2958,25 +2961,36 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
   const { config: c } = await configFor($, rec.root, rec.base)
   const plan = planIssues(rec, now, c.issueSpec)
   if (plan.kind === 'none') return rec
-  // A reset, a fresh lifecycle, a stop or a waiver since this pass began ends it (gate G7-8, R8-2): checked before each issue and
+  // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and
   // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
   const isMoved = (latest: LifecycleRecord | undefined): boolean =>
     latest === undefined ||
     latest.phase === 'archived' ||
     (latest.generation ?? 0) !== (rec.generation ?? 0) ||
-    latest.postStatus !== rec.postStatus ||
-    latest.waivers.length !== rec.waivers.length
+    latest.postStatus !== rec.postStatus
+  // A waiver given while a round runs leaves the deciding to that round (the waive command does not advance it): the pass files
+  // nothing more and hands back the record with the waiver, which the caller decides, so the run never waits on no one.
+  const isWaived = (latest: LifecycleRecord): boolean => latest.waivers.length !== rec.waivers.length
+  const ended = async (): Promise<LifecycleRecord | undefined> => {
+    const latest = await loadRecord($, rec.root, rec.branch)
+    return latest === undefined || isMoved(latest) ? undefined : latest
+  }
   if (plan.kind === 'grant') {
-    const n = rec.grants.filter(one => one.by === 'gate').length + 1
-    const text = `the gate added a round for ${plan.late.join(', ')}, first raised after the allowance was spent (${n} of ${GATE_ROUNDS}): the PR's scope may be too wide`
     let isGone = false
+    let text: string | undefined
+    // Decided again under the lock: two passes at once never add more than GATE_ROUNDS between them.
     const saved = await updateRecord($, rec.root, rec.branch, latest => {
       isGone = isMoved(latest)
-      if (isGone) return latest
-      return { ...latest, grants: [...latest.grants, plan.grant], log: [...(latest.log ?? []), { at: now, kind: 'check' as const, text }].slice(-LOG_CAP) }
+      if (isGone || isWaived(latest)) return latest
+      const grant = gateGrant(latest, now)
+      if (grant === undefined) return latest
+      const n = latest.grants.filter(one => one.by === 'gate').length + 1
+      const late = lateBlockers(latest).map(one => one.id)
+      text = `the gate added a round for ${late.join(', ')}, first raised after the allowance was spent (${n} of ${GATE_ROUNDS}): the PR's scope may be too wide`
+      return { ...latest, grants: [...latest.grants, grant], log: [...(latest.log ?? []), { at: now, kind: 'check' as const, text }].slice(-LOG_CAP) }
     })
     if (isGone) return undefined
-    $.ui.toast(`pr-gate: ${text}.`)
+    if (text !== undefined) $.ui.toast(`pr-gate: ${text}.`)
     return saved ?? rec
   }
   // Each gh call is bounded: a hang ends as a failure, recorded on the finding, never a wait.
@@ -2988,67 +3002,74 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
     }
   }
   const failure = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
-  const results = new Map<string, Filed>()
-  // Logged with the results, in the same guarded write (gate R9-1).
-  const lines: LogEntry[] = []
+  // Each result is saved as soon as its gh call ends, with its log line (gate R9-1), so an issue GitHub has is never filed twice. Only
+  // a reset or a fresh lifecycle stops that save: a stop or a waiver does not undo an issue already filed. Written only where the
+  // follow-up and peak are still the ones filed for: a later answer that moved either is filed anew.
+  const save = async (id: string, got: Filed, line: LogEntry): Promise<boolean> => {
+    let isGone = false
+    const next = await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
+      if (isGone) return latest
+      const findings = latest.findings.map((f): Finding => {
+        if (f.id !== id || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
+        if (got.issueError !== undefined) return { ...f, issueError: got.issueError }
+        if (got.labelError !== undefined) {
+          return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined }
+        }
+        return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
+      })
+      return { ...latest, findings, log: [...(latest.log ?? []), line].slice(-LOG_CAP) }
+    })
+    return next !== undefined && !isGone
+  }
   for (const item of plan.items) {
-    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const current = await loadRecord($, rec.root, rec.branch)
+    if (current === undefined || isMoved(current)) return undefined
+    if (isWaived(current)) return current
     const label = `severity:${item.peak}`
     const base = { peak: item.peak, was: item.followUp, followUp: item.followUp }
     const repo = item.reuse?.repo ?? rec.slug
     // A new issue needs the record's repository: with none known, the filing fails where the agent sees it, never a silent wait.
     if (repo === undefined) {
-      results.set(item.id, { ...base, issueError: 'no GitHub repository is known for this branch (its remote is not on github.com)' })
-      lines.push({ at: await $.clock.now(), kind: 'check', text: `${item.id}: could not file an issue: no repository known` })
+      const got = { ...base, issueError: 'no GitHub repository is known for this branch (its remote is not on github.com)' }
+      if (!(await save(item.id, got, { at: await $.clock.now(), kind: 'check', text: `${item.id}: could not file an issue: no repository known` }))) return undefined
       continue
     }
     // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). Its failure is not
     // read: the labels GitHub returns, or the edit, are the check.
     await gh(['label', 'create', label, '--repo', repo, '--color', LABEL_COLOURS[item.peak]])
-    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const after = await loadRecord($, rec.root, rec.branch)
+    if (after === undefined || isMoved(after)) return undefined
+    if (isWaived(after)) return after
+    let got: Filed
     let text: string
     if (item.reuse !== undefined) {
       const edit = await gh(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
       const labelError = edit.exitCode === 0 ? undefined : failure(edit)
-      results.set(item.id, { ...base, ...(labelError === undefined ? {} : { labelError }) })
+      got = { ...base, ...(labelError === undefined ? {} : { labelError }) }
       text = labelError === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
     } else {
       const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
       if (filed === undefined) {
         const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : failure(post)
-        results.set(item.id, { ...base, issueError })
+        got = { ...base, issueError }
         text = `${item.id}: could not file an issue in ${repo}`
       } else if (!filed.labels.includes(label)) {
         // Filed, but GitHub dropped the label (A7): the issue is kept, and the next pass labels it instead of filing another.
         const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-        results.set(item.id, { ...base, followUp: `#${filed.number}`, labelError })
+        got = { ...base, followUp: `#${filed.number}`, labelError }
         text = `${item.id}: filed ${repo}#${filed.number} without ${label}`
       } else {
-        results.set(item.id, { ...base, followUp: `#${filed.number}` })
+        got = { ...base, followUp: `#${filed.number}` }
         text = `${item.id}: filed ${repo}#${filed.number} ${label}`
       }
     }
-    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
-    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
+    if (!(await save(item.id, got, { at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) }))) return undefined
   }
-  let isGone = false
-  // Written only where the follow-up and peak are still the ones filed for: a later answer that moved either is filed anew.
-  const saved = await updateRecord($, rec.root, rec.branch, latest => {
-    isGone = isMoved(latest)
-    if (isGone) return latest
-    const findings = latest.findings.map((f): Finding => {
-      const got = results.get(f.id)
-      if (got === undefined || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
-      if (got.issueError !== undefined) return { ...f, issueError: got.issueError }
-      if (got.labelError !== undefined) {
-        return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined }
-      }
-      return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
-    })
-    return { ...latest, findings, log: [...(latest.log ?? []), ...lines].slice(-LOG_CAP) }
-  })
-  return isGone ? undefined : (saved ?? rec)
+  // A stop while gh ran: what was filed is saved, and the caller decides nothing for this pass (gate G7-8, R8-2). Otherwise the
+  // caller decides on the record as it is now, with any waiver given meanwhile.
+  return ended()
 }
 
 /** The number and label names in GitHub's answer to an issue POST; undefined when it gave no number. */

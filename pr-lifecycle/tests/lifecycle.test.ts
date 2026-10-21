@@ -905,7 +905,7 @@ test('R92: a deferral owed Codex holds as Codex\'s; one Codex refused is open; a
   const label = standingOf(postRec({ findings: [failed] }), { head: 'a', base: 'dev' }).blockers
   expect(label).toEqual([{
     kind: 'label-failed', id: 'G2-1', said: 'could not label issue #12 severity:P1 (HTTP 404: Not Found)', owner: 'agent',
-    release: 'check the issue exists and gh can edit it; the gate retries on the next pass',
+    release: 'check the issue exists and gh can edit it; the gate retries on the next pass, or the person can /pr-gate waive G2-1 <reason>',
   }])
   const pending = standingOf(postRec({ findings: [ruleDeferral(deferred, true, 2, 6)] }), { head: 'a', base: 'dev' }).blockers
   expect(pending.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'issue-owed', 'gate']])
@@ -1609,4 +1609,30 @@ test('R92: a deferral the agent tied to an issue is filed by labelling that issu
   const plan = planIssues(postRec({ findings: [named, unnamed], slug: 'me/repo' }), 9)
   expect(plan).toMatchObject({ kind: 'file', items: [{ id: 'G2-1', peak: 'P2', reuse: { repo: 'other/lib', number: 7 } }, { id: 'G2-2', peak: 'P3' }] })
   expect(plan.kind === 'file' ? plan.items[1] : undefined).not.toHaveProperty('reuse')
+})
+
+test('R92: an exhaustion says a filing that failed for a finding, in gh\'s words, beside the fix step', async () => {
+  const moved = post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'd', raised: { blocking: 1, advisory: 0 } })
+  const open = finding({ id: 'R3-1', round: 3, status: 'open', issueError: 'HTTP 410: Issues are disabled for this repo' })
+  const rec = { ...at([post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' }), moved], { phase: 'post', allowance: 0, findings: [open] }), head: 'd' }
+  const next = decideNext(rec)
+  expect(next.kind).toBe('exhausted')
+  expect(next.kind === 'exhausted' ? next.why : '').toContain('; could not file an issue for R3-1 (HTTP 410: Issues are disabled for this repo)')
+  const label = decideNext({ ...rec, findings: [{ ...open, issueError: undefined, followUp: '#12', followUpLabelError: 'HTTP 404: Not Found' }] })
+  expect(label.kind === 'exhausted' ? label.why : '').toContain('; could not label issue #12 severity:')
+  // With no failure, the reason is as before.
+  const plain = decideNext({ ...rec, findings: [{ ...open, issueError: undefined }] })
+  expect(plain.kind).toBe('exhausted')
+  expect(plain.kind === 'exhausted' ? plain.why : '').not.toContain('could not')
+})
+
+test('R92: a new answer makes an earlier filing failure stale, so it is cleared', async () => {
+  const failed = finding({ id: 'G2-1', status: 'open', followUp: '#12', issueError: 'HTTP 410: Issues are disabled for this repo', followUpLabelError: 'HTTP 404: Not Found' })
+  const deferred = applyAnswer(failed, { id: 'G2-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 9)
+  expect(deferred.issueError).toBeUndefined()
+  expect(deferred.followUpLabelError).toBeUndefined()
+  expect(deferred.followUp).toBe('#12')
+  const fixed = applyAnswer(failed, { id: 'G2-1', action: 'fixed' }, 3, 'main', 9)
+  expect(fixed.issueError).toBeUndefined()
+  expect(fixed.followUpLabelError).toBeUndefined()
 })

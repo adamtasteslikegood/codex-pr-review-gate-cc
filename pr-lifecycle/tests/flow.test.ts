@@ -3636,7 +3636,7 @@ test('R85: an issue the gate could not label holds the merge, and the next pass 
   expect(held.phase).not.toBe('ready')
   expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('Could not resolve to an issue')
   expect(w.prompts.at(-1)).toContain('could not label issue #12 severity:P3 (GraphQL: Could not resolve to an issue')
-  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass')
+  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass, or the person can /pr-gate waive G2-1 <reason>')
   w.gh.labelAnswer = 'ok'
   await say($, 'resume')
   await w.clock.advance(1000)
@@ -5487,5 +5487,47 @@ test('A7: an issue GitHub filed with its label settles in one pass', async ($, o
   await done($, accept('r2-verify', w))
   expect(w.gh.filed).toHaveLength(1)
   expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R92: an issue filed while a waiver lands is saved at once, and the round decides on it: no second issue, no stuck run', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isWaived = false
+  // The person waives something else while GitHub files the issue: the waive command leaves the deciding to the round in flight.
+  w.gh.onIssue = () => {
+    if (isWaived) return
+    isWaived = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: 'G9-9', head: rec.head, reason: 'not this one', by: 'person', at: 1 }] })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(isWaived).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: filed me/repo#21 severity:P2')).toBe(true)
+  expect(rec.phase).toBe('ready')
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('R92: an issue filed while the person stops the gate is kept, and the resume files no second one', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isStopped = false
+  w.gh.onIssue = async () => {
+    if (isStopped) return
+    isStopped = true
+    await say($, 'stop')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(isStopped).toBe(true)
+  expect((await runOf(w)).status).toBe('stopped')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
   expect((await recordOf(w)).phase).toBe('ready')
 })
