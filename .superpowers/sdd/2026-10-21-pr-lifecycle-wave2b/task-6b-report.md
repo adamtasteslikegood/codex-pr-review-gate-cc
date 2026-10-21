@@ -241,3 +241,92 @@ The A9 unit test in `tests/lifecycle.test.ts` was rewritten to check:
 
 - The pane shows an accepted rebuttal with `needsRecheck` as "re-verify owed (file changed)", from `markOf` in pane.tsx. For a raise, the "(file changed)" part is inaccurate. This is display only; the standing list and the hold text are correct.
 - The re-check is triggered only for a rebuttal Codex had *accepted*. A rebuttal still awaiting Codex is checked anyway, at the severity it has when Codex runs.
+
+## Fix round 1
+
+Commit: 3bbdaa0.
+
+### 1. A raise re-check tells Codex, and the pane, why it was asked (Important)
+
+**Telling the two causes apart.** A new `raiseOf(f)` in lifecycle.ts returns the newest `raisedBy` entry when all of these hold:
+- `needsRecheck` is set;
+- the status is 'rebutted';
+- that entry comes after Codex's last entry in the history.
+
+Otherwise the flag came from a file change (R58). This also covers a raise Codex already ruled on that is later followed by a file change: that case is read as a file change.
+
+**A security-only link now records a raise entry too.** Before, a link that only made the finding security left no history entry. Now `withLinkedPeak` records one whenever it sets the re-check: the severity is unchanged, `from` equals the severity, the note says "made security by its link X", and the entry carries `raisedBy`.
+- `loweringOf` ignores it, because it is not a lower severity.
+- `severitySource: 'tag'` is copied only when the severity actually changed.
+
+**`listFindings` in core.ts.** A raised rebuttal is labelled `(raised to P1[, security,] by its linked item G3-1: re-check)`. The label ` (file changed since: re-verify)` is kept only when the flag came from a file change.
+
+**`verifyPrompt` in core.ts.** A new helper, `raisedBy`, adds two lines after the rebutted list for each raised item:
+- the link, the new severity, and the linked item's own report, looked up in `run.findings`. A GitHub report is fenced as reviewer data. If the linked item is not in `run.findings`, the prompt says "not on this run".
+- the question: "You accepted G2-1's rebuttal|acknowledgement before: does the rebuttal still hold at P1, given that report?"
+
+**The pane (pane.tsx).** A raised rebuttal reads "— re-check owed (raised to P1[, security,] by G3-1)". A file change still reads "— re-verify owed (file changed)".
+
+**Tests.**
+- A new unit test, "6b fix 1: …", covers:
+  - the raise label;
+  - no file-changed label on a raised item;
+  - the linked item's fenced report and the question;
+  - the file-change label for a flag with no raise;
+  - the file-change label for a raise Codex already ruled on, then a file change;
+  - a security-only link: it is flagged, labelled the same way, and is no lowering.
+- The pane flow test gains B4, a raised accepted rebuttal: "B4 [P1] Title of B4 — re-check owed (raised to P1 by G3-1)". It now expects 13 findings, 9 holding the merge.
+
+### 2. A8 broadened (controller ruling)
+
+**The new rule.** `isFixed` no longer requires `finding.round === R`. Round R is charged when any finding that is not a linked duplicate has a `reported-fixed` entry stamped R by the agent, which means any author other than codex or gate.
+- A round is still charged at most once.
+- Answer runs record no round, so they still charge nothing.
+- A rebuttal, deferral or acknowledgement stays free.
+
+The docs of `isChargedRound` and `RoundRecord.isCharged` now say so.
+
+**Tests adapted.**
+- The A8 unit test now asserts the opposite of before: "raised in 2, fixed in 3" charges round 3 and not round 2. It also gains a case: an earlier finding deferred in round 3 stays free.
+- In Task 6's R88 unit test, the `rejectedFix` and `upheld` fixtures had the fix and Codex's ruling in the same round 3. Under A8 the fix alone now charges round 3. So Codex's ruling moved to round 4:
+  - the rejection alone charges round 4;
+  - the verification alone does not.
+
+  This keeps the test of the rejection rule meaningful.
+
+### 3. The R90 flow test's charge check (Minor)
+
+The baseline-only `isCharged === true` filter now asserts that round 2 is `baseline`. A new flow test on `toDiscretionary` covers the charge itself, in round 4:
+- the agent rebuts G4-1 and links G4-2 to it;
+- Codex accepts both;
+- round 4 is recorded `isCharged: false`.
+
+So, at flow level, the link check and an accepted rebuttal cost nothing.
+
+### 4. `refuted` (Minor)
+
+`decidePost` now computes `answersOf(one)` once.
+
+### Left as is, by ruling
+
+- A refused raise re-check counts as a full rejection: a real Codex rejection at the new severity. It charges its round, and a second rebuttal goes to the person (R40).
+- A8 does not check that a push happened: a `reported-fixed` stamped in the round charges it.
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| `npm run test` | 564/564 pass; codex-gate 22/22 |
+| `npm run lint` | clean |
+| `npm run typecheck` | clean |
+
+Two existing tests timed out at their 5 s limit on two runs while the machine's load average was 6-7:
+- "a roster on the base is used…";
+- "#11: the post-PR Codex fallback re-review…".
+
+They took 4.3-4.5 s on the passing run. At the base commit, under the same load, they passed. These are timing flakes, not caused by this change.
+
+### Concerns
+
+- The linked item's report comes from `run.findings`. If a raise came from a linked item that only the record holds, and the check's run lacks it, the prompt says "not on this run" and gives no report. It still names the link and the severity.
+- Broadened A8 charges a round for any fix reported in it, so an agent that re-fixes a finding it fixed earlier spends a round each time. That is what was intended.
