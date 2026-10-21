@@ -997,7 +997,7 @@ test('R33: in the protected round, a comment on the lines just fixed is not call
   await w.clock.advance(30_000)
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('G3-1')
-  expect(said).not.toContain('duplicate of an answered finding')
+  expect(said).not.toContain('same problem as G2-1;')
 })
 
 test('R34: an item left without an answer is asked about once more, and does not reach ready silently', async ($, on) => {
@@ -4629,4 +4629,68 @@ test('R88: a round that raises a new blocker is charged', async ($, on) => {
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'not reachable', replyId: '991' }]))
   await done($, accept('r2-verify', w))
   expect((await recordOf(w)).rounds.filter(one => one.phase === 'post').map(one => one.isCharged)).toEqual([true])
+})
+
+test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [
+    inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10),
+    inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12),
+  ]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const prompt = w.prompts.at(-1) ?? ''
+  expect(prompt).toContain('G2-2 from claude[bot] (src/app.ts:12), same problem as G2-1')
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'deferred', note: 'needs a store change', replyId: '901' },
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' },
+  ]))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(rec.replies['inline:12']).toBe('902')
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+})
+
+test('R90: the agent refuses the gate\'s link by answering the item on its own', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10), inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'clear on logout', replyId: '901' },
+    { id: 'G2-2', action: 'fixed', note: 'a second cache, also cleared now', replyId: '902' },
+  ]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-2')?.duplicateOf).toBeUndefined()
+})
+
+test('R90: the agent\'s link goes to Codex at no round\'s cost; a self-link is no answer and the item is asked again', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10), inline(12, '**P2** stale entries survive a sign-out', w.gh.prHead, 40)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-2')?.duplicateOf).toBeUndefined()
+  // A link to itself is no answer: G2-2 is asked about again.
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'clear on logout', replyId: '901' },
+    { id: 'G2-2', duplicateOf: 'G2-2', replyId: '902' },
+  ]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-2')
+  await done($, triaged('r2-triage', [{ id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' }]))
+  const run = await runOf(w)
+  expect(run.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'agent' })
+  expect(run.rechecks).toEqual(['G2-1', 'G2-2'])
+  expect(w.spawned.at(-1)?.prompt).toContain('Same as: G2-1')
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', isLinkChecked: true })
+  expect(rec.replies['inline:12']).toBe('902')
+  expect(mergeHolds(rec)).toEqual([])
+  expect(rec.rounds.filter(one => one.phase === 'post' && one.isCharged === true)).toEqual([])
 })

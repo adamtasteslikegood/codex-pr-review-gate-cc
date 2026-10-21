@@ -19,6 +19,8 @@ export type FindingEvent = {
   lowering?: 'agreed' | 'refused'
   /** The answer as the agent gave it, when the status alone does not say: an acknowledgement is stored as a rebuttal (R82, R94). */
   answer?: 'acknowledged'
+  /** Codex's refusal of the agent's link (R90): the original it found a different problem. A link to it again is no answer. */
+  refusedLink?: string
   by: string
   at: number
 }
@@ -54,6 +56,12 @@ export type Finding = {
   followUpLabel?: Severity
   /** gh's error when the gate last failed to label the follow-up issue: the deferral holds until a pass labels it. */
   followUpLabelError?: string
+  /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
+  duplicateOf?: string
+  /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */
+  linkBy?: 'gate' | 'agent'
+  /** Codex agreed the agent's link names the same problem. */
+  isLinkChecked?: boolean
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
@@ -307,7 +315,7 @@ export type CheckState = { name: string; bucket: string; isRequired: boolean }
 export type Blocker = {
   kind:
     | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
-    | 'lowering-unchecked' | 'label-owed' | 'label-failed'
+    | 'lowering-unchecked' | 'label-owed' | 'label-failed' | 'link-unchecked'
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string

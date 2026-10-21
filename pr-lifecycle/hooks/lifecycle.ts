@@ -112,9 +112,13 @@ const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed'
  * answered (a fix, a rebuttal, an acknowledgement, a deferral). A rejected fix still uses a round, because it does.
  */
 export function isChargedRound(findings: readonly Finding[], round: number): boolean {
-  const isNewBlocker = findings.some(one => one.round === round && isBlocking(one))
+  // A linked duplicate is not new (R90): it holds through its original.
+  const isNewBlocker = findings.some(one => one.round === round && isBlocking(one) && one.duplicateOf === undefined)
+  // Codex refusing the agent's link rejects no answer (R90): the item was never answered.
   const isRejected = findings.some(one =>
-    one.history.some((each, i) => each.round === round && each.by === 'codex' && each.status === 'open' && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open')),
+    one.history.some((each, i) =>
+      each.round === round && each.by === 'codex' && each.status === 'open' && each.refusedLink === undefined && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open'),
+    ),
   )
   return isNewBlocker || isRejected
 }
@@ -211,6 +215,107 @@ export const markVerified = (f: Finding, round: number, by: string, at: number, 
 /** A reviewer holds the finding against the fix or rebuttal: it is unresolved again. */
 export const markHeld = (f: Finding, round: number, by: string, at: number, note?: string): Finding => moved(f, 'open', round, by, at, note)
 
+/** A linked finding that stands for its original (R90): the gate's link, or the agent's once Codex agreed. */
+export const isLinked = (f: Finding): boolean => f.duplicateOf !== undefined && (f.linkBy !== 'agent' || f.isLinkChecked === true)
+
+/** The agent's link Codex has not ruled on: Codex checks it in the round's free check (R90). */
+export const isLinkOwed = (f: Finding): boolean => f.duplicateOf !== undefined && f.linkBy === 'agent' && f.isLinkChecked !== true
+
+/** Links a finding to its original, never to a linked one (no chains, R90). Its status is its own; its holds are the original's. */
+export function linkTo(f: Finding, original: Finding, by: 'gate' | 'agent', round: number, at: number): Finding {
+  const to = original.duplicateOf ?? original.id
+  return { ...f, duplicateOf: to, linkBy: by, isLinkChecked: undefined, history: [...f.history, { round, status: f.status, note: `linked to ${to}`, by: by === 'gate' ? 'gate' : 'main', at }] }
+}
+
+/** The finding standing alone again: the agent answered it on its own, or Codex found it a different problem. Its security stays. */
+export const dropLink = (f: Finding): Finding => ({ ...f, duplicateOf: undefined, linkBy: undefined, isLinkChecked: undefined })
+
+/**
+ * Codex found the agent's link a different problem (R90): the item stands alone, open, and is asked about again. The refusal names
+ * the original, so linking the item there again is no answer (the gate can't get stuck), and it charges no round.
+ */
+export function refuseLink(f: Finding, round: number, at: number, note: string): Finding {
+  const held = markHeld(dropLink(f), round, 'codex', at, note)
+  const last = held.history.length - 1
+  return { ...held, history: held.history.map((one, i) => (i === last && f.duplicateOf !== undefined ? { ...one, refusedLink: f.duplicateOf } : one)) }
+}
+
+/**
+ * A link never lowers anything (R90): the original's peak becomes the higher of the two, so its issue carries it (R85), and it is
+ * security when either one is (PR #25 review A1), even when a peak is unknown, so a link never lets a security problem past the person.
+ */
+export function withLinkedPeak(original: Finding, linked: Finding): Finding {
+  const security = original.isSecurity === true || linked.isSecurity === true ? { isSecurity: true } : {}
+  return isPeakUnknown(original) || isPeakUnknown(linked)
+    ? { ...original, ...security }
+    : { ...original, ...security, peakSeverity: higher(peakOf(original), peakOf(linked)) }
+}
+
+/** The ids linked to a finding, for "G2-1 (also G2-2)". */
+export const alsoOf = (findings: readonly Finding[], id: string): string[] => findings.filter(one => one.duplicateOf === id && isLinked(one)).map(one => one.id)
+
+/** The agent's word that an item names the same problem as another finding (R90). */
+export type LinkProposal = { id: string; duplicateOf: string }
+
+/**
+ * The agent's links of one answer, applied to the ledger (R90; PR #25 review A2), checked on canonical ids over the whole batch. A
+ * link from or to an id not on the list, to itself, on a cycle, or to an original Codex already found a different problem is no
+ * answer: its finding is left as it was. Every other link points at its final original, and a newly linked original's own links
+ * move with it, as the agent's, so nothing chains. Each original's peak and security rise to its links'. `linked`: the ids whose
+ * link stands as their answer.
+ */
+export function applyLinks(
+  findings: readonly Finding[],
+  proposed: readonly LinkProposal[],
+  round: number,
+  at: number,
+): { findings: Finding[]; linked: string[] } {
+  const byId = new Map(findings.map(one => [one.id, one]))
+  const canon = (id: string): string => byId.get(id)?.duplicateOf ?? id
+  const accepted = new Map<string, string>()
+  for (const one of proposed) {
+    const f = byId.get(one.id)
+    if (f === undefined || !byId.has(one.duplicateOf) || accepted.has(one.id)) continue
+    // Codex refused this link before: asking again is no answer, so the item goes back to the agent, never round and round.
+    if (f.history.some(each => each.refusedLink !== undefined && canon(each.refusedLink) === canon(one.duplicateOf))) continue
+    accepted.set(one.id, one.duplicateOf)
+  }
+  const existing = new Map(findings.flatMap(one => (one.duplicateOf === undefined ? [] : [[one.id, one.duplicateOf] as const])))
+  const edgeOf = (id: string): string | undefined => accepted.get(id) ?? existing.get(id)
+  // Every proposed link on a cycle (a self-link is one) is refused together; again with what is left, until none is.
+  for (;;) {
+    const cyclic = [...accepted.keys()].filter(id => {
+      const seen = new Set([id])
+      let next = edgeOf(id)
+      while (next !== undefined && !seen.has(next)) {
+        seen.add(next)
+        next = edgeOf(next)
+      }
+      return next === id
+    })
+    if (cyclic.length === 0) break
+    for (const id of cyclic) accepted.delete(id)
+  }
+  const rootOf = (id: string): string => {
+    const seen = new Set([id])
+    let here = id
+    for (let next = edgeOf(here); next !== undefined && !seen.has(next); next = edgeOf(here)) {
+      seen.add(next)
+      here = next
+    }
+    return here
+  }
+  const out = findings.map(f => {
+    const to = accepted.has(f.id) || f.duplicateOf !== undefined ? rootOf(f.id) : undefined
+    if (to === undefined || to === f.duplicateOf) return f
+    // The agent's link, or a link moving with its original to the agent's: Codex checks either (R90).
+    return { ...f, duplicateOf: to, linkBy: 'agent' as const, isLinkChecked: undefined, history: [...f.history, { round, status: f.status, note: `linked to ${to}`, by: 'main', at }] }
+  })
+  // A link raised its original when it was made: only the links made here raise theirs now.
+  const made = out.filter((f, i) => f !== findings[i])
+  return { findings: out.map(f => made.filter(one => one.duplicateOf === f.id).reduce(withLinkedPeak, f)), linked: [...accepted.keys()] }
+}
+
 /** The ledger after a round: changed findings replace theirs by id, new ones are appended, nothing else moves. */
 export function mergeFindings(kept: readonly Finding[], changed: readonly Finding[]): Finding[] {
   const byId = new Map(changed.map(one => [one.id, one]))
@@ -239,8 +344,6 @@ function isSame(a: { file?: string; line?: number; title: string }, b: { file?: 
   return shared / Math.max(1, Math.min(x.size, y.size)) >= 0.5
 }
 
-const ANSWERED: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
-
 /** When a finding was last rebutted, or undefined. */
 const rebuttedAt = (f: Finding): number | undefined => f.history.filter(one => one.status === 'rebutted').at(-1)?.at
 
@@ -258,8 +361,15 @@ export function triage(
     const when = one.status === 'rebutted' ? rebuttedAt(one) : undefined
     return item.at !== undefined && when !== undefined && item.at > when
   }
-  const match = findings.find(one => ANSWERED.includes(one.status) && one.needsRecheck !== true && !isAnswerTo(one) && isSame(one, item))
-  return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.id }
+  // Every finding on the list, open ones included (R90). A linked one stands for its original, so the link goes there, and R33 and
+  // a recheck are read on both: an open alias never reopens a settled rebuttal (PR #25 review A3).
+  const byId = new Map(findings.map(one => [one.id, one]))
+  const isCandidate = (one: Finding): boolean => {
+    const original = one.duplicateOf === undefined ? one : (byId.get(one.duplicateOf) ?? one)
+    return [one, original].every(each => each.needsRecheck !== true && !isAnswerTo(each)) && isSame(one, item)
+  }
+  const match = findings.find(isCandidate)
+  return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.duplicateOf ?? match.id }
 }
 
 /** The lines a change touched, per file: each hunk's old and new ranges, both, since a finding's line may predate either side. */
@@ -394,7 +504,7 @@ const deferredBlockers = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): F
 export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
   return rec.findings.filter(
-    one => isBlocking(one) && !waived.has(one.id) && (one.status === 'open' || (one.status === 'deferred' && one.isSecurity === true)),
+    one => isBlocking(one) && !waived.has(one.id) && !isLinked(one) && (one.status === 'open' || (one.status === 'deferred' && one.isSecurity === true)),
   )
 }
 
@@ -404,7 +514,7 @@ export const isReverifyOwed = (f: Pick<Finding, 'status' | 'needsRecheck'>): boo
 /** Blockers the fixer reported fixed that no check has confirmed yet, and verified fixes whose file changed since (R58). */
 export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && (one.status === 'reported-fixed' || isReverifyOwed(one)))
+  return rec.findings.filter(one => isBlocking(one) && !waived.has(one.id) && !isLinked(one) && (one.status === 'reported-fixed' || isReverifyOwed(one)))
 }
 
 /** A rebuttal Codex ruled on and accepted, with its file unchanged since. */
@@ -429,12 +539,18 @@ export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !i
 
 /**
  * What the gate's own Codex check rules on (Adam, decision A; R36, R58, R72): rebuttals Codex has not accepted, short of a dispute
- * (R40); verified fixes whose file changed since (R58); fixes only reported, at any severity, advisories included; and a P3 deferral
- * whose severity the agent lowered (R85, Adam 2026-10-20). Any other deferral is the person's to release (R45), never Codex's.
+ * (R40); verified fixes whose file changed since (R58); fixes only reported, at any severity, advisories included; a P3 deferral
+ * whose severity the agent lowered (R85, Adam 2026-10-20); and the agent's links (R90). Any other deferral is the person's to
+ * release (R45), never Codex's.
  */
 export const checksOwed = (findings: readonly Finding[]): Finding[] =>
   findings.filter(
-    one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one) || one.status === 'reported-fixed' || isLoweringOwed(one),
+    one =>
+      (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) ||
+      isReverifyOwed(one) ||
+      one.status === 'reported-fixed' ||
+      isLoweringOwed(one) ||
+      isLinkOwed(one),
   )
 
 /** The dispute in words: the agent's last argument and Codex's last rejection. */
@@ -523,10 +639,13 @@ export const isSettledDeferral = (f: Finding): boolean => wouldSettle(f) && f.fo
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
  * reported fixed without verification, verified fixed but its file changed since (R58), or rebutted without Codex
  * accepting it, unless the person waived it. The controller's ready and the merge guard both read this, so they never disagree.
+ * A linked duplicate holds through its original (R90).
  */
 export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledDeferral(one))
+  return rec.findings.filter(
+    one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledDeferral(one) && !isLinked(one),
+  )
 }
 
 /** A held verified fix in words, as the merge refusal and the texts name it (R58). */
@@ -548,10 +667,13 @@ const labelFailure = (f: Finding): string =>
   `could not label issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'} severity:${peakOf(f)} (${f.followUpLabelError ?? 'no error recorded'})`
 
 /** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). Never the reviewer's own words (gate R2-3). */
-function blockerOf(f: Finding): Blocker {
-  const tag = `${f.id} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
+function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
+  const tag = `${f.id}${also.length === 0 ? '' : ` (also ${also.join(', ')})`} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
   const waive = `/pr-gate waive ${f.id} <reason>`
   const isSecurityP1 = isBlocking(f) && f.isSecurity === true
+  if (isLinkOwed(f)) {
+    return { kind: 'link-unchecked', id: f.id, said: `${tag}: linked to ${f.duplicateOf ?? '?'}, Codex has not checked the link`, owner: 'codex', release: "the gate's Codex check rules on it" }
+  }
   if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
   if (f.status === 'deferred') {
     const low = loweringOf(f)
@@ -598,7 +720,7 @@ export function standingOf(
   const waiver = isOnBase ? rec.waivers.find(one => one.scope === phase && one.head === at.head && (phase === 'post' || one.base === at.base)) : undefined
   const security = securityHolds(rec)
   const isWaived = waiver !== undefined && security.length === 0
-  const blockers: Blocker[] = (isWaived ? [] : mergeHolds(rec)).map(blockerOf)
+  const blockers: Blocker[] = (isWaived ? [] : mergeHolds(rec)).map(one => blockerOf(one, alsoOf(rec.findings, one.id)))
   if (!isOnBase && phase === 'post') {
     blockers.push({ kind: 'retargeted', said: `reviewed for ${rec.base}, but the PR now targets ${at.base}`, owner: 'person', release: `point it back at ${rec.base}, or /pr-gate reset` })
   }
@@ -787,11 +909,12 @@ function decidePost(rec: LifecycleRecord): Next {
   const disputed = holding.filter(isDisputed)
   // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58); so is the agent's
   // lowering of a deferral's severity (R85, Adam 2026-10-20).
-  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isLoweringOwed(one))
-  const open = holding.filter(one => one.status === 'open')
+  // The agent's link is Codex's to check too (R90): answered, so never an open finding the agent left.
+  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isLoweringOwed(one) || isLinkOwed(one))
+  const open = holding.filter(one => one.status === 'open' && !isLinkOwed(one))
   // A deferral held only by its issue's label is the gate's to retry, not the person's to decide (R85).
   const unlabelled = holding.filter(wouldSettle)
-  const deferred = holding.filter(one => one.status === 'deferred' && !isLoweringOwed(one) && !wouldSettle(one))
+  const deferred = holding.filter(one => one.status === 'deferred' && !isLoweringOwed(one) && !wouldSettle(one) && !isLinkOwed(one))
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -830,20 +953,32 @@ function decidePost(rec: LifecycleRecord): Next {
   }
   // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
   const recheck = (): Next => {
-    const lowered = unchecked.filter(isLoweringOwed)
-    const answered = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one))
+    const links = unchecked.filter(isLinkOwed)
+    const lowered = unchecked.filter(one => isLoweringOwed(one) && !isLinkOwed(one))
+    const answered = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one) && !isLinkOwed(one))
     const acks = answered.filter(isAcknowledged)
     const rebuttals = answered.filter(one => !isAcknowledged(one))
-    const reverify = unchecked.filter(isReverifyOwed)
+    const reverify = unchecked.filter(one => isReverifyOwed(one) && !isLinkOwed(one))
     const said = [
+      ...(links.length === 0 ? [] : [`Codex has not checked the link of ${ids(links)}`]),
       ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
       ...(acks.length === 0 ? [] : [`Codex has not checked the acknowledgement of ${ids(acks)} on ${last.endHead.slice(0, 7)}`]),
       ...(lowered.length === 0 ? [] : [`Codex has not checked the lowered severity of ${ids(lowered)}`]),
       ...reverify.map(reverifyOwed),
     ]
-    const kinds = [rebuttals, acks, lowered, reverify].filter(one => one.length > 0)
+    const kinds = [rebuttals, acks, lowered, reverify, links].filter(one => one.length > 0)
     const what =
-      kinds.length !== 1 ? 'them' : rebuttals.length > 0 ? 'the rebuttal' : acks.length > 0 ? 'the acknowledgement' : lowered.length === 1 ? 'the lowering' : 'them'
+      kinds.length !== 1
+        ? 'them'
+        : rebuttals.length > 0
+          ? 'the rebuttal'
+          : acks.length > 0
+            ? 'the acknowledgement'
+            : links.length > 0
+              ? 'the link'
+              : lowered.length === 1
+                ? 'the lowering'
+                : 'them'
     return {
       kind: 'blocked',
       why: said.join('; '),

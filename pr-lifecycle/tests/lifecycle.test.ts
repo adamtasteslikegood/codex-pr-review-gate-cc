@@ -3,7 +3,14 @@ import { expect, test } from 'claude-code/testing'
 import type { Finding } from '../types'
 import {
   allowanceFor,
+  alsoOf,
   applyAnswer,
+  applyLinks,
+  dropLink,
+  isLinked,
+  isLinkOwed,
+  linkTo,
+  withLinkedPeak,
   decideNext,
   changedLines,
   invalidate,
@@ -30,6 +37,7 @@ import {
   moveLine,
   newRecord,
   readDiff,
+  refuseLink,
   relocate,
   remaining,
   rejections,
@@ -44,7 +52,8 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readLinks, readReview,
+  readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt,
   reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
@@ -352,10 +361,11 @@ test('the triage answer carries dispositions, severities, reply ids and duplicat
       { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
     ],
   })}`
+  // A row with duplicateOf is a link, whatever its action (R90): readLinks reads it, never readTriage.
   expect(readTriage(answer)).toEqual([
     { id: 'G3-1', action: 'fixed', note: 'parameterised', severity: 'P1', isSecurity: true, replyId: '991' },
-    { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
   ])
+  expect(readLinks(answer)).toEqual([{ id: 'G3-2', duplicateOf: 'R1-1', replyId: '992' }])
 })
 
 test('prior rounds list the answered findings that still apply, with their evidence and what is owed', async () => {
@@ -1087,4 +1097,154 @@ test('R88: a post round is charged for a new blocker or a Codex rejection in it;
   expect(usedRounds({ rounds: [pre(), d(2, { isCharged: false }), d(3, { isCharged: true }), d(4)] })).toBe(3)
   expect(usedRounds({ rounds: [pre({ isCharged: false })] })).toBe(1)
   expect(remaining({ allowance: 2, grants: [], rounds: [d(2, { isCharged: false }), d(3, { isCharged: false })] })).toBe(2)
+})
+
+// ------------------------------------------------------------------ R90
+
+test('R90: new feedback links to any finding naming the same problem, open ones included, never to a linked one', async () => {
+  const open = finding({ id: 'G2-1', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, status: 'open' })
+  const item = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 5 }
+  expect(triage(item, [open], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // Linking to a linked finding links to its original.
+  const linked = { ...finding({ id: 'G3-1', source: 'github', title: 'cache never cleared', file: 'src/cache.ts', line: 11 }), duplicateOf: 'G2-1', linkBy: 'gate' as const }
+  expect(triage(item, [linked], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // R33: feedback after a rebuttal answers it; a changed file keeps it new.
+  const rebutted = { ...open, status: 'rebutted' as const, history: [{ round: 2, status: 'rebutted' as const, by: 'main', at: 4 }] }
+  expect(triage(item, [rebutted], new Set()).cls).toBe('new-on-reviewed')
+  expect(triage(item, [open], new Set(['src/cache.ts'])).cls).toBe('new-on-changed')
+})
+
+test('R90: a linked finding holds and settles with its original, is listed beside it, and raises its peak', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', peakSeverity: 'P2', status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1' }), original, 'gate', 2, 5)
+  expect(dup).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(dup.history.at(-1)).toMatchObject({ note: 'linked to G2-1', by: 'gate' })
+  expect(isLinked(dup)).toBe(true)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.peakSeverity).toBe('P1')
+  expect(withLinkedPeak(dup, original).peakSeverity).toBe('P1')
+  const rec = postRec({ findings: [raised, dup] })
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(alsoOf(rec.findings, 'G2-1')).toEqual(['G2-2'])
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers[0]?.said).toBe('G2-1 (also G2-2) [P2] comment from bot: open')
+  // The original settles: so does the link.
+  expect(mergeHolds(postRec({ findings: [markVerified(raised, 2, 'codex', 6), dup] }))).toEqual([])
+  // Never a chain: linking to a linked finding links to its original.
+  expect(linkTo(finding({ id: 'G3-1' }), dup, 'gate', 3, 7).duplicateOf).toBe('G2-1')
+  expect(dropLink(dup)).not.toHaveProperty('duplicateOf', 'G2-1')
+})
+
+test('R90: the agent\'s link waits for Codex, at no round\'s cost; agreed it stands, refused the item stands alone', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', status: 'reported-fixed' })
+  const claimed = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P2' }), original, 'agent', 2, 5)
+  expect(isLinkOwed(claimed)).toBe(true)
+  expect(isLinked(claimed)).toBe(false)
+  const blockers = standingOf(postRec({ findings: [claimed] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-2', 'link-unchecked', 'codex']])
+  expect(checksOwed([claimed]).map(one => one.id)).toEqual(['G2-2'])
+  expect(decideNext(postRec({ findings: [claimed] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-2'] })
+  const agreed = { ...claimed, isLinkChecked: true }
+  expect(isLinked(agreed)).toBe(true)
+  const refused = markHeld(dropLink(claimed), 2, 'codex', 6, 'a different file')
+  expect(isChargedRound([refused], 2)).toBe(false)
+  // A linked duplicate raised as a blocker is not new: it charges nothing.
+  expect(isChargedRound([linkTo(finding({ id: 'G2-3', round: 2, severity: 'P1' }), original, 'gate', 2, 5)], 2)).toBe(false)
+})
+
+test('R90: a row with duplicateOf reads as a link, whatever its action', async () => {
+  const answer = trailerOf({ step: 'r2-triage', dispositions: [
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: 'https://github.com/me/repo/pull/1#discussion_r55' },
+    { id: 'G2-3', action: 'fixed', duplicateOf: 'G2-1' },
+    { id: 'G2-4', action: 'fixed', note: 'done' },
+  ] })
+  expect(readLinks(answer)).toEqual([{ id: 'G2-2', duplicateOf: 'G2-1', replyId: '55' }, { id: 'G2-3', duplicateOf: 'G2-1' }])
+  expect(readTriage(answer).map(one => one.id)).toEqual(['G2-4'])
+})
+
+// ------------------------------------------------------- R90, PR #25 review A1-A3
+
+test('R90 A1: a link carries security to the original, both ways, and nothing clears it', async () => {
+  const deferral = { status: 'deferred' as const, severity: 'P3' as const, peakSeverity: 'P3' as const, followUp: '#5', followUpLabel: 'P3' as const }
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', ...deferral })
+  expect(isSettledDeferral(original)).toBe(true)
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.isSecurity).toBe(true)
+  // A security problem never settles by its issue: it holds for the person.
+  // (isFileable, Task 12's predicate, is not built yet: its assertion goes there.)
+  expect(isSettledDeferral(raised)).toBe(false)
+  const rec = postRec({ findings: [raised, dup] })
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers.map(one => [one.id, one.owner])).toEqual([['G2-1', 'person']])
+  // Neither dropping a link nor an unknown peak clears it.
+  expect(dropLink(raised).isSecurity).toBe(true)
+  const lost = finding({ id: 'G2-3', history: [{ round: 1, status: 'open', severity: 'P3', by: 'main', at: 1 }] })
+  expect(withLinkedPeak(lost, dup).isSecurity).toBe(true)
+  // A security original stays security beside a non-security link.
+  const secure = finding({ id: 'G2-4', isSecurity: true, severity: 'P2' })
+  expect(withLinkedPeak(secure, linkTo(finding({ id: 'G2-5', severity: 'P3' }), secure, 'gate', 2, 5)).isSecurity).toBe(true)
+  expect(applyLinks([secure, finding({ id: 'G2-5', severity: 'P3' })], [{ id: 'G2-5', duplicateOf: 'G2-4' }], 2, 5).findings[0]?.isSecurity).toBe(true)
+})
+
+test('R90 A2: the agent\'s links are checked on canonical ids over the whole batch: no self-link, no cycle, no chain', async () => {
+  const a = finding({ id: 'A', status: 'open' })
+  const b = linkTo(finding({ id: 'B', status: 'open' }), a, 'gate', 2, 5)
+  const c = finding({ id: 'C', status: 'open' })
+  // B is linked to A, and the agent links A to B: that is A to itself, no answer. A still holds; B still holds through A.
+  const self = applyLinks([a, b], [{ id: 'A', duplicateOf: 'B' }], 2, 6)
+  expect(self.linked).toEqual([])
+  expect(self.findings).toEqual([a, b])
+  expect(mergeHolds(postRec({ findings: self.findings })).map(one => one.id)).toEqual(['A'])
+  // A link to itself, or naming an id not on the list, is no answer either.
+  expect(applyLinks([a, c], [{ id: 'A', duplicateOf: 'A' }, { id: 'C', duplicateOf: 'Z' }, { id: 'Z', duplicateOf: 'A' }], 2, 6).linked).toEqual([])
+  // B is linked to A, and the agent links A to C: A and B both point at C, and Codex checks both.
+  const moved = applyLinks([a, b, c], [{ id: 'A', duplicateOf: 'C' }], 2, 6)
+  expect(moved.linked).toEqual(['A'])
+  expect(moved.findings.map(one => [one.id, one.duplicateOf, one.linkBy])).toEqual([['A', 'C', 'agent'], ['B', 'C', 'agent'], ['C', undefined, undefined]])
+  expect(checksOwed(moved.findings).map(one => one.id)).toEqual(['A', 'B'])
+  // Two unlinked findings linked to each other in one answer: neither link is applied, both hold, and no check is owed on a link.
+  const pair = applyLinks([a, c], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'A' }], 2, 6)
+  expect(pair.linked).toEqual([])
+  expect(mergeHolds(postRec({ findings: pair.findings })).map(one => one.id)).toEqual(['A', 'C'])
+  expect(checksOwed(pair.findings)).toEqual([])
+  // A three-finding cycle: none applied.
+  const d = finding({ id: 'D', status: 'open' })
+  const ring = applyLinks([a, c, d], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'D' }, { id: 'D', duplicateOf: 'A' }], 2, 6)
+  expect(ring.linked).toEqual([])
+  expect(ring.findings.every(one => one.duplicateOf === undefined)).toBe(true)
+  // An acyclic A→C→D batch: A and C both point at D.
+  const line = applyLinks([a, c, d], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'D' }], 2, 6)
+  expect(line.linked).toEqual(['A', 'C'])
+  expect(line.findings.map(one => one.duplicateOf)).toEqual(['D', 'D', undefined])
+  // The gate's own link confirmed stays the gate's.
+  expect(applyLinks([a, b], [{ id: 'B', duplicateOf: 'A' }], 2, 6)).toEqual({ findings: [a, b], linked: ['B'] })
+})
+
+test('R90 A3: R33 is read on a candidate\'s original, so an open alias never reopens a settled rebuttal', async () => {
+  const a = finding({ id: 'G2-1', source: 'github', title: 'retry loop has no backoff', file: 'src/net.ts', line: 50, status: 'rebutted',
+    history: [{ round: 2, status: 'rebutted', by: 'main', at: 4 }, { round: 2, status: 'rebutted', by: 'codex', at: 6 }] })
+  const b = { ...finding({ id: 'G3-1', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, status: 'open' }), duplicateOf: 'G2-1', linkBy: 'gate' as const }
+  const objection = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 10 }
+  expect(triage(objection, [a, b], new Set()).cls).toBe('new-on-reviewed')
+  // Before the rebuttal it is the original's duplicate.
+  expect(triage({ ...objection, at: 3 }, [a, b], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // A recheck on the original keeps it new as well.
+  expect(triage({ ...objection, at: 3 }, [{ ...a, needsRecheck: true }, b], new Set()).cls).toBe('new-on-reviewed')
+})
+
+test('R90: a link Codex refused is recorded, charges nothing, and linking there again is no answer (the gate cannot loop)', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
+  const alias = linkTo(finding({ id: 'G2-3', source: 'github' }), original, 'gate', 2, 5)
+  const other = finding({ id: 'G2-9', source: 'github', status: 'open' })
+  // The item had been rebutted: Codex refusing the link still rejects no answer.
+  const claimed = linkTo(finding({ id: 'G2-2', round: 2, severity: 'P2', status: 'rebutted' }), original, 'agent', 2, 5)
+  const refused = refuseLink(claimed, 2, 6, 'a different file')
+  expect(refused).toMatchObject({ status: 'open', duplicateOf: undefined, linkBy: undefined })
+  expect(refused.history.at(-1)).toMatchObject({ by: 'codex', status: 'open', refusedLink: 'G2-1', note: 'a different file' })
+  expect(isChargedRound([refused], 2)).toBe(false)
+  // The same link again, directly or through another finding linked to the same original, is no answer: it is asked again.
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-1' }], 3, 7).linked).toEqual([])
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-3' }], 3, 7).linked).toEqual([])
+  // A link to another problem is still an answer.
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-9' }], 3, 7).linked).toEqual(['G2-2'])
 })

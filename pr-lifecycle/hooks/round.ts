@@ -16,6 +16,7 @@ import {
   isModelId,
   prPrompt,
   readDispositions,
+  readLinks,
   readReview,
   readTrailer,
   readTriage,
@@ -51,7 +52,9 @@ import type { Check, Feedback, Roster } from './github'
 import {
   acceptRebuttal,
   applyAnswer,
+  applyLinks,
   decideNext,
+  dropLink,
   holdText,
   lapseWaivers,
   checksOwed,
@@ -59,6 +62,7 @@ import {
   isBlocking,
   isChargedRound,
   isDisputed,
+  isLinkOwed,
   isLoweringOwed,
   isReverifyOwed,
   issueOf,
@@ -73,6 +77,7 @@ import {
   peakOf,
   raisedIn,
   readDiff,
+  refuseLink,
   rejections,
   relocate,
   roundOf,
@@ -84,6 +89,8 @@ import {
   usedRounds,
   verificationOwed,
   waivedIds,
+  linkTo,
+  withLinkedPeak,
   withRound,
   wouldSettle,
 } from './lifecycle'
@@ -1661,14 +1668,17 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
   // Fresh ids number after every G{round}-k already in the run or the record (R23).
   const idOf = nextIds(`G${run.round}-`, [run.findings, rec.findings])
   const fresh: Finding[] = []
+  // Originals already on the ledger whose peak a new link raised (R90).
+  const raised: Finding[] = []
   const listed: { feedback: Feedback; cls: TriageClass; matchId?: string; findingId: string }[] = []
   for (const feedback of items) {
     const title = feedback.body.split('\n')[0]?.replace(/[*_`#>]/g, '').trim().slice(0, 200) || `${feedback.reviewer} ${feedback.kind}`
     const others = ledger.filter(one => one.externalId !== feedback.id)
-    const placed = triage({ file: feedback.file, line: feedback.line, title, at: feedback.at }, others, new Set())
+    // The batch so far too: a review summary and its own inline comment arrive together (R90).
+    const placed = triage({ file: feedback.file, line: feedback.line, title, at: feedback.at }, [...others, ...fresh], new Set())
     let cls = placed.cls
     let matchId = placed.matchId
-    const base = matchId === undefined ? prevStart : (others.find(one => one.id === matchId)?.headSeen ?? prevStart)
+    const base = matchId === undefined ? prevStart : ([...others, ...fresh].find(one => one.id === matchId)?.headSeen ?? prevStart)
     if (feedback.file !== undefined && base !== undefined && base !== run.headSha) {
       const files = await changedSince(base)
       if (files === 'all' || files.has(feedback.file)) {
@@ -1703,14 +1713,27 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
       status: 'open',
       history: [{ round: run.round, status: 'open', by: feedback.reviewer, at: now }],
     }
-    fresh.push(finding)
+    // The gate's match is a link (R90): the original's peak rises to the new item's, wherever the original is kept.
+    const original = cls === 'duplicate' && matchId !== undefined ? [...ledger, ...fresh].find(one => one.id === matchId) : undefined
+    if (original === undefined) fresh.push(finding)
+    else {
+      const linked = linkTo(finding, original, 'gate', run.round, now)
+      const inBatch = fresh.findIndex(one => one.id === original.id)
+      if (inBatch !== -1) fresh[inBatch] = withLinkedPeak(fresh[inBatch] as Finding, linked)
+      else {
+        const at = raised.findIndex(one => one.id === original.id)
+        if (at === -1) raised.push(withLinkedPeak(original, linked))
+        else raised[at] = withLinkedPeak(raised[at] as Finding, linked)
+      }
+      fresh.push(linked)
+    }
     listed.push({ feedback, cls, ...(matchId === undefined ? {} : { matchId }), findingId: finding.id })
   }
   // Codex's findings of this round still open (the fallback or the final-head check): answered in the same turn.
   const codex = run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
   // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
-  const carried = mergeHolds({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
+  const carried = mergeHolds({ findings: mergeFindings(ledger, [...fresh, ...raised]), waivers: rec.waivers }).filter(
     // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
     one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
   )
@@ -1739,7 +1762,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     ...one,
     phase: 'triage',
     phaseStartedAt: now,
-    findings: mergeFindings(one.findings, fresh),
+    findings: mergeFindings(one.findings, [...fresh, ...raised]),
     triaged: items.map(each => each.id),
     asked,
     pending: [{ role: 'triage', step: stepOf(one, 'triage'), isMain: true }],
@@ -1826,24 +1849,38 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     if (one === undefined || !mayAcknowledge(one) || each.replyId === undefined) return []
     return [{ ...each, note: `No change requested: ${each.note ?? 'the comment asks for no change'}` }]
   })
-  const after = await patch($, run.id, one => ({
-    ...one,
-    pending: [],
-    findings: one.findings.map(finding => {
-      const answer = said.find(each => each.id === finding.id)
-      return answer === undefined ? finding : applyAnswer(finding, answer, one.round, 'main', now)
-    }),
-    steps: withStep(one.steps, {
-      id: `r${one.round}-triage`,
-      label: `Round ${one.round} · answer the reviews (main agent)`,
-      state: 'done',
-      detail: `${said.length} answered`,
-    }),
-  }))
+  // The agent's links (R90), checked on canonical ids over the round's ledger and the record (A2): a link from or to an id not on
+  // the list, to itself, on a cycle, or one Codex already refused is no answer, and the item is asked about again.
+  const proposed = readLinks(run.pending[0]?.answer ?? '')
+  const kept = (await loadRecord($, run.root, run.branch))?.findings ?? []
+  let linked: string[] = []
+  const after = await patch($, run.id, one => {
+    const ledger = mergeFindings(kept, one.findings)
+    const applied = applyLinks(ledger, proposed, one.round, now)
+    linked = applied.linked
+    // What a link moved or raised joins the run, a finding only the record holds included, so the record takes it below.
+    const changed = applied.findings.filter((f, i) => f !== ledger[i])
+    return {
+      ...one,
+      pending: [],
+      findings: mergeFindings(one.findings, changed).map(finding => {
+        if (linked.includes(finding.id)) return finding
+        const answer = said.find(each => each.id === finding.id)
+        // Answered on its own: whatever link it had is dropped (R90), and the agent refuses the gate's link that way.
+        return answer === undefined ? finding : applyAnswer(finding.duplicateOf === undefined ? finding : dropLink(finding), answer, one.round, 'main', now)
+      }),
+      steps: withStep(one.steps, {
+        id: `r${one.round}-triage`,
+        label: `Round ${one.round} · answer the reviews (main agent)`,
+        state: 'done',
+        detail: `${said.length + linked.length} answered`,
+      }),
+    }
+  })
   if (after === null) return
   // Before anything can end the round: answered feedback is processed and its replies are known, so no reply is asked for twice.
   // Feedback still without an answer is not processed (R34): a later round asks again.
-  const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && f.status !== 'open')
+  const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && (f.status !== 'open' || linked.includes(f.id)))
   const triaged = (run.triaged ?? []).filter(answered)
   const rec = await updateRecord($, run.root, run.branch, one => ({
     ...one,
@@ -1853,7 +1890,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     replies: {
       ...one.replies,
       ...Object.fromEntries(
-        said.flatMap(each => {
+        [...said, ...proposed.filter(each => linked.includes(each.id))].flatMap(each => {
           const externalId = after.findings.find(f => f.id === each.id)?.externalId
           return each.replyId === undefined || externalId === undefined ? [] : [[externalId, each.replyId]]
         }),
@@ -1864,7 +1901,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   // An item left without an answer is asked about once more, as the fix step does (R34); one the person waived meanwhile is not.
   const waived = waivedIds(rec)
   const unanswered = (after.asked ?? []).filter(
-    id => after.findings.some(f => f.id === id && f.status === 'open') && !said.some(each => each.id === id) && !waived.has(id),
+    id => after.findings.some(f => f.id === id && f.status === 'open') && !said.some(each => each.id === id) && !linked.includes(id) && !waived.has(id),
   )
   if (unanswered.length > 0 && after.hasReprompted !== true) {
     const step = stepOf(after, 'triage')
@@ -2069,6 +2106,13 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
     findings: one.findings.map(f => {
       const verdict = checked.has(f.id) ? verdicts.get(f.id) : undefined
       if (verdict === undefined) return f
+      // The agent's link (R90), first, whatever the item's status: agreed, it stands; refused, the item stands alone and is asked
+      // about again, and a link to that original again is no answer. Never charged.
+      if (isLinkOwed(f)) {
+        return verdict.holds
+          ? { ...f, isLinkChecked: true, history: [...f.history, { round: one.round, status: f.status, note: `Codex: the same problem as ${f.duplicateOf ?? '?'}`, by: 'codex', at: now }] }
+          : refuseLink(f, one.round, now, verdict.note ?? 'Codex: a different problem')
+      }
       // A re-verified fix (R58): confirmed, it is verified again on this head; refuted, it is open again and goes back to the agent.
       if (isReverifyOwed(f)) {
         return verdict.holds
