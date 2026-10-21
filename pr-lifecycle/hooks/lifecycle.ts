@@ -402,9 +402,11 @@ const wasLowered = (f: Finding): boolean => f.history.some(one => one.severity !
  * A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). The follow-up must
  * say where it is tracked (isFollowUpRef), and the P3 must be the reviewer's label or Codex's: a guessed P3 (a mixed comment that says
  * "nit" anywhere) or a severity the agent lowered settles nothing (I2), so the agent alone never settles a finding nobody called a P3.
+ * A GitHub finding settles only on the reviewer's own tag: one recorded before severitySource existed is a guess too (gate R2-5).
  */
 export const isSettledDeferral = (f: Finding): boolean =>
-  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp) && !wasLowered(f) && f.severitySource !== 'hint'
+  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp) && !wasLowered(f) &&
+  (f.source !== 'github' || f.severitySource === 'tag')
 
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
@@ -425,9 +427,12 @@ export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>
 
 const short = (sha: string): string => sha.slice(0, 7)
 
-/** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). */
+/** A finding's name in agent-facing text: a reviewer's comment is named by who wrote it, since its title is the reviewer's own first line. */
+export const titleOf = (one: Pick<Finding, 'source' | 'reviewer' | 'title'>): string => (one.source === 'github' ? `comment from ${one.reviewer}` : one.title)
+
+/** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). Never the reviewer's own words (gate R2-3). */
 function blockerOf(f: Finding): Blocker {
-  const tag = `${f.id} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${f.title}`
+  const tag = `${f.id} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
   const waive = `/pr-gate waive ${f.id} <reason>`
   const isSecurityP1 = isBlocking(f) && f.isSecurity === true
   if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }

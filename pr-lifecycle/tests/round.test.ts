@@ -12,9 +12,21 @@ test('R81: a note merges into a prompt of the same batch and record only', async
     { text: 'pr-gate: the person reset the lifecycle of feat/x.', key: a, batch: 2, isNote: true },
   ])
   expect(out.map(one => one.text)).toEqual([
-    'pr-gate: the person allowed 1 more round: x.\n\npr-gate: round prompt',
+    'pr-gate: the person allowed 1 more round: x.\n\npr-gate: round prompt\n\nmore',
     'pr-gate: the person stopped the gate.',
     'pr-gate: the person reset the lifecycle of feat/x.',
+  ])
+})
+
+test('gate R2-4: a ready prompt merged with a waiver note keeps what still holds the merge, not the note\'s next step', async () => {
+  const a = { root: '/repo', branch: 'feat/x' }
+  const note = 'pr-gate: the person waived G2-1: fine.\n\nEverything between abc1234 and the merge:\n- check ci failing (yours: fix it)\n\nYour next step: answer what is yours.'
+  const out = mergeNotes([
+    { text: note, key: a, batch: 1, isNote: true },
+    { text: 'pr-gate: ready for the merge decision.', key: a, batch: 1 },
+  ])
+  expect(out.map(one => one.text)).toEqual([
+    'pr-gate: the person waived G2-1: fine.\n\npr-gate: ready for the merge decision.\n\nEverything between abc1234 and the merge:\n- check ci failing (yours: fix it)',
   ])
 })
 

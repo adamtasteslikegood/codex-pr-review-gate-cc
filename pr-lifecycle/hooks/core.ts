@@ -12,6 +12,7 @@ import {
   raisedIn,
   rejections,
   securityHolds,
+  titleOf,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -388,9 +389,6 @@ const noted = (text: string): string => {
   const at = text.indexOf('\n')
   return at < 0 ? `${text}\n${REVIEWER_DATA}` : `${text.slice(0, at)}\n${REVIEWER_DATA}${text.slice(at)}`
 }
-
-/** A finding's name in a prompt: a reviewer's comment is named by who wrote it, since its title is the reviewer's own first line. */
-const titleOf = (one: Finding): string => (one.source === 'github' ? `comment from ${one.reviewer}` : one.title)
 
 const listFindings = (findings: readonly Finding[]): string =>
   findings

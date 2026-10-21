@@ -422,13 +422,20 @@ async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
   await $.prompt.submit({ text }).catch(() => undefined)
 }
 
-/** Within one command's batch, an action's note and a prompt for the same record become one prompt: the note's first line leads it (R81). */
+/**
+ * Within one command's batch, an action's note and a prompt for the same record become one prompt: the note's first line leads it
+ * (R81). What the note says holds the merge follows the prompt, so a failing check is not lost behind a ready prompt (gate R2-4);
+ * only the note's own next step gives way to the prompt's.
+ */
 export function mergeNotes(held: readonly Queued[]): Queued[] {
   const isPair = (a: Queued, b: Queued): boolean => a.batch === b.batch && sameRecord(a.key, b.key)
   return held.flatMap(one => {
     if (one.isNote === true) return held.some(each => each.isNote !== true && isPair(each, one)) ? [] : [one]
     const note = held.find(each => each.isNote === true && isPair(each, one))
-    return [note === undefined ? one : { ...one, text: `${note.text.split('\n')[0] ?? ''}\n\n${one.text}` }]
+    if (note === undefined) return [one]
+    const [lead = '', ...rest] = note.text.split('\n\n')
+    const holds = rest.filter(part => !part.startsWith('Your next step:')).join('\n\n')
+    return [{ ...one, text: [lead, one.text, ...(holds === '' ? [] : [holds])].join('\n\n') }]
   })
 }
 
