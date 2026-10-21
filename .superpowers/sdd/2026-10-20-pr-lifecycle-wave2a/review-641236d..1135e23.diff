@@ -1,0 +1,279 @@
+# Review package: 641236d..1135e23
+
+## Commits
+1135e23 pr-lifecycle: the no-action scope phrase is a fixed shape; a bare hyphen is not an advisory mark (R83, R84)
+213b9e0 sdd: wave 2a ledger, task 1 fix round 1
+
+## Files changed
+ .../sdd/2026-10-20-pr-lifecycle-wave2a/progress.md |  6 +++
+ .../2026-10-20-pr-lifecycle-wave2a/task-1-brief.md | 53 ++++++++++++++--------
+ .../task-1-report.md                               |  7 +++
+ pr-lifecycle/hooks/github.ts                       |  5 +-
+ pr-lifecycle/tests/github.test.ts                  |  6 +++
+ 5 files changed, 57 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
+index 70b0f20..5efa426 100644
+--- a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
+@@ -35,10 +35,16 @@ Ruling: T1's advisory label outranks the security P2 floor (a security-hinted "n
+ ## Tasks
+ Task 1: dispatched (BASE 095f040, implementer a828188ec312e4078, sonnet)
+ Task 1: implementer DONE_WITH_CONCERNS, commit 69f4c58 (421 pass)
+ 
+ ## External review of PR #19 (ChatGPT reviewer, 4 unresolved P2 threads, read 2026-10-20)
+ Ruling: PR19-1 (isNoAction trusts a keyword list) — accept: settle only when EVERY sentence of the body matches a whole-sentence no-action form (LGTM/looks good/approved/ship it/thanks, no actionable|blocking findings|issues|comments [in this …], no issues found, nothing to fix, reviewed <sha> [against <base>]); any other sentence → triage. Enters Task 1's fix loop with the reviewer's two cases — costs if wrong: a few clean reviews with extra prose get triaged (one agent answer each).
+ Ruling: PR19-2 (required checks partial) — accept: each source must be parsed OK or authoritatively absent (classic 404 "not protected"); a throw, 403, 500 or malformed JSON from either → 'unknown' (all required). readRequired returns undefined on malformed classic JSON. Tests for 200/403, 200/500, 403/200, 500/200, throw, malformed. Plan Task 6 amended before dispatch — costs: none beyond fail-closed holds when GitHub hiccups.
+ Ruling: PR19-3 (post waiver guard too late) — accept: advance checks a valid head/base post waiver + no security hold right after its ownership/staleness checks, before startRound/startAnswer/startRecheck. Tests: waived head with open P2, with verification owed, with a round owed → resume starts no triage/recheck/review. Plan Task 8 amended — costs: none.
+ Ruling: PR19-4 (note merging spans commands) — accept: queue entries carry a batch id per holdingPrompts call; mergeNotes merges within a batch only; stop/reset drop queued prompts for the same record from earlier batches. Regression: waive pre then reset before the flush → agent gets the reset note and no open-PR prompt. Plan Tasks 8/9 amended — costs: none.
+ Docs fixes go on docs/wave2 (PR #19) via a worktree, then docs/wave2 is merged into this branch between tasks.
++Task 1: review Approved (spec ✅); minors: (1) ADVISORY regex over-matches "Optional chaining…" — Ruling: fix in round 1 with the plan's tightened regex, cheap and it mislabels real findings as tagged P3 — costs: none; (2) loose text outside the no-action sentence = PR19-1; (3) logEvent loop then updateRecord not atomic — deferred minor; (4) 'New review feedback' assertion wording-dependent — deferred minor.
++Task 1: minor (deferred): beginTriage logs approvals before marking processed; crash between re-logs once
++Task 1: minor (deferred): first R83 flow test's "New review feedback" check depends on prompt wording
++PR #19: docs fixed in 8755fb1, replied in all 4 threads, threads resolved; docs/wave2 merged into this branch.
++Task 1: fix round 1/5 dispatched (FIX_BASE 3aa05cf; findings PR19-1 classifier, ADVISORY over-match)
++Task 1: fix round 1 implementer DONE, commit 641236d (421 pass); re-review dispatched
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-brief.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-brief.md
+index 852fa59..96a9cd5 100644
+--- a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-brief.md
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-brief.md
+@@ -13,21 +13,31 @@
+ - [ ] **Step 1: Write the failing unit tests** (append to `tests/github.test.ts`; add `isNoAction` to its import list from `'../hooks/github'`):
+ 
+ ```ts
+ test('R83: only positive no-action evidence settles a review (review G2-2)', async () => {
+   // Untagged but actionable: never settled.
+   expect(isNoAction('COMMENTED', 'The reset path deletes the pending findings. Preserve them before archiving.')).toBe(false)
+   // Clean approvals.
+   expect(isNoAction('APPROVED', '')).toBe(true)
+   expect(isNoAction('APPROVED', 'LGTM')).toBe(true)
+   expect(isNoAction('COMMENTED', 'No actionable findings in this diff.')).toBe(true)
+-  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
++  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
++  expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
++  expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
++  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
++  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
++  expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
++  expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
++  expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
++  expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
++  expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
++  expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
+   // Approval text mixed with a requested fix.
+   expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
+   expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
+   expect(isNoAction('APPROVED', 'LGTM. Should we also cover the retry path?')).toBe(false)
+   expect(isNoAction('COMMENTED', 'No blocking findings, however the cache is never cleared.')).toBe(false)
+   // A severity tag or a strong word means there is something to act on.
+   expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
+   expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+ })
+ 
+@@ -42,69 +52,76 @@ test('R83: readReviews marks a positive no-action review as no finding, and keep
+ 
+ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 anywhere wins', async () => {
+   expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- add a log line')).toEqual({ severity: 'P3', isSecurity: false, isTagged: true })
+   expect(severityHint('## Advisory (non-blocking)\n1. tidy the docs')).toMatchObject({ severity: 'P3', isTagged: true })
+   expect(severityHint('nit: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+   expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
+   // Quoted inside a sentence, the word labels nothing.
+   expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
+   expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
+   expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
++  // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
++  expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
++  expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
++  expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+ })
+ ```
+ 
+ - [ ] **Step 2: Run them to verify they fail**
+ 
+ Run: `claude plugin test pr-lifecycle`
+ Expected: FAIL. `isNoAction` is not exported, and `severityHint` returns no `isTagged`.
+ 
+ - [ ] **Step 3: Implement in `github.ts`**
+ 
+ Replace `severityHint` (lines 208-216) with:
+ 
+ ```ts
+ /** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
+-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)\b/im
++const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—-]|$)/im
+ 
+ /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
+ export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
+   const isSecurity = SECURITY.test(body)
+   // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
+   const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+   if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
+   if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+   if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
+   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
+   if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
+   return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
+ }
+ 
+-const NO_ACTION = /\b(?:lgtm|no (?:actionable|blocking) (?:findings|issues|comments)|no issues found|nothing to fix)\b/i
+-const REQUEST = /\b(?:please|should|must|needs? to|consider|suggest|recommend)\b/i
+-const STRONG = /\b(?:P[0-2]|critical|blocker|high)\b/i
+-const CAVEAT = /\b(?:but|except|however)\b/i
++/** Whole sentences that settle a review (R83). */
++const SETTLES = [
++  /^no (?:actionable|blocking) (?:findings|issues|comments)(?: (?:in|for) this [\w\s/-]+)?$/i,
++  /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
++]
++/** Whole sentences that may sit beside them and change nothing. */
++const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
+ 
+ /**
+- * Whether a review says there is nothing to act on (R83): positive evidence only, never a missing tag (review G2-2 on PR #19).
+- * An APPROVED review, or a COMMENTED one whose first paragraph says so in a sentence with no caveat; either way no sentence may
+- * ask for anything or carry a P0-P2, critical, blocker or high tag. Inline comments are separate rows, triaged on their own.
++ * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
++ * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
++ * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
+  */
+ export function isNoAction(state: string | undefined, body: string): boolean {
+-  if (state === 'CHANGES_REQUESTED') return false
+-  const text = body.trim()
+-  if (text === '') return state === 'APPROVED' || state === 'COMMENTED'
+-  if (REQUEST.test(text) || STRONG.test(text)) return false
+-  if (state === 'APPROVED') return !CAVEAT.test(text)
+-  if (state !== 'COMMENTED') return false
+-  const first = text.split(/\n\s*\n/)[0] ?? ''
+-  const said = first.split(/(?<=[.!?])\s+/).find(one => NO_ACTION.test(one))
+-  return said !== undefined && !CAVEAT.test(said)
++  if (state !== 'APPROVED' && state !== 'COMMENTED') return false
++  const sentences = body
++    .split(/[.!?;]+|\n+/)
++    .map(one => one.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
++    .filter(one => one !== '')
++  if (sentences.length === 0) return true
++  const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
++  if (!sentences.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
++  return state === 'APPROVED' || sentences.some(settles)
+ }
+ ```
+ 
+ In `readReviews` (line 107) change `isFinding`:
+ 
+ ```ts
+       isFinding: row.state === 'CHANGES_REQUESTED' || (body.trim() !== '' && !isNoAction(str(row.state), body)),
+ ```
+ 
+ Inline comments and issue comments keep `isFinding: body.trim() !== ''`.
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-report.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-report.md
+index 670f592..f54cc1b 100644
+--- a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-report.md
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-1-report.md
+@@ -14,10 +14,17 @@
+ pr-lifecycle/hooks/github.ts, hooks/round.ts, types/index.d.ts, tests/github.test.ts, tests/flow.test.ts
+ 
+ ## Existing test changed
+ tests/github.test.ts "a severity is read from the reviewer's own words": `toEqual` assertions gained `isTagged` (true for P1 tag and 'nit: typo' (advisory), false for Critical, 'minor: possible XSS', 'Consider renaming'). No severity value changed; the security-nit P2 assertion used "minor:", not "nit:", so it still reads P2 (isTagged false).
+ 
+ ## Self-review / concerns
+ - Code applied verbatim from the brief; no adaptation needed.
+ - 'minor:' with security is still not an advisory label (not in ADVISORY list), so P2 floor stays for it; only "nit:" outranks the floor, per the controller ruling.
+ - Settled loop logs once per review via `processed`; the updateRecord runs only when there are settled rows.
+ - I did not run a separate flow test of the "Co-Authored-By" model name: the commit uses the system reminder's "Claude Sonnet 5.5" trailer, while constraints.md says "Claude Opus 5.5". The reminder says it takes precedence for new commits.
++
++## Fix round 1
++- Changed (hooks/github.ts): replaced NO_ACTION/REQUEST/STRONG/CAVEAT and the old `isNoAction` with `SETTLES`, `POLITE` and a whole-body `isNoAction` (every sentence must be a no-action form; COMMENTED also needs a settling sentence). Kept the `u`-flag `\p{L}\p{N}` regex: lint and typecheck accept it. Tightened `ADVISORY` to need a mark (colon, comma, bracket, dash, line end) after the label.
++- Covering tests (tests/github.test.ts): the R83 test gained the whole-body cases ("LGTM. Preserve ...", "LGTM. Reset still deletes ...", "LGTM, the cache is never cleared", "No blocking findings.\n\nHowever ...", Thanks!, emoji heading); the "Reviewed ... \n\nScope: docs only." case flipped to false. The R84 test gained "Optional chaining ...", "Advisory locks ...", "**Nit**: rename this".
++- RED: `claude plugin test pr-lifecycle` -> 419 pass, 2 fail (the R83 and R84 unit tests).
++- GREEN: `claude plugin test pr-lifecycle` -> 421 pass, 0 fail; `npm run lint` and `npm run typecheck` clean.
++- Uncommitted brief.md/progress.md edits in the tree are the coordinator's; not staged.
+diff --git a/pr-lifecycle/hooks/github.ts b/pr-lifecycle/hooks/github.ts
+index 8101457..176b945 100644
+--- a/pr-lifecycle/hooks/github.ts
++++ b/pr-lifecycle/hooks/github.ts
+@@ -198,38 +198,39 @@ export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
+ const postsFor = (login: string, name: string): boolean => {
+   if (login === name) return true
+   if (!login.endsWith('[bot]')) return false
+   const stem = login.slice(0, -'[bot]'.length)
+   return stem === name || stem.startsWith(`${name}-`)
+ }
+ 
+ const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
+ 
+ /** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
+-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—-]|$)/im
++const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|$)/im
+ 
+ /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
+ export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
+   const isSecurity = SECURITY.test(body)
+   // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
+   const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+   if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
+   if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+   if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
+   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
+   if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
+   return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
+ }
+ 
+ /** Whole sentences that settle a review (R83). */
++const SCOPE = '(?: (?:in|for) this (?:[\\w/-]+ ){0,2}(?:diff|pr|pull request|changes?|commit|patch|update|revision))?'
+ const SETTLES = [
+-  /^no (?:actionable|blocking) (?:findings|issues|comments)(?: (?:in|for) this [\w\s/-]+)?$/i,
++  new RegExp(`^no (?:actionable|blocking) (?:findings|issues|comments)${SCOPE}$`, 'i'),
+   /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
+ ]
+ /** Whole sentences that may sit beside them and change nothing. */
+ const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
+ 
+ /**
+  * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
+  * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
+  * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
+  */
+diff --git a/pr-lifecycle/tests/github.test.ts b/pr-lifecycle/tests/github.test.ts
+index 023bfa9..aa4b414 100644
+--- a/pr-lifecycle/tests/github.test.ts
++++ b/pr-lifecycle/tests/github.test.ts
+@@ -395,20 +395,23 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
+   expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
+   expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
+   // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
+   expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+   expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+   expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+   expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
+   expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
+   expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
+   expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
++  // A trailing scope phrase is a fixed shape, not any run of words (round 2): the rest of the sentence is a finding.
++  expect(isNoAction('COMMENTED', 'No actionable findings in this PR but the cache is never cleared')).toBe(false)
++  expect(isNoAction('COMMENTED', 'No blocking issues for this change and the reset deletes pending findings')).toBe(false)
+   // Approval text mixed with a requested fix.
+   expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
+   expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
+   expect(isNoAction('APPROVED', 'LGTM. Should we also cover the retry path?')).toBe(false)
+   expect(isNoAction('COMMENTED', 'No blocking findings, however the cache is never cleared.')).toBe(false)
+   // A severity tag or a strong word means there is something to act on.
+   expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
+   expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+ })
+ 
+@@ -426,12 +429,15 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
+   expect(severityHint('## Advisory (non-blocking)\n1. tidy the docs')).toMatchObject({ severity: 'P3', isTagged: true })
+   expect(severityHint('nit: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+   expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
+   // Quoted inside a sentence, the word labels nothing.
+   expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
+   expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
+   expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
+   // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
+   expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+   expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
++  expect(severityHint('Nit-picking aside, this leaks')).toMatchObject({ severity: 'P3', isTagged: false })
++  expect(severityHint('Optional-chaining crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
++  expect(severityHint('Advisory - rename it')).toMatchObject({ severity: 'P3', isTagged: true })
+   expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+ })

@@ -74,3 +74,6 @@ Task 4: review Approved, but ⚠️ confirmed gap: spec §4 "deferred, follow-up
 Task 4: minor (deferred): followUp not shape-checked (any non-blank text settles a P3) — plan-mandated
 Task 4: minor (deferred): a stale followUp survives a later re-deferral without one
 Task 4: fix round 1 implementer DONE, commit 87c5c44 (437 pass); /pr-gate log has no per-finding status, left alone; re-review dispatched
+Task 4: fix round 1/5 (1 addressed, 0 open; commits 9a27eae..87c5c44)
+Task 4: complete (commits 5c51b96..87c5c44, review clean)
+Task 4: minor (deferred): status puts the settled-deferral note before rec.message (cosmetic)

@@ -1,0 +1,377 @@
+# Review package: 675fdb0..dd58e14
+
+## Commits
+dd58e14 pr-lifecycle: triage carries findings by the round raised in (finding 21); acknowledged needs a reply and a Codex check (R82)
+
+## Files changed
+ pr-lifecycle/hooks/core.ts           | 12 +++----
+ pr-lifecycle/hooks/lifecycle.ts      |  8 +++--
+ pr-lifecycle/hooks/round.ts          | 14 +++++++--
+ pr-lifecycle/tests/flow.test.ts      | 61 ++++++++++++++++++++++++++++++++++++
+ pr-lifecycle/tests/lifecycle.test.ts |  9 ++++++
+ 5 files changed, 93 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/pr-lifecycle/hooks/core.ts b/pr-lifecycle/hooks/core.ts
+index e2cf01b..b183fb7 100644
+--- a/pr-lifecycle/hooks/core.ts
++++ b/pr-lifecycle/hooks/core.ts
+@@ -195,41 +195,41 @@ export function replyIdOf(raw: string): string {
+ /** What the fixer said it did with each finding, as the fix and triage steps both report it; empty when it said nothing. */
+ export function readTriage(answer: string): TriageAnswer[] {
+   const listed = readTrailer(answer)?.dispositions
+   if (!Array.isArray(listed)) return []
+   const out: TriageAnswer[] = []
+   for (const one of listed) {
+     if (typeof one !== 'object' || one === null) continue
+     const row = one as Record<string, unknown>
+     const id = text(row.id)
+     const action = String(row.action ?? '').toLowerCase()
+-    if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
++    if (id === undefined || !['fixed', 'rebutted', 'deferred', 'acknowledged'].includes(action)) continue
+     const severity = String(row.severity ?? '').toUpperCase() as Severity
+     const given =
+       typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
+     const replyId = given === undefined ? undefined : replyIdOf(given)
+     out.push({
+       id,
+-      action,
++      action: action as Answer['action'],
+       ...(text(row.note) === undefined ? {} : { note: text(row.note)?.slice(0, 2000) }),
+       ...(text(row.evidence) === undefined ? {} : { evidence: text(row.evidence)?.slice(0, 2000) }),
+       ...(SEVERITIES.includes(severity) ? { severity } : {}),
+       ...(typeof row.isSecurity === 'boolean' ? { isSecurity: row.isSecurity } : {}),
+       ...(replyId === undefined ? {} : { replyId }),
+       ...(text(row.duplicateOf) === undefined ? {} : { duplicateOf: text(row.duplicateOf) }),
+     })
+   }
+   return out
+ }
+ 
+-/** What the fixer said it did with each finding. */
+-export const readDispositions = (answer: string): Answer[] => readTriage(answer)
++/** What the fixer said it did with each finding; "acknowledged" is a post-PR triage answer only (R82). */
++export const readDispositions = (answer: string): Answer[] => readTriage(answer).filter(one => one.action !== 'acknowledged')
+ 
+ /** The fix reviewer's verdict. An unreadable one confirms nothing: the fixes stay unverified, still owed a check. */
+ export function readVerify(answer: string): { isOk: boolean; isRead: boolean; notes?: string } {
+   const trailer = readTrailer(answer)
+   if (trailer === undefined || typeof trailer.ok !== 'boolean') return { isOk: false, isRead: false }
+   return { isOk: trailer.ok, isRead: true, notes: text(trailer.notes)?.slice(0, 4000) }
+ }
+ 
+ export type Verdict = { holds: boolean; note?: string }
+ 
+@@ -677,33 +677,33 @@ export function triagePrompt(
+     )
+   }
+   const owed = rec.findings.filter(one => isBlocking(one) && one.status === 'reported-fixed')
+   if (owed.length > 0) lines.push('', 'Reported fixed, verification still owed:', listFindings(owed))
+   // Replied feedback by its finding id (M4), not the internal key.
+   const already = Object.keys(rec.replies).map(key => rec.findings.find(one => one.externalId === key)?.id ?? key)
+   lines.push(
+     '',
+     'What to do:',
+     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
+-    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, or defer it with the reason. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
++    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason, or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
+     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
+     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
+       `-f body=...), anything else as a PR comment (gh pr comment ${rec.pr}). ` +
+       'Put the reply id in replyId: the number after #issuecomment- (or #discussion_r) in the URL gh prints.' +
+       `${already.length > 0 ? ` Already replied to: ${already.join(', ')}; do not reply to those again.` : ''}`,
+     '   Before posting, check the thread for a reply of yours already there: never post a second one.',
+     '5. Run the checks that cover what you touched, commit, and push to the PR branch.',
+     '',
+     trailerRule(
+       stepOf(run, 'triage'),
+-      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one"}]}',
++      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one"}]}',
+     ),
+     '',
+     'Then end your turn. /pr-gate collects the next reviews by itself.',
+   )
+   return noted(lines.join('\n'))
+ }
+ 
+ /** `waivedNote`: the person's finding waiver that let a held gate pass, said in place of a clean pass. */
+ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exhausted' | 'waived', waivedNote?: string): string {
+   const hasConverged = status !== 'exhausted'
+diff --git a/pr-lifecycle/hooks/lifecycle.ts b/pr-lifecycle/hooks/lifecycle.ts
+index 28877d0..483f252 100644
+--- a/pr-lifecycle/hooks/lifecycle.ts
++++ b/pr-lifecycle/hooks/lifecycle.ts
+@@ -94,20 +94,26 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
+   deferredBlocking: 0,
+   activeMs: 0,
+   waitMs: 0,
+   startedAt: 0,
+   endedAt: 0,
+   ...over,
+ })
+ 
+ export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
+ 
++const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
++
++/** A GitHub item the agent may answer "no change requested" (R82): no security flag, and no explicit P0-P2 from the reviewer. */
++export const mayAcknowledge = (f: Finding): boolean =>
++  f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2)
++
+ /** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
+ export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
+   finding.round === round || finding.history.some(one => one.round === round && one.status === 'open')
+ 
+ // ----------------------------------------------------------------- ledger
+ 
+ export type Answer = {
+   id: string
+   action: 'fixed' | 'rebutted' | 'deferred' | 'acknowledged'
+   note?: string
+@@ -120,22 +126,20 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
+   ...f,
+   status,
+   note: note ?? f.note,
+   needsRecheck: undefined,
+   history: [
+     ...f.history,
+     { round, status, ...(note === undefined ? {} : { note }), ...(evidence === undefined ? {} : { evidence }), by, at },
+   ],
+ })
+ 
+-const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
+-
+ /**
+  * The fixer's word: fixed is only reported until a check confirms it. A fixer cannot lower a severity a reviewer or Codex set;
+  * disagreement is a rebuttal. A severity only guessed from a GitHub comment's words takes the triaged one, up or down (R84).
+  */
+ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at: number): Finding {
+   const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action === 'acknowledged' ? 'rebutted' : a.action
+   const next = moved(f, status, round, by, at, a.note, a.evidence)
+   const isGuessed = f.severitySource === 'hint'
+   const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
+   const security = f.isSecurity === true || a.isSecurity === true
+diff --git a/pr-lifecycle/hooks/round.ts b/pr-lifecycle/hooks/round.ts
+index 2f0ac33..b95fcf1 100644
+--- a/pr-lifecycle/hooks/round.ts
++++ b/pr-lifecycle/hooks/round.ts
+@@ -44,20 +44,21 @@ import {
+   isBlocking,
+   isDisputed,
+   isReverifyOwed,
+   lastCoveredHead,
+   markHeld,
+   markVerified,
+   mergeFindings,
+   mergeHolds,
+   newRecord,
+   nextIds,
++  mayAcknowledge,
+   raisedIn,
+   readDiff,
+   rejections,
+   relocate,
+   roundOf,
+   triage,
+   unresolvedBlockers,
+   usedRounds,
+   verificationOwed,
+   waivedIds,
+@@ -1239,21 +1240,22 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
+       history: [{ round: run.round, status: 'open', by: feedback.reviewer, at: now }],
+     }
+     fresh.push(finding)
+     listed.push({ feedback, cls, ...(matchId === undefined ? {} : { matchId }), findingId: finding.id })
+   }
+   // Codex's findings of this round still open (the fallback or the final-head check): answered in the same turn.
+   const codex = run.findings.filter(one => one.source !== 'github' && raisedIn(one, run.round) && one.status === 'open')
+   // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
+   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
+   const carried = mergeHolds({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
+-    one => one.status === 'open' && !raisedIn(one, run.round) && !listedIds.has(one.id),
++    // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
++    one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
+   )
+   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
+   let others: string[] = []
+   if (got.prHead !== rec.head) {
+     // A failed fetch, twice, stops the round here (R1-10): the log would read a stale origin.
+     const fetched = await fetchTwice($, run.root, ['--quiet', 'origin'], 60_000)
+     if (!fetched.isOk) {
+       await failPost($, run, `git could not fetch origin, twice (${fetched.err}); check the network and the remote, then run /pr-gate resume`)
+       return
+     }
+@@ -1339,21 +1341,27 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
+     })
+     .catch(() => undefined)
+ }
+ 
+ /** What Codex checks at the end of a post-PR round, on the head the round ends on (`checksOwed`; R36, R58, R72). */
+ const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
+ 
+ /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
+ async function afterTriage($: Engine, run: Run): Promise<void> {
+   const now = await $.clock.now()
+-  const said = readTriage(run.pending[0]?.answer ?? '')
++  // "acknowledged" counts only with a reply in the thread, on an item that may take it (R82); stored as a rebuttal, so Codex checks it.
++  const said = readTriage(run.pending[0]?.answer ?? '').flatMap(each => {
++    if (each.action !== 'acknowledged') return [each]
++    const one = run.findings.find(f => f.id === each.id)
++    if (one === undefined || !mayAcknowledge(one) || each.replyId === undefined) return []
++    return [{ ...each, note: `No change requested: ${each.note ?? 'the comment asks for no change'}` }]
++  })
+   const after = await patch($, run.id, one => ({
+     ...one,
+     pending: [],
+     findings: one.findings.map(finding => {
+       const answer = said.find(each => each.id === finding.id)
+       return answer === undefined ? finding : applyAnswer(finding, answer, one.round, 'main', now)
+     }),
+     steps: withStep(one.steps, {
+       id: `r${one.round}-triage`,
+       label: `Round ${one.round} · answer the reviews (main agent)`,
+@@ -1395,21 +1403,21 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
+       pending: [{ role: 'triage', step, isMain: true }],
+       steps: withStep(one.steps, { id: `r${one.round}-triage`, label: `Round ${one.round} · answer the reviews again (main agent)`, state: 'running' }),
+     }))
+     if (asked === null) return
+     const ids = unanswered.join(', ')
+     await askTriage(
+       $,
+       run.id,
+       `pr-gate: These review items have no answer yet: ${ids}. Answer each one: fix it, rebut it with file:line evidence, or defer it with the reason, ` +
+         `replying in its thread where it came from GitHub. Commit and push any fix. End your final message with ${TRAILER} on its own line, then ` +
+-        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred","severity":"P2","note":"...","replyId":"123"}]}`,
++        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred|acknowledged","severity":"P2","note":"...","replyId":"123"}]}`,
+     )
+     return
+   }
+   const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
+   if (dirty.isOk && dirty.out !== '') {
+     await failPost($, after, 'the reviews were answered with uncommitted changes left: commit and push them, then run /pr-gate resume')
+     return
+   }
+   // The round ends on the PR head as GitHub reports it now (R28): this machine's push, or another agent's on top of it.
+   const local = await git($, run.root, ['rev-parse', 'HEAD'])
+diff --git a/pr-lifecycle/tests/flow.test.ts b/pr-lifecycle/tests/flow.test.ts
+index a273ceb..7062037 100644
+--- a/pr-lifecycle/tests/flow.test.ts
++++ b/pr-lifecycle/tests/flow.test.ts
+@@ -3310,10 +3310,71 @@ test('R83: an inline comment under an APPROVED review is triaged', async ($, on)
+   expect(w.prompts.at(-1)).toContain('this branch never closes the file')
+ })
+ 
+ test('R84: a guessed P2 the agent triages as P3 shows as P3 in the hold', async ($, on) => {
+   const w = world(on)
+   await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+   const rec = await recordOf(w)
+   expect(rec.findings.find(one => one.id === 'G2-1')?.severity).toBe('P3')
+   expect(w.prompts.at(-1)).toContain('G2-1 [P3]')
+ })
++
++/** Finding 21's shape (cookbook PR 3706, G2-11): an approval answered "fixed", which Codex could not verify and reopened. */
++const reopenedApproval = (): Finding => ({
++  id: 'G1-1', round: 1, source: 'github', reviewer: 'claude[bot]', externalId: 'inline:7', threadId: '7', severity: 'P2',
++  title: 'No blocking findings', headSeen: 'a'.repeat(40), status: 'open',
++  history: [
++    { round: 1, status: 'open', by: 'claude[bot]', at: 1 },
++    { round: 1, status: 'reported-fixed', note: 'nothing to fix', by: 'main', at: 2 },
++    { round: 2, status: 'open', note: 'Codex: no fix to verify', by: 'codex', at: 3 },
++  ],
++})
++
++test('finding 21: an earlier round\'s finding Codex reopened this round is carried into triage', async ($, on) => {
++  const w = world(on)
++  w.git.roster = roster
++  await toPost($, w)
++  const rec = await recordOf(w)
++  w.store.set(KEY, { ...rec, findings: [reopenedApproval()], processed: ['inline:7'] })
++  w.gh.comments = [inline(11, 'nit: rename this', w.gh.prHead)]
++  w.gh.reviews = covers(w.gh.prHead)
++  await w.clock.advance(30_000)
++  const said = w.prompts.at(-1) ?? ''
++  expect(said).toContain('Carried from earlier rounds, still open')
++  expect(said).toContain('G1-1')
++  expect((await runOf(w)).asked).toContain('G1-1')
++})
++
++test('R82: acknowledged, with a reply, goes to the Codex check and settles when Codex upholds it', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'Looks fine to me; the retry loop is the same as before.')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', severity: 'P3', note: 'a status note, nothing asked', replyId: '992' }]))
++  const run = await runOf(w)
++  expect(run.findings.find(one => one.id === 'G2-1')?.note).toContain('No change requested:')
++  expect(run.phase).toBe('verify')
++  await done($, accept('r2-verify', w))
++  expect((await recordOf(w)).phase).toBe('ready')
++})
++
++test('R82: acknowledged without a reply, or on a tagged P2 or security finding, is unanswered and asked again', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'P2: the cache is never cleared')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine', replyId: '992' }]))
++  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
++})
++
++test('R82: acknowledged without a reply is unanswered and asked again', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'Looks fine to me.')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine' }]))
++  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
++})
++
++test('R82: Codex rejecting an acknowledgement reopens the item with its reason', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'Looks fine, though the retry loop now never stops.')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'nothing asked', replyId: '992' }]))
++  await done($, accept('r2-verify', w, { 'G2-1': 'it reports a loop that never stops' }))
++  const found = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
++  expect(found?.status).toBe('open')
++  expect(found?.history.at(-1)?.note).toContain('never stops')
++})
+diff --git a/pr-lifecycle/tests/lifecycle.test.ts b/pr-lifecycle/tests/lifecycle.test.ts
+index 74c045c..6a9e8e6 100644
+--- a/pr-lifecycle/tests/lifecycle.test.ts
++++ b/pr-lifecycle/tests/lifecycle.test.ts
+@@ -3,20 +3,21 @@ import { expect, test } from 'claude-code/testing'
+ import type { Finding } from '../types'
+ import {
+   allowanceFor,
+   applyAnswer,
+   decideNext,
+   changedLines,
+   invalidate,
+   lastReviewedHead,
+   markHeld,
+   markVerified,
++  mayAcknowledge,
+   mayStartRound,
+   isDisputed,
+   mergeHolds,
+   mergeFindings,
+   moveLine,
+   newRecord,
+   readDiff,
+   relocate,
+   remaining,
+   rejections,
+@@ -733,10 +734,18 @@ test('R84: a triaged severity replaces a guessed one, up or down, and the change
+   expect(lowered.severity).toBe('P3')
+   expect(lowered.history.at(-1)?.severity).toBe('P3')
+   expect(applyAnswer(guessed, { id: 'R1-1', action: 'fixed', severity: 'P1' }, 2, 'main', 5).severity).toBe('P1')
+ })
+ 
+ test('R84: a reviewer\'s own tag and a Codex severity are never lowered', async () => {
+   const tagged = finding({ source: 'github', severity: 'P2', severitySource: 'tag' })
+   expect(applyAnswer(tagged, { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
+   expect(applyAnswer(finding({ severity: 'P2' }), { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
+ })
++
++test('R82: only an untagged-or-P3, non-security GitHub finding may be acknowledged', async () => {
++  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'hint' }))).toBe(true)
++  expect(mayAcknowledge(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }))).toBe(true)
++  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'tag' }))).toBe(false)
++  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'hint', isSecurity: true }))).toBe(false)
++  expect(mayAcknowledge(finding())).toBe(false)
++})

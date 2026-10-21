@@ -1,0 +1,301 @@
+# Review package: 9a27eae..87c5c44
+
+## Commits
+87c5c44 pr-lifecycle: status and the ready prompt name the follow-up of a settled deferral (R85)
+5cdb443 sdd: wave 2a ledger, task 3 complete, task 4 built
+
+## Files changed
+ .../sdd/2026-10-20-pr-lifecycle-wave2a/progress.md |  8 +++
+ .../2026-10-20-pr-lifecycle-wave2a/task-4-brief.md | 83 ++++++++++++++++++++++
+ .../task-4-report.md                               | 20 ++++++
+ pr-lifecycle/hooks/core.ts                         |  3 +-
+ pr-lifecycle/hooks/register.tsx                    |  4 +-
+ pr-lifecycle/tests/flow.test.ts                    |  7 ++
+ pr-lifecycle/tests/lifecycle.test.ts               |  9 +++
+ 7 files changed, 132 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
+index 4692096..2591788 100644
+--- a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/progress.md
+@@ -55,10 +55,18 @@ Task 1: fix round 2 implementer DONE, commit 1135e23 (421 pass); re-review dispa
+ Task 1: fix round 2/5 (2 addressed, 0 open; commits 641236d..1135e23)
+ Task 1: complete (commits 095f040..1135e23, review clean)
+ Task 2: dispatched (BASE 723724c, sonnet)
+ Task 2: implementer DONE, commit 2226a7d (424 pass); review dispatched
+ Task 2: review Approved; ⚠️ readTriage widening is Task 3 step 5 (checked in plan)
+ Task 2: minor (deferred): severitySource stays 'hint' after triage, so a later answer can move it again
+ Task 2: minor (deferred): no test that a hint finding keeps its severity when the answer carries none
+ Task 2: complete (commits 723724c..2226a7d, review clean)
+ Task 3: dispatched (BASE 675fdb0, sonnet)
+ Task 3: implementer DONE_WITH_CONCERNS, commit dd58e14 (430 pass); concern: tagged-P2 acknowledged test may not exercise mayAcknowledge; reprompt prose still 'fix, rebut or defer'
++Task 3: review Approved (tagged-P2 test does fail if mayAcknowledge is bypassed)
++Task 3: minor (deferred): R82 flow test title claims the security case; only the unit test covers security
++Task 3: minor (deferred): ineligible-acknowledged tests assert only the reprompt text, not that G2-1 stays open / no reply recorded
++Task 3: minor (deferred): positive acknowledged test doesn't assert replyId lands in rec.replies
++Task 3: minor (deferred): R34 reprompt prose still says "fix, rebut or defer" (trailer example has acknowledged)
++Task 3: complete (commits 675fdb0..dd58e14, review clean)
++Task 4: dispatched (BASE 5c51b96, sonnet)
++Task 4: implementer DONE, commit 9a27eae (435 pass); review dispatched
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-brief.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-brief.md
+new file mode 100644
+index 0000000..f325d00
+--- /dev/null
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-brief.md
+@@ -0,0 +1,83 @@
++### Task 4: A P3 deferral with a recorded follow-up settles (decision I)
++
++**Files:**
++- Modify: `pr-lifecycle/types/index.d.ts` (`Finding.followUp?: string`)
++- Modify: `pr-lifecycle/hooks/lifecycle.ts` (`Answer.followUp`, `applyAnswer`, new `isSettledDeferral`, `mergeHolds`)
++- Modify: `pr-lifecycle/hooks/core.ts` (`readTriage` parses `followUp`; triage prompt text)
++- Test: `pr-lifecycle/tests/flow.test.ts`, `pr-lifecycle/tests/lifecycle.test.ts`
++
++**Interfaces:**
++- Produces: `export const isSettledDeferral = (f: Finding): boolean`. `mergeHolds` excludes such findings.
++
++- [ ] **Step 1: Write the failing tests** (`flow.test.ts`):
++
++```ts
++const ISSUE = 'https://github.com/me/repo/issues/9'
++
++test('R85: a P3 deferred with a recorded follow-up settles without a waiver', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'Consider renaming this')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
++  const rec = await recordOf(w)
++  expect(rec.phase).toBe('ready')
++  expect(rec.findings.find(one => one.id === 'G2-1')?.followUp).toBe(ISSUE)
++})
++
++test('R85: a P2 deferral, a P3 one without a follow-up, and a security P3 still wait for the person', async ($, on) => {
++  const w = world(on)
++  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2', followUp: ISSUE })
++  const w2 = world(on)
++  await toAwaiting($, w2, 'Consider renaming this', { severity: 'P3' })
++  const w3 = world(on)
++  await toAwaiting($, w3, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
++})
++```
++
++`toAwaiting` already asserts `postStatus === 'awaiting-decision'`, which is the expectation here. If two worlds per test are refused, split them into three tests.
++
++`lifecycle.test.ts`:
++
++```ts
++test('R85: isSettledDeferral needs deferred, P3, a follow-up and no security flag', async () => {
++  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://x/issues/1' })
++  expect(isSettledDeferral(base)).toBe(true)
++  expect(isSettledDeferral({ ...base, severity: 'P2' })).toBe(false)
++  expect(isSettledDeferral({ ...base, followUp: undefined })).toBe(false)
++  expect(isSettledDeferral({ ...base, isSecurity: true })).toBe(false)
++  expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
++})
++```
++
++- [ ] **Step 2: Run them to verify they fail**
++
++Run: `claude plugin test pr-lifecycle`. Expected: FAIL.
++
++- [ ] **Step 3: Implement**
++- `types/index.d.ts`: on `Finding`, add `/** Where a P3 deferral's follow-up is recorded (R85): an issue or comment URL, or #<n>. */ followUp?: string`.
++- `lifecycle.ts`: add `followUp?: string` to `Answer`. In `applyAnswer`, add `...(a.action === 'deferred' && a.followUp !== undefined ? { followUp: a.followUp } : {})` to the returned object.
++- Add, above `mergeHolds`:
++
++```ts
++/** A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). */
++export const isSettledDeferral = (f: Finding): boolean =>
++  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && f.followUp !== undefined && f.followUp.trim() !== ''
++```
++
++- In `mergeHolds`, add `&& !isSettledDeferral(one)` to the filter.
++- `core.ts` `readTriage`: add `...(text(row.followUp) === undefined ? {} : { followUp: text(row.followUp)?.slice(0, 500) }),`.
++- In the triage prompt step 2 string from Task 3, replace "defer it with the reason" with "defer it with the reason (only what the person must rule on; a P3 with followUp, the issue or comment URL where it is tracked, needs no waiver)". Add `"followUp":"https://… for a P3 deferral"` to the post-PR trailer example.
++
++- [ ] **Step 4: Run the suite**
++
++Run: `claude plugin test pr-lifecycle`
++Expected: PASS. The existing "R39: a deferred P3 after the PR opened is not ready" test has no `followUp`, so it still holds.
++
++- [ ] **Step 5: Commit**
++
++```bash
++git add pr-lifecycle/hooks pr-lifecycle/types/index.d.ts pr-lifecycle/tests
++git commit -m "pr-lifecycle: a P3 deferral with a recorded follow-up settles without a waiver (R85)"
++```
++
++---
++
+diff --git a/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-report.md b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-report.md
+new file mode 100644
+index 0000000..f0bdfd1
+--- /dev/null
++++ b/.superpowers/sdd/2026-10-20-pr-lifecycle-wave2a/task-4-report.md
+@@ -0,0 +1,20 @@
++# Task 4 report: P3 deferral with a recorded follow-up settles (R85)
++
++## Built
++- types: `Finding.followUp?`. lifecycle.ts: `Answer.followUp`, `applyAnswer` keeps it on a deferral, new `isSettledDeferral`, `mergeHolds` excludes settled deferrals.
++- core.ts: `readTriage` parses `followUp` (500 chars); triage step 2 wording and post-PR trailer example carry it. Pre-PR prompts untouched.
++
++## TDD
++- RED: `claude plugin test pr-lifecycle` -> 366 pass, 2 fail ("R85: a P3 deferred ... settles" and lifecycle.test.ts "file did not load", missing export).
++- GREEN: same command -> 435 pass, 0 fail. `npm run lint` and `npm run typecheck` clean.
++
++## Files
++pr-lifecycle/types/index.d.ts, hooks/lifecycle.ts, hooks/core.ts, tests/flow.test.ts, tests/lifecycle.test.ts
++
++## Existing tests changed
++None. The brief's two-world test was split into three tests (P2, no follow-up, security P3), as the brief allowed.
++
++## Self-review / concerns
++- The `isSecurity` check in `isSettledDeferral` uses the finding's flag, which applyAnswer sets from the answer, so a security P3 stays held.
++- A follow-up value is accepted as any non-blank string (no URL validation), per the brief.
++- Commit trailer used the session's attribution reminder (Sonnet 5.5) rather than the constraints file's "Opus 5.5" line.
+diff --git a/pr-lifecycle/hooks/core.ts b/pr-lifecycle/hooks/core.ts
+index 8e39ba9..f41b486 100644
+--- a/pr-lifecycle/hooks/core.ts
++++ b/pr-lifecycle/hooks/core.ts
+@@ -1,18 +1,19 @@
+ // pr-lifecycle's pure half: reading what the agents answered, sizing a change,
+ // reading a `gh pr create`, and the words each agent is sent. No `$` here.
+ 
+ import {
+   isAcceptedRebuttal,
+   isBlocking,
+   isDisputed,
+   isReverifyOwed,
++  isSettledDeferral,
+   mergeHolds,
+   raisedIn,
+   rejections,
+   securityHolds,
+   unresolvedBlockers,
+   usedRounds,
+   verificationOwed,
+   waivedIds,
+ } from './lifecycle'
+ import type { Feedback } from './github'
+@@ -750,21 +751,21 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
+ 
+ export function readyPrompt(rec: LifecycleRecord): string {
+   const done = rec.rounds.filter(one => one.isCompleted)
+   const pre = done.filter(one => one.phase === 'pre').length
+   const post = done.filter(one => one.phase === 'post').length
+   const count = (status: Finding['status']): number => rec.findings.filter(one => one.status === status).length
+   const deferred = rec.findings.filter(one => one.status === 'deferred')
+   const summary = [
+     `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
+     `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
+-    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}`).join('; ')}`,
++    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp})` : ''}`).join('; ')}`,
+   ].join('; ')
+   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
+ }
+ 
+ /**
+  * The person's options after the PR opened: the waiver of each deferral or dispute (M1, R40), and `waive post`.
+  * One more review round is offered only where a round could help (not when the person is only asked to decide, R42).
+  */
+ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRound = true): string => {
+   const theirs = mergeHolds(rec).filter(one => one.status === 'deferred' || isDisputed(one))
+diff --git a/pr-lifecycle/hooks/register.tsx b/pr-lifecycle/hooks/register.tsx
+index 7ef94e6..ef45aaf 100644
+--- a/pr-lifecycle/hooks/register.tsx
++++ b/pr-lifecycle/hooks/register.tsx
+@@ -12,20 +12,21 @@ import type { EngineInterface, Register } from 'claude-code'
+ import type { Effort, Finding, LifecycleRecord, Run } from '../types'
+ import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+ import { readPrAction } from './github'
+ import type { PrAction } from './github'
+ import {
+   allowanceFor,
+   isAcceptedRebuttal,
+   isDisputed,
+   lastReviewedHead,
+   isReverifyOwed,
++  isSettledDeferral,
+   mergeHolds,
+   reverifyOwed,
+   newRecord,
+   remaining,
+   rescope,
+   securityHolds,
+   logSummary,
+   unresolvedBlockers,
+   usedRounds,
+   verificationOwed,
+@@ -791,24 +792,25 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
+     .catch(() => ' The pane could not be opened.')
+   const top = run === null ? await git($, undefined, ['rev-parse', '--show-toplevel']) : { isOk: true, out: run.root }
+   const branch = run?.branch ?? (top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : '')
+   const rec = top.isOk && branch !== '' ? await loadRecord($, top.out, branch) : undefined
+   const live = run === null ? '' : ` The run: ${run.status}, round ${run.round}${run.status === 'running' ? `, ${run.phase}` : ''}.`
+   if (rec === undefined) return `/${COMMAND} has not run${branch === '' ? '' : ` for ${branch}`}.${live}${pane}`
+   const standing = rec.phase === 'pre' ? rec.preStatus : rec.phase === 'post' ? rec.postStatus : undefined
+   const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
+   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
+   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
++  const settled = rec.findings.filter(isSettledDeferral).map(one => ` ${one.id} deferred, follow-up at ${one.followUp}.`).join('')
+   return (
+     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
+     `${usedRounds(rec)}/${rec.allowance + granted} rounds used, baseline ${baseline}/2, ${unresolvedBlockers(rec).length} blocking open, ` +
+-    `${verificationOwed(rec).length} owed, ${mergeHolds(rec).length} holding the merge.${rec.message === undefined ? '' : ` ${rec.message}.`}${live}${pane}`
++    `${verificationOwed(rec).length} owed, ${mergeHolds(rec).length} holding the merge.${settled}${rec.message === undefined ? '' : ` ${rec.message}.`}${live}${pane}`
+   )
+ }
+ 
+ /** Why a finding is settled, for a waiver that has nothing to release. */
+ const settledAs = (rec: LifecycleRecord, one: Finding): string =>
+   rec.waivers.some(each => each.scope === 'finding' && each.findingId === one.id)
+     ? 'waived'
+     : isAcceptedRebuttal(one)
+       ? 'its rebuttal is accepted by Codex'
+       : one.status === 'verified-fixed'
+diff --git a/pr-lifecycle/tests/flow.test.ts b/pr-lifecycle/tests/flow.test.ts
+index 8d728f1..60e902d 100644
+--- a/pr-lifecycle/tests/flow.test.ts
++++ b/pr-lifecycle/tests/flow.test.ts
+@@ -3397,10 +3397,17 @@ test('R85: a P2 deferral with a follow-up still waits for the person', async ($,
+ 
+ test('R85: a P3 deferral without a follow-up still waits for the person', async ($, on) => {
+   const w = world(on)
+   await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+ })
+ 
+ test('R85: a security P3 deferral with a follow-up still waits for the person', async ($, on) => {
+   const w = world(on)
+   await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
+ })
++
++test('R85: /pr-gate status names the follow-up of a settled deferral', async ($, on) => {
++  const w = world(on)
++  await toTriage($, w, 'Consider renaming this')
++  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
++  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}`)
++})
+diff --git a/pr-lifecycle/tests/lifecycle.test.ts b/pr-lifecycle/tests/lifecycle.test.ts
+index 181d770..4cae449 100644
+--- a/pr-lifecycle/tests/lifecycle.test.ts
++++ b/pr-lifecycle/tests/lifecycle.test.ts
+@@ -752,10 +752,19 @@ test('R82: only an untagged-or-P3, non-security GitHub finding may be acknowledg
+ })
+ 
+ test('R85: isSettledDeferral needs deferred, P3, a follow-up and no security flag', async () => {
+   const base = finding({ source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://x/issues/1' })
+   expect(isSettledDeferral(base)).toBe(true)
+   expect(isSettledDeferral({ ...base, severity: 'P2' })).toBe(false)
+   expect(isSettledDeferral({ ...base, followUp: undefined })).toBe(false)
+   expect(isSettledDeferral({ ...base, isSecurity: true })).toBe(false)
+   expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
+ })
++
++test('R85: the ready prompt names the follow-up of a settled deferral and not of a plain one', async () => {
++  const settled = finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', followUp: 'https://github.com/me/repo/issues/9' })
++  const plain = finding({ id: 'G2-2', source: 'github', status: 'deferred', severity: 'P3' })
++  const said = readyPrompt({ ...fresh(), pr: 7, findings: [settled, plain] })
++  expect(said).toContain('G2-1')
++  expect(said).toContain('(follow-up at https://github.com/me/repo/issues/9)')
++  expect(said.match(/follow-up at/g)).toHaveLength(1)
++})
