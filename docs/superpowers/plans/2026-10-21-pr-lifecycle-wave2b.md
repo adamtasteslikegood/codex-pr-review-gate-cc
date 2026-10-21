@@ -70,7 +70,7 @@
 
 ## Review Focus
 
-1. **Resume after a reviewer already commented (#24).** A roster reviewer's issue comment (no `commit_id`) posted after the push but before `/pr-gate resume` still covers the head. The round must not wait out the cap. Test in Task 4.
+1. **Resume after a reviewer already commented (#24).** A roster reviewer's issue comment (no `commit_id`) posted after the gate first saw the head but before `/pr-gate resume` still covers the head (the time is the record's `headArrival`, not a commit or check time; PR #25 review). The round must not wait out the cap. Test in Task 4.
 2. **This machine's login in `requested_reviewers`.** The person may request a review from themselves (the same gh login as `self`). The gate must not wait for that review. Test in Task 5.
 3. **Two pushes between two polls.** The gate sees only the last head. It must close one round on the old head and open one on the newest, never one round per commit, and must not crash on the commit it never saw. Test in Task 9.
 4. **An answer that names a finding raised in a round that has since rolled over.** The agent answers G3-2 after its push ended round 3. The answer applies to G3-2, and it is not dropped as unasked. Test in Task 9.
@@ -616,6 +616,24 @@ with
 
 Run: `claude plugin test pr-lifecycle`
 Expected: PASS. An existing test that set check runs without `started_at` is unaffected (`startedAt` absent, then the commit lookup fails in the world, so `headAt` falls back as before).
+
+- [ ] **Step 4a: Amendment A5 (PR #25 review): a head's time is when the gate first saw it, kept in the record**
+
+This step **replaces** the timestamp source in Steps 1-3. Codex showed that commit and check timestamps break the invariant: a commit authored before an earlier comment and pushed later makes that comment cover the new head, and a check that starts after a reviewer's comment makes a valid comment miss it (#24 again). Do not add `Check.startedAt`, `headArrival` or the `commitDate` knob. Instead:
+
+- Add to `LifecycleRecord` (`types/index.d.ts`): `/** When the gate first saw the PR's head (#24), kept across stop, resume and another session: a comment on the head counts from then. */ headArrival?: { head: string; at: number }`.
+- Wherever the gate first sees a PR head (`onOpened`, `beginCollect`, and `pollOnce` when `isNewHead`), write `headArrival: { head, at: now }` to the record, but only when `rec.headArrival?.head !== head`. A known head's time never moves later.
+- `beginCollect` and `pollOnce` take `collect.headAt` from it: `rec.headArrival?.head === head ? rec.headArrival.at : now`. With no record of the head (pushed while no session ran), the fallback stays `now`, the conservative 1.4.0 rule. Reviews still cover a head by `commit_id`, whatever their time.
+- No recovery from GitHub's timeline: only force-pushes carry an event time there, and an ordinary push has none. Record this as a plan ruling.
+- A comment posted between the push and the gate's first poll (at most `POLL_MS`) does not count. It errs toward waiting, never toward false coverage.
+
+Tests (flow), replacing Step 1's check-run fixtures:
+1. #24: the gate sees the head at T, `/pr-gate stop`, a roster reviewer's issue comment at T+60 s, the clock moves on, `/pr-gate resume`: the comment covers the head and the phase reaches `ready`.
+2. Push seen at 100 s, comment created at 50 s, commit dated 10 s: the comment does not cover the head; collection keeps waiting.
+3. Push seen at 100 s, comment at 120 s, a check run that starts at 200 s: the comment covers the head.
+4. A record whose `headArrival` names an older head: the new head gets `now`, and the old time is not reused.
+
+Use the most capable model for this task: the code is prose here, not given.
 
 - [ ] **Step 5: Commit**
 
@@ -1374,6 +1392,18 @@ In `pr-lifecycle/hooks/round.ts`:
 Run: `claude plugin test pr-lifecycle`
 Expected: PASS. An existing test that relied on a P1 duplicate being its own blocker now sees it held through its original; check each failure against spec §3 and update only where the new rule applies, listing each in your report.
 
+- [ ] **Step 5a: Amendment A1-A3 (PR #25 review): links never drop a hold**
+
+Three holes Codex reproduced with the planned helpers. Fix each one and pin it with a test:
+
+- **A1 (security).** `withLinkedPeak` raises security as well as severity. The original gets `isSecurity: true` when either one has it, even when a peak is unknown. A link never clears it, and neither does `dropLink` on the original. Tests, in both directions:
+  - A non-security original with a security duplicate linked to it: the original is `isSecurity`, `mergeHolds` still holds it for the person, and `isFileable(original)` is false (Task 12's predicate; add the assertion there if Task 12 is not built yet).
+  - A security original with a non-security duplicate: it stays security.
+- **A2 (no self-links).** Validate an agent's link on canonical ids. In `afterTriage`, `const canon = (id: string) => byId.get(id)?.duplicateOf ?? id` over the round's ledger and the record. A link is no answer when `canon(link.duplicateOf) === link.id`, or when either id is not on the list. When the finding being linked is itself an original with linked findings, point those at the new canonical target in the same patch, so links never chain. Tests:
+  - B is linked to A, and the agent answers `A duplicateOf B`: no answer. A still holds and is asked again, and B still holds through A.
+  - B is linked to A, and the agent answers `A duplicateOf C`: A and B both point at C.
+- **A3 (R33 on the original).** In `triage`, resolve each candidate to its canonical original before the R33 (`isAnswerTo`) and `needsRecheck` predicates. Skip the candidate if the original or the alias fails either predicate. Test: A is rebutted and the rebuttal accepted; B is linked to A and still has status `open`; a later objection C matching B is `new-on-reviewed`, not a duplicate of A.
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -1689,6 +1719,16 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
 
 Run: `claude plugin test pr-lifecycle`
 Expected: PASS. A test that relied on `Run.triaged` being rewritten by every poll now reads `Run.polled`; update only those and list them in your report.
+
+- [ ] **Step 3a: Amendment A4 (PR #25 review): the turn guard lasts until `afterTriage` finishes**
+
+`afterTriage` clears `pending` in its first patch and then awaits record, git and GitHub reads. A poll in that gap would see no turn, take Task 9's rollover and open the next round. `startRound` keeps the run's id, so the old continuation's id and status guards would not stop it touching the new round. Fix:
+
+- Add `Run.isSettling?: true` (`types/index.d.ts`): `/** afterTriage is between clearing the turn and its last write: polls only note arrivals (R88). */`.
+- Set it in the same patch that clears `pending` in `afterTriage`. Clear it in every patch that ends `afterTriage`: the back-to-collecting patch in Step 3, `closeCollect`'s `extra`, the `endRound` and `advance` paths, every early return that writes, and `finish`. Also clear it in `startRound`'s patch, so a new round never inherits it.
+- In `pollOnce`, `const isTurn = run.pending.length > 0 || run.isSettling === true`.
+- In `afterTriage`, keep `round` and `generation` from the start. After each awaited read, reload the run and the record, and return without writing if the run's `round`, `status` or the record's `generation` changed.
+- Test (flow): hold `afterTriage`'s PR-head read with a world gate that releases on demand, after `pending` has cleared. Tick with a pushed head while it is held, then release it. Exactly one new round opens, after `afterTriage` ends. The old round's triage step is done, and the new round's steps are untouched.
 
 - [ ] **Step 5: Commit**
 
@@ -3075,6 +3115,21 @@ In `pr-lifecycle/hooks/register.tsx`, in the import from `'./lifecycle'`, replac
 Run: `claude plugin test pr-lifecycle`
 Expected: PASS. Then `npm run lint` and `npm run typecheck` from the repo root.
 
+- [ ] **Step 9a: Amendment A7 (PR #25 review): a filed issue counts only once GitHub shows its label**
+
+GitHub accepts an issue POST from an account without push access and silently drops the labels it was given. A successful POST with a number is therefore not enough to set `followUpLabel`. Fix, in `fileIssues`:
+
+- Read the POST's answer for `labels[].name` alongside `number`, with a helper beside `issueNumberOf`.
+- If the label is missing, keep the issue: write `followUp: '#<n>'` and `followUpLabelError: 'GitHub filed #<n> without its severity:<P> label (the account may lack push access to label it)'`. Leave `followUpLabel` unset, so the finding still holds as `label-failed`.
+- The next pass takes the reuse path (`gh issue edit <n> --add-label`) for that issue and never POSTs a second one.
+- A failed `label create` stays ignored, because the returned labels are now the check.
+
+Tests:
+1. The world's POST answers with `labels: []`: the finding holds as `label-failed` with `followUp` `#<n>`. A second pass, with `issue edit` succeeding, settles it. Exactly one POST is made over both passes.
+2. The POST answers with the label: it settles in one pass, as before.
+
+Add a world knob for the POST answer's labels (default: echo the requested label).
+
 - [ ] **Step 10: Commit**
 
 ```bash
@@ -3676,6 +3731,21 @@ Import `closeLifecycle` from `'./round'` if it is not imported. Check that the `
 
 Run: `claude plugin test pr-lifecycle`
 Expected: PASS, including the R62 tests (no settled findings, so nothing changes for them). Then run `npm run lint` and `npm run typecheck` from the repo root.
+
+- [ ] **Step 6a: Amendment A6 + A7 (PR #25 review): the post-merge check never writes over a replaced lifecycle**
+
+Codex reproduced the bug with a delayed checker. A reset during `checkIssuesAfterMerge`'s reads let `closeLifecycle` write generation 1's findings into generation 2 and then archive it. Fix:
+
+- `checkIssuesAfterMerge($, rec)` uses Task 12's `isMoved` rule against `rec`: the record is gone or archived, its `generation` changed, or its `postStatus` moved. It reloads and checks before every GitHub mutation (reopen, refile) and after the last read. When the record has moved, it returns `{ moved: true }` and does nothing more.
+- In `closeLifecycle`, every `updateRecord` callback returns `latest` unchanged when `(latest.generation ?? 0) !== (rec.generation ?? 0)` or the record is archived, and notes it. On a moved record: no `say`, no finish of the live run, no archive, and the function returns a "replaced" message.
+- `archiveLifecycle` gets an optional `generation` argument and archives only a record of that generation. `closeLifecycle` passes `rec.generation ?? 0`.
+- The refile path follows A7 (Task 12): a POST whose answer lacks the label keeps the new issue number with `followUpLabelError`, counts as failed for this check, and is labelled, not posted again, on resume.
+
+Tests, using Task 12's delayed-`gh` pattern. Each one holds the call, runs `/pr-gate reset` and a fresh start, then releases it:
+1. Holding the issue read: generation 2 is not archived, its findings are its own, and no reopen or POST follows.
+2. Holding the reopen: same, and no refile after it.
+3. Holding the refile POST: same, and generation 2's findings carry no `followUp` from it.
+4. A refile whose POST drops the label: the record stays blocked with `label-failed` named. Resume labels that issue, and only one POST is made.
 
 - [ ] **Step 7: Commit**
 
