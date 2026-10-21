@@ -92,3 +92,4 @@ Ruling: first step timeout of a mid-collection turn in a round → back to colle
 Task 8: task review on opus dispatched (timeout ruling included as a required change)
 Task 8: review Spec ❌ (timeout ruling) Quality Changes needed (I2 unguarded failPost after unpushedBy await; minors: stale threshold = step timeout too short, rec undefined leaves isSettling, shared r{n}-triage step id lets a late answer land on the re-ask) → fix round 1 sent (timeout→collect once; isOwn before failPost; stale max(step,5min); clear isSettling; ignore late answers). Minor 3 (stale check behind poll lock) left, bounded by gh/git timeouts.
 Ruling (Task 16): isTurn = phase==='triage' (equivalent, fail-safe); endCollect counts handed feedback for hasFindings
+Task 8: fix round 1 72ef884 + report 85a8464, 573/573 (timeout→collect once; answers match by turn id so late answer ignored; isOwn guards; stale max(step,5min); record-gone → guarded error) → scoped re-review on opus
