@@ -475,6 +475,12 @@ export async function getRun($: Engine): Promise<Run | null> {
   return (await $.state.get(RUN)).value ?? null
 }
 
+/** Whether run `id` is still the one in flight and running: a step re-reads it after a long await (finding 29, R80). */
+async function isRunning($: Engine, id: string): Promise<boolean> {
+  const live = await getRun($)
+  return live !== null && live.id === id && live.status === 'running'
+}
+
 /** Applies a change to the run in flight; a run that ended or was replaced is left alone. */
 export async function patch($: Engine, id: string, change: (run: Run) => Run): Promise<Run | null> {
   let after: Run | null = null
@@ -749,6 +755,18 @@ export type PrState = 'OPEN' | 'MERGED' | 'CLOSED'
 export const prStateIn = (json: unknown): PrState | undefined => {
   const state = (json as { state?: unknown } | null)?.state
   return state === 'OPEN' || state === 'MERGED' || state === 'CLOSED' ? state : undefined
+}
+
+/** The head of PR `pr`, as gh reports it; undefined when gh cannot say. */
+async function prHeadOf($: Engine, root: string, pr: number): Promise<string | undefined> {
+  const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: root, timeoutMs: 30_000 })
+  if (view.exitCode !== 0) return undefined
+  try {
+    const read = (JSON.parse(view.stdout) as { headRefOid?: unknown } | null)?.headRefOid
+    return typeof read === 'string' && read !== '' ? read : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** The state of PR `pr`, as gh reports it; undefined when gh cannot say. */
@@ -1211,6 +1229,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     // A clean checkout behind the PR head (a reviewer's or a bot's push) catches up on its own (R71).
     const isSynced = await syncToHead($, run.root, run.branch, got.prHead)
     const local = await git($, run.root, ['rev-parse', 'HEAD'])
+    if (!(await isRunning($, run.id))) return
     if (!isSynced || !local.isOk || local.out !== got.prHead) {
       const here = local.isOk ? local.out.slice(0, 7) : 'unknown'
       const why = `the local checkout ${here} is not the PR head ${got.prHead.slice(0, 7)}: pull (or push), then run /pr-gate resume`
@@ -1233,6 +1252,8 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
 
 /** A post-PR step could not read GitHub or the checkout: an attempt, no round used, and the agent is told its next step. */
 async function failPost($: Engine, run: Run, why: string): Promise<void> {
+  // A run stopped or waived meanwhile failed nothing: no attempt, no message (finding 29, R80).
+  if (!(await isRunning($, run.id))) return
   await noteAttempt($, run, why)
   await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
   await say($, run, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
@@ -1264,6 +1285,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     await closeLifecycle($, run.root, run.branch, prior.pr, got.closed)
     return
   }
+  // Each long await below re-reads the run: one stopped or waived meanwhile asks nothing and decides nothing (finding 29, R80).
+  if (!(await isRunning($, id))) return
   if (!got.isOk) {
     await failPost($, run, `GitHub could not be read: ${got.why ?? 'gh failed'}; fix that, then run /pr-gate resume`)
     return
@@ -1359,6 +1382,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     const log = await git($, run.root, ['log', '--format=%h %an %s', `${rec.head}..${got.prHead}`])
     others = log.isOk ? log.out.split('\n').filter(Boolean) : []
   }
+  if (!(await isRunning($, id))) return
   const asked = [...listedIds, ...carried.map(one => one.id)]
   if (asked.length === 0 && others.length === 0) {
     const rebuttals = rebuttalsOwed(run)
@@ -1580,8 +1604,11 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
 async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]): Promise<void> {
   const now = await $.clock.now()
   // Codex reads the checkout: it must be the head the rebuttal is about.
-  // A clean checkout behind the PR head catches up on its own (R71).
-  if (!(await syncToHead($, run.root, run.branch, run.headSha))) {
+  // A clean checkout behind the PR head catches up on its own (R71). A run stopped or waived before or during it goes no further (R80).
+  if (!(await isRunning($, run.id))) return
+  const isSynced = await syncToHead($, run.root, run.branch, run.headSha)
+  if (!(await isRunning($, run.id))) return
+  if (!isSynced) {
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }
@@ -1965,8 +1992,7 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
 async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?: string): Promise<void> {
   // A run stopped or waived while this step awaited git or gh records nothing more and decides nothing (finding 29, R80).
-  const live = await getRun($)
-  if (live === null || live.id !== run.id || live.status !== 'running') return
+  if (!(await isRunning($, run.id))) return
   const now = await $.clock.now()
   // After the PR: the head GitHub last reported for it, whatever is checked out here (an adopted PR, a push from elsewhere).
   const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
@@ -2094,11 +2120,14 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   if (!(await isStillMine($, { root, branch }))) return
   // A post waiver covering this head ends review work for it (R80): checked before any branch that starts triage, a recheck or a round
   // (PR #19 review), so a waived head gets what the waiver covers and what CI still holds, never the hold or more review.
-  const waived =
-    rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 && rec.waivers.some(one => one.scope === 'post' && one.head === rec.head)
-  if (waived && rec.pr !== undefined) {
-    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: rec.head })
-    await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${rec.head.slice(0, 7)}.\n\n${holdText(standing)}`)
+  const posts = rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 ? rec.waivers.filter(one => one.scope === 'post') : []
+  // A waiver given while a round ran names the PR head, which the record's head may not have reached (the late round records
+  // nothing): GitHub's head, read once, decides then.
+  const isRead = rec.pr !== undefined && posts.length > 0 && !posts.some(one => one.head === rec.head)
+  const at = isRead && rec.pr !== undefined ? ((await prHeadOf($, root, rec.pr)) ?? rec.head) : rec.head
+  if (rec.pr !== undefined && posts.some(one => one.head === at)) {
+    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: at })
+    await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
     return
   }
   const next = decideNext(rec)

@@ -781,6 +781,10 @@ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRoun
   return `Their options: ${options.slice(0, -1).join(', ')}${options.length > 1 ? ', and ' : ''}${options.at(-1)}.`
 }
 
+/** The ids a prompt already names: the findings it lists, and the head's review when the prompt's reason is that blocker's own words. */
+const namedIn = (listed: readonly Finding[], reason: string, standing: Standing): Set<string> =>
+  new Set([...listed.map(one => one.id), ...standing.blockers.filter(one => one.id === 'head' && one.said === reason).map(() => 'head')])
+
 /**
  * Post-PR review stopped short of ready: why, what holds the merge, and the agent's next step. The person is named, with their
  * options, only where the decision is theirs: awaiting-decision, exhaustion, a deferred security P1. An answerable block gives
@@ -792,7 +796,7 @@ export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: '
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
   if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
   if (standing !== undefined) {
-    const rest = holdText(standing, new Set(holding.map(one => one.id)))
+    const rest = holdText(standing, namedIn(holding, next.why, standing))
     if (rest !== '') lines.push('', rest)
   }
   lines.push('', `Your next step: ${next.nextStep}.`)
@@ -860,7 +864,7 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string, 
     const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
     if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds))
     if (standing !== undefined) {
-      const rest = holdText(standing, new Set(holds.map(one => one.id)))
+      const rest = holdText(standing, namedIn(holds, why, standing))
       if (rest !== '') post.push('', rest)
     }
     post.push('', `Your next step: ${nextStep}.`)

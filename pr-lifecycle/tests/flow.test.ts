@@ -3587,3 +3587,60 @@ test('R80: after waive post, resume starts no review round owed on the waived he
 test('R80: after waive post, resume starts no round for a fix awaiting verification (PR #19 review)', async ($, on) => {
   await resumeAfterPostWaiver($, world(on), 'round', { status: 'reported-fixed' })
 })
+
+/** Finding 29's window with a waiver landing while triage awaits its fetch of a moved PR head; `onWaived` runs right after it. */
+const waiveWhileTriageFetches = async ($: Parameters<TestBody>[0], w: World, onWaived: () => void = () => undefined) => {
+  w.git.roster = roster
+  await toPost($, w)
+  const before = { prompts: w.prompts.length, spawned: w.spawned.length }
+  const moved = 'f'.repeat(40)
+  w.gh.prHead = moved
+  w.git.head = moved
+  w.git.isAncestor = true
+  w.gh.reviews = covers(moved)
+  let waived = ''
+  w.git.onFetch = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+    onWaived()
+  }
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  return before
+}
+
+test('R80: a waiver landing while triage fetches new commits sends no triage for them (finding 29, real-git path)', async ($, on) => {
+  const w = world(on)
+  // Real git: the log of the moved head lists its commits, so triage would ask the agent to check them.
+  w.git.newCommits = 'fffffff someone a push after the round started'
+  const { prompts, spawned } = await waiveWhileTriageFetches($, w)
+  expect(w.spawned).toHaveLength(spawned)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('New review feedback') || one.includes('check the new commits') || one.includes('fffffff someone'))).toBe(false)
+  expect((await runOf(w)).steps.some(one => one.id.endsWith('-triage'))).toBe(false)
+})
+
+test('R80: a fetch that fails after a mid-round waiver records no attempt and sends no stop', async ($, on) => {
+  const w = world(on)
+  const { prompts } = await waiveWhileTriageFetches($, w, () => {
+    w.git.fetchFails = 2
+  })
+  expect(w.prompts.slice(prompts).some(one => one.includes('stopped'))).toBe(false)
+  expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
+})
+
+test('R80: allow after a mid-round waiver reads the PR head, so the waived head gets no round', async ($, on) => {
+  const w = world(on)
+  await waiveWhileTriageFetches($, w)
+  // The late round recorded nothing: the record's head is still the one before the push.
+  expect((await recordOf(w)).head).not.toBe('f'.repeat(40))
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await say($, 'allow 1 one more look')
+  await w.clock.advance(1000)
+  expect(w.spawned).toHaveLength(spawned)
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.prompts.slice(prompts).at(-1)).toContain("the person's post waiver covers PR #1 at fffffff")
+})

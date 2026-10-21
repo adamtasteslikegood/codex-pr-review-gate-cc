@@ -57,6 +57,8 @@ export type World = {
     fetches: string[]
     /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
     onFetch?: () => void | Promise<void>
+    /** `git log --format=%h %an %s <a>..<b>`: the commits on the PR since the record's head, one per line. */
+    newCommits?: string
     /** The branch's head on origin, as `git ls-remote` prints it; undefined prints nothing. */
     remoteHead?: string
     /** `git log --not --remotes=origin`: the local commits no origin branch has, one `<sha> by <author>` per line. */
@@ -331,6 +333,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('ls-remote origin')) return out(w.git.remoteHead === undefined ? '' : `${w.git.remoteHead}\trefs/heads/${w.git.branch}\n`)
     if (args.startsWith('log --format=%h by %an')) return out(w.git.unpushed)
+    if (args.startsWith('log --format=%h %an %s')) return out(w.git.newCommits ?? '')
     // A fast-forward to a commit the local head is an ancestor of moves the head there.
     const ff = args.match(/^merge --ff-only --quiet (\S+)$/)?.[1]
     if (ff !== undefined) {

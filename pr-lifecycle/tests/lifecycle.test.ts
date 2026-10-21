@@ -834,3 +834,20 @@ test('R79: holdText names every blocker once, skipping ids the caller already na
   expect(rest).toContain('Also holding:')
   expect(holdText(standingOf(postRec(), { head: 'abcdef1234', base: 'dev' }, []))).toContain('Nothing else holds the merge of abcdef1.')
 })
+
+test('R79: an exhausted post report states its reason once, not again under the standing', async () => {
+  const rec = { ...fresh(), phase: 'post' as const, pr: 1 }
+  const why = 'aaaaaaa is not reviewed clean'
+  const report = reportPrompt(rec, { kind: 'exhausted', why, nextStep: 'tell the person' }, {
+    phase: 'post',
+    head: 'a',
+    setAside: [],
+    mayProceed: false,
+    blockers: [
+      { kind: 'head-unreviewed', id: 'head', said: why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' },
+      { kind: 'ci-running', id: 'check', said: 'check check running', owner: 'gate', release: 'wait for it' },
+    ],
+  })
+  expect(report.split(why)).toHaveLength(2)
+  expect(report).toContain('Also holding:\n- check check running')
+})

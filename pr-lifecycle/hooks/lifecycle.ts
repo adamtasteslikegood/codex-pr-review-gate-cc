@@ -447,7 +447,8 @@ export function standingOf(rec: LifecycleRecord, at: { head: string; base: strin
     const next = decideNext(rec)
     if (next.kind === 'round') blockers.push({ kind: 'round-owed', said: `a review round is owed on ${short(at.head)}`, owner: 'gate', release: 'the gate runs it; leave the branch alone' })
     if (next.kind === 'exhausted') {
-      blockers.push({ kind: 'head-unreviewed', said: next.why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' })
+      // Its id lets a text that already gives this reason as its own leave it out (holdText's `named`).
+      blockers.push({ kind: 'head-unreviewed', id: 'head', said: next.why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' })
     }
   }
   const setAside: string[] = []
