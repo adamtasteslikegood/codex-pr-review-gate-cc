@@ -1383,7 +1383,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ---
 
 
-### Task 8: The agent answers feedback while collection still waits (R92, spec §1.1, §1.2)
+### Task 8: The agent answers feedback while collection still waits (R88, spec §1.1, §1.2)
 
 **Why:** In 1.4.0 the agent sees nothing until collection ends (roster covered, checks done, quiet window, or the 20-minute cap). In 1.5.0, feedback that arrives while collection is still waiting goes to the agent after one quiet poll, in a triage turn that does not end the round. A push in that turn ends the round when the turn ends.
 
@@ -1419,7 +1419,7 @@ const early = <T extends object>(one: T): T => ({ ...one, created_at: '1970-01-0
 const ciRunning = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
 const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}"`))
 
-test('R92: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
+test('R88: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
   const w = world(on)
   w.git.roster = ciRunning
   await toPost($, w)
@@ -1468,7 +1468,7 @@ test('R92: feedback is answered while collection waits, after one quiet poll, an
   expect((await runOf(w)).phase).toBe('verify')
 })
 
-test('R92: a push in a mid-collection turn ends the round on the old head when the turn ends', async ($, on) => {
+test('R88: a push in a mid-collection turn ends the round on the old head when the turn ends', async ($, on) => {
   const w = world(on)
   w.git.roster = ciRunning
   await toPost($, w)
@@ -1504,7 +1504,7 @@ Expected: FAIL. In 1.4.0 no triage prompt is sent while `ci` runs, so `triageTur
 In `pr-lifecycle/types/index.d.ts`, add to `Run` after `triaged`:
 
 ```ts
-  /** Post-PR: the feedback ids every triage turn of this round was handed (R92); a turn while collecting asks only what is not in it. */
+  /** Post-PR: the feedback ids every triage turn of this round was handed (R88); a turn while collecting asks only what is not in it. */
   handed?: string[]
   /** Post-PR: the fresh feedback ids the last poll saw, so the next poll can tell what arrived since. */
   polled?: string[]
@@ -1527,7 +1527,7 @@ In `pr-lifecycle/hooks/round.ts`:
 
 ```ts
       if (run.collect !== undefined) {
-        // Collection polls on while a triage turn answers what arrived (R92); only the turn itself has a step timeout.
+        // Collection polls on while a triage turn answers what arrived (R88); only the turn itself has a step timeout.
         await poll($, run)
         if (run.phase === 'collect') return // waiting on reviewers is not a step: no step timeout while collecting
       }
@@ -1580,7 +1580,7 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
 ```ts
   const seenIds = new Set(run.polled ?? [])
   const isArrival = fresh.some(one => !seenIds.has(one.id))
-  // While a triage turn answers, a poll only notes what arrived; the turn's own end reads the head it pushed (R92).
+  // While a triage turn answers, a poll only notes what arrived; the turn's own end reads the head it pushed (R88).
   if (isTurn) {
     await patch($, run.id, one => ({
       ...one,
@@ -1599,7 +1599,7 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
     await endCollect($, after, got, done)
     return
   }
-  // Feedback no turn of this round was handed, with one quiet poll since the last arrival: the agent answers it now (R92).
+  // Feedback no turn of this round was handed, with one quiet poll since the last arrival: the agent answers it now (R88).
   const handed = new Set(after.handed ?? [])
   const unhanded = fresh.filter(one => one.isFinding && !handed.has(one.id))
   if (unhanded.length > 0 && now - (after.collect?.lastArrivalAt ?? now) >= POLL_MS) {
@@ -1611,7 +1611,7 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
 ```
 
 4. In `beginTriage`:
-   - Change the signature to `async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCollect = false): Promise<void>` and its doc comment's first sentence to: `Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier rounds (R32) go to the main agent in one turn. While collection still waits (R92), only the fresh feedback no turn of the round was handed.`
+   - Change the signature to `async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCollect = false): Promise<void>` and its doc comment's first sentence to: `Triage: the round's fresh GitHub feedback, Codex's open findings when it ran, and blockers still open from earlier rounds (R32) go to the main agent in one turn. While collection still waits (R88), only the fresh feedback no turn of the round was handed.`
    - Change `const items = ...` to:
 
 ```ts
@@ -1654,7 +1654,7 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
 5. In `afterTriage`, after `const endHead = prHead`, add:
 
 ```ts
-  // A turn while collecting that pushed nothing: the round goes on collecting on the same head (R92). Its rebuttals and
+  // A turn while collecting that pushed nothing: the round goes on collecting on the same head (R88). Its rebuttals and
   // acknowledgements are checked when the head's collection ends.
   if (after.collect !== undefined && endHead === run.roundStartHead) {
     const back = await $.clock.now()
@@ -1675,7 +1675,7 @@ async function closeCollect($: Engine, id: string, now: number, detail: string, 
    Then, before `const ended = await getRun($)`, add:
 
 ```ts
-  // A push in a turn while collecting ends the round on the head it pushed (R92): collection on the old head is over.
+  // A push in a turn while collecting ends the round on the head it pushed (R88): collection on the old head is over.
   if (after.collect !== undefined) await closeCollect($, run.id, await $.clock.now(), `ended by the push of ${endHead.slice(0, 7)}`)
 ```
 
@@ -1690,7 +1690,7 @@ Expected: PASS. A test that relied on `Run.triaged` being rewritten by every pol
 
 ```bash
 git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
-git commit -m "pr-lifecycle 1.5.0: the agent answers feedback while collection waits (R92)
+git commit -m "pr-lifecycle 1.5.0: the agent answers feedback while collection waits (R88)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
@@ -1698,7 +1698,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
-### Task 9: A push ends the round on its head (R92, spec §1.2, §1.3, §1.6)
+### Task 9: A push ends the round on its head (R88, spec §1.2, §1.3, §1.6)
 
 **Why:** In 1.4.0 a push seen while collecting moves the round's start head inside the same round (`pollOnce`: `roundStartHead: got.prHead`). In 1.5.0 a round is one head. A push with no triage turn in flight (someone else's push, or the agent's outside a turn) ends the round on the old head at the poll that sees it. `decideNext` then opens the next round on the new head, with a fresh cap. Task 8 already ends the round for a push made in a turn.
 
@@ -1721,7 +1721,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 Append to `pr-lifecycle/tests/flow.test.ts` (it uses `early`, `ciRunning` and `triageTurns` from Task 8):
 
 ```ts
-test('R92 (Review Focus 3): two pushes between polls end one round, on the newest head', async ($, on) => {
+test('R88 (Review Focus 3): two pushes between polls end one round, on the newest head', async ($, on) => {
   const w = world(on)
   w.git.roster = ciRunning
   await toPost($, w)
@@ -1743,7 +1743,7 @@ test('R92 (Review Focus 3): two pushes between polls end one round, on the newes
   expect([next.round, next.phase, next.roundStartHead, next.roundKind, next.status]).toEqual([3, 'collect', 'd'.repeat(40), 'baseline', 'running'])
 })
 
-test('R92: a poll during a turn never ends the round; the turn\'s own end does', async ($, on) => {
+test('R88: a poll during a turn never ends the round; the turn\'s own end does', async ($, on) => {
   const w = world(on)
   w.git.roster = ciRunning
   await toPost($, w)
@@ -1765,7 +1765,7 @@ test('R92: a poll during a turn never ends the round; the turn\'s own end does',
   expect((await runOf(w)).round).toBe(3)
 })
 
-test('R92 (Review Focus 4): a finding left unanswered when its round rolled over is answered in the next round', async ($, on) => {
+test('R88 (Review Focus 4): a finding left unanswered when its round rolled over is answered in the next round', async ($, on) => {
   const w = world(on)
   w.git.roster = ciRunning
   await toPost($, w)
@@ -1802,7 +1802,7 @@ Expected: FAIL. In 1.4.0 the poll that sees `d…d` moves round 2's start head a
 In `pr-lifecycle/hooks/round.ts`, in `pollOnce`, directly after the `if (isTurn) { ... }` block from Task 8, add:
 
 ```ts
-  // A push with no turn in flight ends the round on the head it had (R92): someone else's push, or the agent's outside a turn.
+  // A push with no turn in flight ends the round on the head it had (R88): someone else's push, or the agent's outside a turn.
   if (isNewHead) {
     await onNewHead($, run, run.roundStartHead, got.prHead, now)
     const closed = await closeCollect($, run.id, now, `ended by the push of ${got.prHead.slice(0, 7)}`)
@@ -1836,7 +1836,7 @@ Fix each failure only where spec §1.2 changes the behaviour, and list every cha
 
 ```bash
 git add pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
-git commit -m "pr-lifecycle 1.5.0: a push ends the round on its head (R92)
+git commit -m "pr-lifecycle 1.5.0: a push ends the round on its head (R88)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
@@ -1844,7 +1844,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
-### Task 10: Reviewers are asked again once per turn that pushed (R93, spec §1.5)
+### Task 10: Reviewers are asked again once per turn that pushed (R88, spec §1.5)
 
 **Why:** 1.4.0 re-requests the roster's `requestReview` reviewers at the start of every later post round (`beginCollect`). In 1.5.0 a push ends the round, so that would re-request on every push, including someone else's. Spec §1.5: re-request once, when the agent's turn ends, on the head it ends on.
 
@@ -1863,7 +1863,7 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 Append to `pr-lifecycle/tests/flow.test.ts`:
 
 ```ts
-test('R93: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', async ($, on) => {
+test('R88: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
   await toPost($, w)
@@ -1903,11 +1903,11 @@ Expected: FAIL. `beginCollect` requests at the start of round 3, so `w.gh.reques
 
 In `pr-lifecycle/hooks/round.ts`:
 
-1. In `beginCollect`, delete the block from `const rec = await loadRecord($, opened.root, opened.branch)` through the closing `}` of the `if (rec !== undefined && rec.rounds.some(...))` block, with its comment. Change the doc comment to: `/** Post-PR collection: the ticker polls GitHub every 30 s until GitHub's signals, or the wait cap, say it is over (R89). Reviewers are asked again where a turn pushed (R93), not here. */`
+1. In `beginCollect`, delete the block from `const rec = await loadRecord($, opened.root, opened.branch)` through the closing `}` of the `if (rec !== undefined && rec.rounds.some(...))` block, with its comment. Change the doc comment to: `/** Post-PR collection: the ticker polls GitHub every 30 s until GitHub's signals, or the wait cap, say it is over (R89). Reviewers are asked again where a turn pushed (R88), not here. */`
 2. In `afterTriage`, inside `if (endHead !== run.roundStartHead) {`, after the exemption writes, add:
 
 ```ts
-    // The turn pushed (R93): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
+    // The turn pushed (R88): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
     if (rec.pr !== undefined && rec.slug !== undefined) {
       const roster = await rosterOf($, run.root, run.base)
       for (const who of roster?.requestReview ?? []) {
@@ -1930,7 +1930,7 @@ Expected: PASS. A 1.4.0 test that expected a re-request at the start of a later 
 
 ```bash
 git add pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
-git commit -m "pr-lifecycle 1.5.0: reviewers are asked again once per turn that pushed (R93)
+git commit -m "pr-lifecycle 1.5.0: reviewers are asked again once per turn that pushed (R88)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
