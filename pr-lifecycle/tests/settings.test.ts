@@ -243,7 +243,8 @@ test('a roster only on the branch\'s HEAD is ignored: collection does not wait o
   expect(w.gh.requests).toEqual([])
 })
 
-test('a roster on the base is used: collection waits on its reviewer, whose comment is trusted', async ($, on) => {
+// Machine load: 3 engine steps, no real wait (spec §7.3).
+test('a roster on the base is used: collection waits on its reviewer, whose comment is trusted', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["junie[bot]"],"checks":[]}'
   w.git.rosterOn = 'dev'

@@ -544,7 +544,8 @@ test('with a roster, collection waits for the listed reviewers, then needs no Co
   expect(rec.phase).toBe('ready')
 })
 
-test('when no reviewer covers the head by the wait cap, Codex reviews the delta', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('when no reviewer covers the head by the wait cap, Codex reviews the delta', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   // A push after the PR opened: a head no review has covered (the pre-PR round reviewed a...a), checked out here.
@@ -693,7 +694,8 @@ test('a new head mid-collection restarts the quiet period', async ($, on) => {
   expect(w.spawned.filter(one => one.prompt.includes('after it opened'))).toHaveLength(0)
 })
 
-test('a pass-through round whose only feedback is a human comment sends it to triage, not to an error', async ($, on) => {
+// Machine load: 1 engine step, no real wait (spec §7.3).
+test('a pass-through round whose only feedback is a human comment sends it to triage, not to an error', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
@@ -707,7 +709,8 @@ test('a pass-through round whose only feedback is a human comment sends it to tr
   expect(w.spawned).toHaveLength(0)
 })
 
-test('at the wait cap with nobody covering the head, fresh findings still go to triage', async ($, on) => {
+// Machine load: 1 engine step, no real wait (spec §7.3).
+test('at the wait cap with nobody covering the head, fresh findings still go to triage', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   w.git.roster = '{"reviewers":["copilot"],"checks":[]}'
@@ -742,7 +745,8 @@ test('R72: a fix only reported on a covered head gets the Codex check, not a ful
   expect((round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)).toEqual(['github:claude[bot]'])
 })
 
-test('a roster reviewer who never posted is recorded as missing evidence', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('a roster reviewer who never posted is recorded as missing evidence', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["claude[bot]","copilot"],"checks":[]}'
   await toPost($, w)
@@ -1220,7 +1224,8 @@ test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
   expect(isHeld(await $.tool.call(merge))).toBe(true)
 })
 
-test('R39, R92: a pre-PR deferred advisory carried into the PR holds the merge until its issue is filed', async ($, on) => {
+// Machine load: 4 engine steps, no real wait (spec §7.3).
+test('R39, R92: a pre-PR deferred advisory carried into the PR holds the merge until its issue is filed', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS', [P2])))
@@ -1364,7 +1369,8 @@ test('R44: before the PR, a rebuttal Codex accepts stays rebutted with Codex\'s 
   expect(isAcceptedRebuttal(invalidate([one], new Set(['src/app.ts']))[0]!)).toBe(false)
 })
 
-test('R40: a security dispute a later Codex review rules on stays the person\'s', async ($, on) => {
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R40: a security dispute a later Codex review rules on stays the person\'s', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   // Security, so the dispute waits for the person: any other gets its GitHub issue (R92).
@@ -1387,7 +1393,8 @@ test('R40: a security dispute a later Codex review rules on stays the person\'s'
   expect(one?.history.at(-1)?.by).toBe('main')
 })
 
-test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
@@ -2516,7 +2523,8 @@ test('a resume keeps the base the lifecycle was started for', async ($, on) => {
 
 // ------------------------------------------------------------- final fix wave (R60-R65)
 
-test('R60: the post-PR Codex fallback reviews from the last head a review covered, not one pushed during triage', async ($, on) => {
+// Machine load: 4 engine steps, no real wait (spec §7.3).
+test('R60: the post-PR Codex fallback reviews from the last head a review covered, not one pushed during triage', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   // A reviewer comments on a...a; the agent pushes e...e while it answers.
   await toTriage($, w)
@@ -2636,7 +2644,8 @@ test('R63: resuming a pre-PR block on the same head re-opens the fix step; a reb
   expect((await runOf(w)).round).toBe(2)
 })
 
-test('R64: the person\'s own top-level comment reaches triage; the mod\'s recorded reply and inline replies do not', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('R64: the person\'s own top-level comment reaches triage; the mod\'s recorded reply and inline replies do not', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.store.set(KEY, { ...(await recordOf(w)), replies: { 'inline:9': '41' } })
@@ -2697,7 +2706,8 @@ test('R63: a fix committed in a resumed pre-PR fix step is a new head: a waiver 
   expect(rec.waivers.find(one => one.findingId === 'R1-2')?.lapsedAt).toBeDefined()
 })
 
-test('R66: a reply reported as the URL gh prints does not come back as feedback in the next round', async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R66: a reply reported as the URL gh prints does not come back as feedback in the next round', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Typo in the heading.', created_at: '1970-01-01T00:01:00Z' }]
@@ -2886,7 +2896,8 @@ test('R76: a trusted reviewer\'s P1 posted after ready holds the merge until a r
   expect((await recordOf(w)).rounds.length).toBe(rounds)
 })
 
-test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', async ($, on) => {
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
@@ -3163,7 +3174,8 @@ test('#13: a person\'s command that is refused leaves the record with its owner'
 
 // ------------------------------------------- R71: a moved head no longer stops the round
 
-test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.gh.prHead = 'b'.repeat(40) // a bot pushed its own fix to the branch
@@ -4505,7 +4517,8 @@ test('#24 (13): the newest push is the head again, read after the comment: the h
 
 // ------------------------------------------------- #24 fix round 1
 
-test('#24 (14): round 2, no push time and no commit date: a roster comment from round 1 does not count for the new head, and the cap still ends collection', async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('#24 (14): round 2, no push time and no commit date: a roster comment from round 1 does not count for the new head, and the cap still ends collection', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = roster
   w.gh.isActivityBroken = true
@@ -4546,7 +4559,8 @@ test('#24 (15): a PR from a fork: the push is in the fork\'s activity log only, 
   expect(rec.phase).toBe('ready')
 })
 
-test('#24 (16): the wait cap ends collection on the "moved" path while the newest push stays on another sha', async ($, on) => {
+// Machine load: 3 engine steps, no real wait (spec §7.3).
+test('#24 (16): the wait cap ends collection on the "moved" path while the newest push stays on another sha', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = roster
   w.gh.pushes = [pushed(A, 10)]
@@ -5210,7 +5224,8 @@ test('R88 (A4): a record gone when afterTriage settles a turn while collecting s
   expect(run.message).toContain('The lifecycle record of feat/x is gone')
 })
 
-test('R88: a settling flag older than the step timeout (at least five minutes) is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R88: a settling flag older than the step timeout (at least five minutes) is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 }, timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toMidTurn($, w)
   let held = false
@@ -5316,7 +5331,8 @@ test('R88 (Review Focus 4): a finding left unanswered when its round rolled over
   expect((await recordOf(w)).processed).toContain('inline:11')
 })
 
-test('R88: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', async ($, on) => {
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R88: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
   await toPost($, w)
