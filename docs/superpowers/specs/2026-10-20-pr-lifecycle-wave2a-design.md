@@ -94,7 +94,7 @@ type Standing = {
 
 function standingOf(rec, at: { head; base }, ci?: CheckState[] | 'unreadable', late?: Feedback[]): Standing   // pure
 async function gatherStanding($, root, branch, pr?): Promise<Standing>                              // gh pr checks, required checks, untriagedFeedback
-function holdText(s: Standing, audience: 'refusal' | 'prompt' | 'person'): string
+function holdText(s: Standing, named?: ReadonlySet<string>): string   // skips blockers the text already named by id
 ```
 
 - `judgeCreate`, `judgeMerge`, `reportPrompt`, `heldPrompt`, the replies of
@@ -150,7 +150,9 @@ run or no longer running. The lines named by the trace are `1556`, `1609`,
   Examples:
   - `waive post`: "pr-gate: the person waived post-PR review of PR #19 at
     aec7a65 (docs only). Set aside: Independent Claude review. Still
-    holding: required check `check` running. Merge once it passes."
+    holding: required check `check` running." Once nothing holds, the next
+    step says, as `readyPrompt` does, that the PR is ready for the merge
+    decision, which is the person's.
   - `waive pre`: "... Open the PR." This is sent even when `openPr` is off:
     the PR is the agent's to open either way.
   - `waive <id>`: "... G2-3 waived. Still holding: G2-5 [P2] open, yours to
@@ -197,25 +199,37 @@ the same on main.
 1. **Carried by the round raised in.** `beginTriage` carries an open finding
    from an earlier round when `one.round !== run.round`, whoever touched it
    last. `listedIds` already keeps it out of the Codex list.
-2. **An `acknowledged` answer.**
-   - `Answer.action` and `FindingStatus` gain `'acknowledged'`, the agent's
-     "no action needed". It needs no reply on GitHub (a `replyId` is
-     optional) and no Codex check, and it settles the item.
+2. **An `acknowledged` answer, replied to and checked (Adam, 2026-10-20).**
+   An unresolved thread always gets a reply and/or a fix. That rule is older
+   than the gate (Adam's PR guidance and tool-use hooks), and the gate keeps
+   it, so this answer never closes an item silently.
+   - `Answer.action` and `FindingStatus` gain `'acknowledged'`: the agent says
+     the comment asks for no change (an approval with notes, a status
+     report). Unlike a rebuttal, it doesn't claim the comment is wrong.
+   - It needs a reply in the item's thread (`replyId`). Without one, the
+     answer counts as unanswered and goes through the R34 reprompt.
    - It is allowed only for a `source: 'github'` finding that is not
-     security-flagged and has no explicit reviewer severity tag. Anything
-     else answered `acknowledged` counts as unanswered and goes through the
-     R34 reprompt.
-   - The triage prompt explains it: "acknowledged: the review asks for
-     nothing (an approval, a status note)".
+     security-flagged and carries no explicit `P0`-`P2` tag. Anything else
+     answered `acknowledged` counts as unanswered.
+   - Codex checks it as it checks a rebuttal: `checksOwed` includes it, on
+     the same head, using no round (R36, R39). Its prompt asks whether the
+     comment requests any change. Upheld, it settles. Rejected, it is open
+     again with Codex's reason, and R40's rule applies: the agent fixes or
+     defers it, and a second `acknowledged` goes to the person as a dispute.
+   - The triage prompt explains it: "acknowledged: the comment asks for no
+     change (an approval with notes, a status note); reply in its thread
+     saying so; Codex confirms it".
+   - Clear-cut approvals (point 3) never reach the agent, so they need no
+     answer at all.
 3. **Positive no-action evidence (J, as narrowed by G2-2).** In `readReviews`
    (`github.ts:98`), a review is `isFinding: false` (it covers the head and
    raises nothing, as an empty approval does today) only when all of these
    hold:
-   - its state is `APPROVED`, or `COMMENTED` with a body whose first sentence
+   - its state is `APPROVED`, or `COMMENTED` with a body whose first paragraph
      states there is nothing to act on. The phrases are "no actionable
      findings", "no blocking findings", "no issues found", "nothing to fix"
      and "LGTM", case-insensitive, with no "but", "except" or "however" in
-     that sentence;
+     the sentence that says so;
    - no sentence of the body carries a request ("please", "should", "must",
      "needs to", "need to", "consider", "suggest", "recommend") or an explicit
      `P0`-`P2`, critical, blocker or high tag;
@@ -296,7 +310,7 @@ the same on main.
 | R79 | One `standingOf`; every hold text renders from it and lists every blocker | R39, R49, R77 wording |
 | R80 | A post waiver covering the head ends review holds for it; a stopped run's late `endRound` does nothing | R62 |
 | R81 | Every manual action, the pane's Stop included, ends with one agent message through `say()`; merged into a round prompt the action starts | — |
-| R82 | Triage carries open findings by the round raised in; `acknowledged` settles a GitHub item with no reply or Codex check | R32, R34 |
+| R82 | Triage carries open findings by the round raised in; `acknowledged` ("asks for no change") needs a reply and a Codex check, as a rebuttal does | R32, R34, R36, R40 |
 | R83 | A review is `isFinding: false` only on positive no-action evidence | readReviews' non-empty rule |
 | R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
 | R85 | A P3 deferral with a `followUp`, not security, settles without a waiver | R42 |
@@ -308,8 +322,12 @@ New tests in `pr-lifecycle/tests/`, through the existing engine fakes. Each
 fails on 1.3.0:
 
 - **Finding 21:** replay G2-11's history (open, then agent `reported-fixed`,
-  then Codex `open` in round 3). Round 3's triage asks about it, and an
-  `acknowledged` answer settles it.
+  then Codex `open` in round 3). Round 3's triage asks about it. An
+  `acknowledged` answer with a reply goes to the Codex check and settles
+  when Codex upholds it.
+- **`acknowledged` never closes silently:** without a `replyId` it is
+  unanswered and reprompted; on a P2-tagged or security item it is
+  unanswered; Codex rejecting it reopens the item with the reason.
 - **Approval classifier (required by review G2-2):**
   - an untagged actionable COMMENTED summary ("The reset path deletes the
     pending findings. Preserve them before archiving.") goes to triage;
