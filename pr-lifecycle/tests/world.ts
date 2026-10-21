@@ -97,6 +97,10 @@ export type World = {
     /** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */
     classicAnswer?: 'none' | 'ok' | 'garbage' | 'throw' | number
     calls: string[]
+    /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
+    isHeadReadBroken?: boolean
+    /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
+    onChecks?: () => void | Promise<void>
   }
   /** A stand-in engine for calling the mod's async helpers directly: its `process.run` is the fake `gh` and `git`. */
   engine: never
@@ -241,7 +245,7 @@ export function world(on: On): World {
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
-      if (/^api repos\/\S+\/rules\/branches\//.test(args)) {
+      if (/^api repos\/\S+\/rules\/branches\/[^\s?]+\?per_page=100$/.test(args)) {
         const how = w.gh.rulesAnswer ?? 'ok'
         if (how === 'throw') throw new Error('network down')
         if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
@@ -258,12 +262,14 @@ export function world(on: On): World {
         return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
       }
       if (args.startsWith('pr view')) {
+        if (w.gh.isHeadReadBroken === true && args.endsWith('--json headRefOid')) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
         return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
       }
       // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
       if (args.startsWith('pr checks')) {
+        await w.gh.onChecks?.()
         const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
         if (w.gh.isChecksUnreadable) return fail('HTTP 502: Bad Gateway')
         if (w.gh.checks.length === 0) return fail(`no checks reported on the '${w.gh.headRef}' branch`)

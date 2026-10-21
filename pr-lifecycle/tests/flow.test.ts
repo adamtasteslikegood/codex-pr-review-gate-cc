@@ -3441,6 +3441,8 @@ test('R86: the required set is known only when both sources are established (PR 
     ['ok', 'throw', 'unknown'],
     ['garbage', 'none', 'unknown'],
     ['ok', 'garbage', 'unknown'],
+    // Only "Branch not protected" is classic's authoritative none: any other 404 is unknown (final review M3).
+    ['ok', 404, 'unknown'],
   ]
   w.gh.required = ['check']
   for (const [i, [rules, classic, want]] of cases.entries()) {
@@ -3769,6 +3771,39 @@ test('R81: waiving a finding after a push no round recorded sends one message', 
   expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
   expect(sent[0]).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
   expect(sent[0]).toContain('/pr-gate resume reviews it')
+})
+
+test('a PR head read that throws does not fail the controller: the record\'s head decides (final review T8)', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  // A waiver for a head the record never reached makes the controller read GitHub's head.
+  w.gh.prHead = 'e'.repeat(40)
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  w.gh.isHeadReadBroken = true
+  const calls = w.gh.calls.length
+  const said = await say($, 'resume')
+  expect(w.gh.calls.slice(calls)).toContain('pr view 1 --json headRefOid')
+  expect(said.text).not.toContain('gh broke')
+  expect((await recordOf(w)).waivers.some(one => one.scope === 'post')).toBe(true)
+})
+
+test('M1: a post waiver given while the standing is gathered is not followed by a hold (final review)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isWaiving = false
+  w.gh.onChecks = async () => {
+    if (isWaiving) return
+    isWaiving = true
+    await say($, 'waive post reviewed by hand')
+  }
+  const prompts = w.prompts.length
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isWaiving).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
 })
 
 test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {

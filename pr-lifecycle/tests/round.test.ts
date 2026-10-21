@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { mergeNotes } from '../hooks/round'
+import { mergeNotes, patch } from '../hooks/round'
 
 test('R81: a note merges into a prompt of the same batch and record only', async () => {
   const a = { root: '/repo', branch: 'feat/x' }
@@ -16,4 +16,30 @@ test('R81: a note merges into a prompt of the same batch and record only', async
     'pr-gate: the person stopped the gate.',
     'pr-gate: the person reset the lifecycle of feat/x.',
   ])
+})
+
+/** An engine with only the run's state, in memory: what `patch` reads and writes. */
+const holding = (value: object) => {
+  let held = { value, version: 1 }
+  const state = {
+    get: async () => held,
+    set: async (_ref: unknown, next: object, options?: { ifVersion?: number }) => {
+      if (options?.ifVersion !== undefined && options.ifVersion !== held.version) return { isSet: false, version: held.version }
+      held = { value: next, version: held.version + 1 }
+      return { isSet: true, version: held.version }
+    },
+  }
+  return { $: { state } as never, read: () => held.value as { activity?: string } }
+}
+
+test('M2: patch changes only the running run it names, and returns null for any other (final review)', async () => {
+  const running = holding({ id: 'r1', status: 'running', activity: 'a' })
+  expect((await patch(running.$, 'r1', one => ({ ...one, activity: 'b' })))?.activity).toBe('b')
+  expect(running.read().activity).toBe('b')
+  const stopped = holding({ id: 'r1', status: 'stopped', activity: 'a' })
+  expect(await patch(stopped.$, 'r1', one => ({ ...one, activity: 'b' }))).toBeNull()
+  expect(stopped.read().activity).toBe('a')
+  const other = holding({ id: 'r2', status: 'running', activity: 'a' })
+  expect(await patch(other.$, 'r1', one => ({ ...one, activity: 'b' }))).toBeNull()
+  expect(other.read().activity).toBe('a')
 })

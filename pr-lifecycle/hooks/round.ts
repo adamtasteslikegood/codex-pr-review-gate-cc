@@ -490,12 +490,16 @@ async function isRunning($: Engine, id: string): Promise<boolean> {
   return live !== null && live.id === id && live.status === 'running'
 }
 
-/** Applies a change to the run in flight; a run that ended or was replaced is left alone. */
+/**
+ * Applies a change to the run in flight; a run that ended or was replaced is left alone, and null comes back for it (final review
+ * M2), so a caller's `after === null` also catches a run stopped or waived since it was read.
+ */
 export async function patch($: Engine, id: string, change: (run: Run) => Run): Promise<Run | null> {
   let after: Run | null = null
   await update($, runAtom, run => {
-    after = run !== null && run !== undefined && run.id === id && run.status === 'running' ? change(run) : (run ?? null)
-    return after
+    const isOurs = run !== null && run !== undefined && run.id === id && run.status === 'running'
+    after = isOurs ? change(run) : null
+    return isOurs ? after : (run ?? null)
   })
   return after
 }
@@ -766,11 +770,11 @@ export const prStateIn = (json: unknown): PrState | undefined => {
   return state === 'OPEN' || state === 'MERGED' || state === 'CLOSED' ? state : undefined
 }
 
-/** The head of PR `pr`, as gh reports it; undefined when gh cannot say. */
+/** The head of PR `pr`, as gh reports it; undefined when gh cannot say, a failed spawn included (final review T8). */
 async function prHeadOf($: Engine, root: string, pr: number): Promise<string | undefined> {
-  const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: root, timeoutMs: 30_000 })
-  if (view.exitCode !== 0) return undefined
   try {
+    const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid'], { cwd: root, timeoutMs: 30_000 })
+    if (view.exitCode !== 0) return undefined
     const read = (JSON.parse(view.stdout) as { headRefOid?: unknown } | null)?.headRefOid
     return typeof read === 'string' && read !== '' ? read : undefined
   } catch {
@@ -1023,10 +1027,12 @@ export async function requiredChecksOf($: Engine, root: string, slug: string | u
   const seen = required.get(key)
   if (seen !== undefined) return seen
   const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
-  const rules = await api(`repos/${slug}/rules/branches/${base}`)
+  // One page holds every rule a branch is likely to have (final review M3): GitHub's default of 30 could cut a required-checks rule.
+  const rules = await api(`repos/${slug}/rules/branches/${base}?per_page=100`)
   const classic = await api(`repos/${slug}/branches/${base}/protection/required_status_checks`)
   if (rules === undefined || rules.exitCode !== 0 || classic === undefined) return 'unknown'
-  const isClassicNone = classic.exitCode !== 0 && /\b404\b|not protected/i.test(classic.stderr)
+  // Only GitHub's own words are an authoritative none: a 404 for any other reason (a missing branch or token scope) is unknown (M3).
+  const isClassicNone = classic.exitCode !== 0 && /Branch not protected/i.test(classic.stderr)
   if (classic.exitCode !== 0 && !isClassicNone) return 'unknown'
   const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
   if (listed === undefined) return 'unknown'
@@ -1667,7 +1673,9 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   if (saved === undefined) return
   // The whole standing, CI included (R79), as the report a round ends with lists it.
   const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
-  await say($, saved, heldPrompt(saved, why, nextStep, pr === undefined ? undefined : await gatherStanding($, saved, pr)))
+  const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
+  if (await isPostWaived($, saved)) return
+  await say($, saved, heldPrompt(saved, why, nextStep, standing))
 }
 
 /**
@@ -2238,7 +2246,16 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
-  await say($, saved, reportPrompt(saved, next, pr === undefined ? undefined : await gatherStanding($, saved, pr)))
+  const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
+  // A post waiver given while the standing was gathered covers this head: no hold after it (final review M1, R80).
+  if (await isPostWaived($, saved)) return
+  await say($, saved, reportPrompt(saved, next, standing))
+}
+
+/** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */
+async function isPostWaived($: Engine, rec: LifecycleRecord): Promise<boolean> {
+  const latest = await loadRecord($, rec.root, rec.branch)
+  return latest !== undefined && latest.waivers.some(one => one.scope === 'post' && one.head === rec.head) && securityHolds(latest).length === 0
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
