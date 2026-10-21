@@ -179,12 +179,14 @@ in live use, makes a hold on a chained command say nothing in it ran.
    when none of those exist. Check suites are not read: some never finish
    (R89). Which signals are reliable was probed first (spec §2; the Codex
    connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
-6. **One finding per problem (done in 1.5.0, R90).**
-7. **Issues instead of waivers; the agent merges (done in 1.5.0, R92, R93).**
+5. **One finding per problem (done in 1.5.0, R90).**
+6. **Issues instead of waivers; the agent merges (done in 1.5.0, R92, R93).**
+
+The lanes item moved to wave 2c.
 
 ### Wave 2c: parallel fixers in lanes
 
-5. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
+1. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
    groups a round's findings into lanes by the files they touch and starts one fixer per
    lane in parallel; findings that share a file share a lane, so no two fixers edit the
    same code. On PR #20's pre-PR round 1, one fixer took 7 findings in turn where two lanes
@@ -209,9 +211,10 @@ Serves goal 2. Makes the gate legible and reachable from anywhere.
    - Subcommands resolve "the current branch" the same way.
 3. **Archive when the PR merges (finding 14).** The record is archived when the
    merge is seen, not at the next command.
-4. **The shared account (findings 16, 25).** Adam, Codex and the agent all post
-   as `adamtasteslikegood`. The gate skips comments whose ids the session itself
-   reported as `replyId`, and doesn't count others' replies as the agent's own.
+4. **The shared account (findings 16, 25) (done in 1.5.0, R91).** Adam, Codex
+   and the agent all post as `adamtasteslikegood`. The gate skips every comment
+   id the agent reported as a reply, whatever its answer (R91), and the person's
+   other comments under that login still reach triage (R64).
 5. **Announce background work (finding 23).** The pane names the Codex
    verification and final-head sub-agents while they run.
 

@@ -124,7 +124,7 @@ npm run check      # all four
 - `main` is the only long-lived branch; remote `origin` is
   `github.com/adamtasteslikegood/codex-pr-review-gate-cc`.
 - Work on a branch and open a PR to `main`. The ruleset blocks direct pushes.
-- `gh pr create` is held by codex-gate's pre-PR gate until it passes or Adam
+- `gh pr create` is held by pr-lifecycle's pre-PR gate until it passes or Adam
   waives it. Add its "Pre-PR Codex gate" line to the PR body.
 - Commit after each change, end commit messages with a `Co-Authored-By:`
   line for the model, and push when Adam asks. Merge with a merge commit, so

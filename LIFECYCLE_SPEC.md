@@ -250,6 +250,6 @@ No new hosting service, replacement CI pipeline, fixed reviewer roster, or separ
 - **One round is one head (R88).** A post-PR round reviews one head. A push ends it at the end of the turn that pushed. Only a round with a new blocking finding, a Codex rejection, or a fix the agent reports in it (amendment A8) draws on the allowance.
 - **Collection (R89).** It waits for the base's required checks, the PR's requested reviews and the roster; the quiet window only when none exists.
 - **Settling (R92).** Deferrals get Codex's check. When the review can do no more, findings still holding the merge get GitHub issues, except security; the issue settles them.
-- **The merge (R93).** When no review finding holds the merge, the agent merges with the repository's `mergeMethod`. The gate then checks that every follow-up issue is open (reopening it, or refiling it when GitHub says it is missing) before it archives the record.
+- **The merge (R93).** When no review finding holds the merge, the agent merges with the repository's `mergeMethod`. The gate then checks that every follow-up issue is open (reopening it, or filing it again when it is missing or cannot be reopened) before it archives the record.
 
 See `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`.

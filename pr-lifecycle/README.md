@@ -203,8 +203,8 @@ issue filed without it is labelled on the next pass, not filed again. A
 finding whose severity was lost is filed as Critical [P1]. The issue settles
 the finding; a change to its file does not unsettle it. After the merge,
 before the gate archives the record, it checks each follow-up issue: it
-reopens a closed one, and files one again only when gh says it no longer
-exists. A failure to file holds the merge with gh's words, and the next pass
+reopens a closed one, and files one again when gh says it no longer exists or
+the reopen fails (see The agent merges). A failure to file holds the merge with gh's words, and the next pass
 retries. Security findings wait for `/pr-gate waive <id>`.
 
 Before filing, a blocker first raised in the round that spent the allowance
@@ -251,11 +251,18 @@ cannot read hold the merge (fail closed), with gh's error.
 ### Who decides
 
 The gate settles review itself and gives the agent its own next step: fix this,
-answer that, run `/pr-gate resume`. It names the person only for security
-findings. Everything else ends in a fix, Codex's check, or an issue (R92).
-When nothing holds the merge, the agent merges (R93). Before the PR opens,
-exhaustion still names the person under `onExhausted: stop` or when a
-security P1 is open. The person's tools are the waivers and `allow`.
+answer that, run `/pr-gate resume`. It names the person for:
+
+- a security finding that is deferred or disputed, which the gate never files;
+- a review exhausted with a head no round reviewed and nothing to file
+  (`/pr-gate allow 1` or `waive post`);
+- a PR retargeted to another base (point it back, or `/pr-gate reset`);
+- before the PR opens, exhaustion under `onExhausted: stop` or with a
+  security P1 open.
+
+Everything else ends in a fix, Codex's check, or an issue (R92). When nothing
+holds the merge, the agent merges (R93). The person's tools are the waivers
+and `allow`.
 
 ### The agent merges
 
@@ -270,10 +277,11 @@ The merge step is sent once. The agent never writes `Closes`, `Fixes` or
 
 The gate then checks the follow-up issues, after the agent's merge or when a
 poll, a session start or `/pr-gate` sees the PR merged. An open issue is
-logged; a closed one is reopened with a comment; one gh reports missing ("Could
-not resolve to an issue or pull request") is filed again. Any other failure
-leaves the record blocked, the agent gets gh's words, and `/pr-gate resume`
-checks again. Only then is the record archived, and the agent is told which
+logged. A closed one is reopened with a comment; if the reopen fails, the
+gate files a new issue instead. A read that fails with "Could not resolve to
+an issue or pull request" means the issue is gone, and it is filed again; any
+other failed read leaves the record blocked. A refile that fails also leaves
+it blocked. The agent gets gh's words, and `/pr-gate resume` checks again. Only then is the record archived, and the agent is told which
 issues stay open.
 
 ## Settings per repository
