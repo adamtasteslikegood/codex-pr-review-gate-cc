@@ -205,7 +205,7 @@ const postsFor = (login: string, name: string): boolean => {
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 
 /** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—-]|$)/im
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|$)/im
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
@@ -221,8 +221,9 @@ export function severityHint(body: string): { severity: Severity; isSecurity: bo
 }
 
 /** Whole sentences that settle a review (R83). */
+const SCOPE = '(?: (?:in|for) this (?:[\\w/-]+ ){0,2}(?:diff|pr|pull request|changes?|commit|patch|update|revision))?'
 const SETTLES = [
-  /^no (?:actionable|blocking) (?:findings|issues|comments)(?: (?:in|for) this [\w\s/-]+)?$/i,
+  new RegExp(`^no (?:actionable|blocking) (?:findings|issues|comments)${SCOPE}$`, 'i'),
   /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
 ]
 /** Whole sentences that may sit beside them and change nothing. */

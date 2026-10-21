@@ -402,6 +402,9 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
   expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
   expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
+  // A trailing scope phrase is a fixed shape, not any run of words (round 2): the rest of the sentence is a finding.
+  expect(isNoAction('COMMENTED', 'No actionable findings in this PR but the cache is never cleared')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking issues for this change and the reset deletes pending findings')).toBe(false)
   // Approval text mixed with a requested fix.
   expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
   expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
@@ -433,5 +436,8 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
   expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
   expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Nit-picking aside, this leaks')).toMatchObject({ severity: 'P3', isTagged: false })
+  expect(severityHint('Optional-chaining crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Advisory - rename it')).toMatchObject({ severity: 'P3', isTagged: true })
   expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
 })
