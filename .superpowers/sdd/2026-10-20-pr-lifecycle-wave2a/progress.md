@@ -104,3 +104,6 @@ Task 8: review Needs fixes — Important (plan-mandated): real-git beginTriage p
 Task 8: fix round 1/5 dispatched (FIX_BASE ba79873)
 Task 8: minor (deferred): waiver message resent per session (Task 9's 'only if not already sent'); overlapping holdingPrompts share a batch; mergeNotes prepends to every prompt in batch; audit patch()'s stopped-run return for === null checks
 Task 8: fix round 1 implementer DONE, commit bcdf6dc (458 pass); isRunning re-checks after long awaits; advance reads PR head on waiver mismatch; head blocker id 'head'; re-review dispatched
+Task 8: fix round 1/5 (3 addressed, 0 open; commits ba79873..bcdf6dc)
+Task 8: complete (commits 9fc314f..bcdf6dc, review clean)
+Task 8: minor (deferred): advance reads gh pr view each pass while an unmatched post waiver exists; prHeadOf's process.run not try-wrapped (same as prStateOf); a waiver matching rec.head while the PR head moved on still sends the waiver message
