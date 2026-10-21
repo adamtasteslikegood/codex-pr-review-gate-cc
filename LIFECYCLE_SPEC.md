@@ -221,7 +221,7 @@ P1 security findings must not become acceptable simply because time or rounds ra
 
 Keep human waivers explicit and attributable. A pre-PR waiver must not silently waive the post-PR lifecycle.
 
-A post waiver covers its head: it ends review holds for it and sets aside, by name, the checks GitHub doesn't require. Checks GitHub does require, from the base's rulesets and classic protection, still hold, and an unreadable list holds too (R80, R86). Every manual action by the person ends with one message to the agent (R81).
+A post waiver covers its head: it ends review holds for it and sets aside, by name, the checks GitHub doesn't require. Checks GitHub does require, from the base's rulesets and classic protection, still hold, a required check that never reported included, and an unreadable list holds too (R80, R86). A resume reads the PR's head first: when someone pushed past the waived head, it says so and asks for a pull, then a resume. Every manual action by the person ends with one message to the agent (R81).
 
 ## Behaviors to verify
 
