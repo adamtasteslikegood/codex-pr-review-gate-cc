@@ -122,3 +122,4 @@ Task 10: review Approved (spec ✅)
 Task 10: complete (commits f8d8e03..03df5e2, review clean)
 Task 10: minor (deferred): pane stop's runCommand rejection uncaught (same as old button)
 Task 12: implementer dispatched (sonnet), BASE 8a00832
+Task 12: implementer DONE, commit f01ed96 (472 pass); review dispatched

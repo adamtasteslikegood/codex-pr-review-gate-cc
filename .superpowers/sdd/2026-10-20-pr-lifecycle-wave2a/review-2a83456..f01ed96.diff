@@ -1,0 +1,236 @@
+# Review package: 2a83456..f01ed96
+
+## Commits
+f01ed96 pr-lifecycle: a hold on a chained Bash command says nothing in it ran (R87)
+
+## Files changed
+ pr-lifecycle/hooks/github.ts      | 15 +++++++++++++++
+ pr-lifecycle/hooks/register.tsx   | 24 ++++++++++++++++++------
+ pr-lifecycle/tests/flow.test.ts   | 15 +++++++++++++++
+ pr-lifecycle/tests/github.test.ts | 11 +++++++++++
+ 4 files changed, 59 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/pr-lifecycle/hooks/github.ts b/pr-lifecycle/hooks/github.ts
+index 6d9a9df..5d3543c 100644
+--- a/pr-lifecycle/hooks/github.ts
++++ b/pr-lifecycle/hooks/github.ts
+@@ -553,20 +553,35 @@ function readSegment(segment: string, normal: string, cwd: string | undefined):
+ /** Merge wins over create when one command holds both. */
+ function readBash(command: string): PrAction | undefined {
+   const normal = normalise(command)
+   const cwd = cdOf(normal)
+   const found = segmentsOf(normal)
+     .map((segment) => readSegment(segment, normal, cwd))
+     .filter((one): one is PrAction => one !== undefined)
+   return found.find((one) => one.action === 'merge') ?? found[0]
+ }
+ 
++/**
++ * Whether a Bash command does more than its PR action (R87). A hook allows or refuses the whole command, so a held `gh pr create`
++ * also stops the file write or push chained with it. Quoted text, `$(…)` and heredoc bodies belong to their step; a bare `cd` is no step.
++ */
++export function hasOtherSteps(command: string): boolean {
++  const bare = dropHeredocs(command.replace(/\\\r?\n/g, ' '))
++    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, 'Q')
++    .replace(/\$\([^()]*\)/g, 'S')
++  const steps = bare
++    .split(/;|&&|\|\||\||\n/)
++    .map(one => one.trim())
++    .filter(one => one !== '' && !/^cd\s+\S+$/.test(one))
++  return steps.length > 1
++}
++
+ // ------------------------------------------------------------------- MCP
+ 
+ const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
+ const MAX_PLAIN = 120
+ 
+ /** Camel case split, punctuation to spaces, lowercase: `mergePullRequest` and `merge_pull_request` read the same. */
+ const wordsOf = (text: string): string =>
+   text
+     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+     .replace(/[^A-Za-z0-9]+/g, ' ')
+diff --git a/pr-lifecycle/hooks/register.tsx b/pr-lifecycle/hooks/register.tsx
+index e84ecf6..d5cffe3 100644
+--- a/pr-lifecycle/hooks/register.tsx
++++ b/pr-lifecycle/hooks/register.tsx
+@@ -4,21 +4,21 @@
+ //
+ // round.ts runs a round as a state machine the host keeps in `$.state`, and holds
+ // the controller (`advance`), which reads the record after each round and does
+ // what `decideNext` says. Here are the hooks, the guard, the command and the pane.
+ 
+ import { atom, read, update } from 'claude-code'
+ import type { EngineInterface, Register } from 'claude-code'
+ 
+ import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
+ import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+-import { readPrAction } from './github'
++import { hasOtherSteps, readPrAction } from './github'
+ import type { PrAction } from './github'
+ import {
+   allowanceFor,
+   isAcceptedRebuttal,
+   isDisputed,
+   lastReviewedHead,
+   holdText,
+   isReverifyOwed,
+   isSettledDeferral,
+   mergeHolds,
+@@ -570,20 +570,31 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
+ }
+ 
+ /**
+  * A refusal reaches the agent as a failed tool call. It says first that it is a hold, not an error (finding 7): agents read a
+  * plain refusal as something broken and work around it.
+  */
+ function asHold(text: string): string {
+   return text.startsWith('pr-gate: ') ? `pr-gate HOLD (not an error): ${text.slice('pr-gate: '.length)}` : `pr-gate HOLD (not an error): ${text}`
+ }
+ 
++/** The line a hold on a chained Bash command ends with (R87): nothing in it ran, so the agent redoes the other steps on their own. */
++const CHAINED =
++  '\nNothing in this Bash command ran: a hold refuses the whole command, so the steps chained with the PR command did not run either. ' +
++  'Run those on their own (write a PR body file with the Write tool), and keep the PR command in a Bash call by itself.'
++
++/** What a refusal adds for this call: the R87 line when it is a Bash command with other steps. */
++const chainedOf = (tool: string, e: unknown): string => {
++  const command = (e as Record<string, unknown>).command
++  return tool === 'Bash' && typeof command === 'string' && hasOtherSteps(command) ? CHAINED : ''
++}
++
+ /** What still stands between a record and ready, in a few words. */
+ const HOLD: Record<string, string> = {
+   open: 'unresolved',
+   deferred: 'deferred',
+   'reported-fixed': 'fixed, not verified',
+   rebutted: 'rebuttal not accepted by Codex',
+ }
+ 
+ const owedOf = (rec: LifecycleRecord): string => {
+   const post = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
+@@ -1101,46 +1112,47 @@ export const register: Register = (on, options) => {
+         }
+         // The main agent's call belongs to its step's own turn (R51); a sub-agent's to its id.
+         const who = run.pending.find(one => isTurnOf(one, e.agentId))
+         if (who === undefined) return
+         const activity = activityOf(who.role, String(e.tool), e as unknown as Record<string, unknown>)
+         if (activity !== run.activity) await patch($, run.id, one => ({ ...one, activity }))
+       })().catch(() => undefined)
+     }
+     const action = readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
+     if (action === undefined) return next(e)
++    const tail = chainedOf(String(e.tool), e)
+     if (action.action === 'merge') {
+       // A merge given by URL names its repository there: gh pr view reads that one, and another repo's PR is not intercepted.
+       const command = (e as unknown as Record<string, unknown>).command
+       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
+       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
+       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
+-      return refusal !== undefined ? { deny: asHold(refusal) } : next(e)
++      return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)
+     }
+     const found = await gatedCreate($, action)
+-    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) } : next(e)
+-    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) } : next(e)
++    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
++    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
+     const gated = found
+     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
+-    if (refusal !== undefined) return { deny: asHold(refusal) }
++    if (refusal !== undefined) return { deny: asHold(refusal) + tail }
+     const ran = await next(e)
+     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
+     return ran
+   }).catch(($, e, next) => {
+     // Once the hook called `next`, the tool ran: here `next(e)` replays what it settled to and never runs the tool again (Caught).
+     const action = next.called ? undefined : readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
+     if (action === undefined) return next(e)
+     return {
+       deny: asHold(
+         'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
+           `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
+-      ),
++      ) + chainedOf(String(e.tool), e),
+     }
+   })
+ 
+   // A main-loop turn that starts with a step's prompt is that step's own turn (R51).
+   on('turn.start', async ($, e, next) => {
+     const started = await next(e)
+     if (isLiveNow()) await onTurnStart($, e.agentId, e.turnId, e.text).catch(() => undefined)
+     return started
+   })
+ 
+diff --git a/pr-lifecycle/tests/flow.test.ts b/pr-lifecycle/tests/flow.test.ts
+index ac560b0..ea7f112 100644
+--- a/pr-lifecycle/tests/flow.test.ts
++++ b/pr-lifecycle/tests/flow.test.ts
+@@ -3773,10 +3773,25 @@ test('R81: waive post with no PR from gh says the standing is unknown, not ready
+   w.gh.hasPr = false
+   const prompts = w.prompts.length
+   await say($, 'waive post reviewed by hand')
+   await w.clock.advance(1000)
+   const sent = w.prompts.slice(prompts)
+   expect(sent).toHaveLength(1)
+   expect(sent[0]).toContain('what else holds the merge is unknown')
+   expect(sent[0]).not.toContain('PR #?')
+   expect(sent[0]).not.toContain('ready for the merge decision')
+ })
++
++test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
++  world(on)
++  const chained = { tool: 'Bash' as const, command: `cat > /tmp/body.md <<'EOF'\nSummary\nEOF\n${createPr.command} --body-file /tmp/body.md` }
++  const held = await $.tool.call(chained)
++  expect(isHeld(held)).toBe(true)
++  expect(held.deny ?? '').toContain('Nothing in this Bash command ran')
++  expect(held.deny ?? '').toContain('Write tool')
++  const lone = await $.tool.call(createPr)
++  expect(isHeld(lone)).toBe(true)
++  expect(lone.deny ?? '').not.toContain('Nothing in this Bash command ran')
++  const chainedMerge = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash && git checkout dev' })
++  expect(isHeld(chainedMerge)).toBe(true)
++  expect(chainedMerge.deny ?? '').toContain('Nothing in this Bash command ran')
++})
+diff --git a/pr-lifecycle/tests/github.test.ts b/pr-lifecycle/tests/github.test.ts
+index b3fcebe..284d585 100644
+--- a/pr-lifecycle/tests/github.test.ts
++++ b/pr-lifecycle/tests/github.test.ts
+@@ -1,14 +1,15 @@
+ import { expect, test } from 'claude-code/testing'
+ 
+ import {
+   collectionDone,
++  hasOtherSteps,
+   isNoAction,
+   isTrusted,
+   readCheckRuns,
+   readInlineComments,
+   readIssueComments,
+   readJsonList,
+   readPrAction,
+   readRequired,
+   readReviews,
+   readRoster,
+@@ -449,10 +450,20 @@ test('R86: required checks come from the ruleset and classic protection; anythin
+     { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'check' }, { context: 'analyze (actions)' }] } },
+   ])
+   expect(readRequired(rules, undefined)).toEqual(['check', 'analyze (actions)'])
+   expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'], checks: [{ context: 'check' }] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
+   expect(readRequired('[]', undefined)).toEqual([])
+   expect(readRequired('<html>proxy error</html>', undefined)).toBeUndefined()
+   expect(readRequired('', undefined)).toBeUndefined()
+   // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
+   expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
+ })
++
++test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
++  expect(hasOtherSteps('gh pr create --base dev --title "a; b && c"')).toBe(false)
++  expect(hasOtherSteps('gh pr create --base dev --body "$(cat body.md)"')).toBe(false)
++  expect(hasOtherSteps('cd /repo && gh pr create --base dev')).toBe(false)
++  expect(hasOtherSteps("gh pr create --base dev --body-file - <<'EOF'\nline one; two\nEOF")).toBe(false)
++  expect(hasOtherSteps("cat > body.md <<'EOF'\nSummary\nEOF\ngh pr create --base dev --body-file body.md")).toBe(true)
++  expect(hasOtherSteps('git push -u origin HEAD && gh pr create --base dev')).toBe(true)
++  expect(hasOtherSteps('gh pr merge 1 --squash; git checkout dev')).toBe(true)
++})
