@@ -306,7 +306,9 @@ the same on main.
 - P0-P2, security, or no `followUp`: held for the person's waiver, as today
   (R42).
 - The triage prompt says: "deferred: only for what the person must rule on;
-  a P3 with a recorded follow-up needs no waiver".
+  a P3 whose severity you did not lower, with followUp naming where it is
+  tracked (an issue or comment URL, #<n> or owner/repo#<n>), needs no
+  waiver" (amended after the final review, T4 and I2).
 
 ## 5. `waive post` and checks GitHub doesn't require (decision K; findings 28, 29)
 

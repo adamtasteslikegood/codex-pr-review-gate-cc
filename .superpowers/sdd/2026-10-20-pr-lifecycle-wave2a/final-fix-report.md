@@ -52,7 +52,8 @@ Every new test was run and seen failing before its fix, except the M3 case, whic
    `w.gh.isHeadReadBroken` on a resume after a waiver for an unrecorded head.
 
 Docs: R79 (M7 clause + I1 blocker), R82 (M6 clause), R84 (start-of-body label; a lowered guess no longer settles), R85 (shape rule,
-never-lowered, stale clear, cost if wrong); spec §3.5 (start-of-body; agent may raise, never lower a tag, M5), §4 conditions, §6 table;
+never-lowered, stale clear, cost if wrong); spec §3.5 (start-of-body; agent may raise, never lower a tag, M5), §4 conditions and the
+quoted triage sentence, §6 table;
 LIFECYCLE_SPEC R85 line; CLAUDE.md count 472 → 482 (it appears once in Checks, not twice).
 
 ## Concerns
@@ -62,6 +63,10 @@ LIFECYCLE_SPEC R85 line; CLAUDE.md count 472 → 482 (it appears once in Checks,
   give two 'head' ids, and `namedIn` would hide both behind the exhausted reason, or give a contradictory release. Every such case
   still holds (`mayProceed` false). Its wording ("after the review completed") is also used in a non-ready post phase, where the
   review isn't strictly complete; only reachable when the record's head lags the PR.
+- **M1 residual:** `isPostWaived` matches a waiver for the record's head. A `waive post` given mid-gather after the PR head moved past
+  `rec.head` records the PR head, so that hold still goes out; the next `advance` pass (its `isRead` path) then says the waiver covers it.
+- **I1 release:** "/pr-gate resume reviews it" goes through `startGate`, which sets `rec.head` from the local HEAD, moves ready back to
+  post and runs `headMoved`. That holds when the checkout has the push; a push made elsewhere relies on the existing checkout catch-up.
 - **waive <id> after a push skips `advance`.** The record keeps its pre-waive status (e.g. awaiting-decision) until `/pr-gate resume`;
   the note tells the agent so. Safe (holding), but the waived finding's "ready" is only reached on resume.
 - **Residual of C1/I2 (controller's call):** a mixed body whose *guess* is already P3 (it contains "nit", "typo" or "minor" anywhere,
