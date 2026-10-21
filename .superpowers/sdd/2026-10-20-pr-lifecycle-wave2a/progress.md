@@ -84,3 +84,5 @@ Task 5: complete (commits 14ddf6e..d2a3afe, review clean)
 Task 5: minor (deferred): tests don't pin non-security holds under waiver+security P1, retargeted, round-owed, pre phase, disputed; holdText returns '' when all named
 Ruling: spec §1's 'late-feedback' Blocker kind and standingOf's late param are not built — the plan dropped them and judgeMerge's ready branch keeps today's untriagedFeedback hold (Task 7 leaves it), so a late review still blocks the merge — cost if wrong: late reviews aren't listed in the one standing text; final review can add it
 Task 6: implementer dispatched (sonnet), BASE bb3615b
+Ruling: added Task 12 (R87, spec §5a) from Adam's forwarded live report (cookbook #3732/#3741: a held chained create also dropped the body-file write) — run order 10, 12, 11 so Task 11 records R87 — cost if wrong: one small task of scope in 1.4.0; rewriting the command to run only part of it was rejected
+Task 6: implementer DONE_WITH_CONCERNS, commit 1290918 (443 pass); test $ has no process → w.engine fake; brief test bug (classicAnswer reset); cache cleared in setup; review dispatched

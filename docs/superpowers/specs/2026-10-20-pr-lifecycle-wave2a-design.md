@@ -339,6 +339,30 @@ the same on main.
 | R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
 | R85 | A P3 deferral with a `followUp`, not security, settles without a waiver | R42 |
 | R86 | Required checks come from rulesets and classic protection; `waive post` sets aside the rest | R1-9 |
+| R87 | A hold on a Bash command that does more than its PR action says that nothing in it ran (section 5a) | R77 wording |
+
+### 5a. A hold on a chained command (added 2026-10-20, from live use)
+
+**Today.** A hook allows or refuses a whole tool call. An agent that wrote
+`cat > body.md <<'EOF' … EOF` and `gh pr create --body-file body.md` in one
+Bash call had the create held. The file write didn't run either, and the hold
+didn't say so. This happened twice in one session (cookbook PRs #3732 and
+#3741). The agent found the missing file afterwards and rewrote it.
+
+**Design.** `hasOtherSteps(command)` in `github.ts` is true when a Bash
+command has a step besides the PR action. Steps are split on `;`, `&&`, `||`,
+`|` and newlines, after heredoc bodies, quoted text and `$(…)` are removed. A
+bare `cd <dir>` doesn't count. Every hold the `tool.call` hook returns for such
+a command (create, merge, outside, no base, the guard's own failure) ends with:
+
+> Nothing in this Bash command ran: a hold refuses the whole command, so the
+> steps chained with the PR command did not run either. Run those on their own
+> (write a PR body file with the Write tool), and keep the PR command in a Bash
+> call by itself.
+
+**Rejected:** rewriting the command to drop only the PR part, through
+`updatedInput` or a changed `next(e)`. Running part of what the agent wrote,
+silently, is worse than refusing all of it and saying so.
 
 ## 7. Testing
 
