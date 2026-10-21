@@ -50,3 +50,9 @@ Task 4: review Needs fixes (Important: no lower bound when both lookups fail →
 Ruling: A5's plan rulings (activity-log push time; first-seen fallback; re-request or count, never a cap wait; latest/newest push re-reads) are recorded in Task 16's rulings text with R88-R94 — no task owned them — cost if wrong: a missing doc line
 Task 4: fix round 1 9a8cac5, re-review Approved, 527/527. Minors deferred to final review: toMatchObject weakens #24 (7)/(12) asserts; beginCollect records asks but doesn't read them; noteArrival same-head concurrent overwrite (narrow)
 Task 4: complete (commits 5457a09..9a8cac5, review clean)
+Task 5: implemented c4938b2 + report 8f49684 (BASE 3ec5fd8), 534/534; adaptations: roster coverage answers a request; 5 tests count POSTs via w.gh.requests; R79 test sets required=[]
+Task 5: review Changes needed (Important: no-roster coverage answering a request; failed requested_reviewers read stops round) → fix round 1 sent, plus inline comments use original_commit_id (pre-existing false coverage)
+Ruling: team review requests ignored (cannot match a login; only ends collection sooner) — record in Task 16 rulings — cost if wrong: a CODEOWNERS team's review not waited on
+Ruling: a required context posted as a commit status (not a check run) is not seen; costs a cap wait; note in Task 16 rulings / follow-up
+Ruling (revised): commit statuses ARE read for required contexts (sent into Task 5 fix round 1) — a cap wait every round violates 'gate can't get stuck'
+Task 5: fix round 1 0283ef8, 541/541 (roster-only request coverage; failed requested read → [] + log; original_commit_id; isAnswered/unknown-checks flow tests; commit statuses read for required contexts) → scoped re-review on opus dispatched. Concern: a status left pending forever holds collection to the cap when required checks are unreadable (same as a stuck check run; cap is the backstop)
