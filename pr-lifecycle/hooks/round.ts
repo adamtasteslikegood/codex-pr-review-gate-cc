@@ -66,7 +66,6 @@ import {
   isLinkOwed,
   isDeferralOwed,
   isReverifyOwed,
-  issueOf,
   lastCoveredHead,
   markHeld,
   markVerified,
@@ -75,7 +74,9 @@ import {
   newRecord,
   nextIds,
   mayAcknowledge,
-  peakOf,
+  filingPeak,
+  GATE_ROUNDS,
+  planIssues,
   raisedIn,
   readDiff,
   refuseLink,
@@ -93,7 +94,6 @@ import {
   linkTo,
   withLinkedPeak,
   withRound,
-  wouldSettle,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
 import { archiveRecord, isHeldByOther, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
@@ -137,6 +137,8 @@ export type Config = {
   codexModel: string | undefined
   /** The Codex model for high blast-radius changes (R69); undefined names none. */
   codexModelHigh: string | undefined
+  /** The spec handle each filed issue's title names (R92); undefined names none. Repository file only. */
+  issueSpec: string | undefined
   /** Plugin options whose value was invalid, each with why: the default applies to them. */
   badOptions: string[]
 }
@@ -214,6 +216,7 @@ export function configOf(options: PluginOptions): Config {
     fixAgentModel: model('fixAgentModel'),
     codexModel: model('codexModel'),
     codexModelHigh: model('codexModelHigh'),
+    issueSpec: undefined,
     badOptions,
   }
 }
@@ -223,9 +226,9 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, allowanceLight, lightBranches, onExhausted and highRiskPaths, and the models and efforts (R68, R69), each read as configOf reads
- * the option. A key whose value is invalid is left to the option and named in `ignored`; an empty regular expression turns its
- * match off, and an empty model names none, as the option does.
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths and issueSpec (R92), and the models and efforts (R68, R69),
+ * each read as configOf reads the option. A key whose value is invalid is left to the option and named in `ignored`; an empty
+ * regular expression turns its match off, and an empty model names none, as the option does.
  */
 export function overrideConfig(c: Config, text: string | undefined): { config: Config; ignored: string[] } {
   if (text === undefined || text.trim() === '') return { config: c, ignored: [] }
@@ -263,6 +266,8 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   const light = pattern('lightBranches')
   const onExhausted =
     r.onExhausted === undefined || r.onExhausted === 'open-pr' || r.onExhausted === 'stop' ? r.onExhausted : bad('onExhausted', 'not open-pr or stop')
+  const issueSpec =
+    r.issueSpec === undefined ? undefined : typeof r.issueSpec === 'string' && r.issueSpec.trim() !== '' ? r.issueSpec.trim().slice(0, 80) : bad('issueSpec', 'not a non-empty string')
   const highRisk = pattern('highRiskPaths')
   // Set or not, and to what: an empty string sets "no model", which undefined alone cannot tell from unset.
   const model = (key: ModelKey): { model: string | undefined } | undefined =>
@@ -288,6 +293,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
       ...c,
       allowances: { standard: standard ?? c.allowances.standard, high: high ?? c.allowances.high, light: lightRounds ?? c.allowances.light },
       onExhausted: onExhausted ?? c.onExhausted,
+      issueSpec: issueSpec ?? c.issueSpec,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
       effort: efforts.effort ?? c.effort,
@@ -2820,10 +2826,11 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     )
     return
   }
-  // A deferral that settles once its issue carries the finding's peak severity is labelled first, every pass until it is (R85).
-  const labelled = await labelDeferrals($, rec)
-  if (labelled === undefined) return
-  rec = labelled
+  // Where the review can do no more, the gate first adds a round for a late blocker, else files an issue for each held finding but
+  // security; it then decides again from what it wrote (R92).
+  const filed = await fileIssues($, rec)
+  if (filed === undefined) return
+  rec = filed
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2931,67 +2938,132 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   await say($, saved, reportPrompt(saved, next, standing))
 }
 
-/** The colour of each severity label the gate makes on a follow-up's repository (R85). */
+/** The colour of each severity label the gate makes on an issue's repository (R85, R92). */
 const LABEL_COLOURS: Record<Severity, string> = { P0: 'b60205', P1: 'd93f0b', P2: 'fbca04', P3: '0e8a16' }
 
+/** What one filing did to a finding, written under the record's lock. */
+type Filed = { peak: Severity; was: string | undefined; followUp: string | undefined; issueError?: string; labelError?: string }
+
 /**
- * Labels the follow-up issue of each deferral that would settle with the highest severity its finding had (R85, Adam 2026-10-20),
- * once per peak: a peak that rose since adds the new label. The label is made first when the repository lacks it; a failed edit
- * is recorded on the finding, which holds the merge until a later pass labels it (fail closed). Only after the PR opens. Undefined
- * when the lifecycle was reset, replaced or stopped while gh ran: the caller decides nothing for it.
+ * The filing pass (R92, spec §5): where the review can do no more, it first adds a round for a late blocker (`gateGrant`); else it
+ * files a GitHub issue for each held finding but security, or labels the issue the agent's follow-up names, with `severity:<peak>`.
+ * A failure is recorded on the finding, which holds, and the next pass retries. An issue counts only once GitHub shows its label
+ * (A7): GitHub drops the labels of a POST from an account without push access, so a filed issue without it holds as a failed label,
+ * and the next pass labels that issue rather than filing another. Undefined when the lifecycle was reset, replaced, stopped or
+ * waived while gh ran: the caller decides nothing for it (gate G7-8, R8-2). Never through a PR-create command line (spec §5.9).
  */
-export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
-  if (rec.phase === 'pre') return rec
-  const owed = rec.findings.filter(one => wouldSettle(one) && one.followUpLabel !== peakOf(one))
-  if (owed.length === 0) return rec
-  const gh = async (args: string[]): Promise<{ exitCode: number; stderr: string }> => {
+export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+  if (rec.phase === 'pre' || rec.pr === undefined) return rec
+  const now = await $.clock.now()
+  const { config: c } = await configFor($, rec.root, rec.base)
+  const plan = planIssues(rec, now, c.issueSpec)
+  if (plan.kind === 'none') return rec
+  // A reset, a fresh lifecycle, a stop or a waiver since this pass began ends it (gate G7-8, R8-2): checked before each issue and
+  // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
+  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
+    latest === undefined ||
+    latest.phase === 'archived' ||
+    (latest.generation ?? 0) !== (rec.generation ?? 0) ||
+    latest.postStatus !== rec.postStatus ||
+    latest.waivers.length !== rec.waivers.length
+  if (plan.kind === 'grant') {
+    const n = rec.grants.filter(one => one.by === 'gate').length + 1
+    const text = `the gate added a round for ${plan.late.join(', ')}, first raised after the allowance was spent (${n} of ${GATE_ROUNDS}): the PR's scope may be too wide`
+    let isGone = false
+    const saved = await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = isMoved(latest)
+      if (isGone) return latest
+      return { ...latest, grants: [...latest.grants, plan.grant], log: [...(latest.log ?? []), { at: now, kind: 'check' as const, text }].slice(-LOG_CAP) }
+    })
+    if (isGone) return undefined
+    $.ui.toast(`pr-gate: ${text}.`)
+    return saved ?? rec
+  }
+  // Each gh call is bounded: a hang ends as a failure, recorded on the finding, never a wait.
+  const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
     try {
       return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
     } catch (e) {
-      return { exitCode: 1, stderr: e instanceof Error ? e.message : String(e) }
+      return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
     }
   }
-  // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and after its
-  // gh calls, so no later issue is labelled and no log line lands in another lifecycle's log.
-  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
-    latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
-  const results = new Map<string, { followUp: string | undefined; peak: Severity; error?: string }>()
-  // Logged with the results, in the same guarded write: a reset between a check and a log write of its own would put the line in
-  // another lifecycle's log (gate R9-1).
+  const failure = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
+  const results = new Map<string, Filed>()
+  // Logged with the results, in the same guarded write (gate R9-1).
   const lines: LogEntry[] = []
-  for (const one of owed) {
+  for (const item of plan.items) {
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
-    const peak = peakOf(one)
-    const issue = issueOf(one.followUp, rec.slug)
-    if (issue === undefined) {
-      results.set(one.id, { followUp: one.followUp, peak, error: 'no repository is known for this issue' })
+    const label = `severity:${item.peak}`
+    const base = { peak: item.peak, was: item.followUp, followUp: item.followUp }
+    const repo = item.reuse?.repo ?? rec.slug
+    // A new issue needs the record's repository: with none known, the filing fails where the agent sees it, never a silent wait.
+    if (repo === undefined) {
+      results.set(item.id, { ...base, issueError: 'no GitHub repository is known for this branch (its remote is not on github.com)' })
+      lines.push({ at: await $.clock.now(), kind: 'check', text: `${item.id}: could not file an issue: no repository known` })
       continue
     }
-    const label = `severity:${peak}`
-    // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). gh refuses one that
-    // exists; the edit below reports any real failure.
-    await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak]])
+    // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). Its failure is not
+    // read: the labels GitHub returns, or the edit, are the check.
+    await gh(['label', 'create', label, '--repo', repo, '--color', LABEL_COLOURS[item.peak]])
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
-    const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
-    results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
+    let text: string
+    if (item.reuse !== undefined) {
+      const edit = await gh(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
+      const labelError = edit.exitCode === 0 ? undefined : failure(edit)
+      results.set(item.id, { ...base, ...(labelError === undefined ? {} : { labelError }) })
+      text = labelError === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
+    } else {
+      const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
+      const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
+      if (filed === undefined) {
+        const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : failure(post)
+        results.set(item.id, { ...base, issueError })
+        text = `${item.id}: could not file an issue in ${repo}`
+      } else if (!filed.labels.includes(label)) {
+        // Filed, but GitHub dropped the label (A7): the issue is kept, and the next pass labels it instead of filing another.
+        const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
+        results.set(item.id, { ...base, followUp: `#${filed.number}`, labelError })
+        text = `${item.id}: filed ${repo}#${filed.number} without ${label}`
+      } else {
+        results.set(item.id, { ...base, followUp: `#${filed.number}` })
+        text = `${item.id}: filed ${repo}#${filed.number} ${label}`
+      }
+    }
     if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
-    const text = edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`
     lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
   }
-  // And on the write itself: nothing is written, and nothing is decided (gate G7-8, R7-4).
-  let isSuperseded = false
-  // Written only where the follow-up and peak are still the ones labelled: a later answer that moved either is labelled anew.
+  let isGone = false
+  // Written only where the follow-up and peak are still the ones filed for: a later answer that moved either is filed anew.
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
-    isSuperseded = isMoved(latest)
-    if (isSuperseded) return latest
-    const findings = latest.findings.map(f => {
+    isGone = isMoved(latest)
+    if (isGone) return latest
+    const findings = latest.findings.map((f): Finding => {
       const got = results.get(f.id)
-      if (got === undefined || got.followUp !== f.followUp || got.peak !== peakOf(f)) return f
-      return got.error === undefined ? { ...f, followUpLabel: got.peak, followUpLabelError: undefined } : { ...f, followUpLabelError: got.error }
+      if (got === undefined || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
+      if (got.issueError !== undefined) return { ...f, issueError: got.issueError }
+      if (got.labelError !== undefined) {
+        return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined }
+      }
+      return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
     })
     return { ...latest, findings, log: [...(latest.log ?? []), ...lines].slice(-LOG_CAP) }
   })
-  return isSuperseded ? undefined : (saved ?? rec)
+  return isGone ? undefined : (saved ?? rec)
+}
+
+/** The number and label names in GitHub's answer to an issue POST; undefined when it gave no number. */
+const filedIssueOf = (stdout: string): { number: number; labels: string[] } | undefined => {
+  try {
+    const said = JSON.parse(stdout) as { number?: unknown; labels?: unknown }
+    const n = said.number
+    if (typeof n !== 'number' || !Number.isInteger(n) || n <= 0) return undefined
+    const labels = Array.isArray(said.labels)
+      ? said.labels.flatMap(one => (typeof one === 'object' && one !== null && typeof (one as { name?: unknown }).name === 'string' ? [(one as { name: string }).name] : []))
+      : []
+    return { number: n, labels }
+  } catch {
+    return undefined
+  }
 }
 
 /** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */

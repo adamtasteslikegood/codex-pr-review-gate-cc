@@ -20,8 +20,10 @@ import {
   lastReviewedHead,
   holdText,
   isReverifyOwed,
-  isSettledDeferral,
-  peakOf,
+  isFileable,
+  isSettledByIssue,
+  issueLine,
+  scopeNote,
   mergeHolds,
   reverifyOwed,
   newRecord,
@@ -822,9 +824,11 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
+  const note = scopeNote(rec)
   const settled = rec.findings
-    .filter(isSettledDeferral)
-    .map(one => ` ${one.id} deferred, follow-up at ${one.followUp}, labelled severity:${peakOf(one)}.`)
+    .filter(isSettledByIssue)
+    .map(one => ` ${issueLine(one)}.`)
+    .concat(note === undefined ? [] : [` ${note}`])
     .join('')
   return (
     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
@@ -839,9 +843,11 @@ const settledAs = (rec: LifecycleRecord, one: Finding): string =>
     ? 'waived'
     : isAcceptedRebuttal(one)
       ? 'its rebuttal is accepted by Codex'
-      : one.status === 'verified-fixed'
-        ? 'verified fixed'
-        : one.status
+      : isSettledByIssue(one)
+        ? `tracked by its issue: ${issueLine(one)}`
+        : one.status === 'verified-fixed'
+          ? 'verified fixed'
+          : one.status
 
 /** The checkout's branch: its toplevel and name, or undefined outside a checkout or on a detached HEAD. */
 async function hereOf($: Engine): Promise<{ root: string; branch: string } | undefined> {
@@ -951,8 +957,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
     const after = (await loadRecord($, root, branch)) ?? rec
-    // Rounds never settle a deferral or a dispute (R42): only the person's waiver of each does.
-    const theirs = mergeHolds(after).filter(one => one.status === 'deferred' || isDisputed(one))
+    // Rounds never settle a deferral or a dispute (R42): only the person's waiver of each does, or its issue when the gate files it (R92).
+    const theirs = mergeHolds(after).filter(one => (one.status === 'deferred' || isDisputed(one)) && !isFileable(one))
     const settles =
       theirs.length === 0
         ? ''

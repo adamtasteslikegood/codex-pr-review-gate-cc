@@ -2,7 +2,7 @@
 // the controller's choice of what comes next. No `$` here.
 
 import type {
-  Blocker, CheckState, Finding, FindingEvent, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver,
+  Blocker, CheckState, Finding, FindingEvent, FindingStatus, Grant, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver,
 } from '../types'
 
 // ----------------------------------------------------------------- budget
@@ -568,7 +568,12 @@ const deferredBlockers = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): F
 export function unresolvedBlockers(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
   return rec.findings.filter(
-    one => isBlocking(one) && !waived.has(one.id) && !isLinked(one) && (one.status === 'open' || (one.status === 'deferred' && one.isSecurity === true)),
+    one =>
+      isBlocking(one) &&
+      !waived.has(one.id) &&
+      !isLinked(one) &&
+      (one.status === 'open' || (one.status === 'deferred' && one.isSecurity === true)) &&
+      !isSettledByIssue(one),
   )
 }
 
@@ -658,9 +663,6 @@ export function loweringOf(f: Pick<Finding, 'history' | 'severity' | 'peakSeveri
   return found
 }
 
-/** A P3 deferred to a GitHub issue, not security: what may settle without the person (R85). */
-const isIssueDeferral = (f: Finding): boolean => f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp)
-
 /**
  * Codex's ruling on the agent's last deferral (R92 M2), if it gave one since. A 1.4.0 lowering ruling is not one. Read from the
  * answers (`answersOf`), so a link's raise, which copies the status, is never taken for a new deferral.
@@ -697,28 +699,97 @@ export function ruleDeferral(f: Finding, holds: boolean, round: number, at: numb
   return last === undefined ? held : { ...held, history: [...held.history.slice(0, -1), { ...last, deferral: 'refused' }] }
 }
 
-/**
- * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-21): a P3, not security, deferred to a
- * GitHub issue, that Codex agreed cannot reasonably be fixed in this PR (R92 M2). A guessed P3 settles as a tagged one.
- */
-export const wouldSettle = (f: Finding): boolean => isIssueDeferral(f) && !isPeakUnknown(f) && isDeferralAgreed(f)
+/** Severity names in an issue's title (spec §5.6). */
+export const SEVERITY_NAMES: Record<Severity, string> = { P0: 'Blocker', P1: 'Critical', P2: 'Major', P3: 'Minor' }
 
 /**
- * A P3 deferral settled without the person's waiver (R85, decision I): it would settle, and the gate labelled its issue with the
- * highest severity the finding had (`peakOf`). A label that failed, or a peak that rose since, holds it: the gate fails closed.
+ * The severity the gate files and labels a finding's issue with (R92): its peak, or Critical [P1] when the record lost the peak
+ * (gate R7-6). Adam, 2026-10-21: "lost severity critical, not held for me".
  */
-export const isSettledDeferral = (f: Finding): boolean => wouldSettle(f) && f.followUpLabel === peakOf(f)
+export const filingPeak = (f: Finding): Severity => (isPeakUnknown(f) ? 'P1' : peakOf(f))
+
+/** The most rounds the gate adds for late blockers in one lifecycle (R92, spec §5.3). */
+export const GATE_ROUNDS = 2
+
+/** The Jira key in a branch name, if any: its first `[A-Z][A-Z0-9]+-\d+`. */
+export const jiraKeyOf = (branch: string): string | undefined => branch.match(/[A-Z][A-Z0-9]+-\d+/)?.[0]
+
+/**
+ * What the filing pass files (R92, spec §5.2): a held finding that is not security, not a linked duplicate (it holds with its
+ * original), and is open, deferred with Codex's agreement, or disputed. A fix only reported, a rebuttal, link or deferral Codex has
+ * not checked are Codex's first. A record that lost the finding's peak (gate R7-6) is filed as P1 (`filingPeak`).
+ */
+export const isFileable = (f: Finding): boolean =>
+  f.isSecurity !== true && !isLinked(f) && !isLinkOwed(f) && (f.status === 'open' || isDeferralAgreed(f) || isDisputed(f))
+
+/**
+ * A finding settled by its GitHub issue (R92, spec §5.7): not security, open, deferred with Codex's agreement or rebutted, its
+ * follow-up names an issue, and that issue carries the label of the highest severity the finding had. Its file changing does not
+ * unsettle it (unlike a waiver, R55): the issue stays open for the person.
+ */
+export const isSettledByIssue = (f: Finding): boolean =>
+  f.isSecurity !== true &&
+  (f.status === 'open' || f.status === 'rebutted' || (f.status === 'deferred' && !isDeferralOwed(f))) &&
+  isFollowUpRef(f.followUp) &&
+  f.followUpLabel === filingPeak(f)
+
+/** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
+export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
+
+/** A filed issue's title (spec §5.6): `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`. */
+export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string): string {
+  const peak = filingPeak(f)
+  const jira = jiraKeyOf(rec.branch)
+  const where = [`#${rec.pr ?? '?'}`, rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
+  return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
+}
+
+/**
+ * A filed issue's body (spec §5.6; issues #21-#23 are the model): who raised it and where, its peak severity, the problem, why it
+ * was not fixed in the PR, and the findings linked to it.
+ */
+export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>): string {
+  const peak = filingPeak(f)
+  const at = f.file === undefined ? '' : `, at \`${f.file}${f.line === undefined ? '' : `:${f.line}`}\``
+  const thread = f.url === undefined ? '' : ` ([thread](${f.url}))`
+  const codex = f.history.filter(one => one.by === 'codex').at(-1)?.note
+  const why = isDisputed(f)
+    ? `${disputeOf(f)}.`
+    : f.status === 'deferred'
+      ? `Deferred by the agent: ${f.note ?? 'no reason given'}. Codex agreed it cannot reasonably be fixed in this PR.`
+      : `Still open when the review rounds ran out.${codex === undefined ? '' : ` Codex's last word: ${codex}.`}`
+  const named = f.followUp !== undefined && !isFollowUpRef(f.followUp) ? [`Follow-up named by the agent: ${f.followUp}.`] : []
+  const linked = alsoOf(rec.findings, f.id)
+  return [
+    `Raised by ${f.reviewer} in round ${f.round} of #${rec.pr ?? '?'}${at}${thread}.`,
+    isPeakUnknown(f)
+      ? `Severity: ${SEVERITY_NAMES[peak]} [${peak}], assigned because the gate lost this finding's severity (answered as ${f.severity}).`
+      : `Severity: ${SEVERITY_NAMES[peak]} [${peak}]${f.severity === peak ? '' : `, answered as ${f.severity}`}${f.isSecurity === true ? ', security' : ''}.`,
+    '',
+    '## Problem',
+    '',
+    f.detail ?? f.title,
+    '',
+    '## Impact, and why it was not fixed in this PR',
+    '',
+    why,
+    ...named,
+    ...(linked.length === 0 ? [] : ['', '## Linked findings', '', ...linked.map(id => `- ${id}: the same problem, raised again`)]),
+    '',
+    `Filed by pr-gate when the review of #${rec.pr ?? '?'} could do no more.`,
+  ].join('\n')
+}
 
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
  * reported fixed without verification, verified fixed but its file changed since (R58), or rebutted without Codex
  * accepting it, unless the person waived it. The controller's ready and the merge guard both read this, so they never disagree.
- * A linked duplicate holds through its original (R90).
+ * A linked duplicate holds through its original (R90). A finding settled by its issue no longer holds it (R92).
  */
 export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
   return rec.findings.filter(
-    one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledDeferral(one) && !isLinked(one),
+    one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledByIssue(one) && !isLinked(one),
   )
 }
 
@@ -736,29 +807,34 @@ export const titleOf = (one: Pick<Finding, 'source' | 'reviewer' | 'title'>): st
 
 const LABEL_RELEASE = 'check the issue exists and gh can edit it; the gate retries on the next pass'
 
-/** A failed label on a deferral's follow-up issue, in words (R85). */
+/** A failed label on a finding's issue, in words (R85, R92). */
 const labelFailure = (f: Finding): string =>
-  `could not label issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'} severity:${peakOf(f)} (${f.followUpLabelError ?? 'no error recorded'})`
+  `could not label issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'} severity:${filingPeak(f)} (${f.followUpLabelError ?? 'no error recorded'})`
+
+const ISSUE_RELEASE = 'check that gh can create issues in the repository (gh auth status); the gate retries on the next pass'
+
+/** A failed filing in words (R92). */
+const issueFailure = (f: Finding): string => `could not file an issue for ${f.id} (${f.issueError ?? 'no error recorded'})`
 
 /** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). Never the reviewer's own words (gate R2-3). */
 function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
   const tag = `${f.id}${also.length === 0 ? '' : ` (also ${also.join(', ')})`} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
   const waive = `/pr-gate waive ${f.id} <reason>`
   const isSecurityP1 = isBlocking(f) && f.isSecurity === true
+  // The filing pass failed for it (R92): the agent checks gh; the gate retries on its next pass.
+  if (isFileable(f) && f.issueError !== undefined) return { kind: 'issue-failed', id: f.id, said: issueFailure(f), owner: 'agent', release: ISSUE_RELEASE }
+  if (isFileable(f) && f.followUpLabelError !== undefined) return { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: LABEL_RELEASE }
+  const issueOwed = (what: string): Blocker =>
+    ({ kind: 'issue-owed', id: f.id, said: `${tag}: ${what}; the gate files its GitHub issue when the review can do no more`, owner: 'gate', release: 'nothing: the gate files it' })
   if (isLinkOwed(f)) {
     return { kind: 'link-unchecked', id: f.id, said: `${tag}: linked to ${f.duplicateOf ?? '?'}, Codex has not checked the link`, owner: 'codex', release: "the gate's Codex check rules on it" }
   }
-  if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
+  if (isDisputed(f)) return isFileable(f) ? issueOwed('disputed') : { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
   if (f.status === 'deferred') {
     if (isDeferralOwed(f)) {
       return { kind: 'deferral-unchecked', id: f.id, said: `${tag}: deferred, Codex has not checked the deferral`, owner: 'codex', release: "the gate's Codex check rules on it" }
     }
-    if (wouldSettle(f)) {
-      const issue = `issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'}`
-      return f.followUpLabelError === undefined
-        ? { kind: 'label-owed', id: f.id, said: `${tag}: deferred to ${issue}, not yet labelled severity:${peakOf(f)}`, owner: 'gate', release: 'the gate labels it on its next pass (/pr-gate resume)' }
-        : { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: LABEL_RELEASE }
-    }
+    if (isFileable(f)) return issueOwed('deferred, and Codex agreed it cannot reasonably be fixed in this PR')
   }
   if (f.status === 'deferred') return { kind: isSecurityP1 ? 'security-p1' : 'deferred', id: f.id, said: `${tag}: deferred`, owner: 'person', release: waive }
   if (isReverifyOwed(f)) {
@@ -874,8 +950,11 @@ export type Next =
   | { kind: 'open-pr'; status: 'passed' | 'exhausted' }
   | { kind: 'ready' }
   | { kind: 'exhausted'; why: string; nextStep: string }
-  /** answer: the findings the agent can settle on the same head (R37, R63); a resume re-opens triage, or the pre-PR fix step, for them. */
-  | { kind: 'blocked'; why: string; nextStep: string; answer?: string[]; recheck?: string[] }
+  /**
+   * answer: the findings the agent can settle on the same head (R37, R63); a resume re-opens triage, or the pre-PR fix step, for them.
+   * issues: findings the filing pass still owes an issue (R92); the next pass files them.
+   */
+  | { kind: 'blocked'; why: string; nextStep: string; answer?: string[]; recheck?: string[]; issues?: string[] }
   /** Only deferrals stand between the PR and the merge: the person decides (R39). */
   | { kind: 'awaiting-decision'; why: string; nextStep: string }
 
@@ -983,9 +1062,8 @@ function decidePost(rec: LifecycleRecord): Next {
   // The agent's link is Codex's to check too (R90): answered, so never an open finding the agent left.
   const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isDeferralOwed(one) || isLinkOwed(one))
   const open = holding.filter(one => one.status === 'open' && !isLinkOwed(one))
-  // A deferral held only by its issue's label is the gate's to retry, not the person's to decide (R85).
-  const unlabelled = holding.filter(wouldSettle)
-  const deferred = holding.filter(one => one.status === 'deferred' && !isDeferralOwed(one) && !wouldSettle(one) && !isLinkOwed(one))
+  // Deferrals Codex agreed with: the filing pass files each but security (R92); only a security one waits for the person.
+  const deferred = holding.filter(one => one.status === 'deferred' && !isDeferralOwed(one) && !isLinkOwed(one))
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -1074,7 +1152,7 @@ function decidePost(rec: LifecycleRecord): Next {
     if ((isChanged || owed.length > 0) && mayStartRound(rec, false)) {
       return { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
     }
-    if (!isChanged && deferred.length + disputed.length + unlabelled.length === holding.length) return awaiting(deferred, disputed, unlabelled)
+    if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)
     return {
       kind: 'exhausted',
       why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
@@ -1091,25 +1169,32 @@ function decidePost(rec: LifecycleRecord): Next {
   }
   if (unchecked.length > 0) return recheck()
   if (holding.length === 0) return { kind: 'ready' }
-  return awaiting(deferred, disputed, unlabelled)
+  return awaiting(deferred, disputed)
 }
 
 /**
- * Deferrals are honest answers, and a dispute is the agent's word against Codex's: only the person's waiver lets either into the merge
- * (R39, R40). A deferral held only by its issue's label comes first: the gate retries it, after the agent checks the issue (R85).
+ * Only deferrals and disputes hold the merge. Each that is not security gets a GitHub issue from the filing pass (R92): until it has
+ * one, the gate retries, and a failure is the agent's to check. Security ones wait for the person's waiver (R39, R40); a finding
+ * whose peak was lost is filed as P1 (gate R7-6, Adam 2026-10-21).
  */
-function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = [], unlabelled: readonly Finding[] = []): Next {
-  if (unlabelled.length > 0) {
-    const one = unlabelled.length === 1
-    const failed = unlabelled.filter(each => each.followUpLabelError !== undefined)
-    const owed = unlabelled.filter(each => each.followUpLabelError === undefined)
-    const said = [
-      ...failed.map(labelFailure),
-      ...(owed.length === 0 ? [] : [`${ids(owed)} ${owed.length === 1 ? 'settles' : 'settle'} once ${owed.length === 1 ? 'its' : 'their'} follow-up issue is labelled`]),
-    ]
-    return { kind: 'blocked', why: said.join('; '), nextStep: `${LABEL_RELEASE} (/pr-gate resume)${one ? '' : ' for each'}` }
-  }
+function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = []): Next {
   const all = [...deferred, ...disputed]
+  const toFile = all.filter(isFileable)
+  if (toFile.length > 0) {
+    const failed = toFile.filter(each => each.issueError !== undefined || each.followUpLabelError !== undefined)
+    const waiting = toFile.filter(each => !failed.includes(each))
+    const said = [
+      ...failed.map(each => (each.issueError !== undefined ? issueFailure(each) : labelFailure(each))),
+      ...(waiting.length === 0 ? [] : [`${ids(waiting)} ${waiting.length === 1 ? 'waits for its' : 'wait for their'} GitHub issue`]),
+    ]
+    const releases = [...new Set(failed.map(each => (each.issueError !== undefined ? ISSUE_RELEASE : LABEL_RELEASE)))]
+    return {
+      kind: 'blocked',
+      why: said.join('; '),
+      nextStep: `${releases.length === 0 ? 'nothing to change: the gate files them' : releases.join('; ')} (/pr-gate resume)`,
+      issues: toFile.map(each => each.id),
+    }
+  }
   const one = all.length === 1
   const are = (list: readonly Finding[], word: string): string[] => (list.length === 0 ? [] : [`${ids(list)} ${list.length === 1 ? 'is' : 'are'} ${word}`])
   const what = [...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')
@@ -1127,6 +1212,71 @@ export function decideNext(rec: LifecycleRecord): Next {
   // It never holds over an unresolved blocker or a fix still owed its check, whatever wrote them after ready.
   if (rec.phase === 'ready' && rec.head === lastReviewedHead(rec) && mergeHolds(rec).length === 0) return { kind: 'ready' }
   return rec.phase === 'pre' ? decidePre(rec) : decidePost(rec)
+}
+
+/**
+ * Blockers the gate may add a round for at exhaustion (R92, spec §5.3): held, blocking, first raised in the last completed post round
+ * or in the last charged discretionary round, the one that spent the allowance.
+ */
+export function lateBlockers(rec: LifecycleRecord): Finding[] {
+  const done = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)
+  const late = new Set([done.at(-1)?.n, done.filter(one => one.kind === 'discretionary' && one.isCharged !== false).at(-1)?.n])
+  return mergeHolds(rec).filter(one => isBlocking(one) && late.has(one.round))
+}
+
+/**
+ * The round the gate adds for late blockers at exhaustion (R92): under GATE_ROUNDS per lifecycle, and only when it starts a round.
+ * Each one is a sign to the person that the PR's scope is too wide; `scopeNote` says so.
+ */
+export function gateGrant(rec: LifecycleRecord, at: number): Grant | undefined {
+  if (decideNext(rec).kind !== 'exhausted') return undefined
+  if (rec.grants.filter(one => one.by === 'gate').length >= GATE_ROUNDS) return undefined
+  const late = lateBlockers(rec)
+  if (late.length === 0) return undefined
+  const grant: Grant = { n: 1, reason: `late blocker${late.length === 1 ? '' : 's'} ${ids(late)}: the PR's scope may be too wide`, head: rec.head, at, by: 'gate' }
+  return decideNext({ ...rec, grants: [...rec.grants, grant] }).kind === 'round' ? grant : undefined
+}
+
+/** The rounds the gate added, in words for the person (R92); undefined when it added none. */
+export function scopeNote(rec: Pick<LifecycleRecord, 'grants'>): string | undefined {
+  const added = rec.grants.filter(one => one.by === 'gate')
+  if (added.length === 0) return undefined
+  const rounds = `${added.length} round${added.length === 1 ? '' : 's'}`
+  const why = added.map(one => one.reason.replace(/: the PR's scope may be too wide$/, '')).join('; ')
+  return `The gate added ${rounds} for blockers first raised after the allowance was spent (${why}): tell the person the PR's scope may be too wide.`
+}
+
+/** Where the filing pass runs (R92): where 1.4.0 ended exhausted or awaiting the person, and while an issue is still owed. */
+export const isFilingPoint = (next: Next): boolean =>
+  next.kind === 'exhausted' || next.kind === 'awaiting-decision' || (next.kind === 'blocked' && (next.issues ?? []).length > 0)
+
+/** One issue the filing pass owes: a new one, or the one the agent named (`reuse`), labelled `severity:<peak>`. */
+export type IssueItem = { id: string; peak: Severity; followUp?: string; reuse?: { repo: string; number: number }; title: string; body: string }
+
+export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[] }
+
+/**
+ * What the filing pass does (R92, spec §5): nothing before the PR or short of a filing point; else a round for a late blocker
+ * (`gateGrant`); else an issue for each held finding it files (`isFileable`).
+ */
+export function planIssues(rec: LifecycleRecord, at: number, spec?: string): IssuePlan {
+  if (rec.phase === 'pre' || rec.pr === undefined || !isFilingPoint(decideNext(rec))) return { kind: 'none' }
+  const grant = gateGrant(rec, at)
+  if (grant !== undefined) return { kind: 'grant', grant, late: lateBlockers(rec).map(one => one.id) }
+  const items = mergeHolds(rec)
+    .filter(isFileable)
+    .map((f): IssueItem => {
+      const reuse = issueOf(f.followUp, rec.slug)
+      return {
+        id: f.id,
+        peak: filingPeak(f),
+        ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
+        ...(reuse === undefined ? {} : { reuse }),
+        title: issueTitle(f, rec, spec),
+        body: issueBody(f, rec),
+      }
+    })
+  return items.length === 0 ? { kind: 'none' } : { kind: 'file', items }
 }
 
 // -------------------------------------------------------------------- log

@@ -406,3 +406,11 @@ test('M5: the ignored-keys note follows the scope detail and the start message a
   expect(said).toContain('allowanceStandard')
   expect(said).not.toContain('. .')
 })
+
+test('R92: issueSpec names the spec in each issue title; a blank or non-string one is ignored', async () => {
+  expect(configOf({}).issueSpec).toBeUndefined()
+  expect(overrideConfig(configOf({}), '{"issueSpec":"docs/spec.md"}').config.issueSpec).toBe('docs/spec.md')
+  const bad = overrideConfig(configOf({}), '{"issueSpec":7}')
+  expect(bad.config.issueSpec).toBeUndefined()
+  expect(bad.ignored).toEqual(['issueSpec (not a non-empty string)'])
+})

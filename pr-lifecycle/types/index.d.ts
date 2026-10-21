@@ -56,14 +56,19 @@ export type Finding = {
   headSeen: string
   status: FindingStatus
   note?: string
-  /** The GitHub issue a P3 deferral's follow-up is tracked in (R85): `#<n>`, `owner/repo#<n>` or its URL, other text around it. */
+  /**
+   * The GitHub issue that tracks it: named by the agent's answer (R85) or filed by the gate (R92). `#<n>`, `owner/repo#<n>` or its
+   * URL, other text around it.
+   */
   followUp?: string
-  /** The highest severity the finding had during the gate (R85): what its follow-up issue is labelled with. */
+  /** The highest severity the finding had during the gate (R85): what its issue is labelled with. */
   peakSeverity?: Severity
-  /** The `severity:<P>` label the gate put on the follow-up issue; a deferral settles only once it is the peak's. */
+  /** The `severity:<P>` label the gate put on that issue; the finding settles once it is the peak's (R92). */
   followUpLabel?: Severity
-  /** gh's error when the gate last failed to label the follow-up issue: the deferral holds until a pass labels it. */
+  /** gh's error when the gate last failed to label the issue the agent named: the finding holds until a pass labels it. */
   followUpLabelError?: string
+  /** gh's error when the gate last failed to file the finding's issue (R92): the finding holds until a pass files it. */
+  issueError?: string
   /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
   duplicateOf?: string
   /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */
@@ -176,7 +181,8 @@ export type Waiver = {
   lapsedHead?: string
 }
 
-export type Grant = { n: number; reason: string; head: string; at: number }
+/** A round added to the allowance: the person's `/pr-gate allow`, or the gate's own for a late blocker (`by: 'gate'`, R92, at most two). */
+export type Grant = { n: number; reason: string; head: string; at: number; by?: 'gate' }
 
 /**
  * One line of the run log (`/pr-gate log`): what cost time or needed the person. stop: a run ended short of done (error, blocked,
@@ -339,7 +345,7 @@ export type CheckState = { name: string; bucket: string; isRequired: boolean }
 export type Blocker = {
   kind:
     | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
-    | 'deferral-unchecked' | 'label-owed' | 'label-failed' | 'link-unchecked'
+    | 'deferral-unchecked' | 'issue-owed' | 'issue-failed' | 'label-failed' | 'link-unchecked'
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string

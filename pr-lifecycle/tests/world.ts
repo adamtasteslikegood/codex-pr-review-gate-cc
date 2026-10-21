@@ -124,6 +124,16 @@ export type World = {
     onLabel?: () => void | Promise<void>
     /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
     labelled: string[]
+    /** How `gh api -X POST repos/<slug>/issues` answers when the gate files an issue (R92): 'ok' (default) or 'fail'. */
+    issueAnswer?: 'ok' | 'fail'
+    /** The number the next filed issue gets (default 21); each filing adds one. */
+    issueNumber?: number
+    /** The label names the POST's answer carries (A7); undefined echoes the labels asked for. GitHub drops them without push access. */
+    issueLabels?: string[]
+    /** Every issue the gate filed: its argv after `gh`, in order. */
+    filed: string[][]
+    /** Called on each issue filing, before it answers: a test acts while the gate files an issue. */
+    onIssue?: () => void | Promise<void>
     /** Logins `GET .../requested_reviewers` lists (R89); undefined lists none. */
     requested?: string[]
     /** Every `-X POST .../requested_reviewers` call the gate made, in order. */
@@ -234,6 +244,7 @@ export function world(on: On): World {
       isBroken: false,
       calls: [],
       labelled: [],
+      filed: [],
       requests: [],
     },
     store: new Map(),
@@ -289,6 +300,20 @@ export function world(on: On): World {
           return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
         }
         return out(JSON.stringify({ defaultBranchRef: { name: w.gh.defaultBranch } }))
+      }
+      // The gate's issue filing (R92): a POST to repos/<slug>/issues; the answer carries the new issue's number and its labels.
+      if (e.argv[1] === 'api' && e.argv[2] === '-X' && e.argv[3] === 'POST' && /^repos\/[^/\s]+\/[^/\s]+\/issues$/.test(e.argv[4] ?? '')) {
+        w.gh.filed.push(e.argv.slice(1))
+        await w.gh.onIssue?.()
+        if (w.gh.issueAnswer === 'fail') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 410: Issues are disabled for this repo', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        const number = w.gh.issueNumber ?? 21
+        w.gh.issueNumber = number + 1
+        const repo = (e.argv[4] ?? '').split('/').slice(1, 3).join('/')
+        const asked = e.argv.flatMap(one => (one.startsWith('labels[]=') ? [one.slice('labels[]='.length)] : []))
+        const labels = (w.gh.issueLabels ?? asked).map(name => ({ name }))
+        return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}`, labels }))
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })

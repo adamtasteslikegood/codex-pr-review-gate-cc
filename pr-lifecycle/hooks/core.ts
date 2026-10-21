@@ -12,10 +12,12 @@ import {
   isLinkOwed,
   isDeferralOwed,
   isReverifyOwed,
-  isSettledDeferral,
+  isFileable,
+  isSettledByIssue,
+  issueLine,
+  scopeNote,
   loweringOf,
   mergeHolds,
-  peakOf,
   raisedIn,
   rejections,
   securityHolds,
@@ -803,8 +805,8 @@ export function triagePrompt(
       'An item that names the same problem as an earlier finding gets one pointer reply in its thread ("Same as G2-1: fixed in abc1234"), not a new argument, ' +
       'and the answer {"id":"G2-2","duplicateOf":"G2-1","replyId":"…"}. To say it is a different problem, answer it on its own instead.',
     '   Codex checks every deferral at the end of the round: if it says the finding can be fixed in this PR, the finding comes back to you open and the round is charged. ' +
-      'A P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it) needs no waiver once Codex agrees; ' +
-      'the gate labels the issue with the highest severity the finding had.',
+      'When the review can do no more, the gate files a GitHub issue for each finding still held, except security ones, which wait for the person; ' +
+      'if your followUp names the issue that already tracks it (#<n>, owner/repo#<n> or its URL), the gate labels that one instead.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
@@ -816,7 +818,7 @@ export function triagePrompt(
     '',
     trailerRule(
       stepOf(run, 'triage'),
-      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","followUp":"#<n>, owner/repo#<n> or the issue URL, for a P3 deferral"},{"id":"G1-2","duplicateOf":"G1-1","replyId":"124"}]}',
+      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","followUp":"#<n>, owner/repo#<n> or the issue URL that already tracks a deferral"},{"id":"G1-2","duplicateOf":"G1-1","replyId":"124"}]}',
     ),
     '',
     'Then end your turn. /pr-gate collects the next reviews by itself.',
@@ -872,23 +874,22 @@ export function readyPrompt(rec: LifecycleRecord): string {
   const pre = done.filter(one => one.phase === 'pre').length
   const post = done.filter(one => one.phase === 'post').length
   const count = (status: Finding['status']): number => rec.findings.filter(one => one.status === status).length
-  const deferred = rec.findings.filter(one => one.status === 'deferred')
+  const settled = rec.findings.filter(isSettledByIssue)
   const summary = [
     `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
     `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
-    deferred.length === 0
-      ? 'no deferrals'
-      : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp}, labelled severity:${peakOf(one)})` : ''}`).join('; ')}`,
+    settled.length === 0 ? 'no follow-up issues' : `follow-up issues: ${settled.map(issueLine).join('; ')}`,
   ].join('; ')
-  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
+  const note = scopeNote(rec)
+  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.${note === undefined ? '' : ` ${note}`}`
 }
 
 /**
- * The person's options after the PR opened: the waiver of each deferral or dispute (M1, R40), and `waive post`.
+ * The person's options after the PR opened: the waiver of each security deferral or dispute, or one the gate cannot file (R92), and `waive post`.
  * One more review round is offered only where a round could help (not when the person is only asked to decide, R42).
  */
 const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRound = true): string => {
-  const theirs = mergeHolds(rec).filter(one => one.status === 'deferred' || isDisputed(one))
+  const theirs = mergeHolds(rec).filter(one => (one.status === 'deferred' || isDisputed(one)) && !isFileable(one))
   const waive = theirs.map(one => `/pr-gate waive ${one.id} <reason> lets the ${one.status === 'deferred' ? 'deferred' : 'disputed'} ${one.id} into the merge`)
   // A security P1 is released only by a waiver naming it (spec §3): waive post covers the rest once it is.
   const security = securityHolds(rec).map(one => one.id)
@@ -919,6 +920,13 @@ export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: '
     if (rest !== '') lines.push('', rest)
   }
   lines.push('', `Your next step: ${next.nextStep}.`)
+  const note = scopeNote(rec)
+  if (note !== undefined) lines.push(note)
+  // The gate still owes an issue (R92): nothing in the code to change; the agent checks gh when filing failed.
+  if (next.kind === 'blocked' && (next.issues ?? []).length > 0) {
+    lines.push('Do not merge, and do not merge another way: the guard holds the merge until each issue is filed and labelled.')
+    return noted(lines.join('\n'))
+  }
   if (next.kind === 'awaiting-decision') {
     // The person decides (R42): nothing for the agent to change, only to say and stop.
     lines.push(
