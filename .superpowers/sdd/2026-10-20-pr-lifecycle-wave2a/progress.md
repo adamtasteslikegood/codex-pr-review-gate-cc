@@ -128,3 +128,7 @@ Task 12: complete (commits 2a83456..f01ed96, review clean)
 Task 12: minor (deferred): CHAINED wording mentions a PR body for merges too; hasOtherSteps misses background &, backticks/nested $() can false-positive; no unit test for 2>&1 or "don't"
 Task 11: implementer dispatched (sonnet), BASE 2fb4f58
 Task 11: implementer DONE, commit bb4f037; npm run check green (pr-lifecycle 472, codex-gate 22); review dispatched
+Task 11: review Approved (spec ✅)
+Task 11: complete (commits 9a599da..bb4f037, review clean)
+Task 11: minor (deferred): waive-post reach wording differs (spec/ROADMAP/R86); CLAUDE.md heading still "after wave 1"; R82 long
+Final review: dispatched (opus), BASE 7ab6b64, HEAD 7619966, package review-final-7ab6b64..7619966.diff
