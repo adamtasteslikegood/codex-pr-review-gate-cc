@@ -1171,7 +1171,6 @@ test('R90 A1: a link carries security to the original, both ways, and nothing cl
   const raised = withLinkedPeak(original, dup)
   expect(raised.isSecurity).toBe(true)
   // A security problem never settles by its issue: it holds for the person.
-  // (isFileable, Task 12's predicate, is not built yet: its assertion goes there.)
   expect(isSettledDeferral(raised)).toBe(false)
   const rec = postRec({ findings: [raised, dup] })
   expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])

@@ -1880,7 +1880,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   if (after === null) return
   // Before anything can end the round: answered feedback is processed and its replies are known, so no reply is asked for twice.
   // Feedback still without an answer is not processed (R34): a later round asks again.
-  const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && (f.status !== 'open' || linked.includes(f.id)))
+  const answered = (feedbackId: string): boolean => after.findings.some(f => f.externalId === feedbackId && (f.status !== 'open' || f.duplicateOf !== undefined))
   const triaged = (run.triaged ?? []).filter(answered)
   const rec = await updateRecord($, run.root, run.branch, one => ({
     ...one,
