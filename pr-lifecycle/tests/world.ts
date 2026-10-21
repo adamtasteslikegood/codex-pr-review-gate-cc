@@ -56,7 +56,11 @@ export type World = {
     /** Every `git fetch` call's arguments. */
     fetches: string[]
     /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
-    onFetch?: () => void
+    onFetch?: () => void | Promise<void>
+    /** Called on each `git rev-parse HEAD`, before it answers: a test acts while a step awaits the head. */
+    onHead?: () => void | Promise<void>
+    /** `git log --format=%h %an %s <a>..<b>`: the commits on the PR since the record's head, one per line. */
+    newCommits?: string
     /** The branch's head on origin, as `git ls-remote` prints it; undefined prints nothing. */
     remoteHead?: string
     /** `git log --not --remotes=origin`: the local commits no origin branch has, one `<sha> by <author>` per line. */
@@ -88,8 +92,30 @@ export type World = {
     isBroken: boolean
     /** When set, every `gh api` call but `api user` prints this with exit 0, as a proxy's error page would. */
     garbage?: string
+    /** Checks the base requires; undefined requires every check in `checks` (as before R86). */
+    required?: string[]
+    /** How the rules endpoint answers: 'ok' (default), 'garbage', 'throw', or an HTTP status. */
+    rulesAnswer?: 'ok' | 'paged' | 'garbage' | 'throw' | number
+    /** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */
+    classicAnswer?: 'none' | 'off' | 'ok' | 'garbage' | 'throw' | number
     calls: string[]
+    /** How `gh issue edit` answers when the gate labels a follow-up issue (R85): 'ok' (default) or 'fail'. */
+    labelAnswer?: 'ok' | 'fail'
+    /** How `gh label create` answers: 'ok' (default) or 'exists', as gh does for a label the repository already has. */
+    labelCreateAnswer?: 'ok' | 'exists'
+    /** Called on each `gh label create`, before it answers: a test acts while the label is made. */
+    onLabelCreate?: () => void | Promise<void>
+    /** Called on each `gh issue edit`, before it answers: a test acts while the gate labels an issue. */
+    onLabel?: () => void | Promise<void>
+    /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
+    labelled: string[]
+    /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
+    isHeadReadBroken?: boolean
+    /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
+    onChecks?: () => void | Promise<void>
   }
+  /** A stand-in engine for calling the mod's async helpers directly: its `process.run` is the fake `gh` and `git`. */
+  engine: never
   /** The run as the mod last wrote it. */
   run?: Run
   /** The plugin's store, as the mod wrote it. */
@@ -128,8 +154,12 @@ export async function done($: Dispatch, t: Ended): Promise<unknown> {
 
 /** Everything beneath the mod: git, the agents, the main agent's prompt queue. */
 export function world(on: On): World {
-  const clock = mock.clock(on, { now: 1_000 })
+  const mocked = mock.clock(on, { now: 1_000 })
+  // The engine stand-in reads the same time the test's clock moves to.
+  let now = 1_000
+  const clock = { ...mocked, advance: async (ms: number) => { now += ms; await mocked.advance(ms) } }
   const w: World = {
+    engine: undefined as never,
     spawned: [],
     prompts: [],
     opened: [],
@@ -174,6 +204,7 @@ export function world(on: On): World {
       isChecksUnreadable: false,
       isBroken: false,
       calls: [],
+      labelled: [],
     },
     store: new Map(),
     stored: (key: string) => w.store.get(key),
@@ -212,7 +243,7 @@ export function world(on: On): World {
     w.run = e.value as Run
     return next(e)
   })
-  on('process.run', (_$, e) => {
+  const fake = async (e: { argv: readonly string[]; init?: { cwd?: string } }) => {
     const args = e.argv.slice(1).join(' ')
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -229,13 +260,35 @@ export function world(on: On): World {
         return out(JSON.stringify({ defaultBranchRef: { name: w.gh.defaultBranch } }))
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
+      const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+      if (/^api repos\/\S+\/rules\/branches\/[^\s?]+\?per_page=100(&page=\d+)?$/.test(args)) {
+        const how = w.gh.rulesAnswer ?? 'ok'
+        if (how === 'throw') throw new Error('network down')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
+        const names = w.gh.required ?? (w.gh.checks as { name?: string }[]).map(one => String(one.name))
+        // 'paged': a full first page of other rules, the required-checks rule on the second.
+        if (how === 'paged' && !args.includes('&page=')) return out(JSON.stringify(Array.from({ length: 100 }, () => ({ type: 'deletion' }))))
+        return out(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: names.map(context => ({ context })) } }]))
+      }
+      if (/^api repos\/\S+\/branches\/\S+\/protection/.test(args)) {
+        const how = w.gh.classicAnswer ?? 'none'
+        if (how === 'throw') throw new Error('network down')
+        if (how === 'none') return failed('gh: Branch not protected (HTTP 404)')
+        if (how === 'off') return failed('gh: Required status checks not enabled (HTTP 404)')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
+        return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
+      }
       if (args.startsWith('pr view')) {
+        if (w.gh.isHeadReadBroken === true && /--json headRefOid(,baseRefName)?$/.test(args)) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
         return out(JSON.stringify({ number: w.gh.pr, baseRefName, headRefName: w.gh.headRef, headRefOid: w.gh.prHead, state: w.gh.state }))
       }
       // `gh pr checks --json`: the same check runs, by gh's buckets; none at all is gh's "no checks reported" error.
       if (args.startsWith('pr checks')) {
+        await w.gh.onChecks?.()
         const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
         if (w.gh.isChecksUnreadable) return fail('HTTP 502: Bad Gateway')
         if (w.gh.checks.length === 0) return fail(`no checks reported on the '${w.gh.headRef}' branch`)
@@ -256,6 +309,15 @@ export function world(on: On): World {
         }))
         return out(JSON.stringify(rows))
       }
+      // The follow-up issue's severity label (R85): the label is made, then added to the issue, unless the test makes the edit fail.
+      if (args.startsWith('label create') || args.startsWith('issue edit')) {
+        w.gh.labelled.push(args)
+        if (args.startsWith('label create')) await w.gh.onLabelCreate?.()
+        if (args.startsWith('label create') && w.gh.labelCreateAnswer === 'exists') return failed(`label with name "${args.split(' ')[2]}" already exists; use \`--force\` to update its color and description`)
+        if (args.startsWith('issue edit')) await w.gh.onLabel?.()
+        if (args.startsWith('issue edit') && w.gh.labelAnswer === 'fail') return failed('GraphQL: Could not resolve to an issue or pull request with the number of 12.')
+        return out('')
+      }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))
       if (/issues\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.issueComments))
@@ -265,7 +327,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
-      w.git.onFetch?.()
+      await w.git.onFetch?.()
       const fail = (stderr: string) => ({ value: { exitCode: 128, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
       const missing = w.git.missingRefs.find(ref => e.argv.slice(3).includes(ref))
       if (missing !== undefined) return fail(`fatal: couldn't find remote ref ${missing}`)
@@ -288,7 +350,10 @@ export function world(on: On): World {
       return out('', name === w.git.branch || w.git.locals.includes(name) ? 0 : 1)
     }
     if (args.startsWith('rev-parse --verify')) return out('b\n')
-    if (args.startsWith('rev-parse HEAD')) return out(`${w.git.head}\n`)
+    if (args.startsWith('rev-parse HEAD')) {
+      await w.git.onHead?.()
+      return out(`${w.git.head}\n`)
+    }
     if (args.startsWith('status')) return out(w.git.dirty)
     if (args.startsWith('diff --numstat origin/')) return out(w.git.numstat)
     if (args.startsWith('diff --raw')) return out(w.git.raw)
@@ -305,6 +370,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('ls-remote origin')) return out(w.git.remoteHead === undefined ? '' : `${w.git.remoteHead}\trefs/heads/${w.git.branch}\n`)
     if (args.startsWith('log --format=%h by %an')) return out(w.git.unpushed)
+    if (args.startsWith('log --format=%h %an %s')) return out(w.git.newCommits ?? '')
     // A fast-forward to a commit the local head is an ancestor of moves the head there.
     const ff = args.match(/^merge --ff-only --quiet (\S+)$/)?.[1]
     if (ff !== undefined) {
@@ -314,7 +380,13 @@ export function world(on: On): World {
     }
     if (args.startsWith('remote get-url')) return out('https://github.com/me/repo.git\n')
     return out('')
-  })
+  }
+  on('process.run', async (_$, e) => fake(e))
+  // The tests' own `$` has no `process`, and the host refuses it to a module that never calls it: this engine stand-in runs the same fake.
+  w.engine = {
+    process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value },
+    clock: { now: async () => now },
+  } as never
   on('agent.spawn', (_$, e) => {
     w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })
     return { model: 'test', agentId: `agent-${w.spawned.length}` }

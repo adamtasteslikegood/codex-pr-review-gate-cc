@@ -5,7 +5,21 @@ export type FindingStatus = 'open' | 'reported-fixed' | 'verified-fixed' | 'rebu
 
 export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
-export type FindingEvent = { round: number; status: FindingStatus; note?: string; evidence?: string; by: string; at: number }
+/**
+ * `severity`: the severity an answer set, with `from` the one before it (R85). `lowering`: Codex's ruling on the agent's lowering of
+ * the severity before it (Adam, 2026-10-20).
+ */
+export type FindingEvent = {
+  round: number
+  status: FindingStatus
+  note?: string
+  evidence?: string
+  severity?: Severity
+  from?: Severity
+  lowering?: 'agreed' | 'refused'
+  by: string
+  at: number
+}
 
 export type Finding = {
   id: string
@@ -20,6 +34,8 @@ export type Finding = {
   url?: string
   severity: Severity
   isSecurity?: boolean
+  /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
+  severitySource?: 'tag' | 'hint'
   title: string
   file?: string
   line?: number
@@ -28,6 +44,14 @@ export type Finding = {
   headSeen: string
   status: FindingStatus
   note?: string
+  /** The GitHub issue a P3 deferral's follow-up is tracked in (R85): `#<n>`, `owner/repo#<n>` or its URL, other text around it. */
+  followUp?: string
+  /** The highest severity the finding had during the gate (R85): what its follow-up issue is labelled with. */
+  peakSeverity?: Severity
+  /** The `severity:<P>` label the gate put on the follow-up issue; a deferral settles only once it is the peak's. */
+  followUpLabel?: Severity
+  /** gh's error when the gate last failed to label the follow-up issue: the deferral holds until a pass labels it. */
+  followUpLabelError?: string
   /** A later change touched its file: the evidence behind its status needs checking again. */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
@@ -131,7 +155,7 @@ export type Grant = { n: number; reason: string; head: string; at: number }
  * stopped, exhausted); end: a run ended done; person: a /pr-gate command; head: the gate caught up to a head itself; session: a
  * session took the record over, or stood down.
  */
-export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session' | 'check'; text: string }
+export type LogEntry = { at: number; kind: 'stop' | 'end' | 'person' | 'head' | 'session' | 'check' | 'approval'; text: string }
 
 export type LifecycleRecord = {
   version: 1
@@ -164,6 +188,11 @@ export type LifecycleRecord = {
   replies: Record<string, string>
   waivers: Waiver[]
   phase: LifecyclePhase
+  /**
+   * Which lifecycle of the branch this is: a reset raises it, and a fresh start keeps the raised one, so work begun before a reset
+   * can tell the record replaced even when the new one has no rounds yet (gate G7-7). Absent means 0.
+   */
+  generation?: number
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string
@@ -241,6 +270,36 @@ export type Run = {
   phaseStartedAt: number
   endedAt?: number
   message?: string
+}
+
+/** A CI check on a PR head, by gh's bucket (pass, fail, cancel, pending, skipping), and whether the base requires it (R86). */
+export type CheckState = { name: string; bucket: string; isRequired: boolean }
+
+export type Blocker = {
+  kind:
+    | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
+    | 'lowering-unchecked' | 'label-owed' | 'label-failed'
+    | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
+  /** A finding id, or a check name. */
+  id?: string
+  /** gh's own words for a ci-unreadable blocker. */
+  detail?: string
+  /** One line, with the stored (triaged) severity. */
+  said: string
+  owner: 'agent' | 'codex' | 'person' | 'gate'
+  /** The exact step that clears it. */
+  release: string
+}
+
+/** Everything between a head and its merge (R79): one list, none short-circuited. */
+export type Standing = {
+  phase: 'pre' | 'post'
+  head: string
+  waiver?: Waiver
+  /** Checks GitHub doesn't require that a post waiver set aside (R86). */
+  setAside: string[]
+  mayProceed: boolean
+  blockers: Blocker[]
 }
 
 declare module 'claude-code' {

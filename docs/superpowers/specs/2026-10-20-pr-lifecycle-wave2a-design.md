@@ -267,6 +267,10 @@ the same on main.
      `'hint'` finding, lower or higher, and records the change in history.
      For `'tag'` and `'codex'` findings the R-rule stands: a fixer can't
      lower its own finding.
+   - A lowering is Codex's call, not the person's (Adam, 2026-10-20): the
+     history event records the severity before it (`from`), and a P3
+     deferral the agent lowered settles only once Codex agrees (section 4).
+     `peakSeverity` keeps the highest severity the finding had.
    - A security flag stays as set. This wave doesn't let the agent clear a
      keyword-only security flag; clear-cut approvals no longer reach the
      keyword test at all (point 3).
@@ -275,9 +279,12 @@ the same on main.
 5. **Advisory markers (Adam, 2026-10-20).** `severityHint` (`github.ts:208`)
    reads a reviewer's own advisory label as P3. The labels are "advisory",
    "non-blocking", "nit", "optional" and "follow-up", when they label the
-   comment or its list of findings, not inside a quoted phrase. Its
-   `severitySource` is `'tag'`: it is the reviewer's own word, so the agent
-   can't raise it to blocking by itself, though Codex still can. A review
+   comment or its list of findings, not inside a quoted phrase. Only a label
+   at the start of the body counts (a heading mark, list marker or bold
+   allowed): "Nit:" on a later line labels that line, not the finding above
+   it (final review C1). Its `severitySource` is `'tag'`: it is the
+   reviewer's own word, so the agent may raise it but never lower it, as for
+   any reviewer tag (amended after the final review, M5). A review
    comment that lists several advisory findings stays one finding, P3, with
    the list in its detail. The agent answers it once: fixing what it fixes,
    `acknowledged`, or deferred with a follow-up (section 4). An explicit
@@ -285,19 +292,48 @@ the same on main.
 
 ## 4. Cheap deferral (decision I; finding 11)
 
-- `Answer` gains `followUp?: string`: where the follow-up is recorded, as an
-  issue URL, `#<n>`, or a PR comment URL.
+- `Answer` gains `followUp?: string`: the GitHub issue that tracks it, as
+  `#<n>`, `owner/repo#<n>` or the issue's URL; a ticket key may sit beside it.
 - A `deferred` finding settles, so it is no longer in `mergeHolds` or
-  `unresolvedBlockers`, when all of these hold:
-  - it has a `followUp`;
-  - its stored severity is `P3`;
+  `unresolvedBlockers`, when all of these hold (amended by Adam, 2026-10-20,
+  after the final review, replacing the controller's I2 and guessed-P3
+  rulings):
+  - its `followUp` names a GitHub issue (`issueOf`); a PR, comment or other
+    URL alone keeps the deferral but settles nothing (final review T4);
+  - its stored severity is `P3`, guessed or tagged alike;
+  - if the agent lowered its severity (an answer set one below the one
+    before it, recorded as `from` on the history event), Codex agreed with
+    the lowering since. The lowering goes to Codex in the round's own check
+    (`checksOwed`, `checkRebuttals`), with the reviewer's comment, the
+    severity before and after and the agent's reason. Agreed: Codex's entry
+    (`lowering: 'agreed'`) follows the lowering. Disagreed: it holds for the
+    person, said as "Codex disagrees with lowering G2-1 from P1 to P3:
+    <reason>". A later lowering needs Codex again;
+  - the gate labelled the issue `severity:<peak>`: `peakSeverity` is the
+    highest severity the finding had (set at creation, raised by any
+    answer; older records read it from their history, and one whose
+    first severity entry the agent set with none before it has an unknown
+    peak and waits for the person, gate R7-6). `advance` labels each such
+    issue first (`gh label create`, only made when missing, so an existing
+    label keeps its colour, gate R7-7; then
+    `gh issue edit <n> --repo <owner/repo> --add-label severity:<peak>`),
+    once per peak, recording `followUpLabel`. A failure records gh's error
+    and holds: "could not label issue #<n> severity:<peak> (<error>)",
+    owner agent, retried on the next pass. A reset, a fresh lifecycle or a
+    stop while gh runs ends that pass with nothing written or decided
+    (gate G7-8);
   - it is not security-flagged.
 
-  It shows in `/pr-gate status` and the log as "deferred, follow-up at …".
-- P0-P2, security, or no `followUp`: held for the person's waiver, as today
+  A deferral that comes without a `followUp` clears an earlier one.
+
+  It shows in `/pr-gate status` and the ready prompt as "deferred,
+  follow-up at …, labelled severity:<peak>".
+- P0-P2, security, or no issue named: held for the person's waiver, as today
   (R42).
-- The triage prompt says: "deferred: only for what the person must rule on;
-  a P3 with a recorded follow-up needs no waiver".
+- The triage prompt says a P3, not security, deferred with followUp naming
+  the GitHub issue that tracks it needs no waiver; if the agent lowered its
+  severity, Codex checks the lowering; the gate labels the issue with the
+  highest severity the finding had.
 
 ## 5. `waive post` and checks GitHub doesn't require (decision K; findings 28, 29)
 
@@ -336,9 +372,33 @@ the same on main.
 | R81 | Every manual action, the pane's Stop included, ends with one agent message through `say()`; merged into a round prompt the action starts | — |
 | R82 | Triage carries open findings by the round raised in; `acknowledged` ("asks for no change") needs a reply and a Codex check, as a rebuttal does | R32, R34, R36, R40 |
 | R83 | A review is `isFinding: false` only on positive no-action evidence | readReviews' non-empty rule |
-| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag | applyAnswer's rule, severityHint |
-| R85 | A P3 deferral with a `followUp`, not security, settles without a waiver | R42 |
+| R84 | A triaged severity replaces a keyword-guessed one; explicit tags and Codex severities are never lowered; a reviewer's advisory label reads as a P3 tag; a lowering is Codex's to check | applyAnswer's rule, severityHint |
+| R85 | A P3 deferral, not security, with a `followUp` naming a GitHub issue settles without a waiver once the issue is labelled with the peak severity; a lowering needs Codex's agreement first | R42 |
 | R86 | Required checks come from rulesets and classic protection; `waive post` sets aside the rest | R1-9 |
+| R87 | A hold on a Bash command that does more than its PR action says that nothing in it ran (section 5a) | R77 wording |
+
+### 5a. A hold on a chained command (added 2026-10-20, from live use)
+
+**Today.** A hook allows or refuses a whole tool call. An agent that wrote
+`cat > body.md <<'EOF' … EOF` and `gh pr create --body-file body.md` in one
+Bash call had the create held. The file write didn't run either, and the hold
+didn't say so. This happened twice in one session (cookbook PRs #3732 and
+#3741). The agent found the missing file afterwards and rewrote it.
+
+**Design.** `hasOtherSteps(command)` in `github.ts` is true when a Bash
+command has a step besides the PR action. Steps are split on `;`, `&&`, `||`,
+`|` and newlines, after heredoc bodies, quoted text and `$(…)` are removed. A
+bare `cd <dir>` doesn't count. Every hold the `tool.call` hook returns for such
+a command (create, merge, outside, no base, the guard's own failure) ends with:
+
+> Nothing in this Bash command ran: a hold refuses the whole command, so the
+> steps chained with the PR command did not run either. Run those on their own
+> (write a PR body file with the Write tool), and keep the PR command in a Bash
+> call by itself.
+
+**Rejected:** rewriting the command to drop only the PR part, through
+`updatedInput` or a changed `next(e)`. Running part of what the agent wrote,
+silently, is worse than refusing all of it and saying so.
 
 ## 7. Testing
 
@@ -377,8 +437,11 @@ fails on 1.3.0:
   findings becomes one P3 finding with the list in its detail; the same list
   with one item tagged P1 becomes P1; "the reviewer's advisory note" quoted
   inside a sentence doesn't count.
-- **Deferral:** a P3 with `followUp` settles; a P2 with `followUp`, a P3
-  without one, and a security P3 each hold.
+- **Deferral:** a P3 with an issue `followUp` settles once its issue is
+  labelled; a guessed P1 lowered to P3 waits on Codex, settles when Codex
+  agrees (the issue labelled severity:P1) and holds for the person when it
+  disagrees; a failed label holds until a later pass labels it; a P2 with
+  `followUp`, a P3 without one, and a security P3 each hold.
 
 Checks: `npm run check` from the repo root (lint, both test suites, validate,
 typecheck with the generated types present).

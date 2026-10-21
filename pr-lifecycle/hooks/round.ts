@@ -7,7 +7,7 @@
 import { atom, update } from 'claude-code'
 import type { EngineInterface, PluginOptions } from 'claude-code'
 
-import type { Effort, Evidence, Finding, LifecycleRecord, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Step, Waiver } from '../types'
+import type { CheckState, Effort, Evidence, Finding, LifecycleRecord, LogEntry, Pending, RanModels, Role, RoundRecord, Run, RunStatus, Severity, Standing, Step, Waiver } from '../types'
 import {
   compileRisk,
   fixPrompt,
@@ -32,18 +32,31 @@ import {
   triagePrompt,
   verifyPrompt,
 } from './core'
-import { collectionDone, isTrusted, readCheckRuns, readInlineComments, readIssueComments, readReviews, readRoster, severityHint } from './github'
+import {
+  collectionDone,
+  isTrusted,
+  readCheckRuns,
+  readInlineComments,
+  readIssueComments,
+  readRequired,
+  readReviews,
+  readRoster,
+  severityHint,
+} from './github'
 import type { Check, Feedback, Roster } from './github'
 import {
   acceptRebuttal,
   applyAnswer,
   decideNext,
+  holdText,
   lapseWaivers,
   checksOwed,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
+  isLoweringOwed,
   isReverifyOwed,
+  issueOf,
   lastCoveredHead,
   markHeld,
   markVerified,
@@ -51,20 +64,26 @@ import {
   mergeHolds,
   newRecord,
   nextIds,
+  mayAcknowledge,
+  peakOf,
   raisedIn,
   readDiff,
   rejections,
   relocate,
   roundOf,
+  ruleLowering,
+  securityHolds,
+  standingOf,
   triage,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
   waivedIds,
   withRound,
+  wouldSettle,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, isHeldByOther, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -300,6 +319,7 @@ let isPolling = false
 export function setup(c: Config): void {
   config = c
   queued = []
+  required.clear()
 }
 
 // This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
@@ -390,11 +410,16 @@ export const agentModelFor = (role: Role, lifecycle: Run['lifecycle'], c: Config
   role === 'fix' || (role === 'verify' && lifecycle === 'pre') ? c.fixAgentModel : c.runnerModel
 
 // Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
+// Each outermost hold is a batch: its flush sends only its own entries, and a note merges only within it (PR #19 review).
+type Queued = { text: string; key: RecordKey; batch: number; isNote?: boolean }
 let holdDepth = 0
-let queued: { text: string; key: RecordKey }[] = []
+let batch = 0
+let queued: Queued[] = []
 
 /** The record a prompt is about: it is sent only while this session still holds it (#13). */
 export type RecordKey = Pick<Run, 'root' | 'branch'>
+
+const sameRecord = (a: RecordKey, b: RecordKey): boolean => a.root === b.root && a.branch === b.branch
 
 /** Submits a prompt unless another session took its record meanwhile; this one then stands down instead (#13). */
 async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
@@ -402,17 +427,45 @@ async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
   await $.prompt.submit({ text }).catch(() => undefined)
 }
 
-/** Runs `body` with the prompts it decides held back; once it has returned, they are sent one second later, in order. */
+/**
+ * Within one command's batch, an action's note and a prompt for the same record become one prompt: the note's first line leads it
+ * (R81). What the note says holds the merge follows the prompt, so a failing check is not lost behind a ready prompt (gate R2-4);
+ * only the note's own next step gives way to the prompt's.
+ */
+export function mergeNotes(held: readonly Queued[]): Queued[] {
+  const isPair = (a: Queued, b: Queued): boolean => a.batch === b.batch && sameRecord(a.key, b.key)
+  return held.flatMap(one => {
+    if (one.isNote === true) return held.some(each => each.isNote !== true && isPair(each, one)) ? [] : [one]
+    const note = held.find(each => each.isNote === true && isPair(each, one))
+    if (note === undefined) return [one]
+    const [lead = '', ...rest] = note.text.split('\n\n')
+    const holds = rest.filter(part => !part.startsWith('Your next step:')).join('\n\n')
+    return [{ ...one, text: [lead, one.text, ...(holds === '' ? [] : [holds])].join('\n\n') }]
+  })
+}
+
+/**
+ * Drops everything queued about `key`'s record and not yet sent: a stop or reset supersedes it (R81, PR #19 review). Every batch, the
+ * caller's own too: a stop run while another command holds the turn shares that command's batch (gate R4-5), and stop and reset
+ * call this before they queue their own note.
+ */
+export function dropQueued(key: RecordKey): void {
+  queued = queued.filter(one => !sameRecord(one.key, key))
+}
+
+/** Runs `body` with the prompts it decides held back; once it has returned, its own batch is sent one second later, in order. */
 export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
+  if (holdDepth === 0) batch += 1
+  const mine = batch
   holdDepth += 1
   try {
     return await body()
   } finally {
     holdDepth -= 1
-    if (holdDepth === 0 && queued.length > 0) {
+    if (holdDepth === 0 && queued.some(one => one.batch === mine)) {
       $.clock.after(1000, () => {
-        const held = queued
-        queued = []
+        const held = mergeNotes(queued.filter(one => one.batch === mine))
+        queued = queued.filter(one => one.batch !== mine)
         void (async () => {
           for (const one of held) await deliver($, one.key, one.text)
         })()
@@ -423,26 +476,46 @@ export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Prom
 
 /**
  * Sends a prompt about `key`'s record to the main agent now, or after the command that holds the turn has returned. Either way
- * the owner is checked at delivery: a session that lost the record sends nothing (#13).
+ * the owner is checked at delivery: a session that lost the record sends nothing (#13). `isNote`: an action's note, which a prompt
+ * of the same command and record absorbs (R81).
  */
-export async function say($: Engine, key: RecordKey, text: string): Promise<void> {
+export async function say($: Engine, key: RecordKey, text: string, isNote = false): Promise<void> {
   if (holdDepth > 0) {
-    queued.push({ text, key })
+    queued.push({ text, key, batch, ...(isNote ? { isNote } : {}) })
     return
   }
   await deliver($, key, text)
+}
+
+/** The person's action, told to the agent (R81): what they did, what still holds, and the agent's next step. Queued as a note. */
+export async function tellAgent($: Engine, key: RecordKey, did: string, next: string, standing?: Standing): Promise<void> {
+  const lines = [`pr-gate: the person ${did}.`]
+  const holds = standing === undefined ? '' : holdText(standing)
+  if (holds !== '') lines.push('', holds)
+  lines.push('', `Your next step: ${next}`)
+  await say($, key, lines.join('\n'), true)
 }
 
 export async function getRun($: Engine): Promise<Run | null> {
   return (await $.state.get(RUN)).value ?? null
 }
 
-/** Applies a change to the run in flight; a run that ended or was replaced is left alone. */
+/** Whether run `id` is still the one in flight and running: a step re-reads it after a long await (finding 29, R80). */
+async function isRunning($: Engine, id: string): Promise<boolean> {
+  const live = await getRun($)
+  return live !== null && live.id === id && live.status === 'running'
+}
+
+/**
+ * Applies a change to the run in flight; a run that ended or was replaced is left alone, and null comes back for it (final review
+ * M2), so a caller's `after === null` also catches a run stopped or waived since it was read.
+ */
 export async function patch($: Engine, id: string, change: (run: Run) => Run): Promise<Run | null> {
   let after: Run | null = null
   await update($, runAtom, run => {
-    after = run !== null && run !== undefined && run.id === id && run.status === 'running' ? change(run) : (run ?? null)
-    return after
+    const isOurs = run !== null && run !== undefined && run.id === id && run.status === 'running'
+    after = isOurs ? change(run) : null
+    return isOurs ? after : (run ?? null)
   })
   return after
 }
@@ -700,7 +773,7 @@ export async function archiveLifecycle($: Engine, root: string, branch: string, 
     await archiveRecord($, last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived' })
+    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived', generation: (last.generation ?? 0) + 1 })
     return true
   })
 }
@@ -711,6 +784,24 @@ export type PrState = 'OPEN' | 'MERGED' | 'CLOSED'
 export const prStateIn = (json: unknown): PrState | undefined => {
   const state = (json as { state?: unknown } | null)?.state
   return state === 'OPEN' || state === 'MERGED' || state === 'CLOSED' ? state : undefined
+}
+
+/**
+ * The head and base of PR `pr`, as gh reports them; undefined when gh cannot say, a failed spawn included (final review T8). The base
+ * is read with the head, so a PR retargeted since is judged against its new base (gate R3-4).
+ */
+async function prTipOf($: Engine, root: string, pr: number): Promise<{ head: string; base?: string } | undefined> {
+  try {
+    const view = await $.process.run(['gh', 'pr', 'view', String(pr), '--json', 'headRefOid,baseRefName'], { cwd: root, timeoutMs: 30_000 })
+    if (view.exitCode !== 0) return undefined
+    const read = JSON.parse(view.stdout) as { headRefOid?: unknown; baseRefName?: unknown } | null
+    const head = read?.headRefOid
+    const base = read?.baseRefName
+    if (typeof head !== 'string' || head === '') return undefined
+    return { head, ...(typeof base === 'string' && base !== '' ? { base } : {}) }
+  } catch {
+    return undefined
+  }
 }
 
 /** The state of PR `pr`, as gh reports it; undefined when gh cannot say. */
@@ -924,6 +1015,108 @@ type Fetched = {
   ownReplies?: Record<string, string>
 }
 
+/** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, { unreadable: gh's own words } when it can't say. */
+export async function readChecks($: Engine, root: string, pr: number, repo?: string): Promise<{ name: string; bucket: string }[] | { unreadable: string }> {
+  let ran: { exitCode: number; stdout: string; stderr: string }
+  try {
+    ran = await $.process.run(['gh', 'pr', 'checks', String(pr), ...(repo === undefined ? [] : ['--repo', repo]), '--json', 'name,state,bucket'], {
+      cwd: root,
+      timeoutMs: 30_000,
+    })
+  } catch (error) {
+    ran = { exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
+  }
+  try {
+    const read = JSON.parse(ran.stdout) as unknown
+    const row = (one: unknown): Record<string, unknown> => (typeof one === 'object' && one !== null ? (one as Record<string, unknown>) : {})
+    if (Array.isArray(read)) return read.map(one => ({ name: String(row(one).name ?? '?'), bucket: String(row(one).bucket ?? '') }))
+  } catch {
+    // Not JSON: read stderr below.
+  }
+  return /no checks reported/i.test(ran.stderr) ? [] : { unreadable: ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}` }
+}
+
+const required = new Map<string, { found: Set<string>; at: number }>()
+/** How long a base's required checks are reused: a check made required since is read again after this (gate R1-4). */
+const REQUIRED_TTL_MS = 5 * 60_000
+
+/**
+ * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for REQUIRED_TTL_MS.
+ * Each source must be parsed, or authoritatively absent (classic's 404 "not protected" or "status checks not enabled"); a throw,
+ * a 403 or 500, or a payload that doesn't parse from either makes it unknown, with the reason in gh's own words where it gave one:
+ * that holds the merge (R86, gate R3-1, R3-2) and is not cached (PR #19 review).
+ */
+export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | { unknown: string }> {
+  // Without a known slug (a waiver-only record), gh fills {owner}/{repo} from the checkout's own remote.
+  const repo = slug ?? '{owner}/{repo}'
+  const key = `${slug ?? root}:${base}`
+  const now = await $.clock.now()
+  const seen = required.get(key)
+  if (seen !== undefined && now - seen.at < REQUIRED_TTL_MS) return seen.found
+  const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch((err: unknown) => String(err).slice(0, 160))
+  // Pages of 100 (final review M3): GitHub's default of 30 could cut a required-checks rule, and a full page means another may
+  // follow, read until one is short (gate R4-4).
+  // A base such as release/1.0 is one path segment, encoded (gate R5-1).
+  const rulesAt = `repos/${repo}/rules/branches/${encodeURIComponent(base)}`
+  const classicAt = `repos/${repo}/branches/${encodeURIComponent(base)}/protection/required_status_checks`
+  const readRules = async (): Promise<string | { exitCode: number; stdout: string; stderr: string }> => {
+    const all: unknown[] = []
+    for (let page = 1; page <= 20; page += 1) {
+      const got = await api(`${rulesAt}?per_page=100${page === 1 ? '' : `&page=${page}`}`)
+      if (typeof got === 'string' || got.exitCode !== 0) return got
+      let rows: unknown
+      try {
+        rows = JSON.parse(got.stdout)
+      } catch {
+        return got
+      }
+      // A payload that isn't a list goes to readRequired as it came, which reads it as unknown.
+      if (!Array.isArray(rows)) return got
+      all.push(...(rows as unknown[]))
+      if (rows.length < 100) return { ...got, stdout: JSON.stringify(all) }
+    }
+    return 'more than 20 pages of rules'
+  }
+  const rules = await readRules()
+  const classic = await api(classicAt)
+  // The endpoint is named, so the person knows what the gh login must be able to read.
+  const failed = (at: string, ran: string | { exitCode: number; stderr: string }) =>
+    ({ unknown: `gh api ${at}: ${typeof ran === 'string' ? ran : ran.stderr.trim().slice(0, 160) || `exit ${ran.exitCode}`}` })
+  if (typeof rules === 'string' || rules.exitCode !== 0) return failed(rulesAt, rules)
+  if (typeof classic === 'string') return failed(classicAt, classic)
+  // Only GitHub's own words are an authoritative none: a 404 for any other reason (a missing branch or token scope) is unknown (M3).
+  // A protected branch that requires no status checks (reviews only, say) answers "Required status checks not enabled" (gate R4-1, R4-2).
+  const isClassicNone = classic.exitCode !== 0 && /Branch not protected|Required status checks not enabled/i.test(classic.stderr)
+  if (classic.exitCode !== 0 && !isClassicNone) return failed(classicAt, classic)
+  const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
+  if (listed === undefined) return { unknown: `gh api ${rulesAt} or ${classicAt} returned a payload that does not parse` }
+  const found = new Set(listed)
+  required.set(key, { found, at: now })
+  return found
+}
+
+/** The standing of a PR head (R79): the record's findings and review, its checks, and which of them its base requires. */
+export async function gatherStanding(
+  $: Engine,
+  rec: LifecycleRecord,
+  pr: { number: number; baseRefName: string; headRefOid: string },
+  repo?: string,
+): Promise<Standing> {
+  const checks = await readChecks($, rec.root, pr.number, repo)
+  const needed = !Array.isArray(checks) ? new Set<string>() : await requiredChecksOf($, rec.root, repo ?? rec.slug, pr.baseRefName)
+  // A required check that never reported holds the merge too, as GitHub's ruleset does (gate R1-3).
+  const reported = new Set(Array.isArray(checks) ? checks.map(one => one.name) : [])
+  // A base whose required checks can't be read makes every reported check required, so a waiver sets none aside (R86, PR19-2).
+  // It adds no hold of its own: GitHub's ruleset still enforces required checks at merge (Adam's ruling on gate R2-2, option B).
+  if (!(needed instanceof Set)) {
+    return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, (checks as CheckState[]).map(one => ({ ...one, isRequired: true })))
+  }
+  const missing = [...needed].filter(name => !reported.has(name)).map(name => ({ name, bucket: 'missing', isRequired: true }))
+  const ci: CheckState[] | { unreadable: string } =
+    !Array.isArray(checks) ? checks : [...checks.map(one => ({ ...one, isRequired: needed.has(one.name) })), ...missing]
+  return standingOf(rec, { head: pr.headRefOid, base: pr.baseRefName }, ci)
+}
+
 /** Everything GitHub holds for the PR now. Only these polls establish that feedback arrived. */
 async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> {
   const fail = (why: string): Fetched => ({ isOk: false, why, feedback: [], checks: [], prHead: rec.head })
@@ -1113,6 +1306,7 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
     // A clean checkout behind the PR head (a reviewer's or a bot's push) catches up on its own (R71).
     const isSynced = await syncToHead($, run.root, run.branch, got.prHead)
     const local = await git($, run.root, ['rev-parse', 'HEAD'])
+    if (!(await isRunning($, run.id))) return
     if (!isSynced || !local.isOk || local.out !== got.prHead) {
       const here = local.isOk ? local.out.slice(0, 7) : 'unknown'
       const why = `the local checkout ${here} is not the PR head ${got.prHead.slice(0, 7)}: pull (or push), then run /pr-gate resume`
@@ -1135,6 +1329,8 @@ async function endCollect($: Engine, run: Run, got: Fetched, done: ReturnType<ty
 
 /** A post-PR step could not read GitHub or the checkout: an attempt, no round used, and the agent is told its next step. */
 async function failPost($: Engine, run: Run, why: string): Promise<void> {
+  // A run stopped or waived meanwhile failed nothing: no attempt, no message (finding 29, R80).
+  if (!(await isRunning($, run.id))) return
   await noteAttempt($, run, why)
   await finish($, run.id, 'error', `Post-PR round ${run.round} stopped: ${why}.`)
   await say($, run, `pr-gate: post-PR round ${run.round} on ${run.branch} stopped: ${why}.`)
@@ -1166,6 +1362,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     await closeLifecycle($, run.root, run.branch, prior.pr, got.closed)
     return
   }
+  // Each long await below re-reads the run: one stopped or waived meanwhile asks nothing and decides nothing (finding 29, R80).
+  if (!(await isRunning($, id))) return
   if (!got.isOk) {
     await failPost($, run, `GitHub could not be read: ${got.why ?? 'gh failed'}; fix that, then run /pr-gate resume`)
     return
@@ -1176,6 +1374,12 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     ? ((await updateRecord($, run.root, run.branch, one => ({ ...one, replies: { ...own, ...one.replies } }))) ?? prior)
     : prior
   const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id))
+  // A review that said there is nothing to act on settles on its own (R83): logged once, and processed so it is never asked about.
+  const settled = got.feedback.filter(one => one.kind === 'review' && !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
+  for (const one of settled) await logEvent($, run.root, run.branch, 'approval', `${one.reviewer}: ${one.body.split('\n')[0]?.slice(0, 120) ?? ''}`)
+  if (settled.length > 0) {
+    await updateRecord($, run.root, run.branch, one => ({ ...one, processed: [...new Set([...one.processed, ...settled.map(each => each.id)])] }))
+  }
   const ledger = mergeFindings(rec.findings, run.findings)
   // Changed files are read from a finding's own head (or the previous post round's start) to this round's head (R33).
   const prevStart = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted).at(-1)?.startHead
@@ -1222,6 +1426,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
       ...(feedback.threadId === undefined ? {} : { threadId: feedback.threadId }),
       ...(feedback.url === undefined ? {} : { url: feedback.url }),
       severity: hint.severity,
+      peakSeverity: hint.severity,
+      severitySource: hint.isTagged ? 'tag' : 'hint',
       ...(hint.isSecurity ? { isSecurity: true } : {}),
       title,
       ...(feedback.file === undefined ? {} : { file: feedback.file }),
@@ -1239,7 +1445,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
   // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
   const carried = mergeHolds({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
-    one => one.status === 'open' && !raisedIn(one, run.round) && !listedIds.has(one.id),
+    // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
+    one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
   )
   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
   let others: string[] = []
@@ -1253,6 +1460,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
     const log = await git($, run.root, ['log', '--format=%h %an %s', `${rec.head}..${got.prHead}`])
     others = log.isOk ? log.out.split('\n').filter(Boolean) : []
   }
+  if (!(await isRunning($, id))) return
   const asked = [...listedIds, ...carried.map(one => one.id)]
   if (asked.length === 0 && others.length === 0) {
     const rebuttals = rebuttalsOwed(run)
@@ -1339,7 +1547,13 @@ const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
-  const said = readTriage(run.pending[0]?.answer ?? '')
+  // "acknowledged" counts only with a reply in the thread, on an item that may take it (R82); stored as a rebuttal, so Codex checks it.
+  const said = readTriage(run.pending[0]?.answer ?? '').flatMap(each => {
+    if (each.action !== 'acknowledged') return [each]
+    const one = run.findings.find(f => f.id === each.id)
+    if (one === undefined || !mayAcknowledge(one) || each.replyId === undefined) return []
+    return [{ ...each, note: `No change requested: ${each.note ?? 'the comment asks for no change'}` }]
+  })
   const after = await patch($, run.id, one => ({
     ...one,
     pending: [],
@@ -1395,7 +1609,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
       run.id,
       `pr-gate: These review items have no answer yet: ${ids}. Answer each one: fix it, rebut it with file:line evidence, or defer it with the reason, ` +
         `replying in its thread where it came from GitHub. Commit and push any fix. End your final message with ${TRAILER} on its own line, then ` +
-        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred","severity":"P2","note":"...","replyId":"123"}]}`,
+        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred|acknowledged","severity":"P2","note":"...","replyId":"123"}]}`,
     )
     return
   }
@@ -1468,8 +1682,11 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
 async function checkRebuttals($: Engine, run: Run, rebuttals: readonly Finding[]): Promise<void> {
   const now = await $.clock.now()
   // Codex reads the checkout: it must be the head the rebuttal is about.
-  // A clean checkout behind the PR head catches up on its own (R71).
-  if (!(await syncToHead($, run.root, run.branch, run.headSha))) {
+  // A clean checkout behind the PR head catches up on its own (R71). A run stopped or waived before or during it goes no further (R80).
+  if (!(await isRunning($, run.id))) return
+  const isSynced = await syncToHead($, run.root, run.branch, run.headSha)
+  if (!(await isRunning($, run.id))) return
+  if (!isSynced) {
     await failPost($, run, `the local checkout is not the PR head ${run.headSha.slice(0, 7)}: pull, then /pr-gate resume`)
     return
   }
@@ -1516,7 +1733,14 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
   const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
-  if (saved !== undefined) await say($, saved, heldPrompt(saved, why, nextStep))
+  if (saved === undefined) return
+  // The whole standing, CI included (R79), as the report a round ends with lists it.
+  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
+  const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
+  if (await isPostWaived($, saved)) return
+  // A reset, stop or push while the standing was gathered supersedes this hold (gate G7-3).
+  if (!(await isStillCurrent($, saved))) return
+  await say($, saved, heldPrompt(saved, why, nextStep, standing))
 }
 
 /**
@@ -1584,6 +1808,8 @@ async function afterRebuttalCheck($: Engine, run: Run): Promise<void> {
           ? markVerified(f, one.round, 'codex', now, 'Codex: the fix holds')
           : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex: the fix does not hold')
       }
+      // The agent's lowering of a deferral's severity (R85): agreed, it may settle; refused, it is the person's, with Codex's reason.
+      if (isLoweringOwed(f)) return ruleLowering(f, verdict.holds, one.round, now, verdict.holds ? undefined : (verdict.note ?? 'no reason given'))
       // Codex's acceptance is the history entry { status: 'rebutted', by: 'codex' } (isAcceptedRebuttal).
       return verdict.holds ? acceptRebuttal(f, one.round, now) : markHeld(f, one.round, 'codex', now, verdict.note ?? 'Codex did not accept the rebuttal')
     }),
@@ -1849,6 +2075,8 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
 
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
 async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?: string): Promise<void> {
+  // A run stopped or waived while this step awaited git or gh records nothing more and decides nothing (finding 29, R80).
+  if (!(await isRunning($, run.id))) return
   const now = await $.clock.now()
   // After the PR: the head GitHub last reported for it, whatever is checked out here (an adopted PR, a push from elsewhere).
   const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
@@ -1861,13 +2089,17 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     const findings = live !== null && live.id === run.id ? live.findings : run.findings
     // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
     // The carry, never the check's capped effort: advance may start a round at once, before finish could restore it.
-    await updateRecord($, run.root, run.branch, rec => ({
-      ...rec,
-      head: endHead,
-      findings: mergeFindings(rec.findings, findings),
-      effort: run.carriedEffort ?? run.effort,
-    }))
-    if (isCompleted) await advance($, run.root, run.branch)
+    let isGone = false
+    await updateRecord($, run.root, run.branch, async rec => {
+      // Read again under the record's lock: a stop or waiver given while this step awaited writes nothing (gate R3-3).
+      if (!(await isRunning($, run.id))) {
+        isGone = true
+        return rec
+      }
+      return { ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.carriedEffort ?? run.effort }
+    })
+    // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
+    if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
     return
   }
   const current = run.findings.filter(one => raisedIn(one, run.round))
@@ -1900,7 +2132,13 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer' && run.headSha === endHead
   }
   // The head move is read from the record under its lock (R1-6), so a waiver given meanwhile is lapsed or kept, never lost.
+  let isGone = false
   await updateRecord($, run.root, run.branch, async rec => {
+    // Read again under the record's lock: a stop or waiver given while this step awaited the clock or git records no round (gate R3-3).
+    if (!(await isRunning($, run.id))) {
+      isGone = true
+      return rec
+    }
     const moved = isMoved
       ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
       : undefined
@@ -1924,7 +2162,8 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       effort: run.carriedEffort ?? run.effort,
     }
   })
-  if (isCompleted) await advance($, run.root, run.branch)
+  // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
+  if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
 }
 
 /** The effort and Codex model a round ran at (R69), when Codex ran in it: what the reviewers reported, else what the gate named. */
@@ -1970,10 +2209,39 @@ export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresol
  * /pr-gate or resume, which alone re-opens a pre-PR fix step on the same head (R63); a held create or a grant does not.
  */
 export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
-  const rec = await loadRecord($, root, branch)
+  let rec = await loadRecord($, root, branch)
   if (rec === undefined) return
   // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
   if (!(await isStillMine($, { root, branch }))) return
+  // A post waiver covering this head ends review work for it (R80): checked before any branch that starts triage, a recheck or a round
+  // (PR #19 review), so a waived head gets what the waiver covers and what CI still holds, never the hold or more review.
+  const posts = rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 ? rec.waivers.filter(one => one.scope === 'post') : []
+  // GitHub's head, read once whenever a post waiver exists, decides: a waiver given while a round ran names the PR head, which the
+  // record's head may not have reached (the late round records nothing), and a push by someone else after the waiver is not covered
+  // by it (gate R1-1, R1-5). When gh cannot say, the record's head decides.
+  const tip = rec.pr !== undefined && posts.length > 0 ? await prTipOf($, root, rec.pr) : undefined
+  const at = tip?.head ?? rec.head
+  if (rec.pr !== undefined && posts.some(one => one.head === at)) {
+    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: tip?.base ?? rec.base, headRefOid: at })
+    if (!(await isStillCurrent($, rec))) return
+    await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
+    return
+  }
+  // The waiver covers the checkout's head, but the PR moved past it: no review or waiver covers the PR's head yet.
+  const recHead = rec.head
+  if (rec.pr !== undefined && at !== recHead && posts.some(one => one.head === recHead)) {
+    await say(
+      $,
+      rec,
+      `pr-gate: the person's post waiver covers PR #${rec.pr} at ${rec.head.slice(0, 7)}, but the PR head is now ${at.slice(0, 7)}, ` +
+        `which no review or waiver covers. The local checkout ${rec.head.slice(0, 7)} is not the PR head: pull (or push), then run /pr-gate resume.`,
+    )
+    return
+  }
+  // A deferral that settles once its issue carries the finding's peak severity is labelled first, every pass until it is (R85).
+  const labelled = await labelDeferrals($, rec)
+  if (labelled === undefined) return
+  rec = labelled
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2072,7 +2340,101 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (id !== undefined) await say($, saved, heldPrompt(saved, next.why, next.nextStep))
     return
   }
-  await say($, saved, reportPrompt(saved, next))
+  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
+  const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
+  // A post waiver given while the standing was gathered covers this head: no hold after it (final review M1, R80).
+  if (await isPostWaived($, saved)) return
+  // So does a reset, a stop or a push in that time: the report is for a lifecycle that has moved on (gate G7-3).
+  if (!(await isStillCurrent($, saved))) return
+  await say($, saved, reportPrompt(saved, next, standing))
+}
+
+/** The colour of each severity label the gate makes on a follow-up's repository (R85). */
+const LABEL_COLOURS: Record<Severity, string> = { P0: 'b60205', P1: 'd93f0b', P2: 'fbca04', P3: '0e8a16' }
+
+/**
+ * Labels the follow-up issue of each deferral that would settle with the highest severity its finding had (R85, Adam 2026-10-20),
+ * once per peak: a peak that rose since adds the new label. The label is made first when the repository lacks it; a failed edit
+ * is recorded on the finding, which holds the merge until a later pass labels it (fail closed). Only after the PR opens. Undefined
+ * when the lifecycle was reset, replaced or stopped while gh ran: the caller decides nothing for it.
+ */
+export async function labelDeferrals($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+  if (rec.phase === 'pre') return rec
+  const owed = rec.findings.filter(one => wouldSettle(one) && one.followUpLabel !== peakOf(one))
+  if (owed.length === 0) return rec
+  const gh = async (args: string[]): Promise<{ exitCode: number; stderr: string }> => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and after its
+  // gh calls, so no later issue is labelled and no log line lands in another lifecycle's log.
+  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
+    latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0) || latest.postStatus !== rec.postStatus
+  const results = new Map<string, { followUp: string | undefined; peak: Severity; error?: string }>()
+  // Logged with the results, in the same guarded write: a reset between a check and a log write of its own would put the line in
+  // another lifecycle's log (gate R9-1).
+  const lines: LogEntry[] = []
+  for (const one of owed) {
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const peak = peakOf(one)
+    const issue = issueOf(one.followUp, rec.slug)
+    if (issue === undefined) {
+      results.set(one.id, { followUp: one.followUp, peak, error: 'no repository is known for this issue' })
+      continue
+    }
+    const label = `severity:${peak}`
+    // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). gh refuses one that
+    // exists; the edit below reports any real failure.
+    await gh(['label', 'create', label, '--repo', issue.repo, '--color', LABEL_COLOURS[peak]])
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const edit = await gh(['issue', 'edit', String(issue.number), '--repo', issue.repo, '--add-label', label])
+    results.set(one.id, { followUp: one.followUp, peak, ...(edit.exitCode === 0 ? {} : { error: (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200) }) })
+    if (isMoved(await loadRecord($, rec.root, rec.branch))) return undefined
+    const text = edit.exitCode === 0 ? `${one.id}: labelled ${issue.repo}#${issue.number} ${label}` : `${one.id}: could not label ${issue.repo}#${issue.number} ${label}`
+    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
+  }
+  // And on the write itself: nothing is written, and nothing is decided (gate G7-8, R7-4).
+  let isSuperseded = false
+  // Written only where the follow-up and peak are still the ones labelled: a later answer that moved either is labelled anew.
+  const saved = await updateRecord($, rec.root, rec.branch, latest => {
+    isSuperseded = isMoved(latest)
+    if (isSuperseded) return latest
+    const findings = latest.findings.map(f => {
+      const got = results.get(f.id)
+      if (got === undefined || got.followUp !== f.followUp || got.peak !== peakOf(f)) return f
+      return got.error === undefined ? { ...f, followUpLabel: got.peak, followUpLabelError: undefined } : { ...f, followUpLabelError: got.error }
+    })
+    return { ...latest, findings, log: [...(latest.log ?? []), ...lines].slice(-LOG_CAP) }
+  })
+  return isSuperseded ? undefined : (saved ?? rec)
+}
+
+/** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */
+async function isPostWaived($: Engine, rec: LifecycleRecord): Promise<boolean> {
+  const latest = await loadRecord($, rec.root, rec.branch)
+  return latest !== undefined && latest.waivers.some(one => one.scope === 'post' && one.head === rec.head) && securityHolds(latest).length === 0
+}
+
+/**
+ * Whether `rec` is still the branch's live lifecycle, at the same head and state, read afresh. A report or note gathered over a slow
+ * await is dropped once a reset archived the record, a fresh lifecycle replaced it, or a push, a stop or a new round moved it on: the
+ * queue's drop cannot reach work still awaiting (gate G7-3).
+ */
+export async function isStillCurrent($: Engine, rec: LifecycleRecord): Promise<boolean> {
+  const latest = await loadRecord($, rec.root, rec.branch)
+  return (
+    latest !== undefined &&
+    latest.phase !== 'archived' &&
+    (latest.generation ?? 0) === (rec.generation ?? 0) &&
+    latest.head === rec.head &&
+    latest.pr === rec.pr &&
+    latest.postStatus === rec.postStatus &&
+    latest.rounds.length === rec.rounds.length &&
+    latest.rounds[0]?.startedAt === rec.rounds[0]?.startedAt
+  )
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
@@ -2152,6 +2514,7 @@ async function afterReview($: Engine, run: Run): Promise<void> {
         round: run.round,
         source: role === 'challenge' ? 'codex-challenge' : 'codex-review',
         reviewer: 'codex',
+        peakSeverity: one.severity,
         ...(severityHint(`${one.title} ${one.detail ?? ''}`).isSecurity ? { isSecurity: true } : {}),
         headSeen: run.headSha,
         status: 'open',

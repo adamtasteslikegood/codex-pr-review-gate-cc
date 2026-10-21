@@ -157,7 +157,9 @@ Claude should:
 - Fix confirmed issues with appropriate checks.
 - Reply in the original inline thread where applicable.
 - Rebut incorrect findings with code/test/requirement evidence.
-- Explicitly record accepted nonblocking deferrals.
+- Explicitly record accepted nonblocking deferrals. A P3 deferral, not security, whose `followUp` names a GitHub issue (`#<n>`, `owner/repo#<n>` or its URL) settles without a waiver once the gate labels the issue `severity:<peak>`, the highest severity the finding had; if the agent lowered its severity, Codex must agree with the lowering first, and a disagreement leaves it to the person (R85).
+- Mark a finding `acknowledged` when it asks for no change: it needs a reply in the thread, applies only to a GitHub finding with no security flag and no explicit P0-P2, is stored as a rebuttal, and Codex checks it (R82).
+- A review settles with no finding only on positive no-action evidence, such as a plain approval; an unclear one goes to triage (R83).
 
 Do not automatically mark an earlier finding “fixed” because a later reviewer omitted it. Preserve the distinction between:
 - Reported fixed.
@@ -179,7 +181,7 @@ Maintain a lifecycle record containing:
 
 Persist enough to resume after interruption without resetting the budget or processing the same feedback twice.
 
-One session runs each record: a headless session in the same checkout never takes it over, and another interactive session does only once the owner has been quiet for 2 minutes (R74). After the PR opens, the gate's own Codex check verifies reported fixes on the head each round ends on, at no round (R72). See the rulings doc's "after the first live run" section (R71-R78) for the 1.3.0 changes.
+One session runs each record: a headless session in the same checkout never takes it over, and another interactive session does only once the owner has been quiet for 2 minutes (R74). After the PR opens, the gate's own Codex check verifies reported fixes on the head each round ends on, at no round (R72). See the rulings doc's "after the first live run" section (R71-R78) for the 1.3.0 changes, and R79-R87 for 1.4.0.
 
 A normal fix commit continues the lifecycle. A rebase or significant scope change triggers coverage reassessment, not automatic deletion of all history.
 
@@ -218,6 +220,8 @@ When discretionary budget is exhausted:
 P1 security findings must not become acceptable simply because time or rounds ran out.
 
 Keep human waivers explicit and attributable. A pre-PR waiver must not silently waive the post-PR lifecycle.
+
+A post waiver covers its head: it ends review holds for it and sets aside, by name, the checks GitHub doesn't require. Checks GitHub does require, from the base's rulesets and classic protection, still hold, a required check that never reported included. When the required list can't be read, every reported check counts as required, and GitHub's ruleset still enforces the rest at merge (R80, R86). A resume reads the PR's head first: when someone pushed past the waived head, it says so and asks for a pull, then a resume. Every manual action by the person ends with one message to the agent (R81).
 
 ## Behaviors to verify
 

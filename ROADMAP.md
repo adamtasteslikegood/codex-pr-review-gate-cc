@@ -132,6 +132,9 @@ Two PRs (decision L). Specs:
 
 ### Wave 2a: the person's actions and holds (pr-lifecycle 1.4.0)
 
+**Status:** built on `wave2a/pr-lifecycle-1.4.0` (rulings R79-R87). R87, added
+in live use, makes a hold on a chained command say nothing in it ran.
+
 1. **Every manual action tells the agent (decision E; finding 22).** Today
    `waive post`, a post-PR finding waiver, `stop`, `reset` and the pane's
    stop button send the agent nothing, and `waive pre` sends something only
@@ -172,6 +175,11 @@ Two PRs (decision L). Specs:
    review requests instead, and keeps a short quiet window only when none of
    those exist. Which signals are reliable is probed first (the Codex
    connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
+5. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
+   groups a round's findings into lanes by the files they touch and starts one fixer per
+   lane in parallel; findings that share a file share a lane, so no two fixers edit the
+   same code. On PR #20's pre-PR round 1, one fixer took 7 findings in turn where two lanes
+   (required checks, waivers) would have run side by side.
 
 ### Not yet placed: one finding per problem (Adam, 2026-10-20)
 

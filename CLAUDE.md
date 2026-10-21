@@ -19,7 +19,7 @@ the project's goals and their order.
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.3.0** is the plugin in daily use, loaded through
+- `pr-lifecycle/` **1.4.0** is the plugin in daily use, loaded through
   `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. It gates the PRs of
   this repo too, so a change to it is gated by the version loaded, and you
   should expect holds on your own branch. It extends `/pr-gate` across pre-PR
@@ -30,8 +30,8 @@ the project's goals and their order.
   branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
   - Every ruling made while building it, R1–R66, Adam's rulings on
-    codex-gate's deferred items R1-5 to R1-10, R67–R70 after 1.0.0, and
-    R71–R78 after the first live run:
+    codex-gate's deferred items R1-5 to R1-10, R67–R70 after 1.0.0,
+    R71–R78 after the first live run, and R79–R87 in wave 2a:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it. The goals are in
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
@@ -40,7 +40,6 @@ the project's goals and their order.
   creation, so two would gate the same PR twice. Switching
   `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.
 - Open follow-ups, left as is on purpose:
-  - a failing optional CI check holds a pr-lifecycle merge, with no waiver;
   - a failed fetch of a submodule or of the other base stops a round;
   - in a repo with no reviewer roster, review bots without write access are
     dropped (list them under `trusted` to keep them without waiting, R76).
@@ -97,7 +96,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 415)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 504)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four

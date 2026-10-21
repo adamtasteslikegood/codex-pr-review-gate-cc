@@ -2,12 +2,15 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   collectionDone,
+  hasOtherSteps,
+  isNoAction,
   isTrusted,
   readCheckRuns,
   readInlineComments,
   readIssueComments,
   readJsonList,
   readPrAction,
+  readRequired,
   readReviews,
   readRoster,
   severityHint,
@@ -92,12 +95,12 @@ test('check runs and the roster file are read; a bad roster is ignored', async (
 })
 
 test('a severity is read from the reviewer\'s own words, P2 when it says none', async () => {
-  expect(severityHint('**P1** SQL injection')).toEqual({ severity: 'P1', isSecurity: true })
-  expect(severityHint('Critical: crashes on empty input')).toEqual({ severity: 'P1', isSecurity: false })
-  expect(severityHint('nit: typo')).toEqual({ severity: 'P3', isSecurity: false })
+  expect(severityHint('**P1** SQL injection')).toEqual({ severity: 'P1', isSecurity: true, isTagged: true })
+  expect(severityHint('Critical: crashes on empty input')).toEqual({ severity: 'P1', isSecurity: false, isTagged: false })
+  expect(severityHint('nit: typo')).toEqual({ severity: 'P3', isSecurity: false, isTagged: true })
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
-  expect(severityHint('minor: possible XSS here')).toEqual({ severity: 'P2', isSecurity: true })
-  expect(severityHint('Consider renaming')).toEqual({ severity: 'P2', isSecurity: false })
+  expect(severityHint('minor: possible XSS here')).toEqual({ severity: 'P2', isSecurity: true, isTagged: false })
+  expect(severityHint('Consider renaming')).toEqual({ severity: 'P2', isSecurity: false, isTagged: false })
 })
 
 const base = { head: 'b', headAt: 0, startedAt: 0, lastArrivalAt: 0, quietMs: 180_000, capMs: 1_200_000 }
@@ -381,4 +384,117 @@ test('F3: a requestReview name keeps the bot that posts for it, and nothing more
   expect(isTrusted(by('copilotx[bot]'), roster)).toBe(false)
   expect(isTrusted(by('my-copilot[bot]'), roster)).toBe(false)
   expect(isTrusted(by('copilot-pull-request-reviewer'), roster)).toBe(false)
+})
+
+test('R83: only positive no-action evidence settles a review (review G2-2)', async () => {
+  // Untagged but actionable: never settled.
+  expect(isNoAction('COMMENTED', 'The reset path deletes the pending findings. Preserve them before archiving.')).toBe(false)
+  // Clean approvals.
+  expect(isNoAction('APPROVED', '')).toBe(true)
+  expect(isNoAction('APPROVED', 'LGTM')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No actionable findings in this diff.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
+  expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
+  expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
+  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
+  // A trailing scope phrase is a fixed shape, not any run of words (round 2): the rest of the sentence is a finding.
+  expect(isNoAction('COMMENTED', 'No actionable findings in this PR but the cache is never cleared')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking issues for this change and the reset deletes pending findings')).toBe(false)
+  // Approval text mixed with a requested fix.
+  expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM. Should we also cover the retry path?')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings, however the cache is never cleared.')).toBe(false)
+  // A severity tag or a strong word means there is something to act on.
+  expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
+  expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+})
+
+test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {
+  const rows = readReviews(JSON.stringify([
+    { id: 1, user: { login: 'a' }, body: 'No actionable findings.', state: 'COMMENTED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+    { id: 2, user: { login: 'a' }, body: 'The cache is never cleared.', state: 'COMMENTED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+    { id: 3, user: { login: 'a' }, body: 'LGTM', state: 'APPROVED', commit_id: 'h', submitted_at: '1970-01-01T00:01:00Z' },
+  ]))
+  expect(rows.map(one => one.isFinding)).toEqual([false, true, false])
+})
+
+test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 anywhere wins', async () => {
+  expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- add a log line')).toEqual({ severity: 'P3', isSecurity: false, isTagged: true })
+  expect(severityHint('## Advisory (non-blocking)\n1. tidy the docs')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('nit: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
+  // Quoted inside a sentence, the word labels nothing.
+  expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
+  expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
+  // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
+  expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Nit-picking aside, this leaks')).toMatchObject({ severity: 'P3', isTagged: false })
+  expect(severityHint('Optional-chaining crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Advisory - rename it')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
+})
+
+test('R84: an advisory label counts only at the start of the body, or on every line (final review C1)', async () => {
+  // A label on a later line tags nothing: the body's real finding keeps the untagged guess.
+  expect(severityHint('This migration drops the users table on rollback, losing data.\n\nNit: the comment above has a typo.')).toMatchObject({ isTagged: false })
+  expect(severityHint('The reset path deletes pending findings.\n\n**Optional:** add a test.')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Race: the lock is released before the write.\n- nit: rename x')).toMatchObject({ isTagged: false })
+  expect(severityHint('This is a critical bug.\n\nNit: the comment has a typo.')).toMatchObject({ severity: 'P1', isTagged: false })
+  // At the start, with its heading, list marker or bold, it still tags the body.
+  expect(severityHint('Advisory, non-blocking:\n- a\n- b')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('**Nit:** x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('  - nit: rename x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('Nit\n- rename x')).toMatchObject({ severity: 'P3', isTagged: true })
+  expect(severityHint('nit: rename x\n\noptional: add a log line')).toMatchObject({ severity: 'P3', isTagged: true })
+})
+
+test('R86: required checks come from the ruleset and classic protection; anything unreadable is undefined', async () => {
+  const rules = JSON.stringify([
+    { type: 'pull_request', parameters: {} },
+    { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'check' }, { context: 'analyze (actions)' }] } },
+  ])
+  expect(readRequired(rules, undefined)).toEqual(['check', 'analyze (actions)'])
+  expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'], checks: [{ context: 'check' }] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
+  expect(readRequired('[]', undefined)).toEqual([])
+  expect(readRequired('<html>proxy error</html>', undefined)).toBeUndefined()
+  expect(readRequired('', undefined)).toBeUndefined()
+  // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
+  expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
+  // A malformed payload that parses is not an empty policy (gate R1-7).
+  expect(readRequired(JSON.stringify([{ type: 'required_status_checks' }]), undefined)).toBeUndefined()
+  expect(readRequired(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: [{}] } }]), undefined)).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ message: 'Bad Gateway' }))).toBeUndefined()
+  expect(readRequired(rules, 'null')).toBeUndefined()
+  // Classic entries that name no check are malformed too (gate R5-4).
+  expect(readRequired(rules, JSON.stringify({ contexts: [1], checks: [] }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: [], checks: [{}] }))).toBeUndefined()
+  // A field that is there but not a list is malformed, even beside a valid one (gate R1-7, R5-4 at 3116e17).
+  expect(readRequired(rules, JSON.stringify({ contexts: 42, checks: [] }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: [], checks: 'bad' }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
+  // A rules row that is not a typed object is malformed too (gate R1-7 at f9e35cb); a rule of another type is skipped.
+  expect(readRequired('[null]', undefined)).toBeUndefined()
+  expect(readRequired('[{}]', undefined)).toBeUndefined()
+  expect(readRequired('["x"]', undefined)).toBeUndefined()
+  expect(readRequired(JSON.stringify([{ type: 'pull_request', parameters: {} }]), undefined)).toEqual([])
+})
+
+test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
+  expect(hasOtherSteps('gh pr create --base dev --title "a; b && c"')).toBe(false)
+  expect(hasOtherSteps('gh pr create --base dev --body "$(cat body.md)"')).toBe(false)
+  expect(hasOtherSteps('cd /repo && gh pr create --base dev')).toBe(false)
+  expect(hasOtherSteps("gh pr create --base dev --body-file - <<'EOF'\nline one; two\nEOF")).toBe(false)
+  expect(hasOtherSteps("cat > body.md <<'EOF'\nSummary\nEOF\ngh pr create --base dev --body-file body.md")).toBe(true)
+  expect(hasOtherSteps('git push -u origin HEAD && gh pr create --base dev')).toBe(true)
+  expect(hasOtherSteps('gh pr merge 1 --squash; git checkout dev')).toBe(true)
 })

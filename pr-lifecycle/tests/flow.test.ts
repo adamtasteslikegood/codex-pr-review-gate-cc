@@ -2,7 +2,9 @@ import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
-import { invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
+import type { World } from './world'
+import { requiredChecksOf } from '../hooks/round'
+import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -207,6 +209,22 @@ test('a stop and resume keeps the earlier findings under their ids, and records 
   ])
 })
 
+test('gate R3-3: a stop given while a round ends awaits the head records no round and opens no PR', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  let stopped = false
+  w.git.onHead = async () => {
+    if (stopped) return
+    stopped = true
+    await $.command.run(run$('stop'))
+  }
+  const prompts = w.prompts.length
+  await done($, turn(review('r1-review', 'PASS')))
+  expect(stopped).toBe(true)
+  expect((await recordOf(w)).rounds.filter(one => one.isCompleted)).toHaveLength(0)
+  expect(w.prompts.slice(prompts).some(one => /open the PR|gh pr create/i.test(one))).toBe(false)
+})
+
 test('a fix step that times out records an attempt', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
@@ -357,6 +375,8 @@ test('a ready lifecycle lets its own head merge; a later push holds it again', a
   w.gh.prHead = 'e'.repeat(40)
   const held = await $.tool.call(merge)
   expect(held.deny).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
+  // The standing's head blocker says the same: the refusal gives it once (final review I1).
+  expect(held.deny?.split('was pushed after the review completed')).toHaveLength(2)
   expect(held.deny?.startsWith('/')).toBe(false)
 })
 
@@ -2882,13 +2902,17 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('could not be read')
   expect(held).toContain('HTTP 502')
+  expect(held).toContain('gh auth status')
   expect(held).not.toContain('waive')
 })
 
 test('R1-9: a post waiver does not let a head with failing CI merge', async ($, on) => {
   const w = world(on)
   w.gh.hasPr = true
+  // A post waiver sets aside only what the base does not require (R86): this check is required.
+  w.gh.required = ['ci']
   await $.command.run(cmd('waive post shipping it'))
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
   expect(isHeld(await $.tool.call(merge))).toBe(false)
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'cancelled' }]
   const held = (await $.tool.call(merge)).deny ?? ''
@@ -3275,4 +3299,852 @@ test('/pr-gate log counts only the person\'s commands, not an agent\'s refused o
   await say($, 'waive post because', { ...asPerson, origin: { kind: 'sdk' } })
   const out = String((await say($, 'log')).text ?? '')
   expect(out).toContain('The person stepped in 0 times.')
+})
+
+test('R83: a COMMENTED review that says there is nothing to act on covers the head and asks the agent nothing', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const prompts = w.prompts.length
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'No actionable findings in this diff.', state: 'COMMENTED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect(w.prompts.slice(prompts).some(one => one.includes('New review feedback'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.findings.filter(one => one.source === 'github')).toHaveLength(0)
+  expect(rec.processed).toContain('review:5')
+  expect(rec.log?.some(one => one.kind === 'approval' && one.text.includes('No actionable findings'))).toBe(true)
+})
+
+test('R83: an untagged actionable COMMENTED summary still goes to triage', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'The reset path deletes the pending findings. Preserve them before archiving.', state: 'COMMENTED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  await w.clock.advance(30_000)
+  expect(w.prompts.at(-1)).toContain('The reset path deletes the pending findings')
+})
+
+test('R83: an inline comment under an APPROVED review is triaged', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.reviews = [{ id: 5, user: { login: 'claude[bot]' }, body: 'LGTM', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  w.gh.comments = [inline(11, 'this branch never closes the file', w.gh.prHead)]
+  await w.clock.advance(30_000)
+  expect(w.prompts.at(-1)).toContain('this branch never closes the file')
+})
+
+test('R84: a guessed P2 the agent triages as P3 shows as P3 in the hold', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.severity).toBe('P3')
+  expect(w.prompts.at(-1)).toContain('G2-1 [P3]')
+})
+
+/** Finding 21's shape (cookbook PR 3706, G2-11): an approval answered "fixed", which Codex could not verify and reopened. */
+const reopenedApproval = (): Finding => ({
+  id: 'G1-1', round: 1, source: 'github', reviewer: 'claude[bot]', externalId: 'inline:7', threadId: '7', severity: 'P2',
+  title: 'No blocking findings', headSeen: 'a'.repeat(40), status: 'open',
+  history: [
+    { round: 1, status: 'open', by: 'claude[bot]', at: 1 },
+    { round: 1, status: 'reported-fixed', note: 'nothing to fix', by: 'main', at: 2 },
+    { round: 2, status: 'open', note: 'Codex: no fix to verify', by: 'codex', at: 3 },
+  ],
+})
+
+test('finding 21: an earlier round\'s finding Codex reopened this round is carried into triage', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, findings: [reopenedApproval()], processed: ['inline:7'] })
+  w.gh.comments = [inline(11, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('Carried from earlier rounds, still open')
+  expect(said).toContain('G1-1')
+  expect((await runOf(w)).asked).toContain('G1-1')
+})
+
+test('R82: acknowledged, with a reply, goes to the Codex check and settles when Codex upholds it', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine to me; the retry loop is the same as before.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', severity: 'P3', note: 'a status note, nothing asked', replyId: '992' }]))
+  const run = await runOf(w)
+  expect(run.findings.find(one => one.id === 'G2-1')?.note).toContain('No change requested:')
+  expect(run.phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R82: acknowledged without a reply, or on a tagged P2 or security finding, is unanswered and asked again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'P2: the cache is never cleared')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine', replyId: '992' }]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
+})
+
+test('R82: acknowledged without a reply is unanswered and asked again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine to me.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine' }]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
+})
+
+test('R82: Codex rejecting an acknowledgement reopens the item with its reason', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine, though the retry loop now never stops.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'nothing asked', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'it reports a loop that never stops' }))
+  const found = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.history.at(-1)?.note).toContain('never stops')
+})
+
+const ISSUE = 'https://github.com/me/repo/issues/9'
+/** The gate's label call on a follow-up issue (R85). */
+const labelled = (w: ReturnType<typeof world>, n: number, peak: string): boolean =>
+  w.gh.labelled.some(one => one === `issue edit ${n} --repo me/repo --add-label severity:${peak}`)
+
+test('R85: a P3 deferred with a recorded follow-up settles without a waiver, once its issue is labelled', async ($, on) => {
+  const w = world(on)
+  // The reviewer's own P3.
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.followUp).toBe(ISSUE)
+  expect(found?.followUpLabel).toBe('P3')
+  expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16')
+  expect(labelled(w, 9, 'P3')).toBe(true)
+  // The label is logged in the same write as its result (gate R9-1).
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: labelled me/repo#9 severity:P3')).toBe(true)
+})
+
+test('gate R7-7: a severity label the repository already has is kept as it is, and the issue is still labelled', async ($, on) => {
+  const w = world(on)
+  w.gh.labelCreateAnswer = 'exists'
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  expect(w.gh.labelled.some(one => one.includes('--force'))).toBe(false)
+  expect(labelled(w, 9, 'P3')).toBe(true)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing for the archived lifecycle', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  let isResetting = false
+  w.gh.onLabel = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  // No round was started on the archived seed: the person ended this review.
+  expect(rec.rounds).toEqual([])
+  // Nor does the old pass's log line land in the archived seed's log (gate R8-2).
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('labelled')
+  expect((await runOf(w)).status).not.toBe('running')
+})
+
+test('gate R8-2: a reset while the severity label is created prevents the issue edit', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  let isResetting = false
+  w.gh.onLabelCreate = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  expect(rec.rounds).toEqual([])
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('labelled')
+  expect((await runOf(w)).status).not.toBe('running')
+})
+
+test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2', followUp: ISSUE })
+})
+
+test('R85: a P3 deferral without a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+})
+
+test('R85: a P3 deferral whose follow-up is a ticket key alone still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'nit: rename this', { severity: 'P3', followUp: 'KAN-9' })
+  expect(w.gh.labelled).toEqual([])
+})
+
+test('R85: a security P3 deferral with a follow-up still waits for the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
+  expect(w.gh.labelled).toEqual([])
+})
+
+test('R85: a guessed P1 the agent lowers to P3 waits on Codex; Codex agrees, and the issue carries severity:P1 (Adam, 2026-10-20)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: 'KAN-9 #12', replyId: '992' }]))
+  // Not ready: Codex checks the lowering in the round's own check, using no round.
+  const run = await runOf(w)
+  expect(run.phase).toBe('verify')
+  expect((await recordOf(w)).phase).not.toBe('ready')
+  const asked = w.spawned.at(-1)?.prompt ?? ''
+  expect(asked).toContain('The agent lowered it from P1 to P3 and deferred it to KAN-9 #12. Its reason: only the typo is real')
+  expect(asked).toContain('This is a critical bug.')
+  expect(asked).toContain('is P3, with a follow-up issue, right?')
+  expect(w.gh.labelled).toEqual([])
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', lowering: 'agreed' })
+  // The peak, not the lowered severity, goes on the issue.
+  expect(labelled(w, 12, 'P1')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('(follow-up at KAN-9 #12, labelled severity:P1)')
+})
+
+test('R85: Codex disagreeing with a lowering leaves the deferral to the person, with its reason (Adam, 2026-10-20)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: '#12', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'the comment reports a real crash' }))
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('deferred')
+  expect(w.prompts.at(-1)).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  expect((await say($, 'status')).text).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  expect(w.gh.labelled).toEqual([])
+})
+
+test('R85: a finding whose advisory label is not at the start, lowered to P3, settles once Codex agrees (final review C1)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'The reset path deletes pending findings.\n\n**Optional:** add a test.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'a test later', followUp: ISSUE, replyId: '992' }]))
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(labelled(w, 9, 'P2')).toBe(true)
+})
+
+test('R85: a mixed comment guessed P3 from a "nit" in its middle, kept P3 and deferred to an issue, settles once labelled (Adam, 2026-10-20)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'tracked', followUp: ISSUE, replyId: '992' }]))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(labelled(w, 9, 'P3')).toBe(true)
+})
+
+test('R85: an issue the gate could not label holds the merge, and the next pass labels it (fail closed)', async ($, on) => {
+  const w = world(on)
+  w.gh.labelAnswer = 'fail'
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: '#12', replyId: '992' }]))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('Could not resolve to an issue')
+  expect(w.prompts.at(-1)).toContain('could not label issue #12 severity:P3 (GraphQL: Could not resolve to an issue')
+  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass')
+  w.gh.labelAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('ready')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toBeUndefined()
+  expect(labelled(w, 12, 'P3')).toBe(true)
+})
+
+test('R85: /pr-gate status names the follow-up of a settled deferral and its label', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}, labelled severity:P3`)
+})
+
+test('R86: the required set is known only when both sources are established (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  const cases: [World['gh']['rulesAnswer'], World['gh']['classicAnswer'], string[] | 'unknown'][] = [
+    ['ok', 'none', ['check']],
+    ['ok', 'ok', ['check', 'legacy']],
+    ['ok', 403, 'unknown'],
+    ['ok', 500, 'unknown'],
+    [403, 'none', 'unknown'],
+    [500, 'ok', 'unknown'],
+    ['throw', 'none', 'unknown'],
+    ['ok', 'throw', 'unknown'],
+    ['garbage', 'none', 'unknown'],
+    ['ok', 'garbage', 'unknown'],
+    // Only "Branch not protected" is classic's authoritative none: any other 404 is unknown (final review M3).
+    ['ok', 404, 'unknown'],
+    // A protected branch that requires no status checks is a none too (gate R4-1, R4-2).
+    ['ok', 'off', ['check']],
+    // A required-checks rule past a full first page still counts (gate R4-4).
+    ['paged', 'none', ['check']],
+  ]
+  w.gh.required = ['check']
+  for (const [i, [rules, classic, want]] of cases.entries()) {
+    w.gh.rulesAnswer = rules
+    w.gh.classicAnswer = classic
+    const got = await requiredChecksOf(w.engine, '/repo', 'me/repo', `base${i}`)
+    expect(got instanceof Set ? [...got] : 'unknown').toEqual(want)
+  }
+  // An unknown answer is not cached: once GitHub answers, the same base reads.
+  w.gh.classicAnswer = 'none'
+  w.gh.rulesAnswer = 500
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual({ unknown: 'gh api repos/me/repo/rules/branches/later: gh: HTTP 500' })
+  w.gh.rulesAnswer = 'ok'
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+  // A known answer is reused for a while, then read again: a check made required since counts (gate R1-4).
+  w.gh.required = ['check', 'lint']
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+  await w.clock.advance(6 * 60_000)
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'later')).toEqual(new Set(['check', 'lint']))
+  // A base with a slash is one encoded path segment (gate R5-1).
+  w.gh.rulesAnswer = 500
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'release/1.0')).toEqual({ unknown: 'gh api repos/me/repo/rules/branches/release%2F1.0: gh: HTTP 500' })
+  // Both encoded endpoints answer, and their union is the required set (gate R6-1).
+  w.gh.rulesAnswer = 'ok'
+  w.gh.classicAnswer = 'ok'
+  const before = w.gh.calls.length
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'release/1.0')).toEqual(new Set(['check', 'lint', 'legacy']))
+  expect(w.gh.calls.slice(before)).toEqual([
+    'api repos/me/repo/rules/branches/release%2F1.0?per_page=100',
+    'api repos/me/repo/branches/release%2F1.0/protection/required_status_checks',
+  ])
+})
+
+// ------------------------------------------------- task 7: the merge guard renders from the standing
+
+test('R86: waive post sets aside a cancelled check GitHub does not require, and names it; a running required check still holds', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.checks = [
+    { name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' },
+    { name: 'check', status: 'in_progress', conclusion: null },
+  ]
+  const said = await say($, 'waive post reviewed by hand')
+  expect(said.text).toContain('Set aside')
+  expect(said.text).toContain('Independent Claude review')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('check')
+  expect(held.deny ?? '').not.toContain('failing: Independent Claude review')
+  expect(held.deny ?? '').toContain('Set aside')
+  expect(held.deny ?? '').toContain('Independent Claude review')
+  w.gh.checks = [
+    { name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' },
+    { name: 'check', status: 'completed', conclusion: 'success' },
+  ]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R79: one merge refusal names every blocker: findings and CI', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  const held = await $.tool.call(merge)
+  const text = held.deny ?? ''
+  expect(text).toContain('G2-1')
+  expect(text).toContain('check check running')
+})
+
+test('R86: with the required checks unreadable, a waiver sets nothing aside', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.garbage = '<html>proxy error</html>'
+  w.gh.checks = [{ name: 'Independent Claude review', status: 'completed', conclusion: 'cancelled' }]
+  await say($, 'waive post reviewed by hand')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('Independent Claude review')
+})
+
+test('gate R1-3: a required check that never reported holds a waived merge until it passes', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.checks = []
+  await say($, 'waive post reviewed by hand')
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('required but not reported: check')
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R86, gate R2-2 option B: unreadable required checks make every reported check required, with no hold of their own', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = true
+  w.gh.required = ['check']
+  w.gh.classicAnswer = 403
+  await say($, 'waive post reviewed by hand')
+  // Passing or no checks: nothing holds (GitHub's ruleset still enforces required checks at merge).
+  for (const checks of [[{ name: 'check', status: 'completed', conclusion: 'success' }], []]) {
+    w.gh.checks = checks
+    expect(isHeld(await $.tool.call(merge))).toBe(false)
+  }
+  // A failing check the base may not require still holds: the waiver can't set it aside while the policy is unknown.
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }, { name: 'lint', status: 'completed', conclusion: 'failure' }]
+  const held = await $.tool.call(merge)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('lint')
+  // Once GitHub answers, the optional failure is set aside by the waiver.
+  w.gh.classicAnswer = 'none'
+  expect(isHeld(await $.tool.call(merge))).toBe(false)
+})
+
+test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const moved = 'f'.repeat(40)
+  w.gh.prHead = moved
+  w.git.head = moved
+  w.git.isAncestor = true
+  w.gh.reviews = covers(moved)
+  let waived = ''
+  let during = ''
+  // The waiver lands while triage awaits its fetch of the moved head (`fetch --quiet origin`, beginTriage's only fetch).
+  w.git.onFetch = async () => {
+    if (waived !== '') return
+    during = w.git.fetches.at(-1) ?? ''
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+  }
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  expect(during).toBe('fetch --quiet origin')
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  expect(w.spawned).toHaveLength(spawned)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+  expect(sent.some(one => one.includes('post-PR round'))).toBe(false)
+  // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
+  expect(sent).toHaveLength(1)
+  // The only message is the waive's own note (R81), sent once.
+  expect(sent.filter(one => one.includes('ready for the merge decision') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
+  expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
+})
+
+test('R80: after waive post, a resume says the waiver covers the head instead of sending the hold', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+})
+
+test('gate R3-4: a resume after the PR was retargeted under a post waiver reads the new base, and says the review was for the old one', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  w.gh.base = 'main'
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+  expect(sent.at(-1)).toContain('the PR now targets main')
+  expect(w.gh.calls.some(one => one.includes('rules/branches/main'))).toBe(true)
+})
+
+test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver names the new PR head, not the waiver', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  const moved = 'e'.repeat(40)
+  w.gh.prHead = moved
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const last = w.prompts.slice(prompts).at(-1) ?? ''
+  expect(last).toContain(`the PR head is now ${moved.slice(0, 7)}`)
+  expect(last).toContain('pull (or push), then run /pr-gate resume')
+  expect(last).not.toContain('Nothing else holds')
+})
+
+test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
+  const w = world(on)
+  w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  await toAwaiting($, w)
+  expect(w.prompts.at(-1)).toContain('check check running')
+})
+
+/** After `waive post`, a resume on the waived head dispatches nothing and sends the waiver's message (R80, PR #19 review). */
+const resumeAfterPostWaiver = async ($: Parameters<TestBody>[0], w: World, owed: 'answer' | 'recheck' | 'round', over?: Partial<Finding>) => {
+  // A finding's case needs a completed post-PR round, or the round owed would come first.
+  if (over === undefined) await toPost($, w)
+  else await toAwaiting($, w)
+  const rec = await recordOf(w)
+  const shaped = over === undefined ? rec : { ...rec, findings: [{ ...reopenedApproval(), history: [], ...over }] }
+  w.store.set(KEY, shaped)
+  // The work the waiver must stop: without it, resume would start triage (answer), a Codex recheck, or a review round.
+  const next = decideNext(shaped)
+  if (owed === 'round') expect(next.kind).toBe('round')
+  else expect(next.kind === 'blocked' ? (next[owed] ?? []) : []).toEqual(['G1-1'])
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.spawned).toHaveLength(spawned)
+  // A post-PR round collects before it spawns anything: no run may be left running either.
+  expect((await runOf(w)).status).not.toBe('running')
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('New review feedback') || one.includes('stopped short of ready') || one.includes('post-PR round'))).toBe(false)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+}
+
+test('R80: after waive post, resume starts no triage for an open P2 the agent can answer (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'answer', { status: 'open' })
+})
+
+test('R80: after waive post, resume starts no Codex recheck of a rebuttal (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'recheck', { status: 'rebutted' })
+})
+
+test('R80: after waive post, resume starts no review round owed on the waived head (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'round')
+})
+
+test('R80: after waive post, resume starts no round for a fix awaiting verification (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'round', { status: 'reported-fixed' })
+})
+
+/** Finding 29's window with a waiver landing while triage awaits its fetch of a moved PR head; `onWaived` runs right after it. */
+const waiveWhileTriageFetches = async ($: Parameters<TestBody>[0], w: World, onWaived: () => void = () => undefined) => {
+  w.git.roster = roster
+  await toPost($, w)
+  const before = { prompts: w.prompts.length, spawned: w.spawned.length }
+  const moved = 'f'.repeat(40)
+  w.gh.prHead = moved
+  w.git.head = moved
+  w.git.isAncestor = true
+  w.gh.reviews = covers(moved)
+  let waived = ''
+  w.git.onFetch = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+    onWaived()
+  }
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  return before
+}
+
+test('R80: a waiver landing while triage fetches new commits sends no triage for them (finding 29, real-git path)', async ($, on) => {
+  const w = world(on)
+  // Real git: the log of the moved head lists its commits, so triage would ask the agent to check them.
+  w.git.newCommits = 'fffffff someone a push after the round started'
+  const { prompts, spawned } = await waiveWhileTriageFetches($, w)
+  expect(w.spawned).toHaveLength(spawned)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('New review feedback') || one.includes('check the new commits') || one.includes('fffffff someone'))).toBe(false)
+  expect((await runOf(w)).steps.some(one => one.id.endsWith('-triage'))).toBe(false)
+})
+
+test('R80: a fetch that fails after a mid-round waiver records no attempt and sends no stop', async ($, on) => {
+  const w = world(on)
+  const { prompts } = await waiveWhileTriageFetches($, w, () => {
+    w.git.fetchFails = 2
+  })
+  expect(w.prompts.slice(prompts).some(one => one.includes('stopped'))).toBe(false)
+  expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
+})
+
+test('R80: allow after a mid-round waiver reads the PR head, so the waived head gets no round', async ($, on) => {
+  const w = world(on)
+  await waiveWhileTriageFetches($, w)
+  // The late round recorded nothing: the record's head is still the one before the push.
+  expect((await recordOf(w)).head).not.toBe('f'.repeat(40))
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await say($, 'allow 1 one more look')
+  await w.clock.advance(1000)
+  expect(w.spawned).toHaveLength(spawned)
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.prompts.slice(prompts).at(-1)).toContain("the person's post waiver covers PR #1 at fffffff")
+})
+
+test('R81: waive post tells the agent what it covers and what still holds', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('pr-gate: the person waived post-PR review of PR #1')
+  expect(said).toContain('Nothing else holds the merge')
+  expect(said).toContain("the merge decision, which is the person's")
+})
+
+test('R81: waive post sends the agent one message, not a note and a second waiver message', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(5000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+})
+
+test('R81: the person\'s stop tells the agent to stop waiting; an agent\'s stop says nothing', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const prompts = w.prompts.length
+  await say($, 'stop', { ...asPerson, origin: { kind: 'sdk' } })
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const before = w.prompts.length
+  await say($, 'stop')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(before + 1)
+  expect(w.prompts.at(-1)).toContain('the person stopped the gate')
+  expect(w.prompts.at(-1)).toContain('stop waiting on it')
+})
+
+test('R81: an allow that leads to a prompt sends one message, the action line first', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'allow 2 more review')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+  expect(w.prompts.at(-1)?.startsWith('pr-gate: the person allowed 2 more rounds')).toBe(true)
+})
+
+test('R81: waiving a finding tells the agent what still holds; a refused waiver sends nothing', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'waive G9-9 because')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts + 1)
+  expect(w.prompts.at(-1)?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
+})
+
+test('R81: waive pre tells the agent to open the PR even with openPr off', { options: { openPr: false } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await say($, 'waive pre hotfix for the outage')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the person waived the pre-PR review')
+  expect(w.prompts.at(-1)).toContain('open the pull request')
+})
+
+test('R81: reset tells the agent the lifecycle was archived', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the person reset the lifecycle of feat/x')
+})
+
+test('R81: a reset before the flush drops the earlier command\'s open-PR prompt and keeps its own note (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const prompts = w.prompts.length
+  await say($, 'waive pre hotfix for the outage')
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('the person waived the pre-PR review'))).toBe(false)
+  expect(sent.at(-1)).toContain('the person reset the lifecycle')
+})
+
+test('R81: waiving a finding after a push no round recorded sends one message', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.head = 'e'.repeat(40)
+  w.gh.reviews = []
+  await w.clock.advance(30_000)
+  const prompts = w.prompts.length
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived G2-1'))).toHaveLength(1)
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
+  // The live head is not the reviewed one: nothing says ready, and the note names the push (final review I1).
+  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  expect(sent[0]).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
+  expect(sent[0]).toContain('/pr-gate resume reviews it')
+})
+
+test('a PR head read that throws does not fail the controller: the record\'s head decides (final review T8)', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  // A waiver for a head the record never reached makes the controller read GitHub's head.
+  w.gh.prHead = 'e'.repeat(40)
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  w.gh.isHeadReadBroken = true
+  const calls = w.gh.calls.length
+  const said = await say($, 'resume')
+  expect(w.gh.calls.slice(calls)).toContain('pr view 1 --json headRefOid,baseRefName')
+  expect(said.text).not.toContain('gh broke')
+  expect((await recordOf(w)).waivers.some(one => one.scope === 'post')).toBe(true)
+})
+
+test('M1: a post waiver given while the standing is gathered is not followed by a hold (final review)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isWaiving = false
+  w.gh.onChecks = async () => {
+    if (isWaiving) return
+    isWaiving = true
+    await say($, 'waive post reviewed by hand')
+  }
+  const prompts = w.prompts.length
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  await w.clock.advance(1000)
+  expect(isWaiving).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+})
+
+for (const action of ['reset'] as const) {
+  test(`gate G7-3: a ${action} run while the standing is gathered is not followed by the old hold`, async ($, on) => {
+    const w = world(on)
+    await toTriage($, w, 'Consider renaming this')
+    w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+    let isActing = false
+    w.gh.onChecks = async () => {
+      if (isActing) return
+      isActing = true
+      await say($, action)
+    }
+    const prompts = w.prompts.length
+    await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+    await w.clock.advance(1000)
+    expect(isActing).toBe(true)
+    const sent = w.prompts.slice(prompts)
+    expect(sent.some(one => one.startsWith(`pr-gate: the person ${action}`))).toBe(true)
+    expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+    expect(sent.some(one => one.includes('G2-1') && one.includes('waive'))).toBe(false)
+  })
+}
+
+test('gate G7-3: a reset while waive post gathers the standing is not followed by the waiver note', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isResetting = false
+  w.gh.onChecks = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.startsWith('pr-gate: the person reset'))).toBe(true)
+  expect(sent.some(one => one.startsWith('pr-gate: the person waived'))).toBe(false)
+})
+
+test('gate G7-7: a reset and a fresh start while waive post gathers the standing are not followed by the old waiver note', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isRestarting = false
+  w.gh.onChecks = async () => {
+    if (isRestarting) return
+    isRestarting = true
+    await say($, 'reset')
+    await say($, '')
+  }
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  expect(isRestarting).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  // The new lifecycle reports for itself; the old waiver's note, which the new record no longer carries, is not sent.
+  expect(sent.some(one => one.includes('waived post-PR review'))).toBe(false)
+  expect(sent.some(one => one.includes('Nothing else holds the merge') || one.includes('nothing else holds the merge'))).toBe(false)
+  expect((await recordOf(w)).waivers).toEqual([])
+  expect((await recordOf(w)).generation).toBe(1)
+})
+
+test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  expect(w.prompts).toHaveLength(prompts)
+})
+
+test('R81: waive post with no PR from gh says the standing is unknown, not ready', async ($, on) => {
+  const w = world(on)
+  await toPost($, w)
+  w.gh.hasPr = false
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent).toHaveLength(1)
+  expect(sent[0]).toContain('what else holds the merge is unknown')
+  expect(sent[0]).not.toContain('PR #?')
+  expect(sent[0]).not.toContain('ready for the merge decision')
+})
+
+test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
+  world(on)
+  const chained = { tool: 'Bash' as const, command: `cat > /tmp/body.md <<'EOF'\nSummary\nEOF\n${createPr.command} --body-file /tmp/body.md` }
+  const held = await $.tool.call(chained)
+  expect(isHeld(held)).toBe(true)
+  expect(held.deny ?? '').toContain('Nothing in this Bash command ran')
+  expect(held.deny ?? '').toContain('Write tool')
+  const lone = await $.tool.call(createPr)
+  expect(isHeld(lone)).toBe(true)
+  expect(lone.deny ?? '').not.toContain('Nothing in this Bash command ran')
+  const chainedMerge = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash && git checkout dev' })
+  expect(isHeld(chainedMerge)).toBe(true)
+  expect(chainedMerge.deny ?? '').toContain('Nothing in this Bash command ran')
 })

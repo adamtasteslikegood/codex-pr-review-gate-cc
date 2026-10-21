@@ -2,14 +2,20 @@
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
 import {
+  holdText,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
+  isLoweringOwed,
   isReverifyOwed,
+  isSettledDeferral,
+  loweringOf,
   mergeHolds,
+  peakOf,
   raisedIn,
   rejections,
   securityHolds,
+  titleOf,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -17,7 +23,7 @@ import {
 } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, Next, TriageClass } from './lifecycle'
-import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
+import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Standing, Tier } from '../types'
 
 export const TRAILER = 'PR_GATE_RESULT'
 
@@ -202,18 +208,19 @@ export function readTriage(answer: string): TriageAnswer[] {
     const row = one as Record<string, unknown>
     const id = text(row.id)
     const action = String(row.action ?? '').toLowerCase()
-    if (id === undefined || (action !== 'fixed' && action !== 'rebutted' && action !== 'deferred')) continue
+    if (id === undefined || !['fixed', 'rebutted', 'deferred', 'acknowledged'].includes(action)) continue
     const severity = String(row.severity ?? '').toUpperCase() as Severity
     const given =
       typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
     const replyId = given === undefined ? undefined : replyIdOf(given)
     out.push({
       id,
-      action,
+      action: action as Answer['action'],
       ...(text(row.note) === undefined ? {} : { note: text(row.note)?.slice(0, 2000) }),
       ...(text(row.evidence) === undefined ? {} : { evidence: text(row.evidence)?.slice(0, 2000) }),
       ...(SEVERITIES.includes(severity) ? { severity } : {}),
       ...(typeof row.isSecurity === 'boolean' ? { isSecurity: row.isSecurity } : {}),
+      ...(text(row.followUp) === undefined ? {} : { followUp: text(row.followUp)?.slice(0, 500) }),
       ...(replyId === undefined ? {} : { replyId }),
       ...(text(row.duplicateOf) === undefined ? {} : { duplicateOf: text(row.duplicateOf) }),
     })
@@ -221,8 +228,8 @@ export function readTriage(answer: string): TriageAnswer[] {
   return out
 }
 
-/** What the fixer said it did with each finding. */
-export const readDispositions = (answer: string): Answer[] => readTriage(answer)
+/** What the fixer said it did with each finding; "acknowledged" is a post-PR triage answer only (R82). */
+export const readDispositions = (answer: string): Answer[] => readTriage(answer).filter(one => one.action !== 'acknowledged')
 
 /** The fix reviewer's verdict. An unreadable one confirms nothing: the fixes stay unverified, still owed a check. */
 export function readVerify(answer: string): { isOk: boolean; isRead: boolean; notes?: string } {
@@ -385,9 +392,6 @@ const noted = (text: string): string => {
   const at = text.indexOf('\n')
   return at < 0 ? `${text}\n${REVIEWER_DATA}` : `${text.slice(0, at)}\n${REVIEWER_DATA}${text.slice(at)}`
 }
-
-/** A finding's name in a prompt: a reviewer's comment is named by who wrote it, since its title is the reviewer's own first line. */
-const titleOf = (one: Finding): string => (one.source === 'github' ? `comment from ${one.reviewer}` : one.title)
 
 const listFindings = (findings: readonly Finding[]): string =>
   findings
@@ -567,8 +571,15 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
     // The same check re-verifies a verified fix whose file changed since (R58), and verifies a fix only reported (R72).
     const fixes = rebuttals.filter(isReverifyOwed)
     const reported = rebuttals.filter(one => one.status === 'reported-fixed')
-    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed')
-    const what = argued.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
+    // A deferral whose severity the agent lowered (R85, Adam 2026-10-20): Codex rules on the lowering, not on a fix.
+    const lowered = rebuttals.filter(isLoweringOwed)
+    const argued = rebuttals.filter(one => !isReverifyOwed(one) && one.status !== 'reported-fixed' && !isLoweringOwed(one))
+    const what = argued.length + lowered.length === 0 ? 'fixes' : fixes.length + reported.length === 0 ? 'rebuttals' : 'rebuttals and fixes'
+    const lowerings = lowered.map(one => {
+      const low = loweringOf(one)
+      const reason = low?.note ?? one.note ?? 'no reason given'
+      return `${listFindings([one])}\n    The agent lowered it from ${low?.from ?? '?'} to ${low?.to ?? one.severity} and deferred it to ${one.followUp ?? 'no issue'}. Its reason: ${reason}`
+    })
     return noted([
       `You check ${what} for pr-gate's post-PR review. Round ${run.round}.`,
       where(run),
@@ -585,6 +596,14 @@ export function verifyPrompt(run: Run, fromSha: string, rebuttals?: readonly Fin
       ...(fixes.length === 0
         ? []
         : ['', 'These findings were verified fixed, but their file changed since. A fix settles nothing until you re-verify it at HEAD:', listFindings(fixes)]),
+      ...(lowered.length === 0
+        ? []
+        : [
+            '',
+            "The main agent lowered these findings' severity and deferred each to a follow-up GitHub issue. A lowered deferral settles nothing until you agree with the lowering:",
+            ...lowerings,
+            '   For each one: given the reviewer\'s comment and the code at HEAD, is P3, with a follow-up issue, right? holds is true when Codex agrees with the lowering.',
+          ]),
       '',
       // Codex is the judge (R69): the sub-agent puts the findings to it and reports its verdicts, never its own.
       `1. Invoke the Skill tool with skill "codex" and args "consult ${codexArgs(run).flags}", and follow that skill's instructions exactly as written: ` +
@@ -684,7 +703,9 @@ export function triagePrompt(
     '',
     'What to do:',
     '1. Invoke the superpowers:receiving-code-review skill first, if it is available. Verify every claim against the current code before changing anything.',
-    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, or defer it with the reason. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    '2. Give each item one answer: fix it (smallest change, with a test where one fits), rebut it with file:line, test or requirement evidence, defer it with the reason, or acknowledge it when the comment asks for no change (an approval with notes, a status note): reply in its thread saying so, and Codex confirms it. A duplicate gets a reply pointing to the earlier answer, not a new argument.',
+    '   A deferral waits for the person, except a P3, not security, deferred with followUp naming the GitHub issue that tracks it (#<n>, owner/repo#<n> or its URL; a ticket key may sit beside it): that needs no waiver. ' +
+      'If you lowered its severity, Codex checks the lowering first. The gate labels the issue with the highest severity the finding had.',
     ...(items.some(one => one.cls === 'new-on-reviewed') ? ['   An earlier review is not a reason to rebut a new claim: answer it on its merits.'] : []),
     "3. Give each item a severity (P0–P3), keeping the reviewer's own where it gave one, and say whether it is a security issue.",
     `4. Reply where the feedback was given: an inline comment in its thread (gh api repos/${rec.slug}/pulls/${rec.pr}/comments/<threadId>/replies ` +
@@ -696,7 +717,7 @@ export function triagePrompt(
     '',
     trailerRule(
       stepOf(run, 'triage'),
-      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one"}]}',
+      '{"dispositions":[{"id":"G1-1","action":"fixed|rebutted|deferred|acknowledged","severity":"P1","isSecurity":false,"note":"what changed, or the evidence","replyId":"123","duplicateOf":"R1-1 when it is one","followUp":"#<n>, owner/repo#<n> or the issue URL, for a P3 deferral"}]}',
     ),
     '',
     'Then end your turn. /pr-gate collects the next reviews by itself.',
@@ -756,7 +777,9 @@ export function readyPrompt(rec: LifecycleRecord): string {
   const summary = [
     `${pre} pre-PR and ${post} post-PR round${pre + post === 1 ? '' : 's'}`,
     `${rec.findings.length} finding${rec.findings.length === 1 ? '' : 's'} (${count('verified-fixed')} verified fixed, ${count('rebutted')} rebutted, ${count('deferred')} deferred, ${count('open') + count('reported-fixed')} open)`,
-    deferred.length === 0 ? 'no deferrals' : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}`).join('; ')}`,
+    deferred.length === 0
+      ? 'no deferrals'
+      : `deferred: ${deferred.map(one => `${one.id} ${titleOf(one)}${isSettledDeferral(one) ? ` (follow-up at ${one.followUp}, labelled severity:${peakOf(one)})` : ''}`).join('; ')}`,
   ].join('; ')
   return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask.`
 }
@@ -778,16 +801,24 @@ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRoun
   return `Their options: ${options.slice(0, -1).join(', ')}${options.length > 1 ? ', and ' : ''}${options.at(-1)}.`
 }
 
+/** The ids a prompt already names: the findings it lists, and the head's review when the prompt's reason is that blocker's own words. */
+const namedIn = (listed: readonly Finding[], reason: string, standing: Standing): Set<string> =>
+  new Set([...listed.map(one => one.id), ...standing.blockers.filter(one => one.id === 'head' && one.said === reason).map(() => 'head')])
+
 /**
  * Post-PR review stopped short of ready: why, what holds the merge, and the agent's next step. The person is named, with their
  * options, only where the decision is theirs: awaiting-decision, exhaustion, a deferred security P1. An answerable block gives
- * the agent's step alone.
+ * the agent's step alone. `standing`, when gathered, adds what else holds the merge, CI included (R79).
  */
-export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: 'round' | 'open-pr' | 'ready' }>): string {
+export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: 'round' | 'open-pr' | 'ready' }>, standing?: Standing): string {
   // Every finding that holds the merge, at any severity (R39): the same list the merge guard names.
   const holding = mergeHolds(rec)
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
   if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
+  if (standing !== undefined) {
+    const rest = holdText(standing, namedIn(holding, next.why, standing))
+    if (rest !== '') lines.push('', rest)
+  }
   lines.push('', `Your next step: ${next.nextStep}.`)
   if (next.kind === 'awaiting-decision') {
     // The person decides (R42): nothing for the agent to change, only to say and stop.
@@ -843,14 +874,19 @@ export function prePerson(rec: LifecycleRecord): string | undefined {
 
 /**
  * The gate holds the pull request (pre-PR) or its merge (post-PR): why, what holds it and the agent's next step. Before the PR the
- * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46).
+ * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46). After it,
+ * `standing`, when gathered, adds what else holds the merge, CI included (R79).
  */
-export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string): string {
+export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string, standing?: Standing): string {
   if (rec.phase !== 'pre') {
     // After the PR opened: the merge is what is held, by every finding the merge guard names (R39, R46).
     const holds = mergeHolds(rec)
     const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
     if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds))
+    if (standing !== undefined) {
+      const rest = holdText(standing, namedIn(holds, why, standing))
+      if (rest !== '') post.push('', rest)
+    }
     post.push('', `Your next step: ${nextStep}.`)
     // The person is named only for a decision of theirs, as in reportPrompt (R42): a check that could not run is the agent's to rerun.
     const isAwaiting = rec.postStatus === 'awaiting-decision'

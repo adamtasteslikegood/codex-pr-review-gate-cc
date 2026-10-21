@@ -104,7 +104,7 @@ export const readReviews = (text: string): Feedback[] =>
       url: str(row.html_url),
       state: str(row.state),
       at: when(row.submitted_at),
-      isFinding: body.trim() !== '' || row.state === 'CHANGES_REQUESTED',
+      isFinding: row.state === 'CHANGES_REQUESTED' || (body.trim() !== '' && !isNoAction(str(row.state), body)),
       association: associationOf(row),
     }
   })
@@ -204,15 +204,49 @@ const postsFor = (login: string, name: string): boolean => {
 
 const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
 
-/** The reviewer's own severity, when it gave one; the main agent can still change it. */
-export function severityHint(body: string): { severity: Severity; isSecurity: boolean } {
+/**
+ * A reviewer's own advisory label at the start of the body (after a heading mark or list marker), never inside a sentence. Only the
+ * start counts (final review C1): "Nit:" on a later line labels that line, not the finding above it, so it tags nothing.
+ */
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|\n|$)/i
+
+/** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
+export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
   const isSecurity = SECURITY.test(body)
-  const tagged = body.match(/\bP([0-3])\b/)?.[1]
-  if (tagged !== undefined) return { severity: `P${tagged}` as Severity, isSecurity }
-  if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity }
+  // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
+  const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
+  if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+  if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
-  if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity }
-  return { severity: isSecurity ? 'P1' : 'P2', isSecurity }
+  if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
+  return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
+}
+
+/** Whole sentences that settle a review (R83). */
+const SCOPE = '(?: (?:in|for) this (?:[\\w/-]+ ){0,2}(?:diff|pr|pull request|changes?|commit|patch|update|revision))?'
+const SETTLES = [
+  new RegExp(`^no (?:actionable|blocking) (?:findings|issues|comments)${SCOPE}$`, 'i'),
+  /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
+]
+/** Whole sentences that may sit beside them and change nothing. */
+const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
+
+/**
+ * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
+ * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
+ * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
+ */
+export function isNoAction(state: string | undefined, body: string): boolean {
+  if (state !== 'APPROVED' && state !== 'COMMENTED') return false
+  const sentences = body
+    .split(/[.!?;]+|\n+/)
+    .map(one => one.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(one => one !== '')
+  if (sentences.length === 0) return true
+  const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
+  if (!sentences.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
+  return state === 'APPROVED' || sentences.some(settles)
 }
 
 export type CollectInput = {
@@ -529,6 +563,21 @@ function readBash(command: string): PrAction | undefined {
   return found.find((one) => one.action === 'merge') ?? found[0]
 }
 
+/**
+ * Whether a Bash command does more than its PR action (R87). A hook allows or refuses the whole command, so a held `gh pr create`
+ * also stops the file write or push chained with it. Quoted text, `$(…)` and heredoc bodies belong to their step; a bare `cd` is no step.
+ */
+export function hasOtherSteps(command: string): boolean {
+  const bare = dropHeredocs(command.replace(/\\\r?\n/g, ' '))
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, 'Q')
+    .replace(/\$\([^()]*\)/g, 'S')
+  const steps = bare
+    .split(/;|&&|\|\||\||\n/)
+    .map(one => one.trim())
+    .filter(one => one !== '' && !/^cd\s+\S+$/.test(one))
+  return steps.length > 1
+}
+
 // ------------------------------------------------------------------- MCP
 
 const GRAPHQL_MCP = 'mcp__claude_ai_github-graphql-mcp__manage_pull_requests'
@@ -663,4 +712,58 @@ export function readPrAction(tool: string, input: Record<string, unknown>): PrAc
   if (known !== undefined) return known
   if (!tool.startsWith('mcp__') || !/github/i.test(tool)) return undefined
   return readUnknownTool(tool, input, repo)
+}
+
+/**
+ * The checks a base requires (R86): each `required_status_checks` rule of `gh api repos/<slug>/rules/branches/<base>`, plus classic
+ * protection's `contexts` and `checks[].context` when given. undefined when either payload can't be parsed: every check then counts as required.
+ */
+export function readRequired(rules: string, protection: string | undefined): string[] | undefined {
+  let listed: unknown
+  try {
+    listed = JSON.parse(rules)
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(listed)) return undefined
+  const out: string[] = []
+  for (const rule of listed) {
+    // Every rule GitHub lists names its type: a row that is not an object, or has no type, is malformed (gate R1-7).
+    if (typeof rule !== 'object' || rule === null || typeof (rule as { type?: unknown }).type !== 'string') return undefined
+    const row = rule as Record<string, unknown>
+    if (row.type !== 'required_status_checks') continue
+    // A required-checks rule without its list, or with an entry that names no check, is a malformed payload, not an empty policy (gate R1-7).
+    const params = (typeof row.parameters === 'object' && row.parameters !== null ? row.parameters : {}) as { required_status_checks?: unknown }
+    if (!Array.isArray(params.required_status_checks)) return undefined
+    for (const one of params.required_status_checks as unknown[]) {
+      const context = typeof one === 'object' && one !== null ? (one as { context?: unknown }).context : undefined
+      if (typeof context !== 'string') return undefined
+      out.push(context)
+    }
+  }
+  if (protection !== undefined) {
+    let read: unknown
+    try {
+      read = JSON.parse(protection)
+    } catch {
+      // Rulesets and classic protection apply together: half a set is not the set (PR #19 review).
+      return undefined
+    }
+    // Classic protection always lists contexts and checks: a body with neither (an error message) is not the set (gate R1-7).
+    const body = (typeof read === 'object' && read !== null ? read : {}) as { contexts?: unknown; checks?: unknown }
+    if (!Array.isArray(body.contexts) && !Array.isArray(body.checks)) return undefined
+    // A field that is there but not a list is malformed too, even beside a valid one (gate R1-7, R5-4).
+    if ((body.contexts !== undefined && !Array.isArray(body.contexts)) || (body.checks !== undefined && !Array.isArray(body.checks))) return undefined
+    // An entry that names no check is malformed, as in a ruleset (gate R5-4).
+    for (const one of Array.isArray(body.contexts) ? (body.contexts as unknown[]) : []) {
+      if (typeof one !== 'string') return undefined
+      out.push(one)
+    }
+    for (const one of Array.isArray(body.checks) ? (body.checks as unknown[]) : []) {
+      const context = typeof one === 'object' && one !== null ? (one as { context?: unknown }).context : undefined
+      if (typeof context !== 'string') return undefined
+      out.push(context)
+    }
+  }
+  return [...new Set(out)]
 }

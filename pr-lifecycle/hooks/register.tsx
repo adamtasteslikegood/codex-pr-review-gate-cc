@@ -9,16 +9,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Effort, Finding, LifecycleRecord, Run } from '../types'
+import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
 import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
-import { readPrAction } from './github'
+import { hasOtherSteps, readPrAction } from './github'
 import type { PrAction } from './github'
 import {
   allowanceFor,
   isAcceptedRebuttal,
   isDisputed,
   lastReviewedHead,
+  holdText,
   isReverifyOwed,
+  isSettledDeferral,
+  loweringRefusal,
+  peakOf,
   mergeHolds,
   reverifyOwed,
   newRecord,
@@ -39,8 +43,10 @@ import {
   configFor,
   configOf,
   defaultEffort,
+  dropQueued,
   fetchTwice,
   finish,
+  gatherStanding,
   getRun,
   git,
   hasSecurityBlocker,
@@ -50,6 +56,7 @@ import {
   ignoredNote,
   isLiveNow,
   isOwnedElsewhere,
+  isStillCurrent,
   isTurnOf,
   markPr,
   onAnswer,
@@ -62,6 +69,7 @@ import {
   setSession,
   setup,
   startTicker,
+  tellAgent,
   untriagedFeedback,
 } from './round'
 import type { Config } from './round'
@@ -297,7 +305,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         : {
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
             // After a reset: feedback already processed and replied to stays answered (R47).
-            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies }),
+            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, generation: prior.generation }),
             effort,
             ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
           }
@@ -572,6 +580,17 @@ function asHold(text: string): string {
   return text.startsWith('pr-gate: ') ? `pr-gate HOLD (not an error): ${text.slice('pr-gate: '.length)}` : `pr-gate HOLD (not an error): ${text}`
 }
 
+/** The line a hold on a chained Bash command ends with (R87): nothing in it ran, so the agent redoes the other steps on their own. */
+const CHAINED =
+  '\nNothing in this Bash command ran: a hold refuses the whole command, so the steps chained with the PR command did not run either. ' +
+  'Run those on their own (write a PR body file with the Write tool), and keep the PR command in a Bash call by itself.'
+
+/** What a refusal adds for this call: the R87 line when it is a Bash command with other steps. */
+const chainedOf = (tool: string, e: unknown): string => {
+  const command = (e as Record<string, unknown>).command
+  return tool === 'Bash' && typeof command === 'string' && hasOtherSteps(command) ? CHAINED : ''
+}
+
 /** What still stands between a record and ready, in a few words. */
 const HOLD: Record<string, string> = {
   open: 'unresolved',
@@ -596,47 +615,39 @@ const owedOf = (rec: LifecycleRecord): string => {
   return 'review in progress'
 }
 
-/**
- * The CI hold on a merge the review lets through (R1-9): the PR head's checks, from `gh pr checks`. A failing, cancelled or running
- * check holds it, and so do checks gh cannot read (fail closed); none at all, or every one passed or skipped, lets it merge. This hold is
- * the agent's to clear, never the person's: no waiver releases it.
- */
 type MergedPr = { number: number; baseRefName: string; headRefOid: string }
 
-const ciHold = async ($: Engine, root: string, action: PrAction, pr: MergedPr): Promise<string | undefined> => {
+/**
+ * The CI hold on a merge the review lets through (R1-9, narrowed by R86): the standing's CI blockers. A required check that fails, is
+ * cancelled or runs holds it, and so do checks gh can't read; under a post waiver a check GitHub does not require is set aside, named.
+ */
+const ciHold = (action: PrAction, pr: MergedPr, standing: Standing): string | undefined => {
+  const ci = standing.blockers.filter(one => one.kind.startsWith('ci-'))
+  if (ci.length === 0) return undefined
   const head = `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held`
-  let ran: { exitCode: number; stdout: string; stderr: string }
-  try {
-    ran = await $.process.run(
-      ['gh', 'pr', 'checks', String(pr.number), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'name,state,bucket'],
-      { cwd: root, timeoutMs: 30_000 },
-    )
-  } catch (error) {
-    ran = { exitCode: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }
-  }
-  let checks: { name: string; bucket: string }[] | undefined
-  try {
-    const read = JSON.parse(ran.stdout) as unknown
-    const row = (one: unknown): Record<string, unknown> => (typeof one === 'object' && one !== null ? (one as Record<string, unknown>) : {})
-    checks = Array.isArray(read) ? read.map(one => ({ name: String(row(one).name ?? '?'), bucket: String(row(one).bucket ?? '') })) : undefined
-  } catch {
-    checks = undefined
-  }
-  // gh reports a PR without checks as an error: nothing to wait for.
-  if (checks === undefined && /no checks reported/i.test(ran.stderr)) return undefined
-  if (checks === undefined) {
-    const said = ran.stderr.trim().slice(0, 200) || `gh pr checks exited ${ran.exitCode}`
+  const short = pr.headRefOid.slice(0, 7)
+  const failing = ci.filter(one => one.kind === 'ci-failing').map(one => one.id ?? '?')
+  // A required check that never reported (gate R1-3) is held like a running one, and named as what it is.
+  const isMissing = (one: Standing['blockers'][number]): boolean => one.said.endsWith('has not reported')
+  const running = ci.filter(one => one.kind === 'ci-running' && !isMissing(one)).map(one => one.id ?? '?')
+  const missing = ci.filter(one => one.kind === 'ci-running' && isMissing(one)).map(one => one.id ?? '?')
+  const said = [
+    ...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]),
+    ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`]),
+    ...(missing.length === 0 ? [] : [`required but not reported: ${missing.join(', ')}`]),
+  ]
+  const unreadable = ci.find(one => one.kind === 'ci-unreadable')
+  if (unreadable !== undefined) {
+    // Checks read while the base's required ones could not be are named too (gate R3-1): each holds as required.
     return [
-      `${head}: the CI checks on ${pr.headRefOid.slice(0, 7)} could not be read (${said}), and a merge waits until they can.`,
+      `${head}: the CI checks on ${short} could not be read${unreadable.detail === undefined ? '' : ` (${unreadable.detail})`}, and a merge waits until they can.`,
+      ...(said.length === 0 ? [] : [`CI on ${short} is not green either (${said.join('; ')}).`]),
       'Do not merge another way. Check gh auth status and the network, then try the merge again.',
-    ].join('\n')
+    ].join('\n') + unknownNote(action)
   }
-  const failing = checks.filter(one => one.bucket === 'fail' || one.bucket === 'cancel').map(one => one.name)
-  const running = checks.filter(one => one.bucket === 'pending' || !['pass', 'skipping', 'fail', 'cancel'].includes(one.bucket)).map(one => one.name)
-  if (failing.length === 0 && running.length === 0) return undefined
-  const said = [...(failing.length === 0 ? [] : [`failing: ${failing.join(', ')}`]), ...(running.length === 0 ? [] : [`still running: ${running.join(', ')}`])]
   return [
-    `${head}: CI on ${pr.headRefOid.slice(0, 7)} is not green (${said.join('; ')}).`,
+    `${head}: CI on ${short} is not green (${said.join('; ')}).`,
+    ...(standing.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${standing.setAside.join(', ')}.`]),
     'Do not merge another way.',
     ...(failing.length === 0
       ? []
@@ -644,6 +655,9 @@ const ciHold = async ($: Engine, root: string, action: PrAction, pr: MergedPr): 
     ...(running.length === 0
       ? []
       : [`${failing.length === 0 ? 'Your next step: wait' : 'Wait'} for the running checks (gh pr checks ${pr.number} --watch), then try the merge again.`]),
+    ...(missing.length === 0
+      ? []
+      : ['A check the base requires has not reported on this head: wait for it to start, or find why its workflow does not run here, then try the merge again.']),
   ].join('\n') + unknownNote(action)
 }
 
@@ -702,8 +716,9 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
   // not applied; gate R2-3, R4-1).
   const isOnBase = rec !== undefined && rec.base === pr.baseRefName
   const isWaived = isOnBase && rec?.waivers.some(one => one.scope === 'post' && one.head === pr.headRefOid) === true
-  // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a red check.
-  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return ciHold($, root, action, pr)
+  const standing = rec === undefined ? undefined : await gatherStanding($, rec, pr, action.repo)
+  // Whichever lets it through, CI on the head must be green too (R1-9); a waiver does not release a required check (R86).
+  if (isWaived && rec !== undefined && securityHolds(rec).length === 0) return standing === undefined ? undefined : ciHold(action, pr, standing)
   // The same predicate as the controller's ready (R39): ready for this head, and nothing holds the merge.
   if (rec !== undefined && rec.phase === 'ready' && isOnBase && rec.head === pr.headRefOid && mergeHolds(rec).length === 0) {
     // A trusted reviewer is never waited for (R76): what it posted after ready is triaged before the merge, never merged past.
@@ -723,7 +738,7 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
         `Your next step: run /${COMMAND} resume, which triages ${late.length === 1 ? 'it' : 'them'} on this head and uses no review round. Then try the merge again.`,
       ].join('\n')
     }
-    return ciHold($, root, action, pr)
+    return standing === undefined ? undefined : ciHold(action, pr, standing)
   }
   const short = pr.headRefOid.slice(0, 7)
   const missing =
@@ -755,11 +770,16 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
           ? `This needs the person's decision: tell them why. They can type /${COMMAND} waive post <reason> to let this head merge, ` +
             `or /${COMMAND} allow 1 <reason> for one more review round.`
           : `Your next step: check out ${pr.headRefName} and run /${COMMAND} resume, which reviews ${short} and says when the PR is ready to merge.`
+  const isPushedAfter = rec !== undefined && isOnBase && rec.phase === 'ready' && rec.head !== pr.headRefOid
+  // The pushed-after reason is the standing's head blocker in the same words: given once (final review I1).
+  const named = new Set([...(missing.match(/\b[RG]\d+-\d+\b/g) ?? []), ...(isPushedAfter ? ['head'] : [])])
+  const rest = standing === undefined ? '' : holdText(standing, named)
   return (
     [
       `pr-gate: ${action.via} (merge PR #${pr.number} into ${pr.baseRefName}) is held: the lifecycle review is not complete for ${short}: ${missing}.`,
       'Do not merge another way.',
       next,
+      ...(rest === '' ? [] : ['', rest]),
     ].join('\n') + unknownNote(action)
   )
 }
@@ -798,10 +818,15 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
+  const settled = rec.findings
+    .filter(isSettledDeferral)
+    .map(one => ` ${one.id} deferred, follow-up at ${one.followUp}, labelled severity:${peakOf(one)}.`)
+    .concat(rec.findings.flatMap(one => (loweringRefusal(one) === undefined || one.status !== 'deferred' ? [] : [` ${loweringRefusal(one) ?? ''}.`])))
+    .join('')
   return (
     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
     `${usedRounds(rec)}/${rec.allowance + granted} rounds used, baseline ${baseline}/2, ${unresolvedBlockers(rec).length} blocking open, ` +
-    `${verificationOwed(rec).length} owed, ${mergeHolds(rec).length} holding the merge.${rec.message === undefined ? '' : ` ${rec.message}.`}${live}${pane}`
+    `${verificationOwed(rec).length} owed, ${mergeHolds(rec).length} holding the merge.${settled}${rec.message === undefined ? '' : ` ${rec.message}.`}${live}${pane}`
   )
 }
 
@@ -834,13 +859,16 @@ async function logText($: Engine): Promise<string> {
 }
 
 /** The person's commands that change a lifecycle, for its run log. */
+/** Whether a command came from the person: the composer, the bridge or the pane. */
+const isPerson = (origin: string): boolean => origin === 'composer' || origin === 'bridge' || origin === 'pane'
+
 const LOGGED = ['resume', 'stop', 'waive', 'allow', 'reset']
 
 /** Logs a person's command and the first line of its reply on the branch's record (`/pr-gate log`). */
 async function logCommand($: Engine, args: string, reply: string, origin: string): Promise<void> {
   const verb = args.trim().split(/\s+/)[0] ?? ''
   // Only the person's own: an agent's run of a person-only command is refused, and is no step of theirs.
-  if (!LOGGED.includes(verb) || (origin !== 'composer' && origin !== 'bridge')) return
+  if (!LOGGED.includes(verb) || !isPerson(origin)) return
   const here = await hereOf($)
   if (here === undefined) return
   const said = reply.split('\n')[0]?.replace(/^\/pr-gate:?\s*/, '') ?? ''
@@ -858,7 +886,12 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (verb === 'log') return logText($)
   if (verb === 'stop') {
     if (run === null || run.status !== 'running') return `/${COMMAND} is not running.`
+    if (isPerson(origin)) await claimRecord($, run.root, run.branch)
+    dropQueued(run)
     await finish($, run.id, 'stopped', 'Stopped by the person.')
+    if (isPerson(origin)) {
+      await tellAgent($, run, 'stopped the gate', 'stop waiting on it. Opening and merging stay held; /pr-gate resume continues it.')
+    }
     return `/${COMMAND} stopped. The record stays: /${COMMAND} resume continues it. Opening and merging stay held.`
   }
   const isPersons = verb === 'waive' || verb === 'allow' || verb === 'reset'
@@ -894,7 +927,13 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     await take()
     if (isOurs) await finish($, run.id, 'stopped', 'Reset by the person.')
     // The whole record is kept under an archive key; the branch's own key keeps only what a fresh start must not repeat (R47).
-    await archiveLifecycle($, root, branch, now)
+    const did = await archiveLifecycle($, root, branch, now)
+    dropQueued({ root, branch })
+    if (did) {
+      await tellAgent($, { root, branch }, `reset the lifecycle of ${branch}: it is archived, its history kept`,
+        'nothing for the old review. A fresh review starts when the person runs /pr-gate, or when you next open the pull request; ' +
+          'opening and merging stay held until it completes.')
+    }
     return `/${COMMAND}: the lifecycle for ${branch} is archived under its own key, its history kept. /${COMMAND} starts a fresh one.`
   }
   if (verb === 'allow') {
@@ -904,6 +943,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (rec === undefined) return none
     await take()
     await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
+    await tellAgent($, { root, branch }, `allowed ${n} more round${n === 1 ? '' : 's'}: ${reason}`,
+      'the gate continues the review. Leave the branch alone until it sends you what needs an answer.')
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
     const after = (await loadRecord($, root, branch)) ?? rec
@@ -944,13 +985,32 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     await take()
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
-    // Released from the merge test and from ready: the controller decides again, unless a round in flight will.
-    if (!isRunning) await advance($, root, branch)
+    // Released from the merge test and from ready: the controller decides again, unless a round in flight will. After a push no
+    // round recorded, its verdict would be for the record's old head: the note below names the push instead (final review I1).
+    const latest = isRunning ? undefined : await loadRecord($, root, branch)
+    const pushed = latest !== undefined && latest.phase !== 'pre' && latest.pr !== undefined ? await openPrOf($, root, branch) : undefined
+    if (!isRunning && (pushed === undefined || pushed.headRefOid === latest?.head)) await advance($, root, branch)
     const after = await loadRecord($, root, branch)
     const wasPassed = before.preStatus === 'passed' && before.preHead === after?.preHead
     if (after !== undefined && after.phase === 'pre' && after.preStatus === 'passed' && !wasPassed) {
       await sayOpenPr($, after, 'passed', now, `${scope} waived by the person: ${reason}`)
     }
+    const settled = await loadRecord($, root, branch)
+    // The head GitHub reports, as `waive post` reads it: a push no round recorded is not judged by the record's old head.
+    const live = settled?.phase !== 'pre' && settled?.pr !== undefined ? await openPrOf($, root, branch) : undefined
+    const pr = settled?.phase !== 'pre' && settled?.pr !== undefined
+      ? { number: settled.pr, baseRefName: live?.baseRefName ?? settled.base, headRefOid: live?.headRefOid ?? settled.head }
+      : undefined
+    const standing = settled !== undefined && pr !== undefined ? await gatherStanding($, settled, pr) : undefined
+    // A reset while the standing was gathered supersedes this note (gate G7-3).
+    if (settled !== undefined && pr !== undefined && !(await isStillCurrent($, settled))) return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
+    await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`,
+      standing === undefined
+        ? 'nothing more is needed from you for this finding; the pre-PR review continues.'
+        : standing.mayProceed
+          ? "nothing holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          : 'answer what is yours in the list above, and leave the rest to who it names.',
+      standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
   }
   if (scope === 'pre') {
@@ -988,7 +1048,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       if (refusal !== undefined) return undefined
       const base =
         one?.phase === 'archived' || one === undefined
-          ? newRecord({
+          ? {
+            // A record started over a reset keeps the reset's generation (gate G7-7).
+            generation: one?.generation,
+            ...newRecord({
               root,
               branch,
               base: found?.name ?? one?.base ?? '',
@@ -998,7 +1061,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
               lane: 'full',
               allowance: allowances.standard,
               at: now,
-            })
+            }),
+          }
           : one
       const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
@@ -1007,6 +1071,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     await take()
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
     await sayOpenPr($, waived, 'waived', now)
+    await tellAgent($, waived, `waived the pre-PR review of ${branch} at ${head.slice(0, 7)}: ${reason}`,
+      `open the pull request for ${branch} → ${waived.base}; the guard lets it through, and post-PR review runs once it opens.`)
     return (
       `/${COMMAND} waived pre-PR review for ${branch} at ${head.slice(0, 7)}: ${reason}. ` +
       `The PR may open; this waiver covers ${waived.base} only, and post-PR review still runs.`
@@ -1030,7 +1096,10 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   await upsertRecord($, root, branch, one => {
     const base =
       one === undefined || one.phase === 'archived'
-        ? newRecord({
+        ? {
+          // A record started over a reset keeps the reset's generation (gate G7-7).
+          generation: one?.generation,
+          ...newRecord({
             root,
             branch,
             base: pr?.baseRefName ?? fallback ?? config.bases[0] ?? 'dev',
@@ -1040,13 +1109,29 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
             lane: 'full',
             allowance: 0,
             at: now,
-          })
+          }),
+        }
         : one
     return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
   })
   // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
-  return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.`
+  const after = await loadRecord($, root, branch)
+  const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
+  // A reset while the standing was gathered supersedes this note (gate G7-3).
+  const isSuperseded = after !== undefined && pr !== undefined && !(await isStillCurrent($, after))
+  if (!isSuperseded) {
+    await tellAgent($, { root, branch }, `waived post-PR review of ${pr === undefined ? branch : `PR #${pr.number}`} at ${at.slice(0, 7)}: ${reason}`,
+      standing === undefined
+        ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
+            'Check it with gh pr view before telling the person anything; do not merge.'
+        : standing.mayProceed
+          ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          : 'the waiver covers the review only: wait for what is listed, then tell the person.',
+      standing)
+  }
+  const aside = standing === undefined || standing.setAside.length === 0 ? '' : ` Set aside (GitHub does not require them): ${standing.setAside.join(', ')}.`
+  return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.${aside}`
 }
 
 export const register: Register = (on, options) => {
@@ -1072,20 +1157,21 @@ export const register: Register = (on, options) => {
     }
     const action = readPrAction(String(e.tool), e as unknown as Record<string, unknown>)
     if (action === undefined) return next(e)
+    const tail = chainedOf(String(e.tool), e)
     if (action.action === 'merge') {
       // A merge given by URL names its repository there: gh pr view reads that one, and another repo's PR is not intercepted.
       const command = (e as unknown as Record<string, unknown>).command
       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
-      return refusal !== undefined ? { deny: asHold(refusal) } : next(e)
+      return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)
     }
     const found = await gatedCreate($, action)
-    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) } : next(e)
-    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) } : next(e)
+    if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
+    if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
-    if (refusal !== undefined) return { deny: asHold(refusal) }
+    if (refusal !== undefined) return { deny: asHold(refusal) + tail }
     const ran = await next(e)
     if (gated !== undefined && ran.deny === undefined && ran.isError !== true) await onOpened($, gated.root, gated.branch)
     return ran
@@ -1097,7 +1183,7 @@ export const register: Register = (on, options) => {
       deny: asHold(
         'pr-gate: its guard failed, so this pull request action is held. Try it once more; if it fails again, tell the person, ' +
           `who can type /${COMMAND} waive ${action.action === 'merge' ? 'post' : 'pre'} <reason> to let it through.`,
-      ),
+      ) + chainedOf(String(e.tool), e),
     }
   })
 
@@ -1184,6 +1270,11 @@ export const register: Register = (on, options) => {
     const root = run !== null ? run.root : top?.isOk === true ? top.out : ''
     const branch = run !== null ? run.branch : root === '' ? '' : (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
     const rec = root !== '' && branch !== '' && branch !== 'HEAD' ? await loadRecord($, root, branch) : undefined
-    return renderPane($, e, run, rec, now)
+    // The pane's Stop is the person's /pr-gate stop (R81): the owner check, the log line and the agent's message come with it.
+    const stop = async (): Promise<void> => {
+      const text = await holdingPrompts($, () => runCommand($, 'stop', 'pane'))
+      await logCommand($, 'stop', text, 'pane').catch(() => undefined)
+    }
+    return renderPane($, e, run, rec, now, { stop })
   })
 }

@@ -1,7 +1,7 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Tier, Waiver } from '../types'
+import type { Blocker, CheckState, Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver } from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -101,6 +101,34 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
 
 export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
 
+const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
+
+const higher = (a: Severity, b: Severity): Severity => (RANK[a] <= RANK[b] ? a : b)
+
+/**
+ * The highest severity a finding had during the gate (R85, P0 highest): what its follow-up issue is labelled with. A record from
+ * before peakSeverity existed reads it from its severity and every severity its history names.
+ */
+export const peakOf = (f: Pick<Finding, 'severity' | 'peakSeverity' | 'history'>): Severity =>
+  f.history.reduce<Severity>(
+    (top, one) => [one.severity, one.from].reduce<Severity>((at, each) => (each === undefined ? at : higher(at, each)), top),
+    higher(f.peakSeverity ?? f.severity, f.severity),
+  )
+
+/**
+ * A record from before peakSeverity whose first severity entry the agent set, naming none before it: the severity the finding was
+ * raised at is lost, so its peak, and the label its issue would carry, are unknown (gate R7-6). It waits for the person, and no
+ * later answer makes it known (gate R8-1).
+ */
+export const isPeakUnknown = (f: Pick<Finding, 'peakSeverity' | 'history'>): boolean => {
+  const first = f.history.find(one => one.severity !== undefined)
+  return f.peakSeverity === undefined && first !== undefined && first.by !== 'codex' && first.from === undefined
+}
+
+/** A GitHub item the agent may answer "no change requested" (R82): no security flag, and no explicit P0-P2 from the reviewer. */
+export const mayAcknowledge = (f: Finding): boolean =>
+  f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2)
+
 /** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
 export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
   finding.round === round || finding.history.some(one => one.round === round && one.status === 'open')
@@ -109,11 +137,12 @@ export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: num
 
 export type Answer = {
   id: string
-  action: 'fixed' | 'rebutted' | 'deferred'
+  action: 'fixed' | 'rebutted' | 'deferred' | 'acknowledged'
   note?: string
   evidence?: string
   severity?: Severity
   isSecurity?: boolean
+  followUp?: string
 }
 
 const moved = (f: Finding, status: FindingStatus, round: number, by: string, at: number, note?: string, evidence?: string): Finding => ({
@@ -127,15 +156,27 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
   ],
 })
 
-const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
-
-/** The fixer's word: fixed is only reported until a check confirms it. A fixer cannot downgrade its own finding; disagreement is a rebuttal. */
+/**
+ * The fixer's word: fixed is only reported until a check confirms it. A fixer cannot lower a severity a reviewer or Codex set;
+ * disagreement is a rebuttal. A severity only guessed from a GitHub comment's words takes the triaged one, up or down (R84).
+ */
 export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at: number): Finding {
-  const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action
+  const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action === 'acknowledged' ? 'rebutted' : a.action
   const next = moved(f, status, round, by, at, a.note, a.evidence)
-  const severity = a.severity !== undefined && RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
+  const isGuessed = f.severitySource === 'hint'
+  const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
   const security = f.isSecurity === true || a.isSecurity === true
-  return { ...next, severity, ...(security ? { isSecurity: true } : {}) }
+  // A changed severity is recorded with the one before it, so a lowering is known for what it was (R85).
+  const history =
+    severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity, from: f.severity } : one))
+  // Another follow-up, or none, was never labelled: the label was the old issue's.
+  const isNewFollowUp = a.action === 'deferred' && a.followUp !== f.followUp
+  // A lost peak stays unknown: a peak read from the incomplete history would let a lowered legacy finding settle (gate R8-1).
+  const peak = isPeakUnknown(f) ? {} : { peakSeverity: higher(peakOf(f), severity) }
+  return { ...next, severity, history, ...peak, ...(security ? { isSecurity: true } : {}),
+    // A deferral without a follow-up clears an earlier one: an old follow-up never settles a later deferral (final review T4).
+    ...(a.action === 'deferred' ? { followUp: a.followUp } : {}),
+    ...(isNewFollowUp ? { followUpLabel: undefined, followUpLabelError: undefined } : {}) }
 }
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
@@ -363,11 +404,13 @@ export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !i
 
 /**
  * What the gate's own Codex check rules on (Adam, decision A; R36, R58, R72): rebuttals Codex has not accepted, short of a dispute
- * (R40); verified fixes whose file changed since (R58); and fixes only reported, at any severity, advisories included. A deferral is
- * the person's to release (R45), never Codex's.
+ * (R40); verified fixes whose file changed since (R58); fixes only reported, at any severity, advisories included; and a P3 deferral
+ * whose severity the agent lowered (R85, Adam 2026-10-20). Any other deferral is the person's to release (R45), never Codex's.
  */
 export const checksOwed = (findings: readonly Finding[]): Finding[] =>
-  findings.filter(one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one) || one.status === 'reported-fixed')
+  findings.filter(
+    one => (one.status === 'rebutted' && !isAcceptedRebuttal(one) && !isDisputed(one)) || isReverifyOwed(one) || one.status === 'reported-fixed' || isLoweringOwed(one),
+  )
 
 /** The dispute in words: the agent's last argument and Codex's last rejection. */
 const disputeOf = (f: Finding): string => {
@@ -376,6 +419,81 @@ const disputeOf = (f: Finding): string => {
   return `${f.id} is disputed: the agent says "${argued}"; Codex said "${codex}"`
 }
 
+const ISSUE_URL = /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/issues\/(\d+)(?![\w/])/
+const ISSUE_REF = /(?:^|[\s([,;:])([\w.-]+)\/([\w.-]+)#(\d+)(?!\w)/
+const ISSUE_BARE = /(?:^|[\s([,;:])#(\d+)(?!\w)/
+
+/** The GitHub issue a follow-up names (R85): its URL, `owner/repo#<n>`, or `#<n>` in the record's own repository; other text may surround it. */
+export function issueOf(text: string | undefined, slug: string | undefined): { repo: string; number: number } | undefined {
+  if (text === undefined) return undefined
+  const url = text.match(ISSUE_URL) ?? text.match(ISSUE_REF)
+  if (url !== null) return { repo: `${url[1]}/${url[2]}`, number: Number(url[3]) }
+  const bare = text.match(ISSUE_BARE)
+  return bare === null || slug === undefined || slug === '' ? undefined : { repo: slug, number: Number(bare[1]) }
+}
+
+/** Whether a follow-up names a GitHub issue (R85; Adam, 2026-10-20). A ticket key beside it is not checked; a PR or other URL alone is no follow-up. */
+export const isFollowUpRef = (text: string | undefined): boolean => issueOf(text, 'repo/of-record') !== undefined
+
+/**
+ * The agent's last lowering of a finding's severity (Adam, 2026-10-20): an answer that set a severity below the one before it, at
+ * any starting level. An answer from before `from` was recorded, with no severity before it in the history, counts as a lowering.
+ */
+export function loweringOf(f: Pick<Finding, 'history' | 'severity' | 'peakSeverity'>): { at: number; from: Severity; to: Severity; note?: string } | undefined {
+  let before: Severity | undefined
+  let found: { at: number; from: Severity; to: Severity; note?: string } | undefined
+  f.history.forEach((one, i) => {
+    if (one.severity === undefined) return
+    const from = one.from ?? before
+    if (one.by !== 'codex' && (from === undefined || RANK[one.severity] > RANK[from])) {
+      found = { at: i, from: from ?? peakOf(f), to: one.severity, ...(one.note === undefined ? {} : { note: one.note }) }
+    }
+    before = one.severity
+  })
+  return found
+}
+
+/** Codex's ruling on the last lowering, if it gave one after it. */
+const loweringRuling = (f: Finding): Finding['history'][number] | undefined => {
+  const low = loweringOf(f)
+  return low === undefined ? undefined : f.history.slice(low.at + 1).filter(one => one.lowering !== undefined).at(-1)
+}
+
+/** A P3 deferred to a GitHub issue, not security: what may settle without the person (R85). */
+const isIssueDeferral = (f: Finding): boolean => f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp)
+
+
+/** A deferral that would settle but for the agent's lowering of its severity: Codex rules on the lowering first (Adam, 2026-10-20). */
+export const isLoweringOwed = (f: Finding): boolean =>
+  isIssueDeferral(f) && !isPeakUnknown(f) && loweringOf(f) !== undefined && loweringRuling(f) === undefined
+
+/** Codex disagreed with the last lowering, in words; undefined when it did not. */
+export function loweringRefusal(f: Finding): string | undefined {
+  const low = loweringOf(f)
+  const ruling = loweringRuling(f)
+  return low === undefined || ruling?.lowering !== 'refused' ? undefined : `Codex disagrees with lowering ${f.id} from ${low.from} to ${low.to}: ${ruling.note ?? 'no reason given'}`
+}
+
+/** Codex's ruling on a lowering, as the history entry after it: agreed settles the deferral, refused leaves it to the person. */
+export const ruleLowering = (f: Finding, holds: boolean, round: number, at: number, note?: string): Finding => {
+  const low = loweringOf(f)
+  const said = note ?? (holds ? `Codex agrees with lowering ${low?.from ?? '?'} to ${low?.to ?? f.severity}` : 'no reason given')
+  return { ...f, history: [...f.history, { round, status: f.status, note: said, lowering: holds ? 'agreed' : 'refused', by: 'codex', at }] }
+}
+
+/**
+ * Everything a deferral needs to settle but its issue's label (R85, amended by Adam 2026-10-20): a P3, not security, deferred to a
+ * GitHub issue, whose severity the agent either never lowered or lowered with Codex agreeing since. A guessed P3 settles as a tagged one.
+ */
+export const wouldSettle = (f: Finding): boolean =>
+  isIssueDeferral(f) && !isPeakUnknown(f) && (loweringOf(f) === undefined || loweringRuling(f)?.lowering === 'agreed')
+
+/**
+ * A P3 deferral settled without the person's waiver (R85, decision I): it would settle, and the gate labelled its issue with the
+ * highest severity the finding had (`peakOf`). A label that failed, or a peak that rose since, holds it: the gate fails closed.
+ */
+export const isSettledDeferral = (f: Finding): boolean => wouldSettle(f) && f.followUpLabel === peakOf(f)
+
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,
  * reported fixed without verification, verified fixed but its file changed since (R58), or rebutted without Codex
@@ -383,7 +501,7 @@ const disputeOf = (f: Finding): string => {
  */
 export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] {
   const waived = waivedIds(rec)
-  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one))
+  return rec.findings.filter(one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledDeferral(one))
 }
 
 /** A held verified fix in words, as the merge refusal and the texts name it (R58). */
@@ -392,6 +510,121 @@ export const reverifyOwed = (f: Pick<Finding, 'id' | 'severity'>): string => `${
 /** Security P1s that hold the merge: only a waiver naming each one releases it, never `waive post` (spec §3). */
 export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] =>
   mergeHolds(rec).filter(one => isBlocking(one) && one.isSecurity === true)
+
+const short = (sha: string): string => sha.slice(0, 7)
+
+/** A finding's name in agent-facing text: a reviewer's comment is named by who wrote it, since its title is the reviewer's own first line. */
+export const titleOf = (one: Pick<Finding, 'source' | 'reviewer' | 'title'>): string => (one.source === 'github' ? `comment from ${one.reviewer}` : one.title)
+
+const LABEL_RELEASE = 'check the issue exists and gh can edit it; the gate retries on the next pass'
+
+/** A failed label on a deferral's follow-up issue, in words (R85). */
+const labelFailure = (f: Finding): string =>
+  `could not label issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'} severity:${peakOf(f)} (${f.followUpLabelError ?? 'no error recorded'})`
+
+/** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). Never the reviewer's own words (gate R2-3). */
+function blockerOf(f: Finding): Blocker {
+  const tag = `${f.id} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
+  const waive = `/pr-gate waive ${f.id} <reason>`
+  const isSecurityP1 = isBlocking(f) && f.isSecurity === true
+  if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
+  if (f.status === 'deferred') {
+    const low = loweringOf(f)
+    if (isLoweringOwed(f) && low !== undefined) {
+      return { kind: 'lowering-unchecked', id: f.id, said: `${tag}: lowered from ${low.from} to ${low.to}, Codex has not checked the lowering`, owner: 'codex', release: "the gate's Codex check rules on it" }
+    }
+    const refusal = loweringRefusal(f)
+    if (refusal !== undefined && isIssueDeferral(f)) return { kind: 'deferred', id: f.id, said: refusal, owner: 'person', release: waive }
+    if (wouldSettle(f)) {
+      const issue = `issue #${issueOf(f.followUp, 'repo/of-record')?.number ?? '?'}`
+      return f.followUpLabelError === undefined
+        ? { kind: 'label-owed', id: f.id, said: `${tag}: deferred to ${issue}, not yet labelled severity:${peakOf(f)}`, owner: 'gate', release: 'the gate labels it on its next pass (/pr-gate resume)' }
+        : { kind: 'label-failed', id: f.id, said: labelFailure(f), owner: 'agent', release: LABEL_RELEASE }
+    }
+  }
+  if (f.status === 'deferred') return { kind: isSecurityP1 ? 'security-p1' : 'deferred', id: f.id, said: `${tag}: deferred`, owner: 'person', release: waive }
+  if (isReverifyOwed(f)) {
+    return { kind: 'reverify-owed', id: f.id, said: `${tag}: fixed, re-verify owed (file changed)`, owner: 'codex', release: "the gate's Codex check re-verifies it" }
+  }
+  if (f.status === 'reported-fixed') {
+    return { kind: 'verify-owed', id: f.id, said: `${tag}: fixed, verification owed`, owner: 'codex', release: "the gate's Codex check verifies it" }
+  }
+  if (f.status === 'rebutted') {
+    return { kind: 'rebuttal-unchecked', id: f.id, said: `${tag}: rebuttal not yet accepted`, owner: 'codex', release: "the gate's Codex check rules on it" }
+  }
+  return { kind: isSecurityP1 ? 'security-p1' : 'open', id: f.id, said: `${tag}: open`, owner: 'agent', release: 'fix it, or rebut it with file:line evidence' }
+}
+
+/**
+ * Everything between this head and its merge (R79): findings, the head's own review, and CI, with nothing short-circuited. A post
+ * waiver for this head and base leaves only a security P1 and CI; CI a waiver covers is only what GitHub does not require (R86).
+ */
+export function standingOf(
+  rec: LifecycleRecord,
+  at: { head: string; base: string },
+  ci?: readonly CheckState[] | 'unreadable' | { unreadable: string; checks?: readonly CheckState[] },
+): Standing {
+  // A post waiver for this head means a PR exists, even on a record never adopted into post review (a waiver-only or a hand-opened
+  // PR's record): its standing is the merge's, as judgeMerge already reads it (gate R1-2).
+  const isPostNamed = rec.waivers.some(one => one.scope === 'post' && one.head === at.head)
+  const phase = rec.phase === 'pre' && !isPostNamed ? 'pre' : 'post'
+  const isOnBase = rec.base === at.base
+  const waiver = isOnBase ? rec.waivers.find(one => one.scope === phase && one.head === at.head && (phase === 'post' || one.base === at.base)) : undefined
+  const security = securityHolds(rec)
+  const isWaived = waiver !== undefined && security.length === 0
+  const blockers: Blocker[] = (isWaived ? [] : mergeHolds(rec)).map(blockerOf)
+  if (!isOnBase && phase === 'post') {
+    blockers.push({ kind: 'retargeted', said: `reviewed for ${rec.base}, but the PR now targets ${at.base}`, owner: 'person', release: `point it back at ${rec.base}, or /pr-gate reset` })
+  }
+  if (!isWaived && phase === 'post') {
+    const next = decideNext(rec)
+    if (next.kind === 'round') blockers.push({ kind: 'round-owed', said: `a review round is owed on ${short(at.head)}`, owner: 'gate', release: 'the gate runs it; leave the branch alone' })
+    if (next.kind === 'exhausted') {
+      // Its id lets a text that already gives this reason as its own leave it out (holdText's `named`).
+      blockers.push({ kind: 'head-unreviewed', id: 'head', said: next.why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' })
+    } else if (next.kind !== 'round' && waiver === undefined && at.head !== rec.head) {
+      // A push no round has seen (final review I1): the record's verdict is for its own head, never the live one. An owed round or
+      // an exhausted review already holds this head, with its own step, so this is said only when neither is.
+      blockers.push({ kind: 'head-unreviewed', id: 'head', said: `${short(at.head)} was pushed after the review completed at ${short(rec.head)}`, owner: 'gate', release: '/pr-gate resume reviews it' })
+    }
+  }
+  const setAside: string[] = []
+  if (ci === 'unreadable' || (ci !== undefined && 'unreadable' in ci)) {
+    const why = typeof ci === 'object' && 'unreadable' in ci ? ci.unreadable : ''
+    blockers.push({ kind: 'ci-unreadable', ...(why === '' ? {} : { detail: why }), said: `the CI checks on ${short(at.head)} could not be read${why === '' ? '' : ` (${why})`}`, owner: 'agent', release: 'check gh auth status and the network, then try again' })
+  }
+  // Checks read while what the base requires could not be: each still holds as if required (R86, gate R3-1).
+  const listed = ci === 'unreadable' ? [] : ci === undefined || !('unreadable' in ci) ? (ci ?? []) : (ci.checks ?? [])
+  for (const one of listed) {
+    const isBad = one.bucket === 'fail' || one.bucket === 'cancel'
+    if (!isBad && (one.bucket === 'pass' || one.bucket === 'skipping')) continue
+    if (isWaived && !one.isRequired) {
+      setAside.push(one.name)
+      continue
+    }
+    blockers.push(
+      isBad
+        ? { kind: 'ci-failing', id: one.name, said: `check ${one.name} ${one.bucket === 'cancel' ? 'cancelled' : 'failing'}`, owner: 'agent', release: 'fix what it reports and push, or rerun it (gh run rerun <run-id> --failed)' }
+        : one.bucket === 'missing'
+          ? { kind: 'ci-running', id: one.name, said: `required check ${one.name} has not reported`, owner: 'gate', release: 'wait for it to start, or check why it does not run on this head' }
+          : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
+    )
+  }
+  return { phase, head: at.head, ...(waiver === undefined ? {} : { waiver }), setAside, mayProceed: blockers.length === 0, blockers }
+}
+
+const OWNERS: Record<Blocker['owner'], string> = { agent: 'yours', codex: 'the gate (Codex)', person: "the person's", gate: 'the gate' }
+
+/** The standing in words (R79): every blocker once, skipping ids the text around it already named, with who acts and how. */
+export function holdText(s: Standing, named: ReadonlySet<string> = new Set()): string {
+  const what = s.phase === 'pre' ? 'pull request' : 'merge'
+  const aside = s.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${s.setAside.join(', ')}.`]
+  if (s.blockers.length === 0) return [...aside, `Nothing else holds the ${what} of ${short(s.head)}.`].join('\n')
+  const rest = s.blockers.filter(one => one.id === undefined || !named.has(one.id))
+  if (rest.length === 0) return aside.join('\n')
+  const heading = named.size > 0 ? 'Also holding:' : `Everything between ${short(s.head)} and the ${what}:`
+  return [...aside, heading, ...rest.map(one => `- ${one.said} (${OWNERS[one.owner]}: ${one.release})`)].join('\n')
+}
 
 // --------------------------------------------------------------- coverage
 
@@ -526,10 +759,13 @@ function decidePost(rec: LifecycleRecord): Next {
   const owed = holding.filter(one => one.status === 'reported-fixed')
   // A dispute is the person's (R40); every other rebuttal Codex has not accepted is Codex's to check.
   const disputed = holding.filter(isDisputed)
-  // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58).
-  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one))
+  // A verified fix whose file changed is Codex's to re-verify on this head, as free as a rebuttal check (R58); so is the agent's
+  // lowering of a deferral's severity (R85, Adam 2026-10-20).
+  const unchecked = holding.filter(one => (one.status === 'rebutted' && !isDisputed(one)) || isReverifyOwed(one) || isLoweringOwed(one))
   const open = holding.filter(one => one.status === 'open')
-  const deferred = holding.filter(one => one.status === 'deferred')
+  // A deferral held only by its issue's label is the gate's to retry, not the person's to decide (R85).
+  const unlabelled = holding.filter(wouldSettle)
+  const deferred = holding.filter(one => one.status === 'deferred' && !isLoweringOwed(one) && !wouldSettle(one))
   // The protected baseline: a second round whenever the first one changed the head, by anyone. A later push does not spend the allowance on it.
   if (done.length === 1 && isChanged) return { kind: 'round', phase: 'post', roundKind: 'baseline', isAdvisory: false, scope: 'full' }
   // A push after the last completed round (a fix after ready or exhaustion, someone else's commit): review that head.
@@ -568,16 +804,19 @@ function decidePost(rec: LifecycleRecord): Next {
   }
   // A rebuttal Codex has not ruled on (its check was held, or it came from before the PR): Codex checks it on this head, free.
   const recheck = (): Next => {
-    const rebuttals = unchecked.filter(one => !isReverifyOwed(one))
+    const lowered = unchecked.filter(isLoweringOwed)
+    const rebuttals = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one))
     const reverify = unchecked.filter(isReverifyOwed)
     const said = [
       ...(rebuttals.length === 0 ? [] : [`Codex has not checked the rebuttal of ${ids(rebuttals)} on ${last.endHead.slice(0, 7)}`]),
+      ...(lowered.length === 0 ? [] : [`Codex has not checked the lowered severity of ${ids(lowered)}`]),
       ...reverify.map(reverifyOwed),
     ]
+    const what = reverify.length + lowered.length === 0 ? 'the rebuttal' : rebuttals.length + reverify.length === 0 && lowered.length === 1 ? 'the lowering' : 'them'
     return {
       kind: 'blocked',
       why: said.join('; '),
-      nextStep: `run /pr-gate resume: Codex checks ${reverify.length === 0 ? 'the rebuttal' : 'them'} on this head, using no review round`,
+      nextStep: `run /pr-gate resume: Codex checks ${what} on this head, using no review round`,
       recheck: unchecked.map(one => one.id),
     }
   }
@@ -588,7 +827,7 @@ function decidePost(rec: LifecycleRecord): Next {
     if ((isChanged || owed.length > 0) && mayStartRound(rec, false)) {
       return { kind: 'round', phase: 'post', roundKind: 'discretionary', isAdvisory: false, scope: 'full' }
     }
-    if (!isChanged && deferred.length + disputed.length === holding.length) return awaiting(deferred, disputed)
+    if (!isChanged && deferred.length + disputed.length + unlabelled.length === holding.length) return awaiting(deferred, disputed, unlabelled)
     return {
       kind: 'exhausted',
       why: unresolved.length > 0 ? `${ids(unresolved)} unresolved at ${last.endHead.slice(0, 7)}` : `${last.endHead.slice(0, 7)} is not reviewed clean`,
@@ -605,15 +844,31 @@ function decidePost(rec: LifecycleRecord): Next {
   }
   if (unchecked.length > 0) return recheck()
   if (holding.length === 0) return { kind: 'ready' }
-  return awaiting(deferred, disputed)
+  return awaiting(deferred, disputed, unlabelled)
 }
 
-/** Deferrals are honest answers, and a dispute is the agent's word against Codex's: only the person's waiver lets either into the merge (R39, R40). */
-function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = []): Next {
+/**
+ * Deferrals are honest answers, and a dispute is the agent's word against Codex's: only the person's waiver lets either into the merge
+ * (R39, R40). A deferral held only by its issue's label comes first: the gate retries it, after the agent checks the issue (R85).
+ */
+function awaiting(deferred: readonly Finding[], disputed: readonly Finding[] = [], unlabelled: readonly Finding[] = []): Next {
+  if (unlabelled.length > 0) {
+    const one = unlabelled.length === 1
+    const failed = unlabelled.filter(each => each.followUpLabelError !== undefined)
+    const owed = unlabelled.filter(each => each.followUpLabelError === undefined)
+    const said = [
+      ...failed.map(labelFailure),
+      ...(owed.length === 0 ? [] : [`${ids(owed)} ${owed.length === 1 ? 'settles' : 'settle'} once ${owed.length === 1 ? 'its' : 'their'} follow-up issue is labelled`]),
+    ]
+    return { kind: 'blocked', why: said.join('; '), nextStep: `${LABEL_RELEASE} (/pr-gate resume)${one ? '' : ' for each'}` }
+  }
   const all = [...deferred, ...disputed]
   const one = all.length === 1
   const are = (list: readonly Finding[], word: string): string[] => (list.length === 0 ? [] : [`${ids(list)} ${list.length === 1 ? 'is' : 'are'} ${word}`])
-  const what = [...are(deferred, 'deferred'), ...disputed.map(disputeOf)].join('; ')
+  // A deferral Codex would not let the agent lower is said with Codex's reason (R85).
+  const refused = deferred.filter(each => loweringRefusal(each) !== undefined)
+  const plain = deferred.filter(each => !refused.includes(each))
+  const what = [...are(plain, 'deferred'), ...refused.map(each => loweringRefusal(each) ?? ''), ...disputed.map(disputeOf)].join('; ')
   const told = [...are(deferred, 'deferred'), ...are(disputed, 'disputed')]
   return {
     kind: 'awaiting-decision',

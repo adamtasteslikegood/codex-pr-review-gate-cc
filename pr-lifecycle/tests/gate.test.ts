@@ -417,3 +417,22 @@ test('the pane lists the to-dos and the findings on each surface', async ($, on)
   }
   expect((await runOf(w)).status).toBe('stopped')
 })
+
+test('R81: the pane\'s Stop runs /pr-gate stop: logged as the person, and the agent is told', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  const ui = await $.ui.mount({
+    plugin: 'pr-lifecycle',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'pr-lifecycle',
+    props: { title: 'PR lifecycle', isFocused: false, bodyColumns: 48, placement: 'dock', scroll: { top: 0, bodyRows: 40, rows: 40 } as never, view: {} as never },
+  })
+  await ui.press({ key: 'stop' })
+  await ui.unmount()
+  await w.clock.advance(1000)
+  expect((await runOf(w)).status).toBe('stopped')
+  expect(w.prompts.at(-1)).toContain('the person stopped the gate')
+  expect(recordOf(w).log?.some(one => one.kind === 'person' && one.text.includes('/pr-gate stop'))).toBe(true)
+})
