@@ -1,12 +1,12 @@
 // The pane: the status display for /pr-gate. It only reads (the run, the lifecycle record, the clock); nothing here starts a run or writes state,
-// except the Stop button, which the person presses.
+// except the Stop button, which runs the person's /pr-gate stop (R81).
 
 import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { Finding, LifecycleRecord, Run, Step } from '../types'
 import { isBlocking } from './core'
 import { isAcceptedRebuttal, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
-import { elapsed, finish, SPINNER } from './round'
+import { elapsed, SPINNER } from './round'
 
 type Engine = EngineInterface
 
@@ -83,7 +83,7 @@ const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
   return { glyph: isBlocking(one) ? '●' : '·', said: lapse, isSettled: false, isOwed: false, isStruck: false }
 }
 
-export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, rec: LifecycleRecord | undefined, now: number) {
+export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, rec: LifecycleRecord | undefined, now: number, actions: { stop: () => Promise<void> }) {
   const { Box, Button, Text } = $.ui.resolve(e)
 
   if (run === null && rec === undefined) {
@@ -229,7 +229,7 @@ export function renderPane($: Engine, e: RenderInput<'Pane'>, run: Run | null, r
 
       {run !== null && isRunning && (
         <Box marginTop={1}>
-          <Button key="stop" label="Stop the gate" onPress={() => void finish($, run.id, 'stopped', 'Stopped by the person.')} />
+          <Button key="stop" label="Stop the gate" onPress={() => void actions.stop()} />
         </Box>
       )}
     </Box>

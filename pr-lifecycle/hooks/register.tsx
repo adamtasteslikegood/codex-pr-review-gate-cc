@@ -1220,6 +1220,11 @@ export const register: Register = (on, options) => {
     const root = run !== null ? run.root : top?.isOk === true ? top.out : ''
     const branch = run !== null ? run.branch : root === '' ? '' : (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
     const rec = root !== '' && branch !== '' && branch !== 'HEAD' ? await loadRecord($, root, branch) : undefined
-    return renderPane($, e, run, rec, now)
+    // The pane's Stop is the person's /pr-gate stop (R81): the owner check, the log line and the agent's message come with it.
+    const stop = async (): Promise<void> => {
+      const text = await holdingPrompts($, () => runCommand($, 'stop', 'pane'))
+      await logCommand($, 'stop', text, 'pane').catch(() => undefined)
+    }
+    return renderPane($, e, run, rec, now, { stop })
   })
 }
