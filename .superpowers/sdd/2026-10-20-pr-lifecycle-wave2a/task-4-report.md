@@ -18,3 +18,10 @@ None. The brief's two-world test was split into three tests (P2, no follow-up, s
 - The `isSecurity` check in `isSettledDeferral` uses the finding's flag, which applyAnswer sets from the answer, so a security P3 stays held.
 - A follow-up value is accepted as any non-blank string (no URL validation), per the brief.
 - Commit trailer used the session's attribution reminder (Sonnet 5.5) rather than the constraints file's "Opus 5.5" line.
+
+## Fix round 1: settled deferrals shown (spec §4)
+- register.tsx `statusText`: adds ` <id> deferred, follow-up at <followUp>.` per settled deferral (they are no longer in mergeHolds, so no per-finding status line named them before).
+- core.ts `readyPrompt`: a settled deferral reads `<id> <title> (follow-up at <followUp>)`; plain ones unchanged.
+- `/pr-gate log` (logSummary) lists no per-finding status (rounds, time, person steps, stops, events), so left as is.
+- Tests: flow "R85: /pr-gate status names the follow-up of a settled deferral"; lifecycle "R85: the ready prompt names the follow-up ..." (also checks a plain deferral gets no follow-up text).
+- Command: `claude plugin test pr-lifecycle` -> 437 pass, 0 fail (was 435). `npm run lint` and `npm run typecheck` clean.

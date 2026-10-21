@@ -70,3 +70,7 @@ Task 3: minor (deferred): R34 reprompt prose still says "fix, rebut or defer" (t
 Task 3: complete (commits 675fdb0..dd58e14, review clean)
 Task 4: dispatched (BASE 5c51b96, sonnet)
 Task 4: implementer DONE, commit 9a27eae (435 pass); review dispatched
+Task 4: review Approved, but ⚠️ confirmed gap: spec §4 "deferred, follow-up at …" in /pr-gate status and log not built (no task owned it) → fix round 1/5 dispatched (FIX_BASE 9a27eae)
+Task 4: minor (deferred): followUp not shape-checked (any non-blank text settles a P3) — plan-mandated
+Task 4: minor (deferred): a stale followUp survives a later re-deferral without one
+Task 4: fix round 1 implementer DONE, commit 87c5c44 (437 pass); /pr-gate log has no per-finding status, left alone; re-review dispatched
