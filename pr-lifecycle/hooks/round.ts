@@ -1228,6 +1228,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
       ...(feedback.threadId === undefined ? {} : { threadId: feedback.threadId }),
       ...(feedback.url === undefined ? {} : { url: feedback.url }),
       severity: hint.severity,
+      severitySource: hint.isTagged ? 'tag' : 'hint',
       ...(hint.isSecurity ? { isSecurity: true } : {}),
       title,
       ...(feedback.file === undefined ? {} : { file: feedback.file }),

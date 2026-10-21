@@ -3309,3 +3309,11 @@ test('R83: an inline comment under an APPROVED review is triaged', async ($, on)
   await w.clock.advance(30_000)
   expect(w.prompts.at(-1)).toContain('this branch never closes the file')
 })
+
+test('R84: a guessed P2 the agent triages as P3 shows as P3 in the hold', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.severity).toBe('P3')
+  expect(w.prompts.at(-1)).toContain('G2-1 [P3]')
+})

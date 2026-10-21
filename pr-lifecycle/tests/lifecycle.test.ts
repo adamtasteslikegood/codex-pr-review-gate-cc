@@ -726,3 +726,17 @@ test('R1-8: a reviewer finding carried into later prompts is fenced, its title i
   // Codex's own findings are not reviewer text.
   expect(fixPrompt(runOf(), undefined, true)).not.toContain('<reviewer-comment')
 })
+
+test('R84: a triaged severity replaces a guessed one, up or down, and the change is in the history', async () => {
+  const guessed = finding({ source: 'github', severity: 'P2', severitySource: 'hint' })
+  const lowered = applyAnswer(guessed, { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5)
+  expect(lowered.severity).toBe('P3')
+  expect(lowered.history.at(-1)?.severity).toBe('P3')
+  expect(applyAnswer(guessed, { id: 'R1-1', action: 'fixed', severity: 'P1' }, 2, 'main', 5).severity).toBe('P1')
+})
+
+test('R84: a reviewer\'s own tag and a Codex severity are never lowered', async () => {
+  const tagged = finding({ source: 'github', severity: 'P2', severitySource: 'tag' })
+  expect(applyAnswer(tagged, { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
+  expect(applyAnswer(finding({ severity: 'P2' }), { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
+})

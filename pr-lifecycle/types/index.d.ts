@@ -5,7 +5,7 @@ export type FindingStatus = 'open' | 'reported-fixed' | 'verified-fixed' | 'rebu
 
 export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
-export type FindingEvent = { round: number; status: FindingStatus; note?: string; evidence?: string; by: string; at: number }
+export type FindingEvent = { round: number; status: FindingStatus; note?: string; evidence?: string; severity?: Severity; by: string; at: number }
 
 export type Finding = {
   id: string
@@ -20,6 +20,8 @@ export type Finding = {
   url?: string
   severity: Severity
   isSecurity?: boolean
+  /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
+  severitySource?: 'tag' | 'hint'
   title: string
   file?: string
   line?: number

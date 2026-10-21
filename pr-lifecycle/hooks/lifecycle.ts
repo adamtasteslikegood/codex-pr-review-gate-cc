@@ -109,7 +109,7 @@ export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: num
 
 export type Answer = {
   id: string
-  action: 'fixed' | 'rebutted' | 'deferred'
+  action: 'fixed' | 'rebutted' | 'deferred' | 'acknowledged'
   note?: string
   evidence?: string
   severity?: Severity
@@ -129,13 +129,18 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
 
 const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 
-/** The fixer's word: fixed is only reported until a check confirms it. A fixer cannot downgrade its own finding; disagreement is a rebuttal. */
+/**
+ * The fixer's word: fixed is only reported until a check confirms it. A fixer cannot lower a severity a reviewer or Codex set;
+ * disagreement is a rebuttal. A severity only guessed from a GitHub comment's words takes the triaged one, up or down (R84).
+ */
 export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at: number): Finding {
-  const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action
+  const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action === 'acknowledged' ? 'rebutted' : a.action
   const next = moved(f, status, round, by, at, a.note, a.evidence)
-  const severity = a.severity !== undefined && RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
+  const isGuessed = f.severitySource === 'hint'
+  const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
   const security = f.isSecurity === true || a.isSecurity === true
-  return { ...next, severity, ...(security ? { isSecurity: true } : {}) }
+  const history = severity === f.severity ? next.history : next.history.map((one, i) => (i === next.history.length - 1 ? { ...one, severity } : one))
+  return { ...next, severity, history, ...(security ? { isSecurity: true } : {}) }
 }
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
