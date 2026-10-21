@@ -730,17 +730,30 @@ export function readRequired(rules: string, protection: string | undefined): str
   for (const rule of listed) {
     const row = typeof rule === 'object' && rule !== null ? (rule as Record<string, unknown>) : {}
     if (row.type !== 'required_status_checks') continue
-    const params = (row.parameters ?? {}) as { required_status_checks?: { context?: unknown }[] }
-    for (const one of params.required_status_checks ?? []) if (typeof one.context === 'string') out.push(one.context)
+    // A required-checks rule without its list, or with an entry that names no check, is a malformed payload, not an empty policy (gate R1-7).
+    const params = (typeof row.parameters === 'object' && row.parameters !== null ? row.parameters : {}) as { required_status_checks?: unknown }
+    if (!Array.isArray(params.required_status_checks)) return undefined
+    for (const one of params.required_status_checks as unknown[]) {
+      const context = typeof one === 'object' && one !== null ? (one as { context?: unknown }).context : undefined
+      if (typeof context !== 'string') return undefined
+      out.push(context)
+    }
   }
   if (protection !== undefined) {
+    let read: unknown
     try {
-      const read = JSON.parse(protection) as { contexts?: unknown[]; checks?: { context?: unknown }[] }
-      for (const one of read.contexts ?? []) if (typeof one === 'string') out.push(one)
-      for (const one of read.checks ?? []) if (typeof one.context === 'string') out.push(one.context)
+      read = JSON.parse(protection)
     } catch {
       // Rulesets and classic protection apply together: half a set is not the set (PR #19 review).
       return undefined
+    }
+    // Classic protection always lists contexts and checks: a body with neither (an error message) is not the set (gate R1-7).
+    const body = (typeof read === 'object' && read !== null ? read : {}) as { contexts?: unknown; checks?: unknown }
+    if (!Array.isArray(body.contexts) && !Array.isArray(body.checks)) return undefined
+    for (const one of Array.isArray(body.contexts) ? body.contexts : []) if (typeof one === 'string') out.push(one)
+    for (const one of Array.isArray(body.checks) ? (body.checks as unknown[]) : []) {
+      const context = typeof one === 'object' && one !== null ? (one as { context?: unknown }).context : undefined
+      if (typeof context === 'string') out.push(context)
     }
   }
   return [...new Set(out)]

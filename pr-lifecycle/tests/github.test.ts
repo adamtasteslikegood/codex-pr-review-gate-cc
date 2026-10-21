@@ -470,6 +470,11 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   expect(readRequired('', undefined)).toBeUndefined()
   // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
   expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
+  // A malformed payload that parses is not an empty policy (gate R1-7).
+  expect(readRequired(JSON.stringify([{ type: 'required_status_checks' }]), undefined)).toBeUndefined()
+  expect(readRequired(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: [{}] } }]), undefined)).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ message: 'Bad Gateway' }))).toBeUndefined()
+  expect(readRequired(rules, 'null')).toBeUndefined()
 })
 
 test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
