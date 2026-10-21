@@ -127,3 +127,50 @@ once, in the first full run. It passed at 3.5 s on the rerun and in every run af
    no effect while the item stays linked (`mergeHolds` leaves it out), and the only ways a link is dropped add a later event.
 6. A finding only the record holds, which a link moves or raises, joins the run through `changed` in `afterTriage`. The run's ledger
    can therefore grow by such findings. This is harmless, since the record is merged from the run.
+
+## Fix round 1 (task review; spec amendment A9, 1933604)
+
+Commit: b641e4a. Changes are in `hooks/lifecycle.ts` only, plus tests.
+
+- **I1: no match through an unchecked link.**
+  - `triage`'s `isCandidate` now rejects any candidate where `isLinkOwed` is true, so the new item stands alone as `new-on-reviewed`.
+  - `linkTo` resolves only through a link that stands: `isLinked(original) ? original.duplicateOf : original.id`. `beginTriage` looks
+    the original up by `matchId` and links it through `linkTo`, so it gets the same guard. That `matchId` can no longer be an owed
+    candidate.
+  - This settles concern 4 of the first report.
+- **I2: a link raises the original's `severity`.**
+  - `withLinkedPeak` now sets `severity` to the higher of the two. It adds a history event with `severity`, `from`, the note
+    `raised by its link <id>` and `by: 'gate'`, timed at the link's own event.
+  - It takes `severitySource: 'tag'` when the link's severity is tagged, so a raised tag cannot be re-guessed lower (R84).
+  - It never lowers anything. Peak and security behave as before (A1 is kept), including when a peak is unknown.
+  - `loweringOf` ignores the event, because it is a raise. `isChargedRound` sees no new blocker, because the original's `round` is
+    earlier.
+  - A refused agent link leaves the original raised, as A9 says: `refuseLink` touches only the linked item.
+- **Minor #3.** `rejections` skips Codex events that carry `refusedLink`, so a refused link is never "Codex did not accept the
+  rebuttal" and never a dispute.
+
+New tests in `lifecycle.test.ts`:
+- "R90 A9: new feedback never matches through the agent's unchecked link…": X→T is owed and N matches X, so N is `new-on-reviewed`.
+  `linkTo` stops at X. After Codex refuses X→T, N still holds as its own P1 (`mergeHolds`, `unresolvedBlockers`).
+- "R90 A9: a link raises the original's severity…":
+  - A P2 original with a P1 security duplicate becomes P1 with a gate event; `securityHolds` and `mergeHolds` hold it.
+  - A lower link never lowers it, `isChargedRound` stays false, and there is no lowering.
+  - A P3 issue deferral raised by a P1 link no longer settles.
+  - An agent's link raises the original, and the original stays raised after the link is refused.
+- "R90: Codex refusing a link is not a rejected rebuttal": `rejections` 0, not disputed, and the blocked text has no "did not accept
+  the rebuttal".
+
+Adapted test: the brief's "R90: a linked finding holds and settles with its original…" expected `G2-1 (also G2-2) [P2] …`. Under A9
+(spec §3.5) the original is raised to its P1 link, so it now expects `[P1]`.
+
+Checks: `npm run test` passes codex-gate 22/22 and pr-lifecycle 558/558 (3 new). Lint has 0 problems; typecheck has 0 errors.
+
+Left alone as instructed: Minor #4 (the triagePrompt "earlier answer" leaves out an original from the same batch) and Minor #5 (a
+gate-linked item left unanswered has no pointer reply enforced).
+
+Remaining concerns:
+- From the first report, concerns 1-3, 5 and 6 still stand.
+- `withLinkedPeak` now also raises severity on an agent's link that Codex has not checked. A refusal leaves the original at the
+  higher severity. That is A9's ruling; the cost is an extra hold, never a dropped one.
+- A same-batch original raised from P2 to P1 by its link counts as a new blocker of that round, so the round is charged. That is
+  correct: the round did raise a new P1 problem.
