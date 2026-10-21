@@ -1009,3 +1009,360 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 
 ---
 
+### Task 7: One finding per problem (R90, spec §3)
+
+**Why:** `triage()` compares new feedback only with *answered* findings and only labels it `duplicate` in the prompt; the agent's `duplicateOf` is read and never used. On PR #19 review summary G2-1 stayed a separate blocker beside its own inline G2-2.
+
+**Files:**
+- Modify: `pr-lifecycle/types/index.d.ts` (`Finding`, `Blocker`)
+- Modify: `pr-lifecycle/hooks/lifecycle.ts` (`triage`, new link helpers, `mergeHolds`, `checksOwed`, `blockerOf`, `standingOf`, `decidePost`, `isChargedRound`)
+- Modify: `pr-lifecycle/hooks/core.ts` (`readTriage`, new `readLinks`, `triagePrompt`, `verifyPrompt`)
+- Modify: `pr-lifecycle/hooks/round.ts` (`beginTriage`, `afterTriage`, `afterRebuttalCheck`)
+- Test: `pr-lifecycle/tests/lifecycle.test.ts`, `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `isChargedRound` (Task 6), `peakOf`, `higher`, `isPeakUnknown` (R85).
+- Produces:
+  - `Finding.duplicateOf?: string`, `Finding.linkBy?: 'gate' | 'agent'`, `Finding.isLinkChecked?: boolean`; `Blocker` kind `'link-unchecked'`.
+  - In `lifecycle.ts`: `isLinked(f): boolean` (stands for its original: the gate's link, or the agent's once Codex agreed), `isLinkOwed(f): boolean`, `linkTo(f, original, by, round, at): Finding`, `dropLink(f): Finding`, `withLinkedPeak(original, linked): Finding`, `alsoOf(findings, id): string[]`.
+  - In `core.ts`: `export type LinkAnswer = { id: string; duplicateOf: string; replyId?: string }`, `export function readLinks(answer: string): LinkAnswer[]`.
+- Rulings for the plan: a row with `duplicateOf` is a link, whatever its `action`; a link Codex refuses is not charged (the item was never answered, so it is no rejected answer); a link to an id that is not on the list, or to itself, is no answer.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add `alsoOf, dropLink, isLinked, isLinkOwed, linkTo, withLinkedPeak` to the `lifecycle` imports and `readLinks` to the `core` imports in `pr-lifecycle/tests/lifecycle.test.ts`. Append:
+
+```ts
+test('R90: new feedback links to any finding naming the same problem, open ones included, never to a linked one', async () => {
+  const open = finding({ id: 'G2-1', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, status: 'open' })
+  const item = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 5 }
+  expect(triage(item, [open], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // Linking to a linked finding links to its original.
+  const linked = { ...finding({ id: 'G3-1', source: 'github', title: 'cache never cleared', file: 'src/cache.ts', line: 11 }), duplicateOf: 'G2-1', linkBy: 'gate' as const }
+  expect(triage(item, [linked], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // R33: feedback after a rebuttal answers it; a changed file keeps it new.
+  const rebutted = { ...open, status: 'rebutted' as const, history: [{ round: 2, status: 'rebutted' as const, by: 'main', at: 4 }] }
+  expect(triage(item, [rebutted], new Set()).cls).toBe('new-on-reviewed')
+  expect(triage(item, [open], new Set(['src/cache.ts'])).cls).toBe('new-on-changed')
+})
+
+test('R90: a linked finding holds and settles with its original, is listed beside it, and raises its peak', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', peakSeverity: 'P2', status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1' }), original, 'gate', 2, 5)
+  expect(dup).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(dup.history.at(-1)).toMatchObject({ note: 'linked to G2-1', by: 'gate' })
+  expect(isLinked(dup)).toBe(true)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.peakSeverity).toBe('P1')
+  expect(withLinkedPeak(dup, original).peakSeverity).toBe('P1')
+  const rec = postRec({ findings: [raised, dup] })
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(alsoOf(rec.findings, 'G2-1')).toEqual(['G2-2'])
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers[0]?.said).toBe('G2-1 (also G2-2) [P2] comment from bot: open')
+  // The original settles: so does the link.
+  expect(mergeHolds(postRec({ findings: [markVerified(raised, 2, 'codex', 6), dup] }))).toEqual([])
+  // Never a chain: linking to a linked finding links to its original.
+  expect(linkTo(finding({ id: 'G3-1' }), dup, 'gate', 3, 7).duplicateOf).toBe('G2-1')
+  expect(dropLink(dup)).not.toHaveProperty('duplicateOf', 'G2-1')
+})
+
+test('R90: the agent\'s link waits for Codex, at no round\'s cost; agreed it stands, refused the item stands alone', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', status: 'reported-fixed' })
+  const claimed = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P2' }), original, 'agent', 2, 5)
+  expect(isLinkOwed(claimed)).toBe(true)
+  expect(isLinked(claimed)).toBe(false)
+  const blockers = standingOf(postRec({ findings: [claimed] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-2', 'link-unchecked', 'codex']])
+  expect(checksOwed([claimed]).map(one => one.id)).toEqual(['G2-2'])
+  expect(decideNext(postRec({ findings: [claimed] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-2'] })
+  const agreed = { ...claimed, isLinkChecked: true }
+  expect(isLinked(agreed)).toBe(true)
+  const refused = markHeld(dropLink(claimed), 2, 'codex', 6, 'a different file')
+  expect(isChargedRound([refused], 2)).toBe(false)
+  // A linked duplicate raised as a blocker is not new: it charges nothing.
+  expect(isChargedRound([linkTo(finding({ id: 'G2-3', round: 2, severity: 'P1' }), original, 'gate', 2, 5)], 2)).toBe(false)
+})
+
+test('R90: a row with duplicateOf reads as a link, whatever its action', async () => {
+  const answer = trailerOf({ step: 'r2-triage', dispositions: [
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: 'https://github.com/me/repo/pull/1#discussion_r55' },
+    { id: 'G2-3', action: 'fixed', duplicateOf: 'G2-1' },
+    { id: 'G2-4', action: 'fixed', note: 'done' },
+  ] })
+  expect(readLinks(answer)).toEqual([{ id: 'G2-2', duplicateOf: 'G2-1', replyId: '55' }, { id: 'G2-3', duplicateOf: 'G2-1' }])
+  expect(readTriage(answer).map(one => one.id)).toEqual(['G2-4'])
+})
+```
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [
+    inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10),
+    inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12),
+  ]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const prompt = w.prompts.at(-1) ?? ''
+  expect(prompt).toContain('G2-2 from claude[bot] (src/app.ts:12), same problem as G2-1')
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'deferred', note: 'needs a store change', replyId: '901' },
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' },
+  ]))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(rec.replies['inline:12']).toBe('902')
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+})
+
+test('R90: the agent refuses the gate\'s link by answering the item on its own', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10), inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'clear on logout', replyId: '901' },
+    { id: 'G2-2', action: 'fixed', note: 'a second cache, also cleared now', replyId: '902' },
+  ]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-2')?.duplicateOf).toBeUndefined()
+})
+```
+
+Add `mergeHolds` to the `lifecycle` imports in `flow.test.ts` if it is not imported yet.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/lifecycle.test.ts`
+Expected: FAIL: `linkTo` and the other helpers are not exported.
+
+- [ ] **Step 3: Implement the record and the pure rules**
+
+In `pr-lifecycle/types/index.d.ts`, add to `Finding` after `followUpLabelError`:
+
+```ts
+  /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
+  duplicateOf?: string
+  /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */
+  linkBy?: 'gate' | 'agent'
+  /** Codex agreed the agent's link names the same problem. */
+  isLinkChecked?: boolean
+```
+
+and add `| 'link-unchecked'` to `Blocker.kind` after `'label-failed'`.
+
+In `pr-lifecycle/hooks/lifecycle.ts`:
+
+1. In `triage`, replace the last two lines with:
+
+```ts
+  // Every finding on the list, open ones included (R90); a linked one stands for its original, so the link goes there.
+  const match = findings.find(one => one.needsRecheck !== true && !isAnswerTo(one) && isSame(one, item))
+  return match === undefined ? { cls: 'new-on-reviewed' } : { cls: 'duplicate', matchId: match.duplicateOf ?? match.id }
+```
+
+and delete the now-unused `ANSWERED` constant if nothing else reads it (`grep -n ANSWERED pr-lifecycle/hooks/lifecycle.ts`).
+
+2. After `markHeld`, add:
+
+```ts
+/** A linked finding that stands for its original (R90): the gate's link, or the agent's once Codex agreed. */
+export const isLinked = (f: Finding): boolean => f.duplicateOf !== undefined && (f.linkBy !== 'agent' || f.isLinkChecked === true)
+
+/** The agent's link Codex has not ruled on: Codex checks it in the round's free check (R90). */
+export const isLinkOwed = (f: Finding): boolean => f.duplicateOf !== undefined && f.linkBy === 'agent' && f.isLinkChecked !== true
+
+/** Links a finding to its original, never to a linked one (no chains, R90). Its status is its own; its holds are the original's. */
+export function linkTo(f: Finding, original: Finding, by: 'gate' | 'agent', round: number, at: number): Finding {
+  const to = original.duplicateOf ?? original.id
+  return { ...f, duplicateOf: to, linkBy: by, isLinkChecked: undefined, history: [...f.history, { round, status: f.status, note: `linked to ${to}`, by: by === 'gate' ? 'gate' : 'main', at }] }
+}
+
+/** The finding standing alone again: the agent answered it on its own, or Codex found it a different problem. */
+export const dropLink = (f: Finding): Finding => ({ ...f, duplicateOf: undefined, linkBy: undefined, isLinkChecked: undefined })
+
+/** A link never lowers anything (R90): the original's peak becomes the higher of the two, so its issue carries it (R85). */
+export const withLinkedPeak = (original: Finding, linked: Finding): Finding =>
+  isPeakUnknown(original) || isPeakUnknown(linked) ? original : { ...original, peakSeverity: higher(peakOf(original), peakOf(linked)) }
+
+/** The ids linked to a finding, for "G2-1 (also G2-2)". */
+export const alsoOf = (findings: readonly Finding[], id: string): string[] => findings.filter(one => one.duplicateOf === id && isLinked(one)).map(one => one.id)
+```
+
+(If `isPeakUnknown`, `peakOf` or `higher` are defined below this point as `const`s, place these helpers after them.)
+
+3. In `isChargedRound` (Task 6), change `isNewBlocker` to leave linked findings out:
+
+```ts
+  const isNewBlocker = findings.some(one => one.round === round && isBlocking(one) && one.duplicateOf === undefined)
+```
+
+4. In `mergeHolds`, add `&& !isLinked(one)` to the filter, and add to its doc comment: "A linked duplicate holds through its original (R90)."
+
+5. In `checksOwed`, add `|| isLinkOwed(one)` to the filter, and to its doc comment: "and the agent's links (R90)".
+
+6. Give `blockerOf` the linked ids: change its signature to `function blockerOf(f: Finding, also: readonly string[] = []): Blocker`, its first line to
+
+```ts
+  const tag = `${f.id}${also.length === 0 ? '' : ` (also ${also.join(', ')})`} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
+```
+
+and add, before `if (isDisputed(f))`:
+
+```ts
+  if (isLinkOwed(f)) {
+    return { kind: 'link-unchecked', id: f.id, said: `${tag}: linked to ${f.duplicateOf ?? '?'}, Codex has not checked the link`, owner: 'codex', release: "the gate's Codex check rules on it" }
+  }
+```
+
+   In `standingOf`, change `.map(blockerOf)` to `.map(one => blockerOf(one, alsoOf(rec.findings, one.id)))`.
+
+7. In `decidePost`, change the `unchecked` filter to include `|| isLinkOwed(one)`, and in `recheck` add a line for them:
+
+```ts
+    const links = unchecked.filter(isLinkOwed)
+```
+
+   with `...(links.length === 0 ? [] : [`Codex has not checked the link of ${ids(links)}`]),` in `said`, and leave `links` out of `answered` (`answered = unchecked.filter(one => !isReverifyOwed(one) && !isLoweringOwed(one) && !isLinkOwed(one))`). Add `links` to `kinds` in the `what` line (Task 2), with the words `'the link'` when it is the only kind.
+
+- [ ] **Step 4: Implement the answers and prompts**
+
+In `pr-lifecycle/hooks/core.ts`:
+
+1. In `readTriage`, right after `const row = one as Record<string, unknown>`, add `if (text(row.duplicateOf) !== undefined) continue` (a link is read by `readLinks`), and remove the now-dead `duplicateOf` spread from the pushed object. Keep `TriageAnswer`'s `duplicateOf?` field out: change it to `export type TriageAnswer = Answer & { replyId?: string }`.
+2. Below `readTriage`, add:
+
+```ts
+/** The agent's word that an item names a problem already on the list (R90): a row with `duplicateOf`, whatever its action. */
+export type LinkAnswer = { id: string; duplicateOf: string; replyId?: string }
+
+export function readLinks(answer: string): LinkAnswer[] {
+  const listed = readTrailer(answer)?.dispositions
+  if (!Array.isArray(listed)) return []
+  return listed.flatMap(one => {
+    if (typeof one !== 'object' || one === null) return []
+    const row = one as Record<string, unknown>
+    const id = text(row.id)
+    const to = text(row.duplicateOf)
+    if (id === undefined || to === undefined) return []
+    const given = typeof row.replyId === 'string' ? text(row.replyId) : typeof row.replyId === 'number' && Number.isFinite(row.replyId) ? String(row.replyId) : undefined
+    return [{ id, duplicateOf: to, ...(given === undefined ? {} : { replyId: replyIdOf(given) }) }]
+  })
+}
+```
+
+3. In `triagePrompt`, change the `duplicate` class words to `'same problem as an earlier finding, linked'` and make the line for a duplicate name the original: replace the `lines.push(`- ${one.findingId} from ...`)` line with
+
+```ts
+    const kind = one.cls === 'duplicate' && one.matchId !== undefined ? `same problem as ${one.matchId}` : cls[one.cls]
+    lines.push(`- ${one.findingId} from ${one.feedback.reviewer}${at}, ${kind}; ${reply}:\n${quoted}${earlier}`)
+```
+
+   Change step 2's last sentence (`'A duplicate gets a reply pointing to the earlier answer, not a new argument.'`) to:
+
+```ts
+'An item that names the same problem as an earlier finding gets one pointer reply in its thread ("Same as G2-1: fixed in abc1234"), not a new argument, and the answer {"id":"G2-2","duplicateOf":"G2-1","replyId":"…"}. To say it is a different problem, answer it on its own instead.'
+```
+
+   In the trailer example, drop `"duplicateOf":"R1-1 when it is one",` from the disposition and add a second example row: `{"id":"G1-2","duplicateOf":"G1-1","replyId":"124"}`.
+4. In `verifyPrompt`, add a links section. Compute `const links = rebuttals.filter(isLinkOwed)` and leave them out of `argued` (`&& !isLinkOwed(one)`), then add, after the lowerings section:
+
+```ts
+      ...(links.length === 0
+        ? []
+        : [
+            '',
+            'The main agent says each of these names the same problem as an earlier finding, and answered it there. A link settles nothing until you agree:',
+            ...links.map(one => `${listFindings([one])}\n    Same as: ${one.duplicateOf ?? '?'}`),
+            '   For each one: holds is true when it is the same problem as the finding it names; false, with why, when it is a different one.',
+          ]),
+```
+
+   (`isLinkOwed` is imported from `./lifecycle`.)
+
+In `pr-lifecycle/hooks/round.ts`:
+
+1. In `beginTriage`, link a fresh finding the gate matched. Before the loop, add `const raised: Finding[] = []`. After `const finding: Finding = { ... }` is built, replace `fresh.push(finding)` with:
+
+```ts
+    const original = cls === 'duplicate' && matchId !== undefined ? ledger.find(one => one.id === matchId) : undefined
+    if (original === undefined) fresh.push(finding)
+    else {
+      const linked = linkTo(finding, original, 'gate', run.round, now)
+      fresh.push(linked)
+      const prior = raised.find(one => one.id === original.id) ?? original
+      raised.splice(raised.indexOf(prior) >>> 0, prior === original ? 0 : 1, withLinkedPeak(prior, linked))
+    }
+```
+
+   and in the `patch` that opens triage change `findings: mergeFindings(one.findings, fresh)` to `findings: mergeFindings(one.findings, [...fresh, ...raised])`. Also change the `carried` line's `mergeFindings(ledger, fresh)` to `mergeFindings(ledger, [...fresh, ...raised])`.
+
+   (`raised.splice(raised.indexOf(prior) >>> 0, ...)`: when `prior` is the original, nothing is removed and the raised copy is appended; when it is an earlier raised copy, that copy is replaced. If you find that line hard to read, write it as an `if`; the behaviour is what matters.)
+
+2. In `afterTriage`, read links beside answers and apply them. After `const said = ...`, add:
+
+```ts
+  const ids = new Set(run.findings.map(f => f.id))
+  // A link names a finding on the list, never itself (R90); anything else is no answer, and the item is asked about again.
+  const links = readLinks(run.pending[0]?.answer ?? '').filter(each => each.id !== each.duplicateOf && ids.has(each.id) && ids.has(each.duplicateOf))
+```
+
+   (`run.findings` holds the round's ledger: `beginTriage` merged the record's findings in. If a link names a finding only in the record, look it up in `await loadRecord(...)`'s findings as well; add it to `ids` from there.)
+
+   In the `patch`'s `findings` map, replace the body with:
+
+```ts
+    findings: one.findings.map(finding => {
+      const link = links.find(each => each.id === finding.id)
+      if (link !== undefined) {
+        // The gate's own link confirmed stays the gate's; any other link is the agent's, for Codex to check.
+        if (finding.duplicateOf === link.duplicateOf && finding.linkBy === 'gate') return finding
+        const original = one.findings.find(f => f.id === link.duplicateOf)
+        return original === undefined ? finding : linkTo(finding, original, 'agent', one.round, now)
+      }
+      const answer = said.find(each => each.id === finding.id)
+      // Answered on its own: whatever link it had is dropped (R90).
+      return answer === undefined ? finding : applyAnswer(finding.duplicateOf === undefined ? finding : dropLink(finding), answer, one.round, 'main', now)
+    }),
+```
+
+   Then raise each original's peak for the agent's links: after that `patch`, if any link was applied, patch again with `findings: one.findings.map(f => { const dups = one.findings.filter(d => d.duplicateOf === f.id); return dups.reduce(withLinkedPeak, f) })`.
+
+   A link counts as an answer: in `answered` (the `processed` filter) use `f.status !== 'open' || f.duplicateOf !== undefined`; in the `replies` map add the links' `replyId`s the same way as the answers'; in `unanswered`, add `&& !links.some(each => each.id === id)`.
+
+3. In `afterRebuttalCheck`'s `findings` map, before the `isLoweringOwed` line, add:
+
+```ts
+      // The agent's link (R90): agreed, it stands; refused, the item stands alone and is asked about again. Never charged.
+      if (isLinkOwed(f)) {
+        return verdict.holds
+          ? { ...f, isLinkChecked: true, history: [...f.history, { round: one.round, status: f.status, note: `Codex: the same problem as ${f.duplicateOf ?? '?'}`, by: 'codex', at: now }] }
+          : markHeld(dropLink(f), one.round, 'codex', now, verdict.note ?? 'Codex: a different problem')
+      }
+```
+
+   Import `dropLink`, `isLinkOwed`, `linkTo`, `withLinkedPeak` from `./lifecycle` and `readLinks` from `./core`.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. An existing test that relied on a P1 duplicate being its own blocker now sees it held through its original; check each failure against spec §3 and update only where the new rule applies, listing each in your report.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add pr-lifecycle/types/index.d.ts pr-lifecycle/hooks/lifecycle.ts pr-lifecycle/hooks/core.ts pr-lifecycle/hooks/round.ts pr-lifecycle/tests/lifecycle.test.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: one finding per problem; linked duplicates follow their original (R90)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
+
