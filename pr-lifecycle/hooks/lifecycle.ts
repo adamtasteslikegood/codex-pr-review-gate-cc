@@ -400,11 +400,11 @@ const wasLowered = (f: Finding): boolean => f.history.some(one => one.severity !
 
 /**
  * A P3 deferred with its follow-up recorded, not security: settled without the person's waiver (R85, decision I). The follow-up must
- * say where it is tracked (isFollowUpRef), and the P3 must be the reviewer's or Codex's, or a guess the agent kept: a severity the
- * agent lowered settles nothing (I2), so the agent alone never settles a finding raised above P3.
+ * say where it is tracked (isFollowUpRef), and the P3 must be the reviewer's label or Codex's: a guessed P3 (a mixed comment that says
+ * "nit" anywhere) or a severity the agent lowered settles nothing (I2), so the agent alone never settles a finding nobody called a P3.
  */
 export const isSettledDeferral = (f: Finding): boolean =>
-  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp) && !wasLowered(f)
+  f.status === 'deferred' && f.severity === 'P3' && f.isSecurity !== true && isFollowUpRef(f.followUp) && !wasLowered(f) && f.severitySource !== 'hint'
 
 /**
  * What keeps a PR from merging (R39): every finding of either phase, at any severity, that is open, deferred,

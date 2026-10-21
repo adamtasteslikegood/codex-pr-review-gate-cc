@@ -3421,6 +3421,11 @@ test('R85: a guessed P1 the agent lowers to P3 and defers with a follow-up still
   await toAwaiting($, w, 'This is a critical bug.\n\nNit: the comment has a typo.', { severity: 'P3', followUp: ISSUE })
 })
 
+test('R85: a mixed comment guessed P3 from a "nit" in its middle, deferred as P3 with a follow-up, still holds (controller ruling)', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.', { severity: 'P3', followUp: ISSUE })
+})
+
 test('R85: /pr-gate status names the follow-up of a settled deferral', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')

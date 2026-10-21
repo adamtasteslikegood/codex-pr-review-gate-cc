@@ -298,6 +298,10 @@ the same on main.
   - its stored severity is `P3`, and the agent never lowered it: no answer
     changed it to `P3` from a higher guess, in the deferring answer or an
     earlier one (final review I2);
+  - its P3 is the reviewer's label or Codex's, not a guess from the
+    comment's words (`severitySource` is not `'hint'`): a mixed comment that
+    says "nit" or "minor" anywhere is guessed P3 and must not settle on the
+    agent's word (controller's ruling after the final fix round);
   - it is not security-flagged.
 
   A deferral that comes without a `followUp` clears an earlier one.
@@ -306,7 +310,7 @@ the same on main.
 - P0-P2, security, or no `followUp`: held for the person's waiver, as today
   (R42).
 - The triage prompt says: "deferred: only for what the person must rule on;
-  a P3 whose severity you did not lower, with followUp naming where it is
+  a P3 the reviewer labelled or Codex rated, not lowered by you, with followUp naming where it is
   tracked (an issue or comment URL, #<n> or owner/repo#<n>), needs no
   waiver" (amended after the final review, T4 and I2).
 

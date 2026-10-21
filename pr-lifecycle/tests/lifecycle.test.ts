@@ -794,9 +794,9 @@ test('R85: a deferral settles only if the agent never lowered the severity (fina
   // A guessed P2 raised to P1 and brought back down to P3 was lowered.
   const raised = applyAnswer(finding({ source: 'github', severity: 'P2', severitySource: 'hint' }), { id: 'R1-1', action: 'rebutted', severity: 'P1' }, 2, 'main', 5)
   expect(isSettledDeferral(applyAnswer({ ...raised, status: 'open' }, { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 6))).toBe(false)
-  // A reviewer-tagged P3, and a P3 guess the agent kept, settle.
+  // A reviewer-tagged P3 settles; a guessed P3, even one the agent kept, does not (a mixed body that says "nit" anywhere).
   expect(isSettledDeferral(applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5))).toBe(true)
-  expect(isSettledDeferral(applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5))).toBe(true)
+  expect(isSettledDeferral(applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5))).toBe(false)
 })
 
 test('R85: the ready prompt names the follow-up of a settled deferral and not of a plain one', async () => {
