@@ -87,3 +87,6 @@ Task 6b: complete (commits 8c71e69..c77b336, review clean)
 Ruling: A4's isSettling carries its set time; a flag older than the agent step timeout is stale, cleared with a log line, and the poll proceeds (cap still ends collection) — a crash mid-afterTriage must not freeze collection — cost if wrong: a very slow afterTriage could race one poll
 Ruling: a mid-collection turn's step timeout returns to collecting or holds; never phase 'triage' with collect set and nothing in flight
 Task 8: dispatched (BASE d6dacd9, opus) with rulings above, polls during a turn still persist headArrival
+Task 8: implemented 374a840 + report e59c537 + dad1874 (BASE d6dacd9); controller full run 570/570. Concerns: mid-collect turn step timeout → error stop needing /pr-gate resume; isTurn = phase==='triage'; early return moved after noteArrival; endCollect counts handed feedback; generation check on every afterTriage.
+Ruling: first step timeout of a mid-collection turn in a round → back to collecting, feedback asked again; second in the same round → stop as today — Adam: the gate automates babysitting; a resume is a manual step — cost if wrong: one wasted turn
+Task 8: task review on opus dispatched (timeout ruling included as a required change)
