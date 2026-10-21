@@ -1051,8 +1051,9 @@ export async function requiredChecksOf($: Engine, root: string, slug: string | u
   const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch((err: unknown) => String(err).slice(0, 160))
   // Pages of 100 (final review M3): GitHub's default of 30 could cut a required-checks rule, and a full page means another may
   // follow, read until one is short (gate R4-4).
-  const rulesAt = `repos/${repo}/rules/branches/${base}`
-  const classicAt = `repos/${repo}/branches/${base}/protection/required_status_checks`
+  // A base such as release/1.0 is one path segment, encoded (gate R5-1).
+  const rulesAt = `repos/${repo}/rules/branches/${encodeURIComponent(base)}`
+  const classicAt = `repos/${repo}/branches/${encodeURIComponent(base)}/protection/required_status_checks`
   const readRules = async (): Promise<string | { exitCode: number; stdout: string; stderr: string }> => {
     const all: unknown[] = []
     for (let page = 1; page <= 20; page += 1) {

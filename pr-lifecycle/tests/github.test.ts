@@ -475,6 +475,9 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   expect(readRequired(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: [{}] } }]), undefined)).toBeUndefined()
   expect(readRequired(rules, JSON.stringify({ message: 'Bad Gateway' }))).toBeUndefined()
   expect(readRequired(rules, 'null')).toBeUndefined()
+  // Classic entries that name no check are malformed too (gate R5-4).
+  expect(readRequired(rules, JSON.stringify({ contexts: [1], checks: [] }))).toBeUndefined()
+  expect(readRequired(rules, JSON.stringify({ contexts: [], checks: [{}] }))).toBeUndefined()
 })
 
 test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
