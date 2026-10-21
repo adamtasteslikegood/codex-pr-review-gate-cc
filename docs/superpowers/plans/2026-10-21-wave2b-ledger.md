@@ -65,3 +65,4 @@ Ruling: advisory churn (P2/P3 raised on every head, agent fixes and pushes) is n
 Task 6: complete (commits d3c4305..1e981a2, review clean)
 Ruling: a link Codex refused (X→Y) is not accepted again from the agent (same canonical target = no answer, asked again under the reprompt bound) — free link checks must not loop (gate can't get stuck) — cost if wrong: an agent can't re-propose a link after fixing its reasoning; it answers the item on its own instead
 Task 7: dispatched (BASE fd2ae67, opus) with A1-A3 binding; isFileable assertion deferred to Task 12
+Ruling (Adam, 2026-10-21, option b): a post round is also charged when the agent pushed a fix for a finding raised in it (any severity); charged at most once; rebut/defer/acknowledge of non-blocking stays free. Spec §1.4 amended (A8). Build as Task 6b after Task 7 (Task 7 also edits isChargedRound). Record in Task 16 rulings.

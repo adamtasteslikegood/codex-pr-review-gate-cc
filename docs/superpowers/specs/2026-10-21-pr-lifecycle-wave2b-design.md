@@ -74,7 +74,13 @@ same round. Every completed discretionary round is charged (`usedRounds`,
    discretionary round is charged when, during it:
    - a new blocking finding was raised (a linked duplicate (§3) is not new); or
    - Codex rejected a fix (the check found it does not hold) or a rebuttal or
-     acknowledgement.
+     acknowledgement; or
+   - the agent pushed a fix for a finding raised in it, of any severity
+     (amendment A8, Adam 2026-10-21: "charge the push that fixes last round's
+     findings"). Without it, P2/P3 findings raised and fixed on every head were
+     never charged and nothing bounded the loop. A round is charged at most
+     once; a rebuttal, deferral or acknowledgement of a non-blocking finding
+     stays free.
 
    A rejected fix is charged to the round in which Codex rejects it ("a
    rejected fix still uses a round, because it does"). `usedRounds` counts
