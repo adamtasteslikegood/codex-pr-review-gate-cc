@@ -22,8 +22,10 @@ import {
   relocate,
   remaining,
   rejections,
+  holdText,
   rescope,
   roundOf,
+  standingOf,
   triage,
   unresolvedBlockers,
   usedRounds,
@@ -767,4 +769,68 @@ test('R85: the ready prompt names the follow-up of a settled deferral and not of
   expect(said).toContain('G2-1')
   expect(said).toContain('(follow-up at https://github.com/me/repo/issues/9)')
   expect(said.match(/follow-up at/g)).toHaveLength(1)
+})
+
+const postRec = (over: object = {}) => at([post({ endHead: 'a' })], { phase: 'post', pr: 7, ...over })
+
+test('R79: the standing lists every finding that holds the merge, each with its owner and release', async () => {
+  const rec = postRec({
+    findings: [
+      finding({ id: 'G2-1', source: 'github', severity: 'P2', status: 'open' }),
+      finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' }),
+      finding({ id: 'R1-1', status: 'reported-fixed' }),
+      finding({ id: 'R1-2', status: 'verified-fixed', needsRecheck: true }),
+    ],
+  })
+  const s = standingOf(rec, { head: 'a', base: 'dev' })
+  expect(s.blockers.map(one => [one.id, one.kind, one.owner])).toEqual(
+    expect.arrayContaining([
+      ['G2-1', 'open', 'agent'],
+      ['G2-2', 'deferred', 'person'],
+      ['R1-1', 'verify-owed', 'codex'],
+      ['R1-2', 'reverify-owed', 'codex'],
+    ]),
+  )
+  expect(s.mayProceed).toBe(false)
+  expect(s.blockers.find(one => one.id === 'G2-2')?.release).toBe('/pr-gate waive G2-2 <reason>')
+})
+
+test('R79/R86: CI joins the standing; a post waiver sets aside only checks GitHub does not require', async () => {
+  const ci = [
+    { name: 'check', bucket: 'pending', isRequired: true },
+    { name: 'Independent Claude review', bucket: 'cancel', isRequired: false },
+    { name: 'lint', bucket: 'pass', isRequired: true },
+  ]
+  const open = standingOf(postRec(), { head: 'a', base: 'dev' }, ci)
+  expect(open.blockers.map(one => [one.id, one.kind])).toEqual(
+    expect.arrayContaining([['check', 'ci-running'], ['Independent Claude review', 'ci-failing']]),
+  )
+  const waived = postRec({ waivers: [{ scope: 'post', head: 'a', reason: 'docs only', by: 'composer', at: 2 }], findings: [finding({ id: 'G2-1', source: 'github', severity: 'P2' })] })
+  const s = standingOf(waived, { head: 'a', base: 'dev' }, ci)
+  expect(s.setAside).toEqual(['Independent Claude review'])
+  expect(s.blockers.map(one => one.id)).toEqual(['check'])
+  expect(standingOf(waived, { head: 'a', base: 'dev' }, ci.filter(one => one.name !== 'check')).mayProceed).toBe(true)
+})
+
+test('R79: unreadable checks are a blocker; a security P1 survives a post waiver', async () => {
+  expect(standingOf(postRec(), { head: 'a', base: 'dev' }, 'unreadable').blockers.map(one => one.kind)).toContain('ci-unreadable')
+  const rec = postRec({
+    waivers: [{ scope: 'post', head: 'a', reason: 'x', by: 'composer', at: 2 }],
+    findings: [finding({ id: 'R1-1', isSecurity: true, status: 'open' })],
+  })
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers.map(one => one.kind)).toContain('security-p1')
+})
+
+test('R79: holdText names every blocker once, skipping ids the caller already named', async () => {
+  const rec = postRec({ findings: [finding({ id: 'G2-1', source: 'github', severity: 'P2' }), finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' })] })
+  const s = standingOf(rec, { head: 'abcdef1234', base: 'dev' }, [{ name: 'check', bucket: 'fail', isRequired: true }])
+  const all = holdText(s)
+  expect(all).toContain('Everything between abcdef1 and the merge:')
+  expect(all).toContain('G2-1 [P2]')
+  expect(all).toContain('G2-2 [P3]')
+  expect(all).toContain('check')
+  const rest = holdText(s, new Set(['G2-1']))
+  expect(rest).not.toContain('G2-1')
+  expect(rest).toContain('Also holding:')
+  expect(holdText(standingOf(postRec(), { head: 'abcdef1234', base: 'dev' }, []))).toContain('Nothing else holds the merge of abcdef1.')
 })

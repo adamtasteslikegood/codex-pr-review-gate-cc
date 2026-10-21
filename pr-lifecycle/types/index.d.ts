@@ -247,6 +247,33 @@ export type Run = {
   message?: string
 }
 
+/** A CI check on a PR head, by gh's bucket (pass, fail, cancel, pending, skipping), and whether the base requires it (R86). */
+export type CheckState = { name: string; bucket: string; isRequired: boolean }
+
+export type Blocker = {
+  kind:
+    | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
+    | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
+  /** A finding id, or a check name. */
+  id?: string
+  /** One line, with the stored (triaged) severity. */
+  said: string
+  owner: 'agent' | 'codex' | 'person' | 'gate'
+  /** The exact step that clears it. */
+  release: string
+}
+
+/** Everything between a head and its merge (R79): one list, none short-circuited. */
+export type Standing = {
+  phase: 'pre' | 'post'
+  head: string
+  waiver?: Waiver
+  /** Checks GitHub doesn't require that a post waiver set aside (R86). */
+  setAside: string[]
+  mayProceed: boolean
+  blockers: Blocker[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'pr-lifecycle': { run: Run | null; tick: number }

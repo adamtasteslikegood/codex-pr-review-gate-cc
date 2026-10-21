@@ -1,7 +1,7 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Tier, Waiver } from '../types'
+import type { Blocker, CheckState, Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver } from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -407,6 +407,82 @@ export const reverifyOwed = (f: Pick<Finding, 'id' | 'severity'>): string => `${
 /** Security P1s that hold the merge: only a waiver naming each one releases it, never `waive post` (spec §3). */
 export const securityHolds = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] =>
   mergeHolds(rec).filter(one => isBlocking(one) && one.isSecurity === true)
+
+const short = (sha: string): string => sha.slice(0, 7)
+
+/** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). */
+function blockerOf(f: Finding): Blocker {
+  const tag = `${f.id} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${f.title}`
+  const waive = `/pr-gate waive ${f.id} <reason>`
+  const isSecurityP1 = isBlocking(f) && f.isSecurity === true
+  if (isDisputed(f)) return { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
+  if (f.status === 'deferred') return { kind: isSecurityP1 ? 'security-p1' : 'deferred', id: f.id, said: `${tag}: deferred`, owner: 'person', release: waive }
+  if (isReverifyOwed(f)) {
+    return { kind: 'reverify-owed', id: f.id, said: `${tag}: fixed, re-verify owed (file changed)`, owner: 'codex', release: "the gate's Codex check re-verifies it" }
+  }
+  if (f.status === 'reported-fixed') {
+    return { kind: 'verify-owed', id: f.id, said: `${tag}: fixed, verification owed`, owner: 'codex', release: "the gate's Codex check verifies it" }
+  }
+  if (f.status === 'rebutted') {
+    return { kind: 'rebuttal-unchecked', id: f.id, said: `${tag}: rebuttal not yet accepted`, owner: 'codex', release: "the gate's Codex check rules on it" }
+  }
+  return { kind: isSecurityP1 ? 'security-p1' : 'open', id: f.id, said: `${tag}: open`, owner: 'agent', release: 'fix it, or rebut it with file:line evidence' }
+}
+
+/**
+ * Everything between this head and its merge (R79): findings, the head's own review, and CI, with nothing short-circuited. A post
+ * waiver for this head and base leaves only a security P1 and CI; CI a waiver covers is only what GitHub does not require (R86).
+ */
+export function standingOf(rec: LifecycleRecord, at: { head: string; base: string }, ci?: readonly CheckState[] | 'unreadable'): Standing {
+  const phase = rec.phase === 'pre' ? 'pre' : 'post'
+  const isOnBase = rec.base === at.base
+  const waiver = isOnBase ? rec.waivers.find(one => one.scope === phase && one.head === at.head && (phase === 'post' || one.base === at.base)) : undefined
+  const security = securityHolds(rec)
+  const isWaived = waiver !== undefined && security.length === 0
+  const blockers: Blocker[] = (isWaived ? [] : mergeHolds(rec)).map(blockerOf)
+  if (!isOnBase && phase === 'post') {
+    blockers.push({ kind: 'retargeted', said: `reviewed for ${rec.base}, but the PR now targets ${at.base}`, owner: 'person', release: `point it back at ${rec.base}, or /pr-gate reset` })
+  }
+  if (!isWaived && phase === 'post') {
+    const next = decideNext(rec)
+    if (next.kind === 'round') blockers.push({ kind: 'round-owed', said: `a review round is owed on ${short(at.head)}`, owner: 'gate', release: 'the gate runs it; leave the branch alone' })
+    if (next.kind === 'exhausted') {
+      blockers.push({ kind: 'head-unreviewed', said: next.why, owner: 'person', release: '/pr-gate allow 1 <reason>, or /pr-gate waive post <reason>' })
+    }
+  }
+  const setAside: string[] = []
+  if (ci === 'unreadable') {
+    blockers.push({ kind: 'ci-unreadable', said: `the CI checks on ${short(at.head)} could not be read`, owner: 'agent', release: 'check gh auth status and the network, then try again' })
+  } else {
+    for (const one of ci ?? []) {
+      const isBad = one.bucket === 'fail' || one.bucket === 'cancel'
+      if (!isBad && (one.bucket === 'pass' || one.bucket === 'skipping')) continue
+      if (isWaived && !one.isRequired) {
+        setAside.push(one.name)
+        continue
+      }
+      blockers.push(
+        isBad
+          ? { kind: 'ci-failing', id: one.name, said: `check ${one.name} ${one.bucket === 'cancel' ? 'cancelled' : 'failing'}`, owner: 'agent', release: 'fix what it reports and push, or rerun it (gh run rerun <run-id> --failed)' }
+          : { kind: 'ci-running', id: one.name, said: `check ${one.name} running`, owner: 'gate', release: `wait for it (gh pr checks ${rec.pr ?? ''} --watch)` },
+      )
+    }
+  }
+  return { phase, head: at.head, ...(waiver === undefined ? {} : { waiver }), setAside, mayProceed: blockers.length === 0, blockers }
+}
+
+const OWNERS: Record<Blocker['owner'], string> = { agent: 'yours', codex: 'the gate (Codex)', person: "the person's", gate: 'the gate' }
+
+/** The standing in words (R79): every blocker once, skipping ids the text around it already named, with who acts and how. */
+export function holdText(s: Standing, named: ReadonlySet<string> = new Set()): string {
+  const what = s.phase === 'pre' ? 'pull request' : 'merge'
+  const aside = s.setAside.length === 0 ? [] : [`Set aside by the post waiver (GitHub does not require them): ${s.setAside.join(', ')}.`]
+  if (s.blockers.length === 0) return [...aside, `Nothing else holds the ${what} of ${short(s.head)}.`].join('\n')
+  const rest = s.blockers.filter(one => one.id === undefined || !named.has(one.id))
+  if (rest.length === 0) return aside.join('\n')
+  const heading = named.size > 0 ? 'Also holding:' : `Everything between ${short(s.head)} and the ${what}:`
+  return [...aside, heading, ...rest.map(one => `- ${one.said} (${OWNERS[one.owner]}: ${one.release})`)].join('\n')
+}
 
 // --------------------------------------------------------------- coverage
 
