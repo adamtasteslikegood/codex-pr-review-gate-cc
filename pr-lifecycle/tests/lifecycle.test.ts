@@ -11,6 +11,9 @@ import {
   isLinkOwed,
   linkTo,
   withLinkedPeak,
+  acceptRebuttal,
+  isAcceptedRebuttal,
+  raisedIn,
   decideNext,
   changedLines,
   invalidate,
@@ -1333,4 +1336,41 @@ test('A8: a post round is charged when the agent fixes a finding raised in it, o
   // A round with both a new blocker and a fix is charged once: a boolean.
   const blocker = finding({ id: 'G3-3', round: 3, source: 'github', severity: 'P1' })
   expect(isChargedRound([blocker, applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'main', 5)], 3)).toBe(true)
+})
+
+test('A9: a link\'s severity raise moves no status reader: an accepted rebuttal stays accepted, rebutted when it was, acknowledged', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', title: 'cache never cleared', file: 'src/cache.ts', line: 10 })
+  const acked = acceptRebuttal(applyAnswer(p3, { id: 'G2-1', action: 'acknowledged', note: 'by design' }, 2, 'main', 4), 2, 5)
+  expect(isAcceptedRebuttal(acked)).toBe(true)
+  expect(isAcknowledged(acked)).toBe(true)
+  // A P1 duplicate, posted before the rebuttal and linked at 9 in round 3.
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P1', peakSeverity: 'P1', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), acked, 'gate', 3, 9)
+  const raised = withLinkedPeak(acked, dup)
+  // The raise is recorded, as the gate's change with the severity before it (R85).
+  expect(raised.severity).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P3', by: 'gate', raisedBy: 'G3-1' })
+  expect(loweringOf(raised)).toBeUndefined()
+  // Codex's acceptance still stands, and so does the acknowledgement.
+  expect(isAcceptedRebuttal(raised)).toBe(true)
+  expect(isAcknowledged(raised)).toBe(true)
+  expect(rejections(raised)).toBe(0)
+  expect(isDisputed(raised)).toBe(false)
+  // An accepted rebuttal holds nothing at any severity (R39); the link holds through it, so neither holds.
+  expect(mergeHolds(postRec({ findings: [raised, dup] }))).toEqual([])
+  expect(checksOwed([raised])).toEqual([])
+  // R33: a reply posted between the rebuttal (4) and the link (9) still answers the rebuttal; the raise is no new rebuttal.
+  const reply = { file: 'src/cache.ts', line: 11, title: 'cache never cleared on logout', at: 7 }
+  expect(triage(reply, [raised], new Set()).cls).toBe('new-on-reviewed')
+  // Nothing in the link's round: no charge, and the original was not raised in it.
+  expect(isChargedRound([raised], 3)).toBe(false)
+  // A rebuttal Codex has not ruled on stays one, and an open original raised by a link is not "raised in" the link's round.
+  const rebutted = applyAnswer(p3, { id: 'G2-1', action: 'rebutted', note: 'not reachable' }, 2, 'main', 4)
+  const owed = withLinkedPeak(rebutted, dup)
+  expect(checksOwed([owed]).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(postRec({ findings: [owed, dup] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(raisedIn(withLinkedPeak(p3, dup), 3)).toBe(false)
+  // A rejection before the raise is still read as one.
+  const once = withLinkedPeak(markHeld(rebutted, 2, 'codex', 5, 'still reachable'), dup)
+  expect(rejections(once)).toBe(1)
+  expect(isChargedRound([once], 2)).toBe(true)
 })

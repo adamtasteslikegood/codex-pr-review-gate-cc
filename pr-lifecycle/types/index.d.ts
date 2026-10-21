@@ -21,6 +21,11 @@ export type FindingEvent = {
   answer?: 'acknowledged'
   /** Codex's refusal of the agent's link (R90): the original it found a different problem. A link to it again is no answer. */
   refusedLink?: string
+  /**
+   * The id of the link that raised the severity (A9): a record of the raise, not an answer or a ruling. The status it carries is
+   * the finding's own, copied; readers of the answers and rulings skip it (`answersOf`), and `loweringOf` reads its severity.
+   */
+  raisedBy?: string
   by: string
   at: number
 }

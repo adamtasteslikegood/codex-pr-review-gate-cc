@@ -1,7 +1,9 @@
 // The lifecycle's pure half: the budget, the finding ledger, coverage, and
 // the controller's choice of what comes next. No `$` here.
 
-import type { Blocker, CheckState, Finding, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver } from '../types'
+import type {
+  Blocker, CheckState, Finding, FindingEvent, FindingStatus, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver,
+} from '../types'
 
 // ----------------------------------------------------------------- budget
 
@@ -104,6 +106,13 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
 
 export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
 
+/**
+ * A finding's history without a link's severity raise (A9): the answers, rulings and holds every status reader reads. The raise
+ * copies the status, so read as an entry it would put a new gate 'rebutted' last and move Codex's acceptance, the rebuttal's time
+ * (R33) and the acknowledgement off the end.
+ */
+export const answersOf = (f: Pick<Finding, 'history'>): FindingEvent[] => f.history.filter(one => one.raisedBy === undefined)
+
 /** The agent's answers Codex can reject. */
 const REJECTABLE: readonly FindingStatus[] = ['reported-fixed', 'verified-fixed', 'rebutted', 'deferred']
 
@@ -120,12 +129,13 @@ export function isChargedRound(findings: readonly Finding[], round: number): boo
   // The agent's fix (main's, or the fixer's), never a gate or Codex entry; a linked duplicate's fix is its original's to charge.
   const isFixed = findings.some(one =>
     one.round === round && one.duplicateOf === undefined &&
-    one.history.some(each => each.round === round && each.status === 'reported-fixed' && each.by !== 'codex' && each.by !== 'gate'),
+    answersOf(one).some(each => each.round === round && each.status === 'reported-fixed' && each.by !== 'codex' && each.by !== 'gate'),
   )
   // Codex refusing the agent's link rejects no answer (R90): the item was never answered.
   const isRejected = findings.some(one =>
-    one.history.some((each, i) =>
-      each.round === round && each.by === 'codex' && each.status === 'open' && each.refusedLink === undefined && i > 0 && REJECTABLE.includes(one.history[i - 1]?.status ?? 'open'),
+    answersOf(one).some((each, i, all) =>
+      each.round === round && each.by === 'codex' && each.status === 'open' && each.refusedLink === undefined &&
+      i > 0 && REJECTABLE.includes(all[i - 1]?.status ?? 'open'),
     ),
   )
   return isNewBlocker || isRejected || isFixed
@@ -161,7 +171,7 @@ export const mayAcknowledge = (f: Finding): boolean =>
 
 /** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
 export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
-  finding.round === round || finding.history.some(one => one.round === round && one.status === 'open')
+  finding.round === round || answersOf(finding).some(one => one.round === round && one.status === 'open')
 
 // ----------------------------------------------------------------- ledger
 
@@ -214,7 +224,8 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
 }
 
 /** A rebuttal that is the agent's acknowledgement of a comment asking for no change (R82): named as such in every text (R94). */
-export const isAcknowledged = (f: Finding): boolean => f.status === 'rebutted' && f.history.filter(one => one.by !== 'codex').at(-1)?.answer === 'acknowledged'
+export const isAcknowledged = (f: Finding): boolean =>
+  f.status === 'rebutted' && answersOf(f).filter(one => one.by !== 'codex').at(-1)?.answer === 'acknowledged'
 
 /** A check confirmed the fix: the verify step, a reviewer saying so, or Codex conceding it. */
 export const markVerified = (f: Finding, round: number, by: string, at: number, note?: string): Finding =>
@@ -267,7 +278,9 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
           ...(linked.severitySource === 'tag' ? { severitySource: 'tag' as const } : {}),
           history: [
             ...original.history,
-            { round: when?.round ?? linked.round, status: original.status, severity, from: original.severity, note: `raised by its link ${linked.id}`, by: 'gate', at: when?.at ?? 0 },
+            // Marked as the link's raise, so no status reader takes it for an answer or a ruling (`answersOf`).
+            { round: when?.round ?? linked.round, status: original.status, severity, from: original.severity, note: `raised by its link ${linked.id}`,
+              raisedBy: linked.id, by: 'gate', at: when?.at ?? 0 },
           ],
         }
   return isPeakUnknown(original) || isPeakUnknown(linked)
@@ -369,7 +382,7 @@ function isSame(a: { file?: string; line?: number; title: string }, b: { file?: 
 }
 
 /** When a finding was last rebutted, or undefined. */
-const rebuttedAt = (f: Finding): number | undefined => f.history.filter(one => one.status === 'rebutted').at(-1)?.at
+const rebuttedAt = (f: Finding): number | undefined => answersOf(f).filter(one => one.status === 'rebutted').at(-1)?.at
 
 /**
  * Where incoming feedback stands against the ledger. Prior review can make it a duplicate, never dismiss a new claim.
@@ -545,7 +558,7 @@ export function verificationOwed(rec: Pick<LifecycleRecord, 'findings' | 'waiver
 
 /** A rebuttal Codex ruled on and accepted, with its file unchanged since. */
 export const isAcceptedRebuttal = (f: Finding): boolean => {
-  const last = f.history.at(-1)
+  const last = answersOf(f).at(-1)
   return f.status === 'rebutted' && f.needsRecheck !== true && last?.status === 'rebutted' && last.by === 'codex'
 }
 
@@ -559,7 +572,7 @@ export const acceptRebuttal = (f: Finding, round: number, at: number, note = 'Co
 /** How many times Codex rejected a rebuttal of this finding: a Codex `open` entry right after a `rebutted` one. */
 export const rejections = (f: Pick<Finding, 'history'>): number =>
   // Codex refusing the agent's link (R90) rejects no rebuttal.
-  f.history.filter((one, i) => one.by === 'codex' && one.status === 'open' && one.refusedLink === undefined && f.history[i - 1]?.status === 'rebutted').length
+  answersOf(f).filter((one, i, all) => one.by === 'codex' && one.status === 'open' && one.refusedLink === undefined && all[i - 1]?.status === 'rebutted').length
 
 /** Rebutted again after Codex rejected a rebuttal: a dispute only the person settles; it never goes to Codex again (R40). */
 export const isDisputed = (f: Finding): boolean => f.status === 'rebutted' && !isAcceptedRebuttal(f) && rejections(f) > 0
@@ -582,7 +595,7 @@ export const checksOwed = (findings: readonly Finding[]): Finding[] =>
 
 /** The dispute in words: the agent's last argument and Codex's last rejection. */
 const disputeOf = (f: Finding): string => {
-  const argued = f.history.filter(one => one.status === 'rebutted' && one.by !== 'codex').at(-1)?.note ?? 'no argument recorded'
+  const argued = answersOf(f).filter(one => one.status === 'rebutted' && one.by !== 'codex').at(-1)?.note ?? 'no argument recorded'
   const codex = f.history.filter(one => one.status === 'open' && one.by === 'codex').at(-1)?.note ?? 'no reason given'
   return `${f.id} is disputed: the agent says "${argued}"; Codex said "${codex}"`
 }
@@ -956,7 +969,7 @@ function decidePost(rec: LifecycleRecord): Next {
     // A rebuttal Codex did not accept is said as such (M2), not as an unanswered finding; it may be fixed or deferred, not rebutted again (R40).
     const rejected = open.filter(one => rejections(one) > 0)
     // A fix Codex re-verified after its file changed and found no longer holds (R58): the agent's to fix or rebut again.
-    const refuted = open.filter(one => one.history.at(-1)?.by === 'codex' && one.history.at(-2)?.status === 'verified-fixed')
+    const refuted = open.filter(one => answersOf(one).at(-1)?.by === 'codex' && answersOf(one).at(-2)?.status === 'verified-fixed')
     const ignored = open.filter(one => !rejected.includes(one) && !refuted.includes(one))
     const isFeedbackOnly =
       ignored.length > 0 && rejected.length + refuted.length === 0 && open.every(one => one.source === 'github' && !isBlocking(one))

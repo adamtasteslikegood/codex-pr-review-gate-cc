@@ -2,6 +2,7 @@
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
 import {
+  answersOf,
   holdText,
   isAcceptedRebuttal,
   isBlocking,
@@ -729,7 +730,7 @@ export function triagePrompt(
   // After one rejection a finding is fixed or deferred (R40): a second rebuttal goes to the person, not to Codex.
   const rejected = [...(more.carried ?? []), ...(more.codex ?? [])].filter(one => one.status === 'open' && rejections(one) > 0)
   if (rejected.length > 0) {
-    const isAck = (one: Finding) => one.history.filter(each => each.by !== 'codex').at(-1)?.answer === 'acknowledged'
+    const isAck = (one: Finding) => answersOf(one).filter(each => each.by !== 'codex').at(-1)?.answer === 'acknowledged'
     const named = (list: readonly Finding[]) => list.map(one => one.id).join(', ')
     const acked = rejected.filter(isAck)
     const argued = rejected.filter(one => !isAck(one))

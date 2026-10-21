@@ -51,6 +51,7 @@ import {
 import type { Check, Feedback, Roster } from './github'
 import {
   acceptRebuttal,
+  answersOf,
   applyAnswer,
   applyLinks,
   decideNext,
@@ -2447,7 +2448,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
   // A fix the fix reviewer verified in this round owes no re-verify for the round's own commits only if the reviewer read the end
   // head: a commit that landed while it ran (`run.headSha` is the head it read, not `endHead`) leaves the fix owed (R58, R59).
   const isVerifiedAtEnd = (one: Finding): boolean => {
-    const last = one.history.at(-1)
+    const last = answersOf(one).at(-1)
     return one.status === 'verified-fixed' && last?.round === run.round && last.by === 'fix-reviewer' && run.headSha === endHead
   }
   // The head move is read from the record under its lock (R1-6), so a waiver given meanwhile is lapsed or kept, never lost.

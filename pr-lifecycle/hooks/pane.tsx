@@ -5,7 +5,7 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { Finding, LifecycleRecord, Run, Step } from '../types'
 import { isBlocking } from './core'
-import { isAcceptedRebuttal, isAcknowledged, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
+import { answersOf, isAcceptedRebuttal, isAcknowledged, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
 import { elapsed, SPINNER } from './round'
 
 type Engine = EngineInterface
@@ -59,7 +59,8 @@ type Mark = { glyph: string; said: string; isSettled: boolean; isOwed: boolean; 
 
 /** One finding in words: the mark, what stands, and whether it is settled, owed a check, or struck through (only a verified fix is). */
 const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
-  const last = one.history.at(-1)
+  // A link's severity raise (A9) is no ruling: Codex's acceptance is the last answer or ruling.
+  const last = answersOf(one).at(-1)
   const wasAccepted = one.status === 'rebutted' && last?.by === 'codex' && last.status === 'rebutted'
   const isWaived = rec !== undefined && waivedIds(rec).has(one.id)
   const waived = isWaived ? rec.waivers.find(w => w.scope === 'finding' && w.findingId === one.id && w.lapsedAt === undefined) : undefined
