@@ -109,3 +109,5 @@ Task 10: dispatched (BASE 38c02a8, sonnet, implementer af110854db272ab14). Told:
 Task 10: implemented f92e52b (BASE 4e15c32), 581/581, lint/typecheck clean, DONE_WITH_CONCERNS (headArrival.asked no longer written at the re-request → #24 may ask the same reviewer again). Task review (sonnet) dispatched.
 - Task 10 review: Approved. headArrival.asked claim verified (missing mark → only a duplicate POST + log line; never counted coverage, no cap wait). Fix round 1 sent: move re-request below afterTriage's tail ended/generation guard (a stopped/reset run must send none) + test; test that a first post round's pushing turn re-requests. Deferred minor: no test for a reviewer-less roster.
 - Task 10 fix round 1: 0fe8857, 583/583, lint/typecheck clean (request below tail guard + per-POST run/generation re-check; tests for reset at roster read and first-round re-request). Scoped re-review (sonnet) dispatched.
+- Task 10 re-review: all findings addressed, no new breakage. Deferred nit: no test for a reset between isOwn() and the tail guard (tail guard's checks unchanged).
+Task 10: complete (f92e52b, 0fe8857)
