@@ -41,3 +41,7 @@ Ruling: spec §7.2 "texts say acknowledgement" covers the pane and agent-facing 
 Ruling: PR #25 Codex review (7 findings) folded into the plan as amendments A1-A7 (docs a47400f): Task 4 4a (A5 headArrival, replaces commit/check times), Task 7 5a (A1-A3), Task 8 3a (A4 isSettling), Task 12 9a (A7 label verify), Task 15 6a (A6 generation guard + A7 refile). Task 4 now opus (prose). Merge docs/wave2b into build branch before Task 3's brief.
 Task 2: fix round 1 4967be1 (pane + rejection text say acknowledgement), re-reviewed by controller (small diff): clean. Minor deferred: rejection wording untested.
 Task 2: complete (commits 0a320ae..4967be1, review clean)
+Task 3: implemented a575cdf (BASE 63ac5a9), 507/507
+Task 3: review Changes needed (Important: archive seed dropped ownReplies) → fix round 1 d5b8dfe (seed + fresh-start carry in register.tsx, afterFix order, tests), controller re-review clean, 509/509
+Task 3: complete (commits 63ac5a9..d5b8dfe, review clean)
+Ruling: A5 amended again (39b06cb, 7a04661): push time = latest activity-log push into the head; ambiguous comment → re-request or count, never a cap wait (Adam: gate can't get stuck).
