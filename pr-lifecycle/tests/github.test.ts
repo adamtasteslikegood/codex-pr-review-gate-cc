@@ -433,7 +433,8 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   expect(severityHint('Advisory, non-blocking:\n- rename the flag\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
   // Quoted inside a sentence, the word labels nothing.
   expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
-  expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
+  // A mention in a sentence is a hint since R94.
+  expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: false })
   expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
   // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
   expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
@@ -497,4 +498,21 @@ test('R87: hasOtherSteps sees steps chained with a PR command, not text inside q
   expect(hasOtherSteps("cat > body.md <<'EOF'\nSummary\nEOF\ngh pr create --base dev --body-file body.md")).toBe(true)
   expect(hasOtherSteps('git push -u origin HEAD && gh pr create --base dev')).toBe(true)
   expect(hasOtherSteps('gh pr merge 1 --squash; git checkout dev')).toBe(true)
+})
+
+test('R94: a tag is a token standing alone; any other P0-P3 mention is a hint', async () => {
+  for (const body of ['[P2] the cache is never cleared', '(P2) the cache is never cleared', '**P2** the cache', '**P2:** the cache', 'P2: the cache',
+    'P2 - the cache', '  - P2: the cache', '1. P2: the cache', '![P2 Badge](https://img.shields.io/badge/P2-yellow) the cache', 'Intro line\nP2: the cache']) {
+    expect(severityHint(body)).toEqual({ severity: 'P2', isSecurity: false, isTagged: true })
+  }
+  // The gate's own words on PR #20: a mention, not the reviewer's tag.
+  expect(severityHint('Same as G7-2 [P2 thread]: fixed in abc1234')).toEqual({ severity: 'P2', isSecurity: false, isTagged: false })
+  expect(severityHint('supersedes the outstanding P2')).toEqual({ severity: 'P2', isSecurity: false, isTagged: false })
+  expect(severityHint('P2s are fine here')).toMatchObject({ isTagged: false })
+  // The most severe tag still wins, and a tag beats a mention.
+  expect(severityHint('[P3] tidy\n- P1: the token leaks into logs')).toMatchObject({ severity: 'P1', isTagged: true })
+  expect(severityHint('[P3] tidy; see the earlier P1')).toMatchObject({ severity: 'P3', isTagged: true })
+  // A security mention never reads below P2 unless the reviewer tagged it.
+  expect(severityHint('this was a P3 but it leaks a secret')).toEqual({ severity: 'P2', isSecurity: true, isTagged: false })
+  expect(severityHint('[P3] the secret name is misspelt')).toEqual({ severity: 'P3', isSecurity: true, isTagged: true })
 })

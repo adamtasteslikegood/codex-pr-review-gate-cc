@@ -210,13 +210,26 @@ const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(ent
  */
 const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|\n|$)/i
 
+/**
+ * A reviewer's own severity tag (R94): a token standing alone. `[P2]`, `(P2)`, `**P2**` or `**P2:**` anywhere; `P2:` or `P2 -` at the
+ * start of a line, after a list marker; or a badge image named for it (`![P2 Badge]`, as Codex's connector posts). Any other mention,
+ * such as "[P2 thread]" or "the outstanding P2", is a hint the agent may change.
+ */
+const TAG = /\[P([0-3])\]|\(P([0-3])\)|\*\*P([0-3]):?\*\*|!\[P([0-3])[ _-]?Badge\]|^[ \t]*(?:[-*+][ \t]+|\d+\.[ \t]+)?P([0-3])(?::|[ \t]+-[ \t])/gim
+
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
   const isSecurity = SECURITY.test(body)
-  // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
-  const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  // The most severe tag anywhere wins: one P1 in a list of advisories is a P1.
+  const tags = [...body.matchAll(TAG)].map(one => Number(one.slice(1).find(each => each !== undefined)))
   if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
   if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+  // A severity named in passing is a guess (R94): the most severe one named, never below P2 for a security hint.
+  const named = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  if (named.length > 0) {
+    const level = Math.min(...named)
+    return { severity: `P${isSecurity ? Math.min(level, 2) : level}` as Severity, isSecurity, isTagged: false }
+  }
   if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
   if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
