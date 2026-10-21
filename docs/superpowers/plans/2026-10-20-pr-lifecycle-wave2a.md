@@ -66,7 +66,17 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   expect(isNoAction('APPROVED', '')).toBe(true)
   expect(isNoAction('APPROVED', 'LGTM')).toBe(true)
   expect(isNoAction('COMMENTED', 'No actionable findings in this diff.')).toBe(true)
-  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
+  expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
+  expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
+  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
+  expect(isNoAction('APPROVED', 'LGTM, the cache is never cleared')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings.\n\nHowever, the cache is never cleared.')).toBe(false)
+  expect(isNoAction('COMMENTED', 'Thanks!')).toBe(false)
   // Approval text mixed with a requested fix.
   expect(isNoAction('APPROVED', 'LGTM, but please rename X')).toBe(false)
   expect(isNoAction('COMMENTED', 'No blocking findings. You should add a test.')).toBe(false)
@@ -95,6 +105,10 @@ test('R84: a reviewer\'s advisory label reads as a P3 tag; an explicit P0-P2 any
   expect(severityHint('This is not the advisory note you think it is; the loop never ends.')).toMatchObject({ severity: 'P2', isTagged: false })
   expect(severityHint('supersedes the outstanding P2')).toMatchObject({ severity: 'P2', isTagged: true })
   expect(severityHint('the loop never ends')).toMatchObject({ severity: 'P2', isTagged: false })
+  // A label needs a mark after it (colon, comma, bracket, dash or line end): a sentence that starts with the word is not one (Task 1 review).
+  expect(severityHint('Optional chaining here crashes on null')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('Advisory locks are never released')).toMatchObject({ severity: 'P2', isTagged: false })
+  expect(severityHint('**Nit**: rename this')).toMatchObject({ severity: 'P3', isTagged: true })
 })
 ```
 
@@ -109,7 +123,7 @@ Replace `severityHint` (lines 208-216) with:
 
 ```ts
 /** A reviewer's own advisory label, at the start of a line (a heading, a list item or the body itself), never inside a sentence. */
-const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)\b/im
+const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—-]|$)/im
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
@@ -124,26 +138,29 @@ export function severityHint(body: string): { severity: Severity; isSecurity: bo
   return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
 }
 
-const NO_ACTION = /\b(?:lgtm|no (?:actionable|blocking) (?:findings|issues|comments)|no issues found|nothing to fix)\b/i
-const REQUEST = /\b(?:please|should|must|needs? to|consider|suggest|recommend)\b/i
-const STRONG = /\b(?:P[0-2]|critical|blocker|high)\b/i
-const CAVEAT = /\b(?:but|except|however)\b/i
+/** Whole sentences that settle a review (R83). */
+const SETTLES = [
+  /^no (?:actionable|blocking) (?:findings|issues|comments)(?: (?:in|for) this [\w\s/-]+)?$/i,
+  /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
+]
+/** Whole sentences that may sit beside them and change nothing. */
+const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
 
 /**
- * Whether a review says there is nothing to act on (R83): positive evidence only, never a missing tag (review G2-2 on PR #19).
- * An APPROVED review, or a COMMENTED one whose first paragraph says so in a sentence with no caveat; either way no sentence may
- * ask for anything or carry a P0-P2, critical, blocker or high tag. Inline comments are separate rows, triaged on their own.
+ * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
+ * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
+ * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
  */
 export function isNoAction(state: string | undefined, body: string): boolean {
-  if (state === 'CHANGES_REQUESTED') return false
-  const text = body.trim()
-  if (text === '') return state === 'APPROVED' || state === 'COMMENTED'
-  if (REQUEST.test(text) || STRONG.test(text)) return false
-  if (state === 'APPROVED') return !CAVEAT.test(text)
-  if (state !== 'COMMENTED') return false
-  const first = text.split(/\n\s*\n/)[0] ?? ''
-  const said = first.split(/(?<=[.!?])\s+/).find(one => NO_ACTION.test(one))
-  return said !== undefined && !CAVEAT.test(said)
+  if (state !== 'APPROVED' && state !== 'COMMENTED') return false
+  const sentences = body
+    .split(/[.!?;]+|\n+/)
+    .map(one => one.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter(one => one !== '')
+  if (sentences.length === 0) return true
+  const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
+  if (!sentences.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
+  return state === 'APPROVED' || sentences.some(settles)
 }
 ```
 
@@ -801,6 +818,8 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   expect(readRequired('[]', undefined)).toEqual([])
   expect(readRequired('<html>proxy error</html>', undefined)).toBeUndefined()
   expect(readRequired('', undefined)).toBeUndefined()
+  // Classic protection that answered but can't be parsed makes the whole set unknown (PR #19 review).
+  expect(readRequired(rules, '<html>proxy error</html>')).toBeUndefined()
 })
 ```
 
@@ -811,7 +830,7 @@ test('R86: required checks come from the ruleset and classic protection; anythin
 ```ts
 /**
  * The checks a base requires (R86): each `required_status_checks` rule of `gh api repos/<slug>/rules/branches/<base>`, plus classic
- * protection's `contexts` and `checks[].context` when given. undefined when the rules can't be read: every check then counts as required.
+ * protection's `contexts` and `checks[].context` when given. undefined when either payload can't be parsed: every check then counts as required.
  */
 export function readRequired(rules: string, protection: string | undefined): string[] | undefined {
   let listed: unknown
@@ -834,24 +853,76 @@ export function readRequired(rules: string, protection: string | undefined): str
       for (const one of read.contexts ?? []) if (typeof one === 'string') out.push(one)
       for (const one of read.checks ?? []) if (typeof one.context === 'string') out.push(one.context)
     } catch {
-      // Classic protection that can't be read adds nothing; the ruleset still counts.
+      // Rulesets and classic protection apply together: half a set is not the set (PR #19 review).
+      return undefined
     }
   }
   return [...new Set(out)]
 }
 ```
 
-- [ ] **Step 4: Fake the endpoints** in `tests/world.ts`. Add to the `gh` type: `/** Checks the base requires; undefined requires every check in \`checks\` (as before R86). */ required?: string[]`. In the `process.run` handler, after the `garbage` line, add:
+- [ ] **Step 4: Fake the endpoints** in `tests/world.ts`. Add to the `gh` type:
+  - `/** Checks the base requires; undefined requires every check in \`checks\` (as before R86). */ required?: string[]`
+  - `/** How the rules endpoint answers: 'ok' (default), 'garbage', 'throw', or an HTTP status. */ rulesAnswer?: 'ok' | 'garbage' | 'throw' | number`
+  - `/** How classic protection answers: 'none' (404, the default), 'ok' (requires 'legacy'), 'garbage', 'throw', or an HTTP status. */ classicAnswer?: 'none' | 'ok' | 'garbage' | 'throw' | number`
+
+In the `process.run` handler, after the `garbage` line, add:
 
 ```ts
+      const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
       if (/^api repos\/\S+\/rules\/branches\//.test(args)) {
+        const how = w.gh.rulesAnswer ?? 'ok'
+        if (how === 'throw') throw new Error('network down')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
         const names = w.gh.required ?? (w.gh.checks as { name?: string }[]).map(one => String(one.name))
         return out(JSON.stringify([{ type: 'required_status_checks', parameters: { required_status_checks: names.map(context => ({ context })) } }]))
       }
       if (/^api repos\/\S+\/branches\/\S+\/protection/.test(args)) {
-        return { value: { exitCode: 1, stdout: '', stderr: 'gh: Branch not protected (HTTP 404)', isStdoutTruncated: false, isStderrTruncated: false } }
+        const how = w.gh.classicAnswer ?? 'none'
+        if (how === 'throw') throw new Error('network down')
+        if (how === 'none') return failed('gh: Branch not protected (HTTP 404)')
+        if (typeof how === 'number') return failed(`gh: HTTP ${how}`)
+        if (how === 'garbage') return out('<html>proxy error</html>')
+        return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
       }
 ```
+
+If a throwing handler doesn't surface as a rejected `process.run` in this harness, model `'throw'` however the fake engine reports a failed spawn, and say so in the report.
+
+Add the source-combination test to `tests/flow.test.ts` (import `requiredChecksOf` from `'../hooks/round'`):
+
+```ts
+test('R86: the required set is known only when both sources are established (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  const cases: [World['gh']['rulesAnswer'], World['gh']['classicAnswer'], string[] | 'unknown'][] = [
+    ['ok', 'none', ['check']],
+    ['ok', 'ok', ['check', 'legacy']],
+    ['ok', 403, 'unknown'],
+    ['ok', 500, 'unknown'],
+    [403, 'none', 'unknown'],
+    [500, 'ok', 'unknown'],
+    ['throw', 'none', 'unknown'],
+    ['ok', 'throw', 'unknown'],
+    ['garbage', 'none', 'unknown'],
+    ['ok', 'garbage', 'unknown'],
+  ]
+  w.gh.required = ['check']
+  for (const [i, [rules, classic, want]] of cases.entries()) {
+    w.gh.rulesAnswer = rules
+    w.gh.classicAnswer = classic
+    const got = await requiredChecksOf($, '/repo', 'me/repo', `base${i}`)
+    expect(got === 'unknown' ? 'unknown' : [...got]).toEqual(want)
+  }
+  // An unknown answer is not cached: once GitHub answers, the same base reads.
+  w.gh.rulesAnswer = 500
+  expect(await requiredChecksOf($, '/repo', 'me/repo', 'later')).toBe('unknown')
+  w.gh.rulesAnswer = 'ok'
+  expect(await requiredChecksOf($, '/repo', 'me/repo', 'later')).toEqual(new Set(['check']))
+})
+```
+
+Use the world type the file already uses (`ReturnType<typeof world>`) if `World` isn't exported.
 
 - [ ] **Step 5: Implement the async helpers** in `round.ts` (near `fetchFeedback`; import `readRequired` from `./github`, and the `Standing` and `CheckState` types and `standingOf` from `./lifecycle` and `../types`):
 
@@ -877,19 +948,27 @@ export async function readChecks($: Engine, root: string, pr: number, repo?: str
   return /no checks reported/i.test(ran.stderr) ? [] : 'unreadable'
 }
 
-const required = new Map<string, Set<string> | 'unknown'>()
+const required = new Map<string, Set<string>>()
 
-/** The base's required checks (R86), cached per repository and base for the session; 'unknown' fails closed (all required). */
+/**
+ * The base's required checks (R86): the union of its rulesets and classic protection, cached per repository and base for the session.
+ * Each source must be parsed, or authoritatively absent (classic's 404 "not protected"); a throw, a 403 or 500, or a payload that
+ * doesn't parse from either makes it 'unknown', which fails closed (every check required) and is not cached (PR #19 review).
+ */
 export async function requiredChecksOf($: Engine, root: string, slug: string | undefined, base: string): Promise<Set<string> | 'unknown'> {
   if (slug === undefined) return 'unknown'
   const key = `${slug}:${base}`
   const seen = required.get(key)
   if (seen !== undefined) return seen
-  const rules = await $.process.run(['gh', 'api', `repos/${slug}/rules/branches/${base}`], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
-  const classic = await $.process.run(['gh', 'api', `repos/${slug}/branches/${base}/protection/required_status_checks`], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
-  const isNone = classic !== undefined && classic.exitCode !== 0 && /404|not protected/i.test(classic.stderr)
-  const listed = rules === undefined || rules.exitCode !== 0 ? undefined : readRequired(rules.stdout, classic?.exitCode === 0 ? classic.stdout : undefined)
-  const found = listed === undefined || (classic !== undefined && classic.exitCode !== 0 && !isNone) ? 'unknown' : new Set(listed)
+  const api = (path: string) => $.process.run(['gh', 'api', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
+  const rules = await api(`repos/${slug}/rules/branches/${base}`)
+  const classic = await api(`repos/${slug}/branches/${base}/protection/required_status_checks`)
+  if (rules === undefined || rules.exitCode !== 0 || classic === undefined) return 'unknown'
+  const isClassicNone = classic.exitCode !== 0 && /\b404\b|not protected/i.test(classic.stderr)
+  if (classic.exitCode !== 0 && !isClassicNone) return 'unknown'
+  const listed = readRequired(rules.stdout, classic.exitCode === 0 ? classic.stdout : undefined)
+  if (listed === undefined) return 'unknown'
+  const found = new Set(listed)
   required.set(key, found)
   return found
 }
@@ -1079,8 +1158,9 @@ git commit -m "pr-lifecycle: the merge guard names every blocker; waive post set
 
 **Interfaces:**
 - Produces: `reportPrompt(rec, next, standing?: Standing)` and `heldPrompt(rec, why, nextStep, standing?: Standing)`. In the post phase, `holdText(standing, idsAlreadyListed)` is appended before the "Do not merge" lines.
-- Produces: `say($, key, text, isNote = false)`. Queued notes merge into a queued prompt for the same record (used by Task 9).
-- Produces: `export function mergeNotes(held: readonly Queued[]): Queued[]`, where `type Queued = { text: string; key: RecordKey; isNote?: boolean }`.
+- Produces: `say($, key, text, isNote = false)`. A queued note merges into a prompt queued by the same command (batch) for the same record (used by Task 9).
+- Produces: `export function mergeNotes(held: readonly Queued[]): Queued[]`, where `type Queued = { text: string; key: RecordKey; batch: number; isNote?: boolean }`.
+- Produces: `export function dropQueued(key: RecordKey): void`: drops undelivered prompts and notes about `key`'s record that earlier commands queued (used by stop and reset in Task 9).
 
 - [ ] **Step 1: Make `onFetch` awaitable** in `tests/world.ts`. Change the type to `onFetch?: () => void | Promise<void>`. Change the handler to async (`on('process.run', async (_$, e) => {`) and call `await w.git.onFetch?.()`.
 
@@ -1147,18 +1227,53 @@ The first test relies on `beginTriage` fetching when the PR head moved (`got.prH
 
 Then check each `endRound` caller (lines 1260, 1464, 1558, 1609, 2231, 2336, 2363) and confirm none calls it after finishing its own run. If one does, call `finish` after `endRound` there instead.
 
-- [ ] **Step 5: `advance` honours a post waiver.** In `advance`, just before the final `await say($, saved, reportPrompt(saved, next))`:
+- [ ] **Step 5: `advance` honours a post waiver before it dispatches any work.** In `advance` (round.ts:1972), right after the `isStillMine` check (line 1976) and **before** the first branch that dispatches work (`startRound` at 1993, and later `startAnswer` and `startRecheck`), add:
 
 ```ts
-  // A post waiver covering this head ends review holds for it (R80): say what it covers and what CI still holds, never the hold.
-  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
-  const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
-  if (standing?.waiver !== undefined && securityHolds(saved).length === 0) {
-    await say($, saved, `pr-gate: the person's post waiver covers PR #${saved.pr} at ${saved.head.slice(0, 7)}.\n\n${holdText(standing)}`)
+  // A post waiver covering this head ends review work for it (R80): checked before any branch that starts triage, a recheck or a round
+  // (PR #19 review), so a waived head gets what the waiver covers and what CI still holds, never the hold or more review.
+  const waived = rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 && rec.waivers.some(one => one.scope === 'post' && one.head === rec.head)
+  if (waived && rec.pr !== undefined) {
+    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: rec.head })
+    await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${rec.head.slice(0, 7)}.\n\n${holdText(standing)}`)
     return
   }
-  await say($, saved, reportPrompt(saved, next, standing))
 ```
+
+Then, at the end of the post branch, pass the standing to the report: replace `await say($, saved, reportPrompt(saved, next))` with:
+
+```ts
+  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
+  await say($, saved, reportPrompt(saved, next, pr === undefined ? undefined : await gatherStanding($, saved, pr)))
+```
+
+Add the regression the PR #19 review asked for (`flow.test.ts`; `reopenedApproval` and `KEY` are defined in the file by Task 3):
+
+```ts
+test('R80: after waive post, resume starts no triage, recheck or review round on the waived head (PR #19 review)', async ($, on) => {
+  for (const [label, over] of [
+    ['an open P2 the agent can answer', { status: 'open' }],
+    ['a fix awaiting verification', { status: 'reported-fixed' }],
+  ] as const) {
+    const w = world(on)
+    await toPost($, w)
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: [{ ...reopenedApproval(), history: [], ...over }] })
+    await say($, 'waive post reviewed by hand')
+    await w.clock.advance(1000)
+    const prompts = w.prompts.length
+    const spawned = w.spawned.length
+    await say($, 'resume')
+    await w.clock.advance(1000)
+    expect(w.spawned, label).toHaveLength(spawned)
+    const sent = w.prompts.slice(prompts)
+    expect(sent.some(one => one.includes('New review feedback') || one.includes('stopped short of ready')), label).toBe(false)
+    expect(sent.at(-1), label).toContain("the person's post waiver covers")
+  }
+})
+```
+
+Add a third case where a review round is owed on the waived head: build a record for which `decideNext(rec).kind === 'round'` (assert that precondition in the test before waiving), and expect the same. If two worlds per test are refused, split the cases into separate tests. If `expect` takes no message argument here, drop the labels.
 
 - [ ] **Step 6: Append the standing to post prompts.** In `core.ts` `reportPrompt`, after the "What holds the merge" block:
 
@@ -1171,47 +1286,80 @@ Then check each `endRound` caller (lines 1260, 1464, 1558, 1609, 2231, 2336, 236
 
 Do the same in the post branch of `heldPrompt` (with `holds`). Add the optional `standing?: Standing` parameter to both, and import `holdText` and the type. Where `advance` calls `heldPrompt` for a post record, pass the standing if one was gathered; the pre-PR branch is unchanged.
 
-- [ ] **Step 7: Notes merge into a prompt for the same record.** Replace `queued`, `say` and the flush in `holdingPrompts`:
+- [ ] **Step 7: Notes merge only within one command's batch.** The queue is global and flushed a second later, so two commands can queue before one flush (PR #19 review). Each outermost `holdingPrompts` call gets a batch id; entries carry it, the flush sends only its own batch, and merging never crosses batches. Replace `queued`, `holdingPrompts` and `say` (round.ts:393-433) with:
 
 ```ts
-type Queued = { text: string; key: RecordKey; isNote?: boolean }
+type Queued = { text: string; key: RecordKey; batch: number; isNote?: boolean }
+let holdDepth = 0
+let batch = 0
 let queued: Queued[] = []
 
 const sameRecord = (a: RecordKey, b: RecordKey): boolean => a.root === b.root && a.branch === b.branch
 
-/** An action's note and a prompt the same command queued for the same record become one prompt: the note's first line leads it (R81). */
+/** Within one command's batch, an action's note and a prompt for the same record become one prompt: the note's first line leads it (R81). */
 export function mergeNotes(held: readonly Queued[]): Queued[] {
-  const prompts = held.filter(one => one.isNote !== true)
+  const isPair = (a: Queued, b: Queued): boolean => a.batch === b.batch && sameRecord(a.key, b.key)
   return held.flatMap(one => {
-    if (one.isNote === true) return prompts.some(each => sameRecord(each.key, one.key)) ? [] : [one]
-    const note = held.find(each => each.isNote === true && sameRecord(each.key, one.key))
+    if (one.isNote === true) return held.some(each => each.isNote !== true && isPair(each, one)) ? [] : [one]
+    const note = held.find(each => each.isNote === true && isPair(each, one))
     return [note === undefined ? one : { ...one, text: `${note.text.split('\n')[0] ?? ''}\n\n${one.text}` }]
   })
 }
 
+/** Drops what earlier commands queued about `key`'s record and haven't sent: a stop or reset supersedes it (R81, PR #19 review). */
+export function dropQueued(key: RecordKey): void {
+  queued = queued.filter(one => one.batch === batch || !sameRecord(one.key, key))
+}
+
+/** Runs `body` with the prompts it decides held back; once it has returned, its own batch is sent one second later, in order. */
+export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
+  if (holdDepth === 0) batch += 1
+  const mine = batch
+  holdDepth += 1
+  try {
+    return await body()
+  } finally {
+    holdDepth -= 1
+    if (holdDepth === 0 && queued.some(one => one.batch === mine)) {
+      $.clock.after(1000, () => {
+        const held = mergeNotes(queued.filter(one => one.batch === mine))
+        queued = queued.filter(one => one.batch !== mine)
+        void (async () => {
+          for (const one of held) await deliver($, one.key, one.text)
+        })()
+      })
+    }
+  }
+}
+
 export async function say($: Engine, key: RecordKey, text: string, isNote = false): Promise<void> {
   if (holdDepth > 0) {
-    queued.push({ text, key, ...(isNote ? { isNote } : {}) })
+    queued.push({ text, key, batch, ...(isNote ? { isNote } : {}) })
     return
   }
   await deliver($, key, text)
 }
 ```
 
-In `holdingPrompts`, change `const held = queued` to `const held = mergeNotes(queued)`.
+Keep the existing doc comments on `RecordKey`, `deliver` and `say`.
 
-Add a unit test in `lifecycle.test.ts`, or a new `tests/round.test.ts` if importing `round.ts` there is cleaner:
+Add a unit test (in `lifecycle.test.ts`, or a new `tests/round.test.ts` if importing `round.ts` there is cleaner):
 
 ```ts
-test('R81: a note merges into a prompt for the same record only', async () => {
+test('R81: a note merges into a prompt of the same batch and record only', async () => {
   const a = { root: '/repo', branch: 'feat/x' }
   const b = { root: '/repo', branch: 'feat/y' }
   const out = mergeNotes([
-    { text: 'pr-gate: the person allowed 1 more round: x.\n\nmore', key: a, isNote: true },
-    { text: 'pr-gate: round prompt', key: a },
-    { text: 'pr-gate: the person stopped the gate.', key: b, isNote: true },
+    { text: 'pr-gate: the person allowed 1 more round: x.\n\nmore', key: a, batch: 1, isNote: true },
+    { text: 'pr-gate: round prompt', key: a, batch: 1 },
+    { text: 'pr-gate: the person stopped the gate.', key: b, batch: 1, isNote: true },
+    { text: 'pr-gate: the person reset the lifecycle of feat/x.', key: a, batch: 2, isNote: true },
   ])
-  expect(out.map(one => one.text)).toEqual(['pr-gate: the person allowed 1 more round: x.\n\npr-gate: round prompt', 'pr-gate: the person stopped the gate.'])
+  expect(out.map(one => one.text)).toEqual([
+    'pr-gate: the person allowed 1 more round: x.\n\npr-gate: round prompt',
+    'pr-gate: the person stopped the gate.',
+    'pr-gate: the person reset the lifecycle of feat/x.',
+  ])
 })
 ```
 
@@ -1333,6 +1481,7 @@ export async function tellAgent($: Engine, key: RecordKey, did: string, next: st
 
 ```ts
     if (isPerson(origin)) await claimRecord($, run.root, run.branch)
+    dropQueued(run)
     await finish($, run.id, 'stopped', 'Stopped by the person.')
     if (isPerson(origin)) {
       await tellAgent($, run, 'stopped the gate', 'stop waiting on it. Opening and merging stay held; /pr-gate resume continues it.')
@@ -1343,6 +1492,7 @@ export async function tellAgent($: Engine, key: RecordKey, did: string, next: st
 - **reset**: after `archiveLifecycle(...)`:
 
 ```ts
+    dropQueued({ root, branch })
     await tellAgent($, { root, branch }, `reset the lifecycle of ${branch}: it is archived, its history kept`,
       `nothing for the old review. /${COMMAND} starts a fresh one; opening and merging stay held until it completes.`)
 ```
@@ -1389,6 +1539,22 @@ When `openPr` is on, `sayOpenPr` queues the open-PR prompt and the note merges i
 ```
 
 - **resume** sends no note. Its restarted step's prompt says what it needs.
+
+- [ ] **Step 4b: The regression for superseded prompts** (PR #19 review), in `flow.test.ts`:
+
+```ts
+test('R81: a reset before the flush drops the earlier command\'s open-PR prompt and keeps its own note (PR #19 review)', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  const prompts = w.prompts.length
+  await say($, 'waive pre hotfix for the outage')
+  await say($, 'reset')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('open the pull request'))).toBe(false)
+  expect(sent.at(-1)).toContain('the person reset the lifecycle')
+})
+```
 
 - [ ] **Step 5: Log the pane as the person.** In `logCommand` (line 843), replace `(origin !== 'composer' && origin !== 'bridge')` with `!isPerson(origin)`. In `runCommand` line 866, keep `waive`, `allow` and `reset` to `composer` and `bridge` as today. `pane` gains them in wave 3, when its links exist.
 
