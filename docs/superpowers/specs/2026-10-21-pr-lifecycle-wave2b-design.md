@@ -319,7 +319,8 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
    roster reviewer's comment already on the head stops counting, and the round
    waits out the cap (PR 3749 in the cookbook repo, 2026-10-21). `headAt` is
    now the time the head was pushed, from GitHub's repository activity log
-   (`GET repos/<repo>/activity`, matched on the head sha), kept in the record
+   (`GET repos/<repo>/activity`, the latest push into the head sha, since a
+   branch can return to a sha), kept in the record
    (`headArrival`) across stop, resume and another session. If GitHub has
    no entry, it is when the gate first saw the head, replaced by the push
    time once GitHub has it. Commit and check times are never used: a commit

@@ -625,11 +625,15 @@ This step **replaces** the timestamp source in Steps 1-3. Codex showed that comm
 - **The push time comes from GitHub (Adam: "the gate can't get stuck").** GitHub's repository activity log records each push with the
   head it moved the branch to: `gh api 'repos/<head repo>/activity?ref=refs/heads/<branch>&per_page=100' --jq '.[] | select(.after == "<head>") | .timestamp'`
   (`activity_type` `push` or `force_push`; for a PR from a fork, the head repo is the fork's). Checked live on this repo, 2026-10-21:
-  the push of a47400f reads 13:57:14Z. Add `pushTimeOf($, rec, head): Promise<number | undefined>` in `round.ts` (30 s timeout; the
-  earliest matching timestamp; undefined on any failure or no match).
+  the push of a47400f reads 13:57:14Z. Add `pushTimeOf($, rec, head): Promise<number | undefined>` in `round.ts` (30 s timeout;
+  undefined on any failure or no match). It returns the **latest** transition into the head, never the earliest: a branch can revisit a
+  sha (A at 10, B at 20, a comment on B at 30, a force-push back to A at 40), and only the last arrival of A is A's arrival now (PR #25
+  review, A→B→A).
 - When the gate first sees a PR head (`onOpened`, `beginCollect`, and `pollOnce` when `isNewHead`) and `rec.headArrival?.head !== head`,
   it reads `pushTimeOf`. It writes `headArrival: { head, at, isPushTime }`: `at` is the push time when GitHub gave it (never later
-  than now), else `now` with `isPushTime: false`. A known head's time never moves later. When a later poll finds the push time for a
+  than now), else `now` with `isPushTime: false`. Each `beginCollect` reads `pushTimeOf` again even when the stored head matches: a
+  latest transition later than the stored time means the branch left the head and came back while no session saw it, and the later time
+  replaces the stored one. Within one collection, a known head's time never moves later. When a later poll finds the push time for a
   head stored with `isPushTime: false`, it replaces `at` with it (it is earlier) and sets `isPushTime: true`; try once per poll, at most
   until collection ends.
 - `beginCollect` and `pollOnce` take `collect.headAt` from `rec.headArrival` for that head, else `now`. Reviews still cover a head by
@@ -655,6 +659,8 @@ Tests (flow), replacing Step 1's check-run fixtures. Add a world knob `w.gh.push
 5b. Same, for a roster reviewer not in `requestReview`: the comment counts at once, with the "counted" log line, and collection ends without the cap.
 6. The activity call fails at first sight and works at the next poll: `headArrival.at` moves earlier to the push time, `isPushTime` becomes true.
 7. A record whose `headArrival` names an older head: the new head is looked up afresh; the old time is never reused.
+8. A→B→A: pushes A at 10, B at 20, a roster comment at 30, a force-push to A at 40 (all in `pushes`), the gate first sees A at 50: `headArrival.at` is 40 and the comment does not cover A.
+9. The record holds A at 10 (`isPushTime: true`); the branch went to B and back to A at 40 while no session ran; `/pr-gate resume`: `beginCollect` moves A's time to 40.
 
 Use the most capable model for this task: the code is prose here, not given.
 
