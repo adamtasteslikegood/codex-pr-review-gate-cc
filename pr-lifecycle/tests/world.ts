@@ -56,7 +56,7 @@ export type World = {
     /** Every `git fetch` call's arguments. */
     fetches: string[]
     /** Called on each `git fetch`, before it answers: a test changes what the remote has. */
-    onFetch?: () => void
+    onFetch?: () => void | Promise<void>
     /** The branch's head on origin, as `git ls-remote` prints it; undefined prints nothing. */
     remoteHead?: string
     /** `git log --not --remotes=origin`: the local commits no origin branch has, one `<sha> by <author>` per line. */
@@ -221,7 +221,7 @@ export function world(on: On): World {
     w.run = e.value as Run
     return next(e)
   })
-  const fake = (e: { argv: readonly string[]; init?: { cwd?: string } }) => {
+  const fake = async (e: { argv: readonly string[]; init?: { cwd?: string } }) => {
     const args = e.argv.slice(1).join(' ')
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -291,7 +291,7 @@ export function world(on: On): World {
     }
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
-      w.git.onFetch?.()
+      await w.git.onFetch?.()
       const fail = (stderr: string) => ({ value: { exitCode: 128, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
       const missing = w.git.missingRefs.find(ref => e.argv.slice(3).includes(ref))
       if (missing !== undefined) return fail(`fatal: couldn't find remote ref ${missing}`)
@@ -341,9 +341,9 @@ export function world(on: On): World {
     if (args.startsWith('remote get-url')) return out('https://github.com/me/repo.git\n')
     return out('')
   }
-  on('process.run', (_$, e) => fake(e))
+  on('process.run', async (_$, e) => fake(e))
   // The tests' own `$` has no `process`, and the host refuses it to a module that never calls it: this engine stand-in runs the same fake.
-  w.engine = { process: { run: async (argv: readonly string[], init?: { cwd?: string }) => fake({ argv, init }).value } } as never
+  w.engine = { process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value } } as never
   on('agent.spawn', (_$, e) => {
     w.spawned.push({ prompt: e.prompt, description: e.description, ...(e.model === undefined ? {} : { model: e.model }) })
     return { model: 'test', agentId: `agent-${w.spawned.length}` }

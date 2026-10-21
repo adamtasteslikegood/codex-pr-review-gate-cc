@@ -48,6 +48,7 @@ import {
   acceptRebuttal,
   applyAnswer,
   decideNext,
+  holdText,
   lapseWaivers,
   checksOwed,
   isAcceptedRebuttal,
@@ -67,6 +68,7 @@ import {
   rejections,
   relocate,
   roundOf,
+  securityHolds,
   standingOf,
   triage,
   unresolvedBlockers,
@@ -403,11 +405,16 @@ export const agentModelFor = (role: Role, lifecycle: Run['lifecycle'], c: Config
   role === 'fix' || (role === 'verify' && lifecycle === 'pre') ? c.fixAgentModel : c.runnerModel
 
 // Prompts decided while a /pr-gate command (or the session start) holds the turn: the host refuses a submit then, so they wait here.
+// Each outermost hold is a batch: its flush sends only its own entries, and a note merges only within it (PR #19 review).
+type Queued = { text: string; key: RecordKey; batch: number; isNote?: boolean }
 let holdDepth = 0
-let queued: { text: string; key: RecordKey }[] = []
+let batch = 0
+let queued: Queued[] = []
 
 /** The record a prompt is about: it is sent only while this session still holds it (#13). */
 export type RecordKey = Pick<Run, 'root' | 'branch'>
+
+const sameRecord = (a: RecordKey, b: RecordKey): boolean => a.root === b.root && a.branch === b.branch
 
 /** Submits a prompt unless another session took its record meanwhile; this one then stands down instead (#13). */
 async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
@@ -415,17 +422,34 @@ async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
   await $.prompt.submit({ text }).catch(() => undefined)
 }
 
-/** Runs `body` with the prompts it decides held back; once it has returned, they are sent one second later, in order. */
+/** Within one command's batch, an action's note and a prompt for the same record become one prompt: the note's first line leads it (R81). */
+export function mergeNotes(held: readonly Queued[]): Queued[] {
+  const isPair = (a: Queued, b: Queued): boolean => a.batch === b.batch && sameRecord(a.key, b.key)
+  return held.flatMap(one => {
+    if (one.isNote === true) return held.some(each => each.isNote !== true && isPair(each, one)) ? [] : [one]
+    const note = held.find(each => each.isNote === true && isPair(each, one))
+    return [note === undefined ? one : { ...one, text: `${note.text.split('\n')[0] ?? ''}\n\n${one.text}` }]
+  })
+}
+
+/** Drops what earlier commands queued about `key`'s record and haven't sent: a stop or reset supersedes it (R81, PR #19 review). */
+export function dropQueued(key: RecordKey): void {
+  queued = queued.filter(one => one.batch === batch || !sameRecord(one.key, key))
+}
+
+/** Runs `body` with the prompts it decides held back; once it has returned, its own batch is sent one second later, in order. */
 export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Promise<T> {
+  if (holdDepth === 0) batch += 1
+  const mine = batch
   holdDepth += 1
   try {
     return await body()
   } finally {
     holdDepth -= 1
-    if (holdDepth === 0 && queued.length > 0) {
+    if (holdDepth === 0 && queued.some(one => one.batch === mine)) {
       $.clock.after(1000, () => {
-        const held = queued
-        queued = []
+        const held = mergeNotes(queued.filter(one => one.batch === mine))
+        queued = queued.filter(one => one.batch !== mine)
         void (async () => {
           for (const one of held) await deliver($, one.key, one.text)
         })()
@@ -436,11 +460,12 @@ export async function holdingPrompts<T>($: Engine, body: () => Promise<T>): Prom
 
 /**
  * Sends a prompt about `key`'s record to the main agent now, or after the command that holds the turn has returned. Either way
- * the owner is checked at delivery: a session that lost the record sends nothing (#13).
+ * the owner is checked at delivery: a session that lost the record sends nothing (#13). `isNote`: an action's note, which a prompt
+ * of the same command and record absorbs (R81).
  */
-export async function say($: Engine, key: RecordKey, text: string): Promise<void> {
+export async function say($: Engine, key: RecordKey, text: string, isNote = false): Promise<void> {
   if (holdDepth > 0) {
-    queued.push({ text, key })
+    queued.push({ text, key, batch, ...(isNote ? { isNote } : {}) })
     return
   }
   await deliver($, key, text)
@@ -1603,7 +1628,10 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
   const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
-  if (saved !== undefined) await say($, saved, heldPrompt(saved, why, nextStep))
+  if (saved === undefined) return
+  // The whole standing, CI included (R79), as the report a round ends with lists it.
+  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
+  await say($, saved, heldPrompt(saved, why, nextStep, pr === undefined ? undefined : await gatherStanding($, saved, pr)))
 }
 
 /**
@@ -1936,6 +1964,9 @@ export function answerRun(rec: LifecycleRecord, ids: readonly string[], now: num
 
 /** The round in flight ended, complete or not: append it to the record, then let the controller choose. */
 async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?: string): Promise<void> {
+  // A run stopped or waived while this step awaited git or gh records nothing more and decides nothing (finding 29, R80).
+  const live = await getRun($)
+  if (live === null || live.id !== run.id || live.status !== 'running') return
   const now = await $.clock.now()
   // After the PR: the head GitHub last reported for it, whatever is checked out here (an adopted PR, a push from elsewhere).
   const head = run.lifecycle === 'post' ? undefined : await git($, run.root, ['rev-parse', 'HEAD'])
@@ -2061,6 +2092,15 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   if (rec === undefined) return
   // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
   if (!(await isStillMine($, { root, branch }))) return
+  // A post waiver covering this head ends review work for it (R80): checked before any branch that starts triage, a recheck or a round
+  // (PR #19 review), so a waived head gets what the waiver covers and what CI still holds, never the hold or more review.
+  const waived =
+    rec.phase !== 'pre' && rec.pr !== undefined && securityHolds(rec).length === 0 && rec.waivers.some(one => one.scope === 'post' && one.head === rec.head)
+  if (waived && rec.pr !== undefined) {
+    const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: rec.base, headRefOid: rec.head })
+    await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${rec.head.slice(0, 7)}.\n\n${holdText(standing)}`)
+    return
+  }
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
   // decided afresh instead of written from a stale decision.
@@ -2159,7 +2199,8 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (id !== undefined) await say($, saved, heldPrompt(saved, next.why, next.nextStep))
     return
   }
-  await say($, saved, reportPrompt(saved, next))
+  const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
+  await say($, saved, reportPrompt(saved, next, pr === undefined ? undefined : await gatherStanding($, saved, pr)))
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */

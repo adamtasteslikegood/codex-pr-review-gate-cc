@@ -2,6 +2,7 @@
 // reading a `gh pr create`, and the words each agent is sent. No `$` here.
 
 import {
+  holdText,
   isAcceptedRebuttal,
   isBlocking,
   isDisputed,
@@ -18,7 +19,7 @@ import {
 } from './lifecycle'
 import type { Feedback } from './github'
 import type { Answer, Next, TriageClass } from './lifecycle'
-import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Tier } from '../types'
+import type { Effort, Finding, LifecycleRecord, Role, Run, Severity, Standing, Tier } from '../types'
 
 export const TRAILER = 'PR_GATE_RESULT'
 
@@ -783,13 +784,17 @@ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRoun
 /**
  * Post-PR review stopped short of ready: why, what holds the merge, and the agent's next step. The person is named, with their
  * options, only where the decision is theirs: awaiting-decision, exhaustion, a deferred security P1. An answerable block gives
- * the agent's step alone.
+ * the agent's step alone. `standing`, when gathered, adds what else holds the merge, CI included (R79).
  */
-export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: 'round' | 'open-pr' | 'ready' }>): string {
+export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: 'round' | 'open-pr' | 'ready' }>, standing?: Standing): string {
   // Every finding that holds the merge, at any severity (R39): the same list the merge guard names.
   const holding = mergeHolds(rec)
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
   if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding))
+  if (standing !== undefined) {
+    const rest = holdText(standing, new Set(holding.map(one => one.id)))
+    if (rest !== '') lines.push('', rest)
+  }
   lines.push('', `Your next step: ${next.nextStep}.`)
   if (next.kind === 'awaiting-decision') {
     // The person decides (R42): nothing for the agent to change, only to say and stop.
@@ -845,14 +850,19 @@ export function prePerson(rec: LifecycleRecord): string | undefined {
 
 /**
  * The gate holds the pull request (pre-PR) or its merge (post-PR): why, what holds it and the agent's next step. Before the PR the
- * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46).
+ * person's options follow; after it, only where the decision is theirs (awaiting-decision, a deferred security P1, R46). After it,
+ * `standing`, when gathered, adds what else holds the merge, CI included (R79).
  */
-export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string): string {
+export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string, standing?: Standing): string {
   if (rec.phase !== 'pre') {
     // After the PR opened: the merge is what is held, by every finding the merge guard names (R39, R46).
     const holds = mergeHolds(rec)
     const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
     if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds))
+    if (standing !== undefined) {
+      const rest = holdText(standing, new Set(holds.map(one => one.id)))
+      if (rest !== '') post.push('', rest)
+    }
     post.push('', `Your next step: ${nextStep}.`)
     // The person is named only for a decision of theirs, as in reportPrompt (R42): a check that could not run is the agent's to rerun.
     const isAwaiting = rec.postStatus === 'awaiting-decision'

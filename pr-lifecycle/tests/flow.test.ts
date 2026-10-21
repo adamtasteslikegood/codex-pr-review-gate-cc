@@ -4,7 +4,7 @@ import type { TestBody } from 'claude-code/testing'
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf } from '../hooks/round'
-import { invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
+import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -3491,4 +3491,95 @@ test('R86: with the required checks unreadable, a waiver sets nothing aside', as
   const held = await $.tool.call(merge)
   expect(isHeld(held)).toBe(true)
   expect(held.deny ?? '').toContain('Independent Claude review')
+})
+
+test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const moved = 'f'.repeat(40)
+  w.gh.prHead = moved
+  w.git.head = moved
+  w.git.isAncestor = true
+  w.gh.reviews = covers(moved)
+  let waived = ''
+  let during = ''
+  // The waiver lands while triage awaits its fetch of the moved head (`fetch --quiet origin`, beginTriage's only fetch).
+  w.git.onFetch = async () => {
+    if (waived !== '') return
+    during = w.git.fetches.at(-1) ?? ''
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+  }
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  expect(during).toBe('fetch --quiet origin')
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  expect(w.spawned).toHaveLength(spawned)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+  expect(sent.some(one => one.includes('post-PR round'))).toBe(false)
+  // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
+  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
+})
+
+test('R80: after waive post, a resume says the waiver covers the head instead of sending the hold', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  await say($, 'waive post the rename is cosmetic')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+})
+
+test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
+  const w = world(on)
+  w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  await toAwaiting($, w)
+  expect(w.prompts.at(-1)).toContain('check check running')
+})
+
+/** After `waive post`, a resume on the waived head dispatches nothing and sends the waiver's message (R80, PR #19 review). */
+const resumeAfterPostWaiver = async ($: Parameters<TestBody>[0], w: World, owed: 'answer' | 'recheck' | 'round', over?: Partial<Finding>) => {
+  // A finding's case needs a completed post-PR round, or the round owed would come first.
+  if (over === undefined) await toPost($, w)
+  else await toAwaiting($, w)
+  const rec = await recordOf(w)
+  const shaped = over === undefined ? rec : { ...rec, findings: [{ ...reopenedApproval(), history: [], ...over }] }
+  w.store.set(KEY, shaped)
+  // The work the waiver must stop: without it, resume would start triage (answer), a Codex recheck, or a review round.
+  const next = decideNext(shaped)
+  if (owed === 'round') expect(next.kind).toBe('round')
+  else expect(next.kind === 'blocked' ? (next[owed] ?? []) : []).toEqual(['G1-1'])
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  const prompts = w.prompts.length
+  const spawned = w.spawned.length
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.spawned).toHaveLength(spawned)
+  // A post-PR round collects before it spawns anything: no run may be left running either.
+  expect((await runOf(w)).status).not.toBe('running')
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.includes('New review feedback') || one.includes('stopped short of ready') || one.includes('post-PR round'))).toBe(false)
+  expect(sent.at(-1)).toContain("the person's post waiver covers")
+}
+
+test('R80: after waive post, resume starts no triage for an open P2 the agent can answer (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'answer', { status: 'open' })
+})
+
+test('R80: after waive post, resume starts no Codex recheck of a rebuttal (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'recheck', { status: 'rebutted' })
+})
+
+test('R80: after waive post, resume starts no review round owed on the waived head (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'round')
 })
