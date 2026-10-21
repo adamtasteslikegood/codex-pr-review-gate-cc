@@ -36,6 +36,7 @@ import {
 import {
   collectionDone,
   isTrusted,
+  postsFor,
   readCheckRuns,
   readInlineComments,
   readIssueComments,
@@ -774,7 +775,9 @@ export async function archiveLifecycle($: Engine, root: string, branch: string, 
     await archiveRecord($, last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, phase: 'archived', generation: (last.generation ?? 0) + 1 })
+    // When the head reached the PR (#24) is kept only for the head the seed names: a fresh start on another head looks it up afresh.
+    const arrival = last.headArrival?.head === head ? { headArrival: last.headArrival } : {}
+    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, ...arrival, phase: 'archived', generation: (last.generation ?? 0) + 1 })
     return true
   })
 }
@@ -961,18 +964,148 @@ async function beginCollect($: Engine, id: string): Promise<void> {
     steps: withStep(run.steps, { id: `r${run.round}-collect`, label: `Round ${run.round} · collect reviews (${run.roundKind})`, state: 'running' }),
   }))
   if (opened === null) return
+  // When the head reached the PR, read from GitHub again on every collection (#24): a stop and a resume keep a comment's coverage,
+  // and a head the branch left and came back to while no session ran takes its later arrival.
+  const arrival = await noteArrival($, opened.root, opened.branch, opened.roundStartHead, now)
+  if (arrival !== undefined && arrival.at !== now) {
+    await patch($, id, run => (run.collect === undefined ? run : { ...run, collect: { ...run.collect, headAt: arrival.at } }))
+  }
   const rec = await loadRecord($, opened.root, opened.branch)
   // A later post-PR round, on a new head: ask the roster's reviewers to look again.
   if (rec !== undefined && rec.rounds.some(one => one.phase === 'post' && one.isCompleted) && rec.pr !== undefined && rec.slug !== undefined) {
     const roster = await rosterOf($, opened.root, opened.base)
-    for (const who of roster?.requestReview ?? []) {
-      await $.process.run(['gh', 'api', '-X', 'POST', `repos/${rec.slug}/pulls/${rec.pr}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
-        cwd: opened.root,
-        timeoutMs: 30_000,
-      })
-    }
+    for (const who of roster?.requestReview ?? []) await askAgain($, rec, who)
   }
   $.ui.status(`pr-gate r${opened.round}: waiting on reviewers`)
+}
+
+/** Asks a requestReview reviewer to review the PR again: the POST to `requested_reviewers` (1.4.0). */
+async function askAgain($: Engine, rec: LifecycleRecord, who: string): Promise<void> {
+  await $.process
+    .run(['gh', 'api', '-X', 'POST', `repos/${rec.slug ?? ''}/pulls/${rec.pr ?? ''}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
+      cwd: rec.root,
+      timeoutMs: 30_000,
+    })
+    .catch(() => undefined)
+}
+
+type HeadArrival = NonNullable<LifecycleRecord['headArrival']>
+
+/** Where the PR's head branch lives: its repository (a fork's, for a PR from one) and branch name. Absent parts are the record's. */
+export type HeadPlace = { repo?: string; branch?: string }
+
+/** A push into the PR's head branch, as GitHub's repository activity log lists it: the sha it moved the branch to, and when. */
+type Push = { after: string; at: number }
+
+/** The head branch's pushes from GitHub's repository activity log (#24); undefined when gh fails or the answer does not parse. */
+async function pushesOf($: Engine, rec: LifecycleRecord, where: HeadPlace = {}): Promise<Push[] | undefined> {
+  const repo = where.repo ?? rec.slug
+  const branch = where.branch ?? rec.branch
+  if (repo === undefined || repo === '' || branch === '') return undefined
+  const ref = `refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`
+  try {
+    const ran = await $.process.run(['gh', 'api', `repos/${repo}/activity?ref=${ref}&per_page=100`], { cwd: rec.root, timeoutMs: 30_000 })
+    if (ran.exitCode !== 0) return undefined
+    const rows = JSON.parse(ran.stdout) as unknown
+    if (!Array.isArray(rows)) return undefined
+    return rows.flatMap(row => {
+      const one = row as { after?: unknown; timestamp?: unknown } | null
+      const at = typeof one?.timestamp === 'string' ? Date.parse(one.timestamp) : Number.NaN
+      return typeof one?.after === 'string' && Number.isFinite(at) ? [{ after: one.after, at }] : []
+    })
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * When `head` was last pushed into the PR's head branch (#24): the latest push into it, never the earliest, since a branch can return
+ * to a sha (A, B, then A again: only the last arrival of A is A's arrival now). undefined when GitHub does not say.
+ */
+export async function pushTimeOf($: Engine, rec: LifecycleRecord, head: string, where: HeadPlace = {}): Promise<number | undefined> {
+  const times = (await pushesOf($, rec, where))?.filter(one => one.after === head).map(one => one.at) ?? []
+  return times.length === 0 ? undefined : Math.max(...times)
+}
+
+/** The head branch's newest push, whatever sha it moved the branch to; undefined when GitHub does not say. */
+export async function latestPushOf($: Engine, rec: LifecycleRecord, where: HeadPlace = {}): Promise<Push | undefined> {
+  const pushes = await pushesOf($, rec, where)
+  if (pushes === undefined || pushes.length === 0) return undefined
+  return pushes.reduce((newest, one) => (one.at > newest.at ? one : newest))
+}
+
+/**
+ * Notes on the record when `head` reached the PR (#24): GitHub's push time when it gives one (never later than now), which replaces
+ * a stored time for the same head; else the stored time; else `fallback`, the time the gate first saw it. A record whose
+ * `headArrival` names another head never lends that head's time. undefined when there is no record.
+ */
+export async function noteArrival(
+  $: Engine,
+  root: string,
+  branch: string,
+  head: string,
+  fallback: number,
+  where: HeadPlace = {},
+): Promise<HeadArrival | undefined> {
+  const rec = await loadRecord($, root, branch)
+  if (rec === undefined) return undefined
+  const now = await $.clock.now()
+  const stored = rec.headArrival?.head === head ? rec.headArrival : undefined
+  const push = await pushTimeOf($, rec, head, where)
+  const at = push === undefined ? undefined : Math.min(push, now)
+  const next: HeadArrival =
+    at === undefined
+      ? (stored ?? { head, at: Math.min(fallback, now), isPushTime: false })
+      : stored?.isPushTime === true && stored.at === at
+        ? stored
+        : { head, at, isPushTime: true }
+  if (next !== stored) await updateRecord($, root, branch, one => ({ ...one, headArrival: next }))
+  return next
+}
+
+/** A time as GitHub prints it, for the run log. */
+const isoOf = (at: number): string => new Date(at).toISOString().replace(/\.\d{3}Z$/, 'Z')
+
+/**
+ * No silent wait on a guess (#24): while GitHub gives no push time for the head, a roster reviewer's issue comment posted after the
+ * head commit's committer date but before the gate first saw the head may or may not be about it. A requestReview reviewer is asked
+ * again, once per head, and its reply covers the head; any other roster reviewer's comment counts for the head. Both are logged.
+ * Returns the coverage with the counted comments placed on the head.
+ */
+async function guessCover($: Engine, rec: LifecycleRecord, roster: Roster, arrival: HeadArrival, cover: Feedback[]): Promise<Feedback[]> {
+  const head = arrival.head
+  const doubtful = cover.filter(one => one.kind === 'comment' && one.head === undefined && one.at < arrival.at && roster.reviewers.includes(one.reviewer))
+  const asked = new Set(arrival.asked ?? [])
+  const counted = new Set(arrival.counted ?? [])
+  const nameOf = (one: Feedback): string | undefined => roster.requestReview.find(name => postsFor(one.reviewer, name))
+  const open = doubtful.filter(one => !counted.has(one.id) && !asked.has(nameOf(one) ?? ''))
+  if (open.length > 0) {
+    // The committer date only bounds the window: a commit is never pushed before it was made. Unknown, nothing bounds it.
+    const dated = await $.process
+      .run(['gh', 'api', `repos/${rec.slug ?? ''}/commits/${head}`, '--jq', '.commit.committer.date'], { cwd: rec.root, timeoutMs: 30_000 })
+      .catch(() => undefined)
+    const parsed = dated?.exitCode === 0 ? Date.parse(dated.stdout.trim()) : Number.NaN
+    const since = Number.isFinite(parsed) ? parsed : 0
+    for (const one of open.filter(each => each.at > since).sort((a, b) => a.at - b.at)) {
+      const name = nameOf(one)
+      if (name !== undefined) {
+        if (asked.has(name)) continue
+        asked.add(name)
+        await askAgain($, rec, name)
+        await logEvent($, rec.root, rec.branch, 'head', `${one.reviewer}: comment at ${isoOf(one.at)} may predate ${head.slice(0, 7)}; asked again`)
+      } else {
+        counted.add(one.id)
+        await logEvent($, rec.root, rec.branch, 'head', `${one.reviewer}: comment at ${isoOf(one.at)} counted for ${head.slice(0, 7)}; GitHub gave no push time`)
+      }
+    }
+    const isChanged = asked.size !== (arrival.asked ?? []).length || counted.size !== (arrival.counted ?? []).length
+    if (isChanged) {
+      await updateRecord($, rec.root, rec.branch, one =>
+        one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, asked: [...asked], counted: [...counted] } },
+      )
+    }
+  }
+  return cover.map(one => (counted.has(one.id) ? { ...one, head } : one))
 }
 
 /**
@@ -1014,6 +1147,8 @@ type Fetched = {
   prHead: string
   /** Feedback id to the id of this machine's own reply in its thread, posted after it (R35). */
   ownReplies?: Record<string, string>
+  /** Where the PR's head branch lives, as gh says (a fork's, for a PR from one), for its push times (#24). */
+  where?: HeadPlace
 }
 
 /** The PR head's checks from `gh pr checks` (R1-9): [] when gh reports none, { unreadable: gh's own words } when it can't say. */
@@ -1131,16 +1266,29 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     const found = self
     await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }))
   }
-  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state'], { cwd: rec.root, timeoutMs: 30_000 })
+  const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state,headRefName,headRepository,headRepositoryOwner'], {
+    cwd: rec.root,
+    timeoutMs: 30_000,
+  })
   if (pr.exitCode !== 0) {
     return fail(`gh could not read PR #${rec.pr} (${pr.stderr.trim().slice(0, 160) || `exit ${pr.exitCode}`}); check gh auth login and the network`)
   }
   let prHead: string | undefined
   let state: PrState | undefined
+  const where: HeadPlace = {}
   try {
-    const read = JSON.parse(pr.stdout) as { headRefOid?: unknown } | null
+    const read = JSON.parse(pr.stdout) as {
+      headRefOid?: unknown
+      headRefName?: unknown
+      headRepository?: { name?: unknown } | null
+      headRepositoryOwner?: { login?: unknown } | null
+    } | null
     prHead = read?.headRefOid as string | undefined
     state = prStateIn(read)
+    if (typeof read?.headRefName === 'string' && read.headRefName !== '') where.branch = read.headRefName
+    const owner = read?.headRepositoryOwner?.login
+    const name = read?.headRepository?.name
+    if (typeof owner === 'string' && owner !== '' && typeof name === 'string' && name !== '') where.repo = `${owner}/${name}`
   } catch {
     prHead = undefined
   }
@@ -1184,7 +1332,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
         .at(-1)
       if (answered !== undefined) ownReplies[answered.id] = mine.id.slice('inline:'.length)
     }
-    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies }
+    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies, where }
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
     return fail(`gh returned unreadable output (${said}); check gh auth login, rate limits and the network`)
@@ -1235,7 +1383,12 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   const lastArrivalAt = Math.max(collect.lastArrivalAt, ...fresh.map(one => Math.min(one.at, now)))
   // The PR's head, not the local one, is what the round covers (an adopted PR, another agent's push).
   const isNewHead = got.prHead !== run.roundStartHead
-  const headAt = isNewHead ? now : collect.headAt
+  // When the head reached the PR (#24): the record's, read from GitHub on first sight and, while GitHub has given no push time, on
+  // each poll; else the time the gate first saw it.
+  const known = rec.headArrival?.head === got.prHead ? rec.headArrival : undefined
+  const arrival =
+    known?.isPushTime === true ? known : ((await noteArrival($, run.root, run.branch, got.prHead, isNewHead ? now : collect.headAt, got.where)) ?? known)
+  let headAt = arrival?.at ?? (isNewHead ? now : collect.headAt)
   // A new head restarts the quiet period: its checks may not be registered yet.
   const arrived = isNewHead || fresh.length > (run.triaged?.length ?? 0)
   // Judged from the head the round had before this one replaces it (R56).
@@ -1248,18 +1401,47 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   }))
   if (after === null) return
   const roster = await rosterOf($, run.root, run.base)
-  const done = collectionDone({
-    roster,
-    feedback: got.cover ?? got.feedback,
-    checks: got.checks,
-    head: got.prHead,
-    headAt,
-    startedAt: collect.startedAt,
-    lastArrivalAt: after.collect?.lastArrivalAt ?? now,
-    now,
-    quietMs: (roster?.quietMinutes ?? config.quietMs / 60_000) * 60_000,
-    capMs: (roster?.waitCapMinutes ?? config.waitCapMs / 60_000) * 60_000,
-  })
+  let cover = got.cover ?? got.feedback
+  if (roster !== undefined && arrival !== undefined && !arrival.isPushTime) {
+    cover = await guessCover($, (await loadRecord($, run.root, run.branch)) ?? rec, roster, arrival, cover)
+  }
+  const capMs = (roster?.waitCapMinutes ?? config.waitCapMs / 60_000) * 60_000
+  const judge = () =>
+    collectionDone({
+      roster,
+      feedback: cover,
+      checks: got.checks,
+      head: got.prHead,
+      headAt,
+      startedAt: collect.startedAt,
+      lastArrivalAt: after.collect?.lastArrivalAt ?? now,
+      now,
+      quietMs: (roster?.quietMinutes ?? config.quietMs / 60_000) * 60_000,
+      capMs,
+    })
+  let done = judge()
+  // Coverage that rests on an issue comment (no commit) is checked against the branch's newest push before it ends collection
+  // (#24, A→B→A between two polls): the branch may have left the head and come back after the comment. Reviews carry their commit.
+  const restsOnComment = cover.some(one => one.kind === 'comment' && one.head === undefined && one.at >= headAt && done.covered.includes(one.reviewer))
+  if (done.isDone && restsOnComment) {
+    const newest = await latestPushOf($, rec, got.where)
+    const head7 = got.prHead.slice(0, 7)
+    if (newest === undefined) {
+      // The gate never gets stuck: a failed check keeps the stored time, and the log says so.
+      await logEvent($, run.root, run.branch, 'head', `could not read when ${head7} was last pushed; a comment with no commit ends collection on the stored time`)
+    } else if (newest.after !== got.prHead && now - collect.startedAt < capMs) {
+      // The head moved during the poll: the next poll reads the new one.
+      const moved = `the branch moved to ${newest.after.slice(0, 7)}; reading it at the next poll`
+      if (moved !== after.activity) await patch($, run.id, one => ({ ...one, activity: moved }))
+      return
+    } else if (newest.after === got.prHead && Math.min(newest.at, now) > headAt) {
+      headAt = Math.min(newest.at, now)
+      const at = headAt
+      await updateRecord($, run.root, run.branch, one => ({ ...one, headArrival: { head: got.prHead, at, isPushTime: true } }))
+      await patch($, run.id, one => (one.collect === undefined ? one : { ...one, collect: { ...one.collect, headAt: at } }))
+      done = judge()
+    }
+  }
   if (!done.isDone) {
     const waiting = done.missing.length > 0 ? `waiting on ${done.missing.join(', ')}` : 'waiting for feedback to go quiet'
     if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))

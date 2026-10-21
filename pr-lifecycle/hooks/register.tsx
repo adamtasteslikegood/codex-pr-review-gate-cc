@@ -59,6 +59,7 @@ import {
   isStillCurrent,
   isTurnOf,
   markPr,
+  noteArrival,
   onAnswer,
   onTurnStart,
   PANE,
@@ -306,6 +307,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
             // After a reset: feedback already processed and replied to stays answered (R47).
             ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, ownReplies: prior.ownReplies, generation: prior.generation }),
+            // When the head reached the PR (#24) carries over only for that same head.
+            ...(prior?.headArrival?.head === head ? { headArrival: prior.headArrival } : {}),
             effort,
             ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
           }
@@ -794,6 +797,8 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   if (pr === undefined) return
   const who = await identityOf($, root)
   const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }))
+  // When the head reached the PR (#24): GitHub's push time, else now.
+  if (saved !== undefined) await noteArrival($, root, branch, pr.headRefOid, await $.clock.now())
   await markOpened($)
   if (saved !== undefined) await advance($, root, branch)
 }

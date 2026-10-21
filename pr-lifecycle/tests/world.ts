@@ -79,6 +79,15 @@ export type World = {
     comments: object[]
     issueComments: object[]
     checks: object[]
+    /**
+     * The branch's pushes, as GitHub's repository activity log lists them (#24): the sha each moved the branch to, and when.
+     * Only the PR's head branch (`headRef`) has any; undefined lists none.
+     */
+    pushes?: { after: string; timestamp: string }[]
+    /** The activity log call fails, as it does for a token that cannot read it. */
+    isActivityBroken?: boolean
+    /** The head commit's committer date, as `gh api repos/<slug>/commits/<sha> --jq .commit.committer.date` prints it; undefined fails it. */
+    commitDate?: string
     isAuthed: boolean
     /** Whether the branch has an open PR: false until a PR-creating Bash call succeeds, or a test opens one. */
     hasPr: boolean
@@ -317,6 +326,15 @@ export function world(on: On): World {
         if (args.startsWith('issue edit')) await w.gh.onLabel?.()
         if (args.startsWith('issue edit') && w.gh.labelAnswer === 'fail') return failed('GraphQL: Could not resolve to an issue or pull request with the number of 12.')
         return out('')
+      }
+      const activity = args.match(/^api repos\/\S+\/activity\?ref=refs\/heads\/(\S+)&per_page=100$/)?.[1]
+      if (activity !== undefined) {
+        if (w.gh.isActivityBroken === true) return failed('gh: Resource not accessible by integration (HTTP 403)')
+        const rows = decodeURIComponent(activity) === w.gh.headRef ? (w.gh.pushes ?? []) : []
+        return out(JSON.stringify(rows.map(one => ({ ...one, activity_type: 'push', ref: `refs/heads/${w.gh.headRef}` }))))
+      }
+      if (/^api repos\/\S+\/commits\/[0-9a-f]+ --jq \.commit\.committer\.date$/.test(args)) {
+        return w.gh.commitDate === undefined ? failed('gh: Not Found (HTTP 404)') : out(`${w.gh.commitDate}\n`)
       }
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))

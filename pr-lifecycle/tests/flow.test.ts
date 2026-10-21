@@ -4200,3 +4200,226 @@ test('R91: a fix step\'s reply ids land in ownReplies too', async ($, on) => {
   await done($, turn(said))
   expect((await recordOf(w)).ownReplies).toEqual(['55'])
 })
+
+// ------------------------------------------------- #24: a head's time is when it reached the PR (A5)
+
+const A = 'a'.repeat(40)
+const B = 'b'.repeat(40)
+/** A second on the 1970 clock the world starts on, as GitHub prints it. */
+const iso = (s: number) => new Date(s * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+const pushed = (after: string, s: number) => ({ after, timestamp: iso(s) })
+const remark = (id: number, s: number, login = 'claude[bot]') => ({ id, user: { login }, body: '', created_at: iso(s), html_url: `c${id}` })
+/** The gate first sees the PR at second `s`: it adopts the open PR then. */
+const adoptAt = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, s: number) => {
+  await w.clock.advance(s * 1000 - 1000)
+  w.gh.hasPr = true
+  await $.command.run(cmd(''))
+}
+const logOf = async (w: ReturnType<typeof world>): Promise<string[]> => ((await recordOf(w)).log ?? []).map(one => one.text)
+
+test('#24 (1): after a resume, a roster reviewer\'s comment on the head since its push still covers it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  await $.command.run(cmd('stop'))
+  w.gh.issueComments = [remark(31, 61)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.headArrival).toEqual({ head: A, at: 1000, isPushTime: true })
+  expect(rec.phase).toBe('ready')
+})
+
+test('#24 (2): a push the gate never saw: a comment after it covers the head the gate first sees later', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.issueComments = [remark(31, 120)]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 100_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('#24 (3): a comment before the push does not cover the head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 50)]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (4): a check run that starts after the comment does not move the head\'s time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.issueComments = [remark(31, 120)]
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success', started_at: iso(200) }]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('#24 (5): with no push time, a requestReview reviewer whose comment may predate the head is asked again once, and its reply covers it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 600_000, isPushTime: false })
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=alice'])
+  expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z may predate aaaaaaa; asked again')
+  expect((await recordOf(w)).headArrival?.asked).toEqual(['alice'])
+  w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.calls.filter(one => one.includes('requested_reviewers'))).toHaveLength(1)
+})
+
+test('#24 (5b): with no push time, a roster reviewer the gate cannot ask has its comment counted, and the log says so', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z counted for aaaaaaa; GitHub gave no push time')
+  expect(w.gh.calls.some(one => one.includes('requested_reviewers'))).toBe(false)
+})
+
+test('#24 (6): a push time GitHub gives at a later poll replaces the first-seen time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isActivityBroken = true
+  w.gh.pushes = [pushed(A, 100)]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 600_000, isPushTime: false })
+  w.gh.isActivityBroken = false
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 100_000, isPushTime: true })
+  expect((await runOf(w)).collect?.headAt).toBe(100_000)
+})
+
+test('#24 (7): a new head is looked up afresh; the old head\'s time is never reused', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  expect((await recordOf(w)).headArrival?.head).toBe(A)
+  await $.command.run(cmd('stop'))
+  w.gh.prHead = B
+  w.git.head = B
+  w.gh.pushes = [pushed(A, 1), pushed(B, 1800)]
+  w.gh.issueComments = [remark(31, 60)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toEqual({ head: B, at: 1_800_000, isPushTime: true })
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (8): A→B→A: the latest push into the head is its arrival, so a comment on B does not cover A', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 40), pushed(B, 20), pushed(A, 10)]
+  w.gh.issueComments = [remark(31, 30)]
+  await adoptAt($, w, 50)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 40_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (9): a resume reads the push time again: a head that left and came back while no session ran takes the later time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 1000, isPushTime: true })
+  await $.command.run(cmd('stop'))
+  w.gh.pushes = [pushed(A, 1), pushed(B, 20), pushed(A, 40)]
+  w.gh.issueComments = [remark(31, 30)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 40_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+})
+
+test('#24 (10): A→B→A between two polls: before a comment ends collection, the push time is read again, and the comment on B does not cover A', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 15)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  w.gh.pushes = [pushed(A, 10), pushed(B, 50), pushed(A, 60)]
+  w.gh.issueComments = [remark(31, 55)]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 60_000, isPushTime: true })
+  expect((await runOf(w)).collect?.headAt).toBe(60_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (11): a failed re-read keeps the stored time: collection ends on the comment, and the log notes the failed check', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 15)
+  await w.clock.advance(30_000)
+  w.gh.pushes = [pushed(A, 10), pushed(B, 50), pushed(A, 60)]
+  w.gh.issueComments = [remark(31, 55)]
+  w.gh.isActivityBroken = true
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 10_000, isPushTime: true })
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.includes('could not read when aaaaaaa was last pushed'))).toBe(true)
+})
+
+test('#24 (12): the newest push is another head, read after the comment: collection does not end on it, and the next poll opens on that head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 20)
+  // The poll reads head A and a roster comment at 25; by the re-read, B was pushed at 26.
+  w.gh.issueComments = [remark(31, 25)]
+  w.gh.pushes = [pushed(A, 10), pushed(B, 26)]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).roundStartHead).toBe(A)
+  w.gh.prHead = B
+  w.git.head = B
+  await w.clock.advance(30_000)
+  const run = await runOf(w)
+  expect(run.roundStartHead).toBe(B)
+  expect(run.phase).toBe('collect')
+  expect((await recordOf(w)).headArrival).toEqual({ head: B, at: 26_000, isPushTime: true })
+})
+
+test('#24 (13): the newest push is the head again, read after the comment: the head\'s time moves to it, and the comment does not cover it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 20)
+  w.gh.issueComments = [remark(31, 25)]
+  w.gh.pushes = [pushed(A, 30), pushed(B, 22), pushed(A, 10)]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).collect?.headAt).toBe(30_000)
+  expect((await recordOf(w)).headArrival).toEqual({ head: A, at: 30_000, isPushTime: true })
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})

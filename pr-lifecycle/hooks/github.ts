@@ -195,7 +195,7 @@ export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
  * name or starts with `<name>-` (`copilot` posts as `copilot-pull-request-reviewer[bot]`). Only a `[bot]` login, which no person can
  * hold, matches by prefix.
  */
-const postsFor = (login: string, name: string): boolean => {
+export const postsFor = (login: string, name: string): boolean => {
   if (login === name) return true
   if (!login.endsWith('[bot]')) return false
   const stem = login.slice(0, -'[bot]'.length)

@@ -190,6 +190,12 @@ export type LifecycleRecord = {
   replies: Record<string, string>
   /** Every reply id the agent reported, in any step and for any answer, accepted or not (R91): never read back as feedback. */
   ownReplies?: string[]
+  /**
+   * When the PR's head reached the PR (#24), kept across stop, resume and another session: GitHub's push time (the latest push into
+   * the head, from the repository activity log), else when the gate first saw it. `asked`: the requestReview names asked again for
+   * this head because a comment may predate it; `counted`: comments counted for it on a guess while GitHub gave no push time.
+   */
+  headArrival?: { head: string; at: number; isPushTime: boolean; asked?: string[]; counted?: string[] }
   waivers: Waiver[]
   phase: LifecyclePhase
   /**
