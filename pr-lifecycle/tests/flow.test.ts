@@ -3918,6 +3918,47 @@ test('M1: a post waiver given while the standing is gathered is not followed by 
   expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
 })
 
+for (const action of ['reset'] as const) {
+  test(`gate G7-3: a ${action} run while the standing is gathered is not followed by the old hold`, async ($, on) => {
+    const w = world(on)
+    await toTriage($, w, 'Consider renaming this')
+    w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+    let isActing = false
+    w.gh.onChecks = async () => {
+      if (isActing) return
+      isActing = true
+      await say($, action)
+    }
+    const prompts = w.prompts.length
+    await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+    await w.clock.advance(1000)
+    expect(isActing).toBe(true)
+    const sent = w.prompts.slice(prompts)
+    expect(sent.some(one => one.startsWith(`pr-gate: the person ${action}`))).toBe(true)
+    expect(sent.some(one => one.includes('stopped short of ready'))).toBe(false)
+    expect(sent.some(one => one.includes('G2-1') && one.includes('waive'))).toBe(false)
+  })
+}
+
+test('gate G7-3: a reset while waive post gathers the standing is not followed by the waiver note', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }]
+  let isResetting = false
+  w.gh.onChecks = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  const prompts = w.prompts.length
+  await say($, 'waive post reviewed by hand')
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const sent = w.prompts.slice(prompts)
+  expect(sent.some(one => one.startsWith('pr-gate: the person reset'))).toBe(true)
+  expect(sent.some(one => one.startsWith('pr-gate: the person waived'))).toBe(false)
+})
+
 test('R81: a second reset, with nothing to archive, tells the agent nothing', async ($, on) => {
   const w = world(on)
   await toAwaiting($, w)

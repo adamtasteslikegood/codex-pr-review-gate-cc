@@ -54,6 +54,7 @@ import {
   ignoredNote,
   isLiveNow,
   isOwnedElsewhere,
+  isStillCurrent,
   isTurnOf,
   markPr,
   onAnswer,
@@ -995,6 +996,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       ? { number: settled.pr, baseRefName: live?.baseRefName ?? settled.base, headRefOid: live?.headRefOid ?? settled.head }
       : undefined
     const standing = settled !== undefined && pr !== undefined ? await gatherStanding($, settled, pr) : undefined
+    // A reset while the standing was gathered supersedes this note (gate G7-3).
+    if (settled !== undefined && pr !== undefined && !(await isStillCurrent($, settled))) return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
     await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`,
       standing === undefined
         ? 'nothing more is needed from you for this finding; the pre-PR review continues.'
@@ -1101,14 +1104,18 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
   const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
-  await tellAgent($, { root, branch }, `waived post-PR review of ${pr === undefined ? branch : `PR #${pr.number}`} at ${at.slice(0, 7)}: ${reason}`,
-    standing === undefined
-      ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
-          'Check it with gh pr view before telling the person anything; do not merge.'
-      : standing.mayProceed
-        ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
-        : 'the waiver covers the review only: wait for what is listed, then tell the person.',
-    standing)
+  // A reset while the standing was gathered supersedes this note (gate G7-3).
+  const isSuperseded = after !== undefined && pr !== undefined && !(await isStillCurrent($, after))
+  if (!isSuperseded) {
+    await tellAgent($, { root, branch }, `waived post-PR review of ${pr === undefined ? branch : `PR #${pr.number}`} at ${at.slice(0, 7)}: ${reason}`,
+      standing === undefined
+        ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
+            'Check it with gh pr view before telling the person anything; do not merge.'
+        : standing.mayProceed
+          ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          : 'the waiver covers the review only: wait for what is listed, then tell the person.',
+      standing)
+  }
   const aside = standing === undefined || standing.setAside.length === 0 ? '' : ` Set aside (GitHub does not require them): ${standing.setAside.join(', ')}.`
   return `/${COMMAND} waived post-PR review for ${branch} at ${at.slice(0, 7)}: ${reason}. This head may merge; a new commit needs a new review or waiver.${aside}`
 }

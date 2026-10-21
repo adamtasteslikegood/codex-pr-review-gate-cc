@@ -1732,6 +1732,8 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
   const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
   if (await isPostWaived($, saved)) return
+  // A reset, stop or push while the standing was gathered supersedes this hold (gate G7-3).
+  if (!(await isStillCurrent($, saved))) return
   await say($, saved, heldPrompt(saved, why, nextStep, standing))
 }
 
@@ -2213,6 +2215,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   const at = tip?.head ?? rec.head
   if (rec.pr !== undefined && posts.some(one => one.head === at)) {
     const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: tip?.base ?? rec.base, headRefOid: at })
+    if (!(await isStillCurrent($, rec))) return
     await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
     return
   }
@@ -2328,6 +2331,8 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   const standing = pr === undefined ? undefined : await gatherStanding($, saved, pr)
   // A post waiver given while the standing was gathered covers this head: no hold after it (final review M1, R80).
   if (await isPostWaived($, saved)) return
+  // So does a reset, a stop or a push in that time: the report is for a lifecycle that has moved on (gate G7-3).
+  if (!(await isStillCurrent($, saved))) return
   await say($, saved, reportPrompt(saved, next, standing))
 }
 
@@ -2335,6 +2340,24 @@ export async function advance($: Engine, root: string, branch: string, isResume 
 async function isPostWaived($: Engine, rec: LifecycleRecord): Promise<boolean> {
   const latest = await loadRecord($, rec.root, rec.branch)
   return latest !== undefined && latest.waivers.some(one => one.scope === 'post' && one.head === rec.head) && securityHolds(latest).length === 0
+}
+
+/**
+ * Whether `rec` is still the branch's live lifecycle, at the same head and state, read afresh. A report or note gathered over a slow
+ * await is dropped once a reset archived the record, a fresh lifecycle replaced it, or a push, a stop or a new round moved it on: the
+ * queue's drop cannot reach work still awaiting (gate G7-3).
+ */
+export async function isStillCurrent($: Engine, rec: LifecycleRecord): Promise<boolean> {
+  const latest = await loadRecord($, rec.root, rec.branch)
+  return (
+    latest !== undefined &&
+    latest.phase !== 'archived' &&
+    latest.head === rec.head &&
+    latest.pr === rec.pr &&
+    latest.postStatus === rec.postStatus &&
+    latest.rounds.length === rec.rounds.length &&
+    latest.rounds[0]?.startedAt === rec.rounds[0]?.startedAt
+  )
 }
 
 /** Blockers that hold an exhausted gate: unresolved, or only reported fixed. */
