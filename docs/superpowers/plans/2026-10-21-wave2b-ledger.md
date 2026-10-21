@@ -81,3 +81,4 @@ Task 6b: review Spec ✅ Quality Changes needed (Important: raise re-check promp
 Ruling: A8 broadened to Adam's words — a discretionary post round is charged when the agent reports a fix in it for ANY finding (raised then or earlier); linked dups excluded; once; answer runs free — cost if wrong: allowance spent faster on late blocker fixes
 Ruling: a refused raise re-check is a full rejection (rejections+1, charged if discretionary) — it is a real Codex rejection at the new severity — cost if wrong: one round
 Note: A8 does not verify a push happened ("fixed" answer + Codex holds still charged) — low impact, accepted
+Task 6b: fix round 1 3bbdaa0 + report c77b336, 564/564 (raiseOf labels; A8 any fix in round; R90 flow test on discretionary) → scoped re-review on sonnet
