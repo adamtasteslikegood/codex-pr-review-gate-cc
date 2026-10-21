@@ -3583,3 +3583,7 @@ test('R80: after waive post, resume starts no Codex recheck of a rebuttal (PR #1
 test('R80: after waive post, resume starts no review round owed on the waived head (PR #19 review)', async ($, on) => {
   await resumeAfterPostWaiver($, world(on), 'round')
 })
+
+test('R80: after waive post, resume starts no round for a fix awaiting verification (PR #19 review)', async ($, on) => {
+  await resumeAfterPostWaiver($, world(on), 'round', { status: 'reported-fixed' })
+})
