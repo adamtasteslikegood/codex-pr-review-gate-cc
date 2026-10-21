@@ -365,13 +365,15 @@ test('a merge to an ungated base, or of a promotion, is not held', async ($, on)
 
 test('a ready lifecycle lets its own head merge; a later push holds it again', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   // Ready through the controller (R65): nobody posts by the wait cap, and the pre-PR Codex review already covered the head.
   await w.clock.advance(20 * 60_000)
   expect((await recordOf(w)).phase).toBe('ready')
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.prHead = 'e'.repeat(40)
   const held = await $.tool.call(merge)
   expect(held.deny).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
@@ -1438,13 +1440,15 @@ const say = ($: Parameters<TestBody>[0], args: string, as: object = asPerson) =>
 
 test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   expect((await say($, 'waive pre hotfix for the outage')).text).toContain('post-PR review still runs')
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   expect((await recordOf(w)).phase).toBe('post')
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(true)
   await say($, 'waive post reviewed by hand')
-  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })).deny).toBeUndefined()
   const waivers = (await recordOf(w)).waivers
   expect(waivers.map(one => [one.scope, one.reason, one.by])).toEqual([
     ['pre', 'hotfix for the outage', 'composer'],
@@ -1454,10 +1458,12 @@ test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
 
 test('gate R4-1: a post waiver given while the PR targeted dev does not release a merge after it is retargeted to main', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await say($, 'waive pre hotfix for the outage')
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   await say($, 'waive post reviewed by hand')
-  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })).deny).toBeUndefined()
   w.gh.base = 'main'
   const held = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })
   expect(isHeld(held)).toBe(true)
@@ -2931,13 +2937,15 @@ test('R1-9: a ready PR with CI still running is held', async ($, on) => {
 
 test('R1-9: a ready PR with no checks, or all of them green or skipped, merges', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await toReady($, w)
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.checks = [
     { name: 'ci', status: 'completed', conclusion: 'success' },
     { name: 'deploy', status: 'completed', conclusion: 'skipped' },
   ]
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
 })
 
 test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on) => {
@@ -2953,12 +2961,14 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
 
 test('R1-9: a post waiver does not let a head with failing CI merge', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   w.gh.hasPr = true
   // A post waiver sets aside only what the base does not require (R86): this check is required.
   w.gh.required = ['ci']
   await $.command.run(cmd('waive post shipping it'))
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'cancelled' }]
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('failing: ci')
@@ -3784,6 +3794,8 @@ test('gate R1-3: a required check that never reported holds a waived merge until
 
 test('R86, gate R2-2 option B: unreadable required checks make every reported check required, with no hold of their own', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await toPost($, w)
   w.gh.hasPr = true
   w.gh.required = ['check']
@@ -3792,7 +3804,7 @@ test('R86, gate R2-2 option B: unreadable required checks make every reported ch
   // Passing or no checks: nothing holds (GitHub's ruleset still enforces required checks at merge).
   for (const checks of [[{ name: 'check', status: 'completed', conclusion: 'success' }], []]) {
     w.gh.checks = checks
-    expect(isHeld(await $.tool.call(merge))).toBe(false)
+    expect((await $.tool.call(merge)).deny).toBeUndefined()
   }
   // A failing check the base may not require still holds: the waiver can't set it aside while the policy is unknown.
   w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }, { name: 'lint', status: 'completed', conclusion: 'failure' }]
@@ -3801,7 +3813,7 @@ test('R86, gate R2-2 option B: unreadable required checks make every reported ch
   expect(held.deny ?? '').toContain('lint')
   // Once GitHub answers, the optional failure is set aside by the waiver.
   w.gh.classicAnswer = 'none'
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
 })
 
 test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
@@ -5569,4 +5581,188 @@ test('R93: a waiver that makes the lifecycle ready sends the merge step once', a
   await w.clock.advance(1000)
   const sent = w.prompts.slice(prompts).join('\n')
   expect(sent.split('gh pr merge ').length - 1).toBe(1)
+})
+
+/** A P2 deferral Codex agreed with, filed as #21 by the gate: the lifecycle is ready (Task 12). */
+const toFiled = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): Promise<void> => {
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+}
+
+/** The branch's archived records, oldest first. */
+const archivesOf = (w: ReturnType<typeof world>): LifecycleRecord[] =>
+  [...w.store.keys()].filter(one => one.startsWith(`${KEY}:archived:`)).map(one => w.stored(one) as LifecycleRecord)
+const archivedOf = (w: ReturnType<typeof world>): LifecycleRecord | undefined => archivesOf(w).at(-1)
+
+test('spec §5.12: after the agent merges, the gate finds each follow-up issue open, logs it, archives the record and says what stays open', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' }))).toBe(false)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('PR #1 merged. Follow-up issues still open: G2-1 → #21 Major [P2].')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a follow-up issue the merge closed is reopened with a comment', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.reopened[0]?.slice(0, 5)).toEqual(['issue', 'reopen', '21', '--repo', 'me/repo'])
+  expect(w.gh.reopened[0]?.at(-1)).toContain('PR #1 merged without fixing G2-1')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge')).toBe(true)
+})
+
+test('spec §5.12: a follow-up issue that is gone is filed again, and the finding names the new one', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(w.gh.filed[1]).toContain(`title=G2-1 Major [P2] Consider renaming this (#${w.gh.pr}, feat/x)`)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.followUp).toBe('#22')
+  expect(w.prompts.at(-1)).toContain('G2-1 → #22 Major [P2]')
+})
+
+test('spec §5.12: when an issue cannot be reopened or filed again, the record is not archived, and resume checks again', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'fail'
+  w.gh.issueAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate could not confirm the follow-up issue of G2-1')
+  expect(w.prompts.at(-1)).toContain('HTTP 403: Resource not accessible by integration')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  w.gh.reopenAnswer = 'ok'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.issueStates[21]).toBe('OPEN')
+})
+
+test('spec §6.4: a merge GitHub refuses leaves the lifecycle where it was', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.mergeAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a merge the session finds at its start runs the check before it archives', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+/** A reset and a fresh start, run while the post-merge check awaits gh (A6): the check must write nothing into what follows. */
+const replaceWhile = ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): { hook: () => Promise<void>; isDone: () => boolean } => {
+  let isReplaced = false
+  return {
+    hook: async () => {
+      if (isReplaced) return
+      isReplaced = true
+      await say($, 'reset')
+      // The fresh lifecycle adopts the PR as open: a PR read as merged here would be the new lifecycle's own R62 close on its
+      // first poll, not the old check's write (the check read the merge before this hook ran).
+      w.gh.state = 'OPEN'
+      await say($, '')
+    },
+    isDone: () => isReplaced,
+  }
+}
+
+const expectReplaced = async (w: ReturnType<typeof world>, archives: number): Promise<void> => {
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('archived')
+  expect(rec.generation).toBe(1)
+  expect(rec.findings.some(one => one.followUp !== undefined)).toBe(false)
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('after the merge')
+  expect(archivesOf(w)).toHaveLength(archives)
+}
+
+test('A6: a reset and a fresh start while the gate reads an issue after the merge: nothing is reopened, filed or archived for the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  const swap = replaceWhile($, w)
+  w.gh.onIssueView = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.reopened).toEqual([])
+  expect(w.gh.filed).toHaveLength(1)
+  await expectReplaced(w, 1)
+})
+
+test('A6: a reset and a fresh start while the gate reopens an issue: nothing is filed or archived for the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'fail'
+  const swap = replaceWhile($, w)
+  w.gh.onReopen = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.filed).toHaveLength(1)
+  await expectReplaced(w, 1)
+})
+
+test('A6: a reset and a fresh start while the gate files an issue again: the new lifecycle gets no follow-up from it and is not archived', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  const swap = replaceWhile($, w)
+  w.gh.onIssue = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.filed).toHaveLength(2)
+  await expectReplaced(w, 1)
+})
+
+test('A6, A7: an issue filed again without its label holds the record blocked; resume labels that issue and files no other', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueLabels = []
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22' })
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('without its severity:P2 label')
+  expect(w.prompts.at(-1)).toContain('label-failed')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueLabels = undefined
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(labelled(w, 22, 'P2')).toBe(true)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
 })

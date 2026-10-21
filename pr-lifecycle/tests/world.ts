@@ -134,6 +134,18 @@ export type World = {
     filed: string[][]
     /** Called on each issue filing, before it answers: a test acts while the gate files an issue. */
     onIssue?: () => void | Promise<void>
+    /** Each issue's state for `gh issue view` (spec §5.12); absent means OPEN, 'missing' answers as a deleted issue does. */
+    issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing'>
+    /** How `gh issue reopen` answers: 'ok' (default) or 'fail'. */
+    reopenAnswer?: 'ok' | 'fail'
+    /** Every reopen the gate ran: its argv after `gh`. */
+    reopened: string[][]
+    /** Called on each `gh issue view`, before it answers: a test acts while the gate reads an issue after the merge. */
+    onIssueView?: () => void | Promise<void>
+    /** Called on each `gh issue reopen`, before it answers: a test acts while the gate reopens an issue. */
+    onReopen?: () => void | Promise<void>
+    /** How the agent's `gh pr merge` answers in the Bash fake: 'ok' (default) merges the PR, 'fail' refuses as GitHub would. */
+    mergeAnswer?: 'ok' | 'fail'
     /** Logins `GET .../requested_reviewers` lists (R89); undefined lists none. */
     requested?: string[]
     /** Every `-X POST .../requested_reviewers` call the gate made, in order. */
@@ -245,6 +257,8 @@ export function world(on: On): World {
       calls: [],
       labelled: [],
       filed: [],
+      issueStates: {},
+      reopened: [],
       requests: [],
     },
     store: new Map(),
@@ -314,6 +328,24 @@ export function world(on: On): World {
         const asked = e.argv.flatMap(one => (one.startsWith('labels[]=') ? [one.slice('labels[]='.length)] : []))
         const labels = (w.gh.issueLabels ?? asked).map(name => ({ name }))
         return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}`, labels }))
+      }
+      // The post-merge check (spec §5.12): gh issue view <n> --repo <r> --json state, and gh issue reopen <n> --repo <r> --comment <text>.
+      if (e.argv[1] === 'issue' && e.argv[2] === 'view') {
+        await w.gh.onIssueView?.()
+        const state = w.gh.issueStates[Number(e.argv[3])] ?? 'OPEN'
+        if (state === 'missing') {
+          return { value: { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to an issue or pull request with the number of ${e.argv[3]}.`, isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        return out(JSON.stringify({ state }))
+      }
+      if (e.argv[1] === 'issue' && e.argv[2] === 'reopen') {
+        w.gh.reopened.push(e.argv.slice(1))
+        await w.gh.onReopen?.()
+        if (w.gh.reopenAnswer === 'fail') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        w.gh.issueStates[Number(e.argv[3])] = 'OPEN'
+        return out('')
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)
       const failed = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
@@ -500,6 +532,16 @@ export function world(on: On): World {
     // A PR-creating call that ran opens the branch's PR on the fake GitHub, when it is to the fake PR's base.
     const base = e.command.match(/--base\s+(\S+)/)?.[1]
     if (/\bpr\s+create\b|createPullRequest|\/pulls\b/.test(e.command) && (base === undefined || base === w.gh.base)) w.gh.hasPr = true
+    // The agent's merge (R93): GitHub accepts it and the PR reads MERGED, or refuses it.
+    if (/\bgh\s+pr\s+merge\b/.test(e.command)) {
+      if (w.gh.mergeAnswer === 'fail') {
+        return { result: { stdout: '', stderr: 'GraphQL: Required status check "ci" is expected. (mergePullRequest)', interrupted: false }, isError: true } as never
+      }
+      // A merge of another repository's PR leaves this one as it is.
+      const isOther = /github\.com\/(?!me\/repo\/)/.test(e.command) || /(?:-R|--repo)\s+(?!me\/repo\b)\S+/.test(e.command)
+      if (!isOther) w.gh.state = 'MERGED'
+      return { result: { stdout: `✓ Merged pull request #${w.gh.pr}`, stderr: '', interrupted: false } as never }
+    }
     return { result: { stdout: 'https://github.com/me/repo/pull/1', stderr: '', interrupted: false } as never }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))

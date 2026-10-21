@@ -96,6 +96,13 @@ import {
   linkTo,
   withLinkedPeak,
   withRound,
+  isFileable,
+  isFollowUpRef,
+  isSettledByIssue,
+  issueBody,
+  issueLine,
+  issueOf,
+  issueTitle,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
 import { archiveRecord, isHeldByOther, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
@@ -853,12 +860,15 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
 
 /**
  * Archives the branch's record (R47): the whole record under its own key, and on the branch's key a seed that keeps only what a
- * fresh start must not repeat (processed feedback, recorded replies and the replies the agent reported, R91). False when there was no live record.
+ * fresh start must not repeat (processed feedback, recorded replies and the replies the agent reported, R91). False when there was no live record,
+ * or, with `generation`, when the live record is another lifecycle's (A6).
  */
-export async function archiveLifecycle($: Engine, root: string, branch: string, now: number): Promise<boolean> {
+export async function archiveLifecycle($: Engine, root: string, branch: string, now: number, generation?: number): Promise<boolean> {
   return lockRecord(root, branch, async () => {
     const last = await loadRecord($, root, branch)
     if (last === undefined || last.phase === 'archived') return false
+    // A caller that read the record earlier archives only that lifecycle, never one a reset and a fresh start put in its place (A6).
+    if (generation !== undefined && (last.generation ?? 0) !== generation) return false
     await archiveRecord($, last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
@@ -906,12 +916,70 @@ export async function prStateOf($: Engine, root: string, pr: number): Promise<Pr
   }
 }
 
-/** The PR was merged or closed (R62): the branch's live run ends with a short message, and its record is archived. */
+/**
+ * The PR was merged or closed (R62): the branch's live run ends with a short message, and its record is archived. After a merge the
+ * follow-up issues are checked first (spec §5.12): if one cannot be confirmed, or the check itself fails, the record stays, blocked,
+ * the agent gets gh's words, and `/pr-gate resume` checks again. A reset or a fresh start while gh ran ends it with nothing written,
+ * said or archived (A6).
+ */
 export async function closeLifecycle($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+  const rec = await loadRecord($, root, branch)
+  const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was reset or replaced while the gate checked its follow-up issues: nothing was written for it`
+  let open: Finding[] = []
+  if (state === 'MERGED' && rec !== undefined && rec.phase !== 'archived') {
+    let checked: MergeCheck
+    try {
+      checked = await checkIssuesAfterMerge($, rec)
+    } catch (error) {
+      // Never silent (the gate can't get stuck): a check that threw is a failed check, and resume runs it again.
+      const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+      checked = { failed: [`its findings (the check itself failed: ${said})`], lines: [], findings: rec.findings, touched: [] }
+    }
+    if (checked.moved === true) return replaced
+    const done = checked
+    // Only the fields the check changed are written, onto the record as it is now, under the lock.
+    const apply = (latest: LifecycleRecord): Finding[] =>
+      latest.findings.map(f => {
+        const got = done.touched.includes(f.id) ? done.findings.find(one => one.id === f.id) : undefined
+        if (got === undefined) return f
+        return { ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError }
+      })
+    let isGone = false
+    if (done.failed.length > 0) {
+      const why = `PR #${pr ?? '?'} merged, but the gate could not confirm the follow-up issue of ${done.failed.join('; ')}`
+      const saved = await updateRecord($, root, branch, latest => {
+        isGone = isMovedFrom(rec, latest)
+        if (isGone) return latest
+        const log = [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP)
+        return { ...latest, findings: apply(latest), postStatus: 'blocked', message: why.slice(0, 1000), log }
+      })
+      if (isGone || saved === undefined) return replaced
+      // A collection in flight ends here: its next poll would only run the check again. Resume does that.
+      const run = await getRun($)
+      if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'blocked', why.slice(0, 300))
+      await say($, saved, `pr-gate: ${why}. Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again.`)
+      return why
+    }
+    if (done.lines.length > 0 || done.touched.length > 0) {
+      const saved = await updateRecord($, root, branch, latest => {
+        isGone = isMovedFrom(rec, latest)
+        if (isGone) return latest
+        return { ...latest, findings: apply(latest), log: [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP) }
+      })
+      if (isGone || saved === undefined) return replaced
+      open = saved.findings.filter(isSettledByIssue)
+    }
+  }
   const said = `PR #${pr ?? '?'} from ${branch} was ${state === 'MERGED' ? 'merged' : 'closed'}: its lifecycle is archived, its history kept`
+  // Only the lifecycle read above is ended and archived: one a reset and a fresh start put in its place is left alone (A6).
+  if (rec !== undefined && rec.phase !== 'archived') {
+    const latest = await loadRecord($, root, branch)
+    if (latest === undefined || latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)) return state === 'MERGED' ? replaced : said
+  }
   const run = await getRun($)
   if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'stopped', `${said}.`)
-  await archiveLifecycle($, root, branch, await $.clock.now())
+  const did = await archiveLifecycle($, root, branch, await $.clock.now(), rec === undefined ? undefined : (rec.generation ?? 0))
+  if (did && open.length > 0) await say($, { root, branch }, `pr-gate: PR #${pr ?? '?'} merged. Follow-up issues still open: ${open.map(issueLine).join('; ')}.`)
   return said
 }
 
@@ -2953,6 +3021,16 @@ export async function advance($: Engine, root: string, branch: string, isResume 
 /** The colour of each severity label the gate makes on an issue's repository (R85, R92). */
 const LABEL_COLOURS: Record<Severity, string> = { P0: 'b60205', P1: 'd93f0b', P2: 'fbca04', P3: '0e8a16' }
 
+/**
+ * Whether the branch's record, read afresh as `latest`, has moved on from `rec` while gh ran (gate G7-8, R8-2, A6): it is gone or
+ * archived, a reset or a fresh start changed its generation, or a stop changed its post-PR status.
+ */
+const isMovedFrom = (rec: LifecycleRecord, latest: LifecycleRecord | undefined): boolean =>
+  latest === undefined ||
+  latest.phase === 'archived' ||
+  (latest.generation ?? 0) !== (rec.generation ?? 0) ||
+  latest.postStatus !== rec.postStatus
+
 /** What one filing did to a finding, written under the record's lock. */
 type Filed = { peak: Severity; was: string | undefined; followUp: string | undefined; issueError?: string; labelError?: string }
 
@@ -2973,11 +3051,7 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
   if (plan.kind === 'none') return rec
   // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and
   // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
-  const isMoved = (latest: LifecycleRecord | undefined): boolean =>
-    latest === undefined ||
-    latest.phase === 'archived' ||
-    (latest.generation ?? 0) !== (rec.generation ?? 0) ||
-    latest.postStatus !== rec.postStatus
+  const isMoved = (latest: LifecycleRecord | undefined): boolean => isMovedFrom(rec, latest)
   // A waiver given while a round runs leaves the deciding to that round (the waive command does not advance it): the pass files
   // nothing more and hands back the record with the waiver, which the caller decides, so the run never waits on no one.
   const isWaived = (latest: LifecycleRecord): boolean => latest.waivers.length !== rec.waivers.length
@@ -3095,6 +3169,125 @@ const filedIssueOf = (stdout: string): { number: number; labels: string[] } | un
   } catch {
     return undefined
   }
+}
+
+/**
+ * What the post-merge check found (spec §5.12): each finding whose issue it could not confirm, with gh's words (`failed`), the log
+ * lines, the findings with any issue filed again (`touched` names them). `moved`: the lifecycle was reset or replaced while gh ran,
+ * and the caller writes, says and archives nothing (A6).
+ */
+export type MergeCheck = { moved: true } | { moved?: undefined; failed: string[]; lines: LogEntry[]; findings: Finding[]; touched: string[] }
+
+/**
+ * After a merge (spec §5.12, decision M3): each finding settled by its issue still has an open issue. A closed one is reopened with a
+ * comment; a missing one, or one gh cannot reopen, is filed again with its title and body. An issue filed again whose answer lacks
+ * its label keeps its number and holds as a failed label (A7); the next check labels it, never files another. Before each GitHub
+ * change, and after the last read, the record is read afresh: one reset or replaced since ends the check with `moved` (A6).
+ * Never through a PR-create command line (spec §5.9).
+ */
+export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Promise<MergeCheck> {
+  const failed: string[] = []
+  const lines: LogEntry[] = []
+  const touched = new Map<string, Finding>()
+  const waived = waivedIds(rec)
+  // A finding settled by its issue, or one whose issue this check filed again without its label (A7): that issue gets the label.
+  const isLabelOwed = (f: Finding): boolean => isFileable(f) && !waived.has(f.id) && isFollowUpRef(f.followUp) && f.followUpLabelError !== undefined
+  const targets = rec.findings.filter(f => isSettledByIssue(f) || isLabelOwed(f))
+  if (targets.length === 0) return { failed, lines, findings: rec.findings, touched: [] }
+  const { config: c } = await configFor($, rec.root, rec.base)
+  // Each gh call is bounded: a hang ends as a failure, with gh's words, never a wait.
+  const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  const words = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
+  const log = async (text: string): Promise<void> => {
+    lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
+  }
+  const isMoved = async (): Promise<boolean> => isMovedFrom(rec, await loadRecord($, rec.root, rec.branch))
+  for (const f of targets) {
+    const peak = filingPeak(f)
+    const label = `severity:${peak}`
+    const ref = issueOf(f.followUp, rec.slug)
+    if (ref === undefined) {
+      // Unreachable for a filed issue (it needs the record's repository); logged, never a silent skip or a wait no one can end.
+      await log(`${f.id}: could not check ${f.followUp ?? 'its issue'} after the merge: no repository is known for it`)
+      continue
+    }
+    const where = `${ref.repo}#${ref.number}`
+    const view = await gh(['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'state'])
+    let state: unknown
+    try {
+      state = view.exitCode === 0 ? (JSON.parse(view.stdout) as { state?: unknown } | null)?.state : undefined
+    } catch {
+      state = undefined
+    }
+    if (state === 'OPEN' && !isLabelOwed(f)) {
+      await log(`${f.id}: ${where} open after the merge`)
+      continue
+    }
+    if (await isMoved()) return { moved: true }
+    let why = view.exitCode === 0 ? `gh read the issue's state as ${String(state)}` : words(view)
+    let isOpen = state === 'OPEN'
+    if (state === 'CLOSED') {
+      const comment = `Reopened by pr-gate: PR #${rec.pr ?? '?'} merged without fixing ${f.id}. It stays open as the follow-up.`
+      const reopen = await gh(['issue', 'reopen', String(ref.number), '--repo', ref.repo, '--comment', comment])
+      if (reopen.exitCode === 0) {
+        await log(`${f.id}: reopened ${where} after the merge`)
+        isOpen = true
+      } else {
+        why = words(reopen)
+      }
+      if (await isMoved()) return { moved: true }
+    }
+    if (isOpen && !isLabelOwed(f)) continue
+    if (isOpen) {
+      // Filed again by an earlier check without its label (A7): labelled now, as the filing pass labels an issue it reuses.
+      await gh(['label', 'create', label, '--repo', ref.repo, '--color', LABEL_COLOURS[peak]])
+      if (await isMoved()) return { moved: true }
+      const edit = await gh(['issue', 'edit', String(ref.number), '--repo', ref.repo, '--add-label', label])
+      if (edit.exitCode === 0) {
+        touched.set(f.id, { ...f, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })
+        await log(`${f.id}: labelled ${where} ${label} after the merge`)
+        continue
+      }
+      touched.set(f.id, { ...f, followUpLabelError: words(edit) })
+      failed.push(`${f.id} (label-failed: could not label ${where} ${label}: ${words(edit)})`)
+      await log(`${f.id}: could not label ${where} ${label} after the merge`)
+      continue
+    }
+    // Gone, or not reopened: filed again in this repository, labelled as before.
+    if (rec.slug === undefined) {
+      failed.push(`${f.id} (${why}; filing it again: no GitHub repository is known for this branch)`)
+      await log(`${f.id}: could not confirm ${where} after the merge`)
+      continue
+    }
+    await gh(['label', 'create', label, '--repo', rec.slug, '--color', LABEL_COLOURS[peak]])
+    if (await isMoved()) return { moved: true }
+    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${issueTitle(f, rec, c.issueSpec)}`, '-f', `body=${issueBody(f, rec)}`, '-f', `labels[]=${label}`])
+    const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
+    const was = state === 'CLOSED' ? 'could not be reopened' : 'is gone'
+    if (filed === undefined) {
+      failed.push(`${f.id} (${why}; filing it again: ${post.exitCode === 0 ? "GitHub did not give the new issue's number" : words(post)})`)
+      await log(`${f.id}: could not confirm ${where} after the merge`)
+      continue
+    }
+    if (!filed.labels.includes(label)) {
+      // Filed, but GitHub dropped the label (A7): the new issue is kept, and the next check labels it instead of filing another.
+      const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
+      touched.set(f.id, { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined })
+      failed.push(`${f.id} (label-failed: ${labelError})`)
+      await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} without ${label}`)
+      continue
+    }
+    touched.set(f.id, { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })
+    await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
+  }
+  if (await isMoved()) return { moved: true }
+  return { failed, lines, findings: rec.findings.map(f => touched.get(f.id) ?? f), touched: [...touched.keys()] }
 }
 
 /** Whether a post waiver now covers the record's head, read afresh: what a hold sent after a slow gather checks first (M1). */

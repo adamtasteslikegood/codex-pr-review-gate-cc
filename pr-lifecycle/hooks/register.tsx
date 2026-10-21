@@ -804,6 +804,30 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   if (saved !== undefined) await advance($, root, branch)
 }
 
+/**
+ * The agent's merge went through (R93): once GitHub reads the PR as merged, the lifecycle closes, after the issue check (spec §5.12).
+ * A merge not yet done (`--auto`), or a `gh pr view` that fails here, is left to the next poll, session start or /pr-gate (R62).
+ */
+const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
+  const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
+  if (!top.isOk) return
+  const view = await $.process.run(
+    ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'number,headRefName,state'],
+    { cwd: top.out, timeoutMs: 30_000 },
+  )
+  let pr: { number?: unknown; headRefName?: unknown; state?: unknown } | undefined
+  try {
+    pr = view.exitCode === 0 ? (JSON.parse(view.stdout) as { number?: unknown; headRefName?: unknown; state?: unknown } | null) ?? undefined : undefined
+  } catch {
+    pr = undefined
+  }
+  if (pr?.state !== 'MERGED' || typeof pr.headRefName !== 'string' || typeof pr.number !== 'number') return
+  const rec = await loadRecord($, top.out, pr.headRefName)
+  if (rec === undefined || rec.phase === 'archived' || rec.pr !== pr.number) return
+  // closeLifecycle turns a failed issue check into a blocked record with gh's words, which /pr-gate resume runs again.
+  await closeLifecycle($, top.out, pr.headRefName, pr.number, 'MERGED')
+}
+
 // ------------------------------------------------------------ the command
 
 const ids = (findings: readonly Finding[]): string => findings.map(one => one.id).join(', ')
@@ -1179,7 +1203,17 @@ export const register: Register = (on, options) => {
       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
-      return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)
+      if (refusal !== undefined) return { deny: asHold(refusal) + tail }
+      const ran = await next(e)
+      // A merge GitHub refused leaves the lifecycle where it was (spec §6.4); one that went through closes it (spec §5.12). What fails
+      // here is said, never dropped: the merge itself has run, so its result goes back as it was. The agent's turn holds the
+      // session while its tool runs, so what the check tells it waits until the call has returned, as a command's prompts do.
+      if (ran.deny === undefined && ran.isError !== true) {
+        await holdingPrompts($, () => onMerged($, target)).catch((error: unknown) => {
+          $.ui.toast(`pr-gate: the merge went through, but the gate could not close its lifecycle (${error instanceof Error ? error.message : String(error)}). Run /pr-gate.`.slice(0, 300))
+        })
+      }
+      return ran
     }
     const found = await gatedCreate($, action)
     if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
@@ -1251,11 +1285,16 @@ export const register: Register = (on, options) => {
         // Only a session a person is at takes a record over, and only once its owner has gone quiet (#13; Adam, decision D): a
         // headless child in the same checkout (a hook's `claude -p`) never runs the lifecycle or gets its prompts.
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
+        // A ready record's PR merged meanwhile is closed too, after the issue check (spec §5.12); one still open is left as it is.
+        if (rec !== undefined && isMine && rec.phase === 'ready' && rec.pr !== undefined && (await prStateOf($, top.out, rec.pr)) === 'MERGED') {
+          await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, 'MERGED'))
+          return next(e)
+        }
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
           // A PR merged or closed meanwhile is not collected again: its record is archived (R62).
           const state = rec.pr === undefined ? undefined : await prStateOf($, top.out, rec.pr)
           if (state === 'MERGED' || state === 'CLOSED') {
-            await closeLifecycle($, top.out, branch, rec.pr, state)
+            await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, state))
             return next(e)
           }
           if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
