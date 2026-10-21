@@ -728,7 +728,9 @@ export function readRequired(rules: string, protection: string | undefined): str
   if (!Array.isArray(listed)) return undefined
   const out: string[] = []
   for (const rule of listed) {
-    const row = typeof rule === 'object' && rule !== null ? (rule as Record<string, unknown>) : {}
+    // Every rule GitHub lists names its type: a row that is not an object, or has no type, is malformed (gate R1-7).
+    if (typeof rule !== 'object' || rule === null || typeof (rule as { type?: unknown }).type !== 'string') return undefined
+    const row = rule as Record<string, unknown>
     if (row.type !== 'required_status_checks') continue
     // A required-checks rule without its list, or with an entry that names no check, is a malformed payload, not an empty policy (gate R1-7).
     const params = (typeof row.parameters === 'object' && row.parameters !== null ? row.parameters : {}) as { required_status_checks?: unknown }

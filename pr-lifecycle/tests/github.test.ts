@@ -482,6 +482,11 @@ test('R86: required checks come from the ruleset and classic protection; anythin
   expect(readRequired(rules, JSON.stringify({ contexts: 42, checks: [] }))).toBeUndefined()
   expect(readRequired(rules, JSON.stringify({ contexts: [], checks: 'bad' }))).toBeUndefined()
   expect(readRequired(rules, JSON.stringify({ contexts: ['legacy'] }))).toEqual(['check', 'analyze (actions)', 'legacy'])
+  // A rules row that is not a typed object is malformed too (gate R1-7 at f9e35cb); a rule of another type is skipped.
+  expect(readRequired('[null]', undefined)).toBeUndefined()
+  expect(readRequired('[{}]', undefined)).toBeUndefined()
+  expect(readRequired('["x"]', undefined)).toBeUndefined()
+  expect(readRequired(JSON.stringify([{ type: 'pull_request', parameters: {} }]), undefined)).toEqual([])
 })
 
 test('R87: hasOtherSteps sees steps chained with a PR command, not text inside quotes, $(…) or a heredoc body', async () => {
