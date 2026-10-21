@@ -778,7 +778,8 @@ test('an unknown gh login found again is kept on the record', async ($, on) => {
 })
 
 const inline = (id: number, body: string, head: string, line = 4) => ({
-  id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: `u${id}`,
+  id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, original_commit_id: head, created_at: '1970-01-01T00:01:00Z',
+  html_url: `u${id}`,
 })
 const roster = '{"reviewers":["claude[bot]"],"checks":[]}'
 const covers = (head: string) => [
@@ -4511,9 +4512,9 @@ test('R89: a pending review request holds the round until that reviewer reviews 
   w.gh.reviews = covers(w.gh.prHead)
   await w.clock.advance(30_000)
   expect((await runOf(w)).activity).toBe('waiting on alice')
-  // GitHub drops the request once alice reviews.
-  w.gh.requested = []
-  w.gh.reviews = [...covers(w.gh.prHead), { id: 6, user: { login: 'alice' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }]
+  // Her review of the head answers the request even while GitHub still lists it (the list can lag the review).
+  const approval = { id: 6, user: { login: 'alice' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }
+  w.gh.reviews = [...covers(w.gh.prHead), approval]
   await w.clock.advance(30_000)
   expect((await recordOf(w)).phase).toBe('ready')
 })
@@ -4528,7 +4529,10 @@ test('R89 (Review Focus 2): a review requested from this machine\'s own login is
   expect((await recordOf(w)).phase).toBe('ready')
 })
 
-test('R89: without a roster, a completed required check ends collection with no quiet wait; a running one that is not required is not waited for', async ($, on) => {
+test('R89: without a roster, a completed required check ends collection with no quiet wait; a running check not required is not waited for', async (
+  $,
+  on,
+) => {
   const w = world(on)
   w.gh.required = ['ci']
   await toPost($, w)
@@ -4541,7 +4545,7 @@ test('R89: without a roster, a completed required check ends collection with no 
   expect((await runOf(w)).phase).not.toBe('collect')
 })
 
-test('R89 with #24 (5): the request the gate made stays pending on GitHub; the reviewer\'s reply in a comment still answers it, with no wait on the cap', async ($, on) => {
+test('R89 with #24 (5): the request the gate made stays pending on GitHub; the reviewer\'s reply in a comment still answers it', async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
   w.gh.isActivityBroken = true
@@ -4557,4 +4561,55 @@ test('R89 with #24 (5): the request the gate made stays pending on GitHub; the r
   w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
   await w.clock.advance(30_000)
   expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: unknown required checks make every reported check stand in: a running one holds collection until it completes', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.rulesAnswer = 500
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.checks = [{ name: 'preview', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on preview')
+  w.gh.checks = [{ name: 'preview', status: 'completed', conclusion: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: a failed read of the review requests is logged and the round goes on by its other signals', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isRequestedBroken = true
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.startsWith('could not read requested reviewers: gh: Server Error (HTTP 502)'))).toBe(true)
+})
+
+test('R89: a required context posted only as a commit status ends collection once it is final, with no wait on the cap', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.required = ['deploy/ci']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.statuses = [{ context: 'deploy/ci', state: 'pending' }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on deploy/ci')
+  w.gh.statuses = [{ context: 'deploy/ci', state: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: a failed read of commit statuses is logged and collection falls back to check runs', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isStatusBroken = true
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.startsWith('could not read commit statuses: gh: Server Error (HTTP 502)'))).toBe(true)
 })

@@ -124,6 +124,12 @@ export type World = {
     requested?: string[]
     /** Every `-X POST .../requested_reviewers` call the gate made, in order. */
     requests: string[]
+    /** Commit statuses on the head (`{ context, state }`), as `GET .../commits/<sha>/status` lists them; undefined lists none. */
+    statuses?: object[]
+    /** `GET .../commits/<sha>/status` fails, as a 502 would. */
+    isStatusBroken?: boolean
+    /** `GET .../requested_reviewers` fails, as a 502 would. */
+    isRequestedBroken?: boolean
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
@@ -358,12 +364,17 @@ export function world(on: On): World {
       if (/pulls\/\d+\/reviews/.test(args)) return out(JSON.stringify(w.gh.reviews))
       if (/pulls\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.comments))
       if (/issues\/\d+\/comments/.test(args)) return out(JSON.stringify(w.gh.issueComments))
+      if (/commits\/[0-9a-f]+\/status$/.test(args)) {
+        if (w.gh.isStatusBroken === true) return failed('gh: Server Error (HTTP 502)')
+        return out(JSON.stringify({ state: 'pending', statuses: w.gh.statuses ?? [] }))
+      }
       if (/commits\/[0-9a-f]+\/check-runs/.test(args)) return out(JSON.stringify({ check_runs: w.gh.checks }))
       if (/requested_reviewers/.test(args)) {
         if (args.includes('-X POST')) {
           w.gh.requests.push(args)
           return out('{}')
         }
+        if (w.gh.isRequestedBroken === true) return failed('gh: Server Error (HTTP 502)')
         return out(JSON.stringify({ users: (w.gh.requested ?? []).map(login => ({ login })), teams: [] }))
       }
       return out('')

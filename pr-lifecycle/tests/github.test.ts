@@ -14,6 +14,7 @@ import {
   readRequired,
   readReviews,
   readRoster,
+  readStatuses,
   severityHint,
 } from '../hooks/github'
 import type { Feedback } from '../hooks/github'
@@ -127,7 +128,7 @@ test('#14: a trusted reviewer is never waited for, but its review already in cov
   expect(isTrusted(bot, { ...roster, trusted: [] })).toBe(false)
 })
 
-test('R89: a running required check holds collection; a completed one is a signal, so no quiet wait; with no signal at all, the quiet window decides', async () => {
+test('R89: a running required check holds collection; a completed one is a signal, so no quiet wait; with no signal, the quiet window decides', async () => {
   const running = [{ name: 'ci', status: 'in_progress', conclusion: null }]
   const done = [{ name: 'ci', status: 'completed', conclusion: 'failure' }]
   expect(collectionDone({ ...base, feedback: [], checks: running, now: 600_000 }).isDone).toBe(false)
@@ -525,15 +526,18 @@ test('R94: a tag is a token standing alone; any other P0-P3 mention is a hint', 
 test('R89: required checks need a completed run on the head; a check that is not required is not waited for', async () => {
   const running = (name: string) => ({ name, status: 'in_progress', conclusion: null })
   const completed = (name: string) => ({ name, status: 'completed', conclusion: 'success' })
-  expect(collectionDone({ ...base, required: ['ci'], feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: true, isComplete: true })
+  const both = [completed('ci'), running('preview')]
+  const at = { ...base, feedback: [], now: 60_000 }
+  expect(collectionDone({ ...at, required: ['ci'], checks: both })).toMatchObject({ isDone: true, isComplete: true })
   // A required check with no run yet is missing.
-  expect(collectionDone({ ...base, required: ['ci', 'analyze'], feedback: [], checks: [completed('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['analyze'] })
-  expect(collectionDone({ ...base, required: 'unknown', feedback: [], checks: [completed('ci'), running('preview')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['preview'] })
+  expect(collectionDone({ ...at, required: ['ci', 'analyze'], checks: [completed('ci')] })).toMatchObject({ isDone: false, missing: ['analyze'] })
+  expect(collectionDone({ ...at, required: 'unknown', checks: both })).toMatchObject({ isDone: false, missing: ['preview'] })
   // With a roster, a required check is waited for too.
   const roster = { reviewers: ['claude[bot]'], checks: [], requestReview: [], trusted: [] }
-  expect(collectionDone({ ...base, roster, required: ['ci'], feedback: [fb('claude[bot]', 'b')], checks: [running('ci')], now: 60_000 })).toMatchObject({ isDone: false, missing: ['ci'] })
+  const reviewed = { ...at, roster, feedback: [fb('claude[bot]', 'b')] }
+  expect(collectionDone({ ...reviewed, required: ['ci'], checks: [running('ci')] })).toMatchObject({ isDone: false, missing: ['ci'] })
   // The cap still ends it.
-  expect(collectionDone({ ...base, required: ['analyze'], feedback: [], checks: [], now: 1_200_000 })).toMatchObject({ isDone: true, isComplete: false, missing: ['analyze'] })
+  expect(collectionDone({ ...at, required: ['analyze'], checks: [], now: 1_200_000 })).toMatchObject({ isDone: true, isComplete: false, missing: ['analyze'] })
 })
 
 test('R89: a pending review request holds collection until that reviewer reviews the head; this machine\'s login is never waited for', async () => {
@@ -549,7 +553,7 @@ test('R89: a pending review request holds collection until that reviewer reviews
   expect(readRequested('<html>proxy error</html>', 'me')).toEqual([])
 })
 
-test('R89: a roster reviewer the gate asked again answers its request by covering the head, as the roster counts it (#24: never a wait on the cap)', async () => {
+test('R89: a roster reviewer the gate asked again answers its request by covering the head as the roster counts it (#24: no wait on the cap)', async () => {
   const roster = { reviewers: ['alice'], checks: [], requestReview: ['alice'], trusted: [] }
   const req = { ...base, roster, required: [] as string[], checks: [], requested: ['alice'], now: 60_000 }
   // A comment with no commit, placed on the head by the roster's rules (a reply to a re-request, or a counted guess), covers it.
@@ -557,4 +561,30 @@ test('R89: a roster reviewer the gate asked again answers its request by coverin
   expect(collectionDone({ ...req, feedback: [reply] })).toMatchObject({ isDone: true, isComplete: true, covered: ['alice'] })
   // A comment on an older head does not.
   expect(collectionDone({ ...req, feedback: [{ ...reply, head: 'a' }] })).toMatchObject({ isDone: false, missing: ['alice'] })
+})
+
+test('R89: without a roster, coverage never answers a request: an inline comment GitHub moved to the head is no review of it', async () => {
+  const moved = { id: 'inline:9', kind: 'inline' as const, reviewer: 'alice', body: 'nit', head: 'b', at: 10, isFinding: true }
+  const req = { ...base, required: [] as string[], checks: [], requested: ['alice'], now: 60_000 }
+  expect(collectionDone({ ...req, feedback: [moved] })).toMatchObject({ isDone: false, missing: ['alice'] })
+})
+
+test('an inline comment\'s head is the commit it was written on: one written on A that GitHub moved to B does not cover B', async () => {
+  const written = { commit_id: 'b', original_commit_id: 'a' }
+  const row = { id: 9, user: { login: 'alice' }, body: 'nit', path: 'a.ts', line: 3, created_at: '1970-01-01T00:00:10Z', ...written }
+  const [read] = readInlineComments(JSON.stringify([row]))
+  expect(read?.head).toBe('a')
+  expect(collectionDone({ ...base, required: [], feedback: [read!], checks: [], now: 600_000 }).covered).toEqual([])
+  // With no original_commit_id, commit_id stands.
+  expect(readInlineComments(JSON.stringify([{ ...row, original_commit_id: undefined }]))[0]?.head).toBe('b')
+})
+
+test('R89: a commit status is a check; a final state completes it, pending does not', async () => {
+  const text = JSON.stringify({ state: 'pending', statuses: [{ context: 'ci', state: 'success' }, { context: 'lint', state: 'pending' }, { state: 'error' }] })
+  expect(readStatuses(text)).toEqual([
+    { name: 'ci', status: 'completed', conclusion: 'success' },
+    { name: 'lint', status: 'pending', conclusion: null },
+  ])
+  expect(collectionDone({ ...base, required: ['ci', 'lint'], feedback: [], checks: readStatuses(text), now: 60_000 })).toMatchObject({ missing: ['lint'] })
+  expect(() => readStatuses('<html>proxy error</html>')).toThrow()
 })

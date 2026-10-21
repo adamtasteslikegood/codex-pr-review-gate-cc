@@ -115,7 +115,9 @@ export const readInlineComments = (text: string): Feedback[] =>
     kind: 'inline',
     reviewer: login(row),
     body: str(row.body) ?? '',
-    head: str(row.commit_id),
+    // The commit the comment was written on: GitHub moves commit_id forward to the newest commit while the line is unchanged, which
+    // would make an old comment read as coverage of a new head.
+    head: str(row.original_commit_id) ?? str(row.commit_id),
     file: str(row.path),
     line: num(row.line) ?? num(row.original_line),
     threadId: String(num(row.in_reply_to_id) ?? row.id),
@@ -143,6 +145,26 @@ export function readCheckRuns(text: string): Check[] {
     const runs = (page as { check_runs?: unknown } | null)?.check_runs
     return Array.isArray(runs) ? (runs as Row[]) : []
   }).map(row => ({ name: String(row.name ?? ''), status: String(row.status ?? ''), conclusion: str(row.conclusion) ?? null }))
+}
+
+/** Commit-status states that are final: a pending status has not finished. */
+const FINAL_STATES = ['success', 'failure', 'error']
+
+/**
+ * The head's combined commit status (`{ state, statuses: [{ context, state }] }` per page) read as checks (R89): some CI posts a
+ * required check as a status, not a check run. A final state is a completed check whose conclusion is that state. Throws on text
+ * that does not parse, so the caller can say so.
+ */
+export function readStatuses(text: string): Check[] {
+  return readPages(text).flatMap(page => {
+    const rows = (page as { statuses?: unknown } | null)?.statuses
+    return Array.isArray(rows) ? (rows as Row[]) : []
+  }).flatMap(row => {
+    const name = str(row.context)
+    const state = str(row.state) ?? ''
+    if (name === undefined) return []
+    return [{ name, status: FINAL_STATES.includes(state) ? 'completed' : 'pending', conclusion: FINAL_STATES.includes(state) ? state : null }]
+  })
 }
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((one): one is string => typeof one === 'string' && one !== '') : [])
@@ -297,11 +319,12 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
   const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
   const required = input.required === undefined || input.required === 'unknown' ? [...new Set(input.checks.map(one => one.name))] : input.required
   const requested = input.requested ?? []
-  // A request is answered by a review of the head, or by the reviewer covering it as the roster counts it: a roster reviewer the
-  // gate asked again may reply in a comment, which GitHub never clears the request for (#24: never a wait on the cap).
+  // A request is answered by a review of the head, or, with a roster, by the reviewer covering it as the roster counts it: a roster
+  // reviewer the gate asked again may reply in a comment, which GitHub never clears the request for (#24: never a wait on the cap).
+  // Without a roster, coverage never answers one: only a review of the head does.
   const isAnswered = (who: string): boolean =>
     input.feedback.some(one => one.kind === 'review' && one.head === input.head && postsFor(one.reviewer, who)) ||
-    covered.some(one => postsFor(one, who))
+    (hasRoster && covered.some(one => postsFor(one, who)))
   const missing = [
     ...new Set([
       ...(hasRoster ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))] : []),

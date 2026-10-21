@@ -44,6 +44,7 @@ import {
   readRequired,
   readReviews,
   readRoster,
+  readStatuses,
   severityHint,
 } from './github'
 import type { Check, Feedback, Roster } from './github'
@@ -1346,15 +1347,29 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   const place = { ...rec.headPlace, ...where }
   if (JSON.stringify(place) !== JSON.stringify(rec.headPlace ?? {})) await updateRecord($, rec.root, rec.branch, one => ({ ...one, headPlace: place }))
   const at = `repos/${rec.slug}`
-  const [reviews, inline, comments, checks, requests] = await Promise.all([
+  const [reviews, inline, comments, checks, requests, status] = await Promise.all([
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/comments`),
     ghJson($, rec.root, `${at}/issues/${rec.pr}/comments`),
     ghJson($, rec.root, `${at}/commits/${prHead}/check-runs`),
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/requested_reviewers`),
+    ghJson($, rec.root, `${at}/commits/${prHead}/status`),
   ])
-  const bad = [reviews, inline, comments, checks, requests].find(one => !one.isOk)
+  const bad = [reviews, inline, comments, checks].find(one => !one.isOk)
   if (bad !== undefined) return fail(`gh api failed (${bad.err.slice(0, 160)}); check gh auth login, rate limits and the network`)
+  // Pending review requests only add waits (R89): a failed read lists none, and the round goes on by its other signals.
+  if (!requests.isOk) await logEvent($, rec.root, rec.branch, 'head', `could not read requested reviewers: ${requests.err.slice(0, 160)}`)
+  // A required check some CI posts as a commit status, not a check run (R89): without it, its context would never finish and every
+  // round would wait out the cap. A failed or unreadable read falls back to check runs only, and the log says so.
+  let statuses: Check[] = []
+  if (!status.isOk) await logEvent($, rec.root, rec.branch, 'check', `could not read commit statuses: ${status.err.slice(0, 160)}; check runs only`)
+  else {
+    try {
+      statuses = readStatuses(status.out)
+    } catch {
+      await logEvent($, rec.root, rec.branch, 'check', 'could not read commit statuses: unreadable JSON from gh; check runs only')
+    }
+  }
   // A proxy's error page or a cut-off page is not "no feedback" (R12): the poll fails closed.
   try {
     // Only feedback from someone with write access, or on the roster, is read (R1-8); this machine's own rows are sorted out below.
@@ -1382,7 +1397,8 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
         .at(-1)
       if (answered !== undefined) ownReplies[answered.id] = mine.id.slice('inline:'.length)
     }
-    return { isOk: true, feedback, cover: others, checks: readCheckRuns(checks.out), prHead, ownReplies, where, requested: readRequested(requests.out, self) }
+    const requested = requests.isOk ? readRequested(requests.out, self) : []
+    return { isOk: true, feedback, cover: others, checks: [...readCheckRuns(checks.out), ...statuses], prHead, ownReplies, where, requested }
   } catch (error) {
     const said = error instanceof Error ? error.message : String(error)
     return fail(`gh returned unreadable output (${said}); check gh auth login, rate limits and the network`)
