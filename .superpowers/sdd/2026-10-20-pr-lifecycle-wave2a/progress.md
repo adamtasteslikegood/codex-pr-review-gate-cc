@@ -100,3 +100,7 @@ Task 7: complete (commits e853524..e8b9dd3, review clean)
 Task 7: minor (deferred): unreadable reason in both said and detail (harmless duplication)
 Task 8: implementer dispatched (opus — timing + queue), BASE d32640d
 Task 8: implementer DONE, commits 98f8b48, ba79873 (454 pass); concern: waiver landing mid-round names the PR head while rec.head stays old → a later resume reviews the waived head again; waiver message resent each session; review dispatched (opus)
+Task 8: review Needs fixes — Important (plan-mandated): real-git beginTriage path (git log prints commits → patch → askTriage) still triages after a waiver; patch returns a stopped run, not null. Important (plan-mandated): advance matches waiver to stale rec.head on session-start/allow/waive <id> paths → round on waived PR head. Minor: head-unreviewed repeated (no id)
+Task 8: fix round 1/5 dispatched (FIX_BASE ba79873)
+Task 8: minor (deferred): waiver message resent per session (Task 9's 'only if not already sent'); overlapping holdingPrompts share a batch; mergeNotes prepends to every prompt in batch; audit patch()'s stopped-run return for === null checks
+Task 8: fix round 1 implementer DONE, commit bcdf6dc (458 pass); isRunning re-checks after long awaits; advance reads PR head on waiver mismatch; head blocker id 'head'; re-review dispatched

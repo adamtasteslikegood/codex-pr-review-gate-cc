@@ -107,3 +107,65 @@ None of them calls `finish` before `endRound`, so I changed no order.
 3. **An exhausted post report says its reason twice.** `standingOf` adds a `head-unreviewed` blocker whose `said` is `next.why`, and `reportPrompt` already leads with `next.why`. So the prompt says it twice, the second time under "Also holding:". No test asserts on that prompt's shape. Note it for Task 9 or the spec.
 4. **`holdPost` reads gh more.** It now makes one or two more reads per held rebuttal check. A failed read shows as a `ci-unreadable` blocker in the prompt and doesn't throw.
 5. **`dropQueued` isn't called yet.** Task 9 wires it into stop and reset, as planned.
+
+---
+
+# Fix round 1
+
+Commit: `bcdf6dc`. The full suite gives 458 pass, 0 fail; `npm run lint` and `npm run typecheck` are clean.
+
+## 1. Finding 29 on the real-git path (IMPORTANT)
+
+- I added `isRunning($, id)` to `round.ts`. It re-reads the run and is true only when the run is the same one and still `running`. `endRound` now uses it.
+- `beginTriage` re-checks the run in two places:
+  - after `fetchFeedback`, after the closed-PR branch and before `failPost` or any record write. A merged or closed PR still archives.
+  - after the moved-head fetch and `git log`, before it computes `asked` and calls `patch` and `askTriage`.
+
+  A failed fetch goes through `failPost`, which is now guarded itself.
+- `failPost` returns before `noteAttempt` and `say` when the run isn't running, so it records no attempt and sends no "stopped" message.
+- `checkRebuttals` checks before `syncToHead` and again after it, before `failPost` and the `patch` and spawn.
+- `endCollect` checks after `syncToHead` and `rev-parse`, before its `failPost`/`finish` and `beginReview`.
+- `tests/world.ts` has a new `w.git.newCommits`. It answers `git log --format=%h %an %s …`, which before printed nothing.
+
+Tests: a shared helper, `waiveWhileTriageFetches`, sets up the window.
+- **New commits in the window.** `newCommits` returns a commit line. The test asserts:
+  - no prompt mentions `New review feedback`, `check the new commits` or the commit;
+  - nothing was spawned;
+  - the run has no triage step.
+- **The fetch fails after the waiver.** `fetchFails = 2` is set right after the waiver. The test asserts no "stopped" prompt and no post-phase attempt in the record.
+
+RED, before the fix: both failed. The first sent a triage prompt; the second sent "stopped" and recorded an attempt.
+
+## 2. A mid-round waiver is matched on the PR head (IMPORTANT)
+
+- In `advance`, I collect the post waivers when the phase isn't pre, the PR is known and there's no security P1.
+- If none of them matches `rec.head`, `advance` reads the PR head once with a new `prHeadOf($, root, pr)` (`gh pr view <n> --json headRefOid`, next to `prStateOf`). That head is used both to match the waiver and as `headRefOid` for `gatherStanding`. If gh can't answer, it falls back to `rec.head`.
+- `waive post` doesn't touch `rec.head`, as instructed.
+- The read covers every path into `advance`: session start, `allow`, `waive <id>`, resume, and the end of a round.
+- It costs one gh read per `advance` only while a post waiver exists that names a head other than `rec.head`.
+
+Test: a mid-round waiver, then `allow 1 one more look`. It asserts:
+- the record's head is still the old one (the precondition);
+- nothing was spawned and no run is running;
+- the last prompt contains `the person's post waiver covers PR #1 at fffffff`.
+
+RED, before the fix: a run was running, because `allow` started a round.
+
+## 3. The repeated reason (MINOR)
+
+- In `standingOf`, the `head-unreviewed` blocker now has `id: 'head'`.
+- In `core.ts`, a new `namedIn(listed, reason, standing)` adds `'head'` to the ids already named when that blocker's `said` equals the prompt's reason (`next.why` in `reportPrompt`, `why` in `heldPrompt`).
+- New unit test, in `lifecycle.test.ts`: an exhausted report gives its reason exactly once and still lists `Also holding:\n- check check running`.
+- With the `namedIn` match disabled, only that test fails.
+- Task 5's tests pass unchanged.
+
+## Notes
+
+- One line is about 165 columns: the `head-unreviewed` push in `lifecycle.ts`, after the added `id`.
+- Deferred, as instructed:
+  - the waiver message resent each session;
+  - overlapping command batches;
+  - `mergeNotes` prepending to every prompt in its batch;
+  - the general audit of `patch`'s return value.
+
+  Still visible from the earlier list: `checkRebuttals` and `beginTriage` still trust `patch`'s non-null return after their new checks. The window left is the few awaits between the check and the patch, such as `configFor` and `loadRecord`.
