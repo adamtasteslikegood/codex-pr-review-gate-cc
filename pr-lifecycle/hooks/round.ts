@@ -765,7 +765,7 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
 
 /**
  * Archives the branch's record (R47): the whole record under its own key, and on the branch's key a seed that keeps only what a
- * fresh start must not repeat (processed feedback and recorded replies). False when there was no live record.
+ * fresh start must not repeat (processed feedback, recorded replies and the replies the agent reported, R91). False when there was no live record.
  */
 export async function archiveLifecycle($: Engine, root: string, branch: string, now: number): Promise<boolean> {
   return lockRecord(root, branch, async () => {
@@ -774,7 +774,7 @@ export async function archiveLifecycle($: Engine, root: string, branch: string, 
     await archiveRecord($, last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, phase: 'archived', generation: (last.generation ?? 0) + 1 })
+    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, phase: 'archived', generation: (last.generation ?? 0) + 1 })
     return true
   })
 }
@@ -1546,13 +1546,13 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
 /** What Codex checks at the end of a post-PR round, on the head the round ends on (`checksOwed`; R36, R58, R72). */
 const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 
-/** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 /** Keeps every reply id an answer reported as the gate's own (R91), in the order given, once each. */
 const withOwnReplies = (rec: LifecycleRecord, answer: string): Pick<LifecycleRecord, 'ownReplies'> => {
   const ids = replyIdsOf(answer)
   return ids.length === 0 ? {} : { ownReplies: [...new Set([...(rec.ownReplies ?? []), ...ids])] }
 }
 
+/** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
   // "acknowledged" counts only with a reply in the thread, on an item that may take it (R82); stored as a rebuttal, so Codex checks it.
@@ -2648,9 +2648,8 @@ async function strayModel($: Engine, run: Run, role: string, ran: string, named:
 
 async function afterFix($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
-  const said = readDispositions(run.pending[0]?.answer ?? '')
   const answer = run.pending[0]?.answer ?? ''
-  if (replyIdsOf(answer).length > 0) await updateRecord($, run.root, run.branch, one => ({ ...one, ...withOwnReplies(one, answer) }))
+  const said = readDispositions(answer)
   const head = await git($, run.root, ['rev-parse', 'HEAD'])
   const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
   const fromSha = run.headSha
@@ -2680,6 +2679,7 @@ async function afterFix($: Engine, run: Run): Promise<void> {
     ),
   }))
   if (after === null) return
+  if (replyIdsOf(answer).length > 0) await updateRecord($, run.root, run.branch, one => ({ ...one, ...withOwnReplies(one, answer) }))
   // A finding of this round left without an answer gets the fix step once more (no round consumed); then it stays open.
   // One the person waived while the round ran is not asked about again.
   const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [] })

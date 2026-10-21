@@ -305,7 +305,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         : {
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
             // After a reset: feedback already processed and replied to stays answered (R47).
-            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, generation: prior.generation }),
+            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, ownReplies: prior.ownReplies, generation: prior.generation }),
             effort,
             ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
           }

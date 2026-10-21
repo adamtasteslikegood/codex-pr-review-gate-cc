@@ -4178,3 +4178,25 @@ test('R91: every reply id the agent reports is the gate\'s own, whatever the ans
   expect(rec.ownReplies).toEqual(['79', '77', '81'])
   expect((await untriagedFeedback(w.engine, rec))?.map(one => one.id)).toEqual(['comment:80'])
 })
+
+test('R91: a reset keeps the reply ids the agent reported, so a fresh start does not read them as feedback', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.gh.issueComments = [{ id: 79, user: { login: 'me' }, body: 'Round 2: R1-9 rebutted', created_at: '1970-01-01T00:02:00Z', html_url: 'c79' }]
+  await done($, triaged('r2-triage', [{ id: 'R1-9', action: 'rebutted', note: 'not reachable', replyId: '79' }]))
+  expect((await recordOf(w)).ownReplies).toEqual(['79'])
+  await say($, 'reset')
+  await say($, '')
+  const fresh = await recordOf(w)
+  expect(fresh.ownReplies).toEqual(['79'])
+  expect((await untriagedFeedback(w.engine, fresh))?.map(one => one.id) ?? []).not.toContain('comment:79')
+})
+
+test('R91: a fix step\'s reply ids land in ownReplies too', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  const said = `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed', note: 'done', replyId: '55' }] })}`
+  await done($, turn(said))
+  expect((await recordOf(w)).ownReplies).toEqual(['55'])
+})
