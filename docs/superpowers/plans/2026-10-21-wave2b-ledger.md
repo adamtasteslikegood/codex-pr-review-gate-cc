@@ -128,3 +128,7 @@ Deferred minors for final review (Task 12): no flow test that the merge guard ho
 Task 12: complete (d27b3c8, 691cbae)
 Task 13: dispatched (BASE after this ledger commit, sonnet).
 Task 13: implemented 0ec1bbc (BASE 8505fd0), 605 pass, lint/typecheck clean. Three negative asserts moved from the old phrase to 'gh pr merge'. Task review (sonnet) dispatched.
+- Task 13 review: Needs fixes. Important: ready prompt claims "Nothing holds the merge" without reading CI (decideNext reads findings+head only; judgeMerge holds on ciHold).
+Ruling: the merge step says no review finding holds the merge; the agent merges, and if the guard holds for running checks it waits (gh pr checks <n> --watch) and merges again; a failed required check or a GitHub refusal → report and stop — keeps Adam hands-off with no new gate polling — cost if wrong: the agent waits on checks in its own turn.
+Fix round 1 sent: that wording; R81 negative assert made meaningful; configFor read before the currency checks; merge step sent once when a waiver triggers advance's ready prompt.
+Task 14: controller running Step 1 (suite ×3 under 8-core load) in parallel; outputs in .superpowers/flaky/.
