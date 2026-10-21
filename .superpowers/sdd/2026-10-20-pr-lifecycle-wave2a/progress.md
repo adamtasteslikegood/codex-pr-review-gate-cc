@@ -91,3 +91,7 @@ Task 6: complete (commits 7efabdb..1290918, review clean)
 Task 6: minor (deferred): required cache keyed slug:base, cleared only in setup; classic 404 regex reads all of stderr
 Task 7: implementer dispatched (sonnet), BASE 5dc0b21
 Task 7: implementer DONE, commit ee94802 (446 pass); unreadable-CI refusal lost gh's stderr (test now matches 'gh auth status'); review dispatched
+Task 7: review Approved (spec ✅, untriagedFeedback ruling intact, R77 intact)
+Task 7: fix round 1/5 dispatched (FIX_BASE ee94802): restore gh stderr on unreadable CI; tighten tests 1 and 3
+Task 7: minor (deferred): standing read before late-review check (extra gh calls); retargeted/round-owed may repeat what 'missing' says (no id to skip)
+Task 7: fix round 1 implementer DONE, commit e8b9dd3 (446 pass); Blocker gains optional detail; readChecks returns {unreadable}; re-review dispatched
