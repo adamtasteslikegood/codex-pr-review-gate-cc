@@ -3493,6 +3493,15 @@ test('R86: the required set is known only when both sources are established (PR 
   // A base with a slash is one encoded path segment (gate R5-1).
   w.gh.rulesAnswer = 500
   expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'release/1.0')).toEqual({ unknown: 'gh api repos/me/repo/rules/branches/release%2F1.0: gh: HTTP 500' })
+  // Both encoded endpoints answer, and their union is the required set (gate R6-1).
+  w.gh.rulesAnswer = 'ok'
+  w.gh.classicAnswer = 'ok'
+  const before = w.gh.calls.length
+  expect(await requiredChecksOf(w.engine, '/repo', 'me/repo', 'release/1.0')).toEqual(new Set(['check', 'lint', 'legacy']))
+  expect(w.gh.calls.slice(before)).toEqual([
+    'api repos/me/repo/rules/branches/release%2F1.0?per_page=100',
+    'api repos/me/repo/branches/release%2F1.0/protection/required_status_checks',
+  ])
 })
 
 // ------------------------------------------------- task 7: the merge guard renders from the standing
