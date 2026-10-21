@@ -1463,7 +1463,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
       $,
       read.root,
       read.branch,
-      'stop',
+      'head',
       `post-PR round ${read.round}: the answers to a turn taken while collecting were not settled within ${elapsed(config.stepTimeoutMs)}; ` +
         'settling flag cleared, collection goes on',
     )

@@ -31,7 +31,7 @@ Commit: `374a840` pr-lifecycle 1.5.0: the agent answers feedback while collectio
   - **Guard:** it accepts phase `'collect'` or `'triage'` with `collect` set.
   - **Stale-flag check (ruling 1):** this runs before the 30 s throttle.
     - It fires when `isSettling` is older than `config.stepTimeoutMs` and nothing is pending.
-    - It clears the flag, puts the run back in phase `'collect'` (adding `activeMs` and resetting `hasReprompted`), and logs a kind `'stop'` line: "…settling flag cleared, collection goes on".
+    - It clears the flag, puts the run back in phase `'collect'` (adding `activeMs` and resetting `hasReprompted`), and logs a kind `'head'` line (not `'stop'`: `/pr-gate log` counts `'stop'` entries as stops, and the run did not stop): "…settling flag cleared, collection goes on".
     - The poll then goes on normally.
   - **`isTurn = run.phase === 'triage'`:** this covers both a turn in flight and `afterTriage` settling one (see the fit notes below).
   - **A failed gh read during a turn:** the poll returns, and the next poll tries again.
@@ -99,7 +99,7 @@ Commit: `374a840` pr-lifecycle 1.5.0: the agent answers feedback while collectio
 ## Rulings
 1. **Stale-turn guard.**
    - `isSettling` is a timestamp.
-   - `pollOnce` clears a flag older than `config.stepTimeoutMs` (the `stepTimeoutMinutes` setting, 30 min by default), with a kind `'stop'` log line. It returns the run to `'collect'`, and the poll goes on.
+   - `pollOnce` clears a flag older than `config.stepTimeoutMs` (the `stepTimeoutMinutes` setting, 30 min by default), with a kind `'head'` log line. It returns the run to `'collect'`, and the poll goes on.
    - The ticker leaves the settling state to this check rather than to `finish(error)`, so the stale path is the one that actually runs. Test: "a settling flag older than the step timeout…".
    - **The cap during a turn:** a poll during a turn never judges collection, so the 20-minute cap cannot end collection mid-turn.
      - A turn that hits its step timeout ends through the ticker: `noteAttempt` + `finish('error')`, with the message above. The run is no longer running, so neither the ticker nor `pollOnce` acts on it.
@@ -130,6 +130,9 @@ Commit: `374a840` pr-lifecycle 1.5.0: the agent answers feedback while collectio
 - `npm run typecheck`: clean, 0 errors.
 
 ## Concerns
+- **The step timeout of a mid-collection turn stops the run; it does not go back to collecting.** It ends with `finish('error')` and a message naming `/pr-gate resume`. That is not a state the cap governs. It matches how 1.4.0 handles an end-of-head triage timeout, and the resume is tested.
+  - The controller may prefer to go back to collecting here: clear `pending` and set phase `'collect'`, so the cap that has already passed ends collection at the next poll and the end-of-head triage asks the feedback.
+  - That is a change of about 10 lines in the ticker's `else` branch.
 - **A head push during collection with no turn in flight** still moves `roundStartHead` inside the round (1.4.0's `onNewHead` path). Task 9's rollover replaces that. The same applies to a push left after a stale-flag clear: the answers already recorded stand, and the next poll moves the head as before.
 - **`isOwn()` re-reads the record after each await.** That adds a few store reads per triage end. The generation check applies to every `afterTriage`, not only mid-collection turns. The full suite shows no behaviour change.
 - **The ticker skips the step timeout while a mid-collection turn settles.** The stale-flag check in `pollOnce` is the only backstop there. It runs on every tick (before the 30 s throttle), so it fires within a second of the threshold.
