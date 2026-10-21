@@ -1581,9 +1581,17 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     )
     return
   }
-  // A new head restarts the quiet period: its checks may not be registered yet.
+  // The round's first poll has seen no head on the PR yet: the head it reads is the round's own, not a push (an adopted PR whose
+  // record holds the local head, or a push before the round first looked). It becomes the round's start head.
+  const isFirstPoll = collect.polledAt === 0
+  // A push with no turn in flight ends the round on the head it had (R88): someone else's push, or the agent's outside a turn.
+  if (isNewHead && !isFirstPoll) {
+    await rollOver($, run, collect.startedAt, got.prHead, now)
+    return
+  }
+  // A head taken at the first poll restarts the quiet period: its checks may not be registered yet.
   const arrived = isNewHead || isArrival
-  // Judged from the head the round had before this one replaces it (R56).
+  // Judged from the head the round started from (R56).
   if (isNewHead) await onNewHead($, run, run.roundStartHead, got.prHead, now)
   const after = await patch($, run.id, one => ({
     ...one,
@@ -1664,15 +1672,57 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   if (waiting !== after.activity) await patch($, run.id, one => ({ ...one, activity: waiting }))
 }
 
-/** Collection on the round's head is over: its wait is added, `collect` is cleared and its step is marked done. */
-async function closeCollect($: Engine, id: string, now: number, detail: string, extra: Partial<Run> = {}): Promise<Run | null> {
-  return patch($, id, one => ({
-    ...one,
-    ...extra,
-    waitMs: one.waitMs + (one.collect === undefined ? 0 : now - one.collect.startedAt),
-    collect: undefined,
-    steps: withStep(one.steps, { id: `r${one.round}-collect`, label: `Round ${one.round} · collect reviews (${one.roundKind})`, state: 'done', detail }),
-  }))
+/**
+ * Collection on the round's head is over: its wait is added, `collect` is cleared and its step is marked done. With `when`, only a run
+ * it accepts is closed; null when it is not (or the run is gone).
+ */
+async function closeCollect(
+  $: Engine,
+  id: string,
+  now: number,
+  detail: string,
+  extra: Partial<Run> = {},
+  when: (one: Run) => boolean = () => true,
+): Promise<Run | null> {
+  let isClosed = false
+  const after = await patch($, id, one => {
+    isClosed = when(one)
+    if (!isClosed) return one
+    return {
+      ...one,
+      ...extra,
+      waitMs: one.waitMs + (one.collect === undefined ? 0 : now - one.collect.startedAt),
+      collect: undefined,
+      steps: withStep(one.steps, { id: `r${one.round}-collect`, label: `Round ${one.round} · collect reviews (${one.roundKind})`, state: 'done', detail }),
+    }
+  })
+  return isClosed ? after : null
+}
+
+/**
+ * A push seen while collecting, with no turn in flight, ends the round on the head it had (R88). The closed round records the old
+ * head as its start and the new one as its end; decideNext opens the next round on the new head: a round, or exhausted after a
+ * final-head check, never blocked (the head changed). Feedback left unanswered stays unprocessed, so the next round hands it again.
+ */
+async function rollOver($: Engine, run: Run, startedAt: number, head: string, now: number): Promise<void> {
+  const from = run.roundStartHead
+  // This poll saw the new head on the PR: a later head reached it after now (#24).
+  await updateRecord($, run.root, run.branch, one => (one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } }))
+  // Judged from the head the round had (R56). Placing a finding at a head is idempotent, so a stand-down below harms nothing.
+  await onNewHead($, run, from, head, now)
+  // Only the collection this poll read, still collecting: a turn begun, a stop or a reset meanwhile owns the run.
+  const isSame = (one: Run): boolean => one.round === run.round && one.phase === 'collect' && one.collect?.startedAt === startedAt
+  const closed = await closeCollect($, run.id, now, `ended by the push of ${head.slice(0, 7)}`, {}, isSame)
+  if (closed === null) return
+  await logEvent($, run.root, run.branch, 'head', `round ${run.round} ended on ${from.slice(0, 7)}: the PR moved to ${head.slice(0, 7)}`)
+  // From here no poll runs for the round (`collect` is cleared); a throw below leaves a collect phase with no collection, which the
+  // step timeout stops with a message, never a silent wait.
+  const ended = await getRun($)
+  if (ended === null || ended.id !== run.id || ended.status !== 'running' || ended.round !== run.round) return
+  // What Codex owes is checked on the new head first (R72); then the round ends and the next one opens.
+  const owed = rebuttalsOwed(ended)
+  if (owed.length > 0) await checkRebuttals($, { ...ended, headSha: head }, owed)
+  else await endRound($, { ...ended, headSha: head }, true)
 }
 
 /** Collection is over: Codex covers a head nobody reviewed (or verification owed); then the feedback goes to triage. */

@@ -5112,3 +5112,73 @@ test('R88: a settling flag older than the step timeout (at least five minutes) i
   await w.clock.advance(30_000)
   expect((await runOf(w)).phase).toBe('verify')
 })
+
+test('R88 (Review Focus 3): two pushes between polls end one round, on the newest head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(2)
+  // Someone pushes twice before the next poll; the gate only ever sees the second.
+  w.gh.prHead = 'c'.repeat(40)
+  w.gh.prHead = 'd'.repeat(40)
+  w.git.head = 'd'.repeat(40)
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'd'.repeat(40), true]])
+  // The round is free (R88): a baseline round never draws on the allowance, so it records no charge either way (Task 6).
+  expect([post[0]?.kind, post[0]?.isCharged]).toEqual(['baseline', undefined])
+  expect(rec.head).toBe('d'.repeat(40))
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind, next.status]).toEqual([3, 'collect', 'd'.repeat(40), 'baseline', 'running'])
+})
+
+test('R88: a poll during a turn never ends the round; the turn\'s own end does', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  // The agent pushes, and a poll runs before its turn ends.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  const during = await runOf(w)
+  expect([during.round, during.phase, during.roundStartHead]).toEqual([2, 'triage', 'a'.repeat(40)])
+  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  const post = (await recordOf(w)).rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40)]])
+  expect((await runOf(w)).round).toBe(3)
+})
+
+test('R88 (Review Focus 4): a finding left unanswered when its round rolled over is answered in the next round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  // No answer, asked once more (R34), no answer again: the round goes on collecting with G2-1 open.
+  await done($, triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
+  expect((await runOf(w)).phase).toBe('collect')
+  // Someone else's push ends round 2.
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.head = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  // Round 3 hands G2-1 to the agent again, under its own id, after one quiet poll.
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r3-triage')[0]).toContain('G2-1')
+  await done($, triaged('r3-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block', replyId: '991' }]))
+  const g = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(g?.status).toBe('rebutted')
+  expect(g?.history.at(-1)?.round).toBe(3)
+  expect((await recordOf(w)).processed).toContain('inline:11')
+})
