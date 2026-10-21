@@ -62,3 +62,11 @@ Task 2: minor (deferred): no test that a hint finding keeps its severity when th
 Task 2: complete (commits 723724c..2226a7d, review clean)
 Task 3: dispatched (BASE 675fdb0, sonnet)
 Task 3: implementer DONE_WITH_CONCERNS, commit dd58e14 (430 pass); concern: tagged-P2 acknowledged test may not exercise mayAcknowledge; reprompt prose still 'fix, rebut or defer'
+Task 3: review Approved (tagged-P2 test does fail if mayAcknowledge is bypassed)
+Task 3: minor (deferred): R82 flow test title claims the security case; only the unit test covers security
+Task 3: minor (deferred): ineligible-acknowledged tests assert only the reprompt text, not that G2-1 stays open / no reply recorded
+Task 3: minor (deferred): positive acknowledged test doesn't assert replyId lands in rec.replies
+Task 3: minor (deferred): R34 reprompt prose still says "fix, rebut or defer" (trailer example has acknowledged)
+Task 3: complete (commits 675fdb0..dd58e14, review clean)
+Task 4: dispatched (BASE 5c51b96, sonnet)
+Task 4: implementer DONE, commit 9a27eae (435 pass); review dispatched
