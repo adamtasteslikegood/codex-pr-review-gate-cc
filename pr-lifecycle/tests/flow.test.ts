@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
-import { requiredChecksOf } from '../hooks/round'
+import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
 import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
@@ -4152,4 +4152,29 @@ test('R87: a hold on a chained command says nothing in it ran; a lone PR command
   const chainedMerge = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash && git checkout dev' })
   expect(isHeld(chainedMerge)).toBe(true)
   expect(chainedMerge.deny ?? '').toContain('Nothing in this Bash command ran')
+})
+
+test('R91: every reply id the agent reports is the gate\'s own, whatever the answer, and never comes back as feedback (PR #20 G7-4, G7-9, G11-2)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const mine = (id: number, body: string) => ({ id, user: { login: 'me' }, body, created_at: '1970-01-01T00:02:00Z', html_url: `c${id}` })
+  w.gh.issueComments = [
+    mine(77, 'Same as G7-2 [P2 thread]: no change asked'),
+    mine(79, 'Round 2: R1-9 rebutted, see src/app.ts:4'),
+    mine(81, 'Thanks, noted'),
+    // The person's own note, under the same gh login: still feedback.
+    mine(80, 'Please also rename the flag'),
+  ]
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'parameterised' },
+    // A Codex finding: no GitHub item, so 1.4.0 recorded no reply.
+    { id: 'R1-9', action: 'rebutted', note: 'not reachable', replyId: '79' },
+    // A P1 may not be acknowledged (R82): the answer is dropped, its reply is still the gate's.
+    { id: 'G2-1', action: 'acknowledged', note: 'nothing asked', replyId: 'https://github.com/me/repo/pull/1#issuecomment-77' },
+    // Not an answer the gate can read at all: its reply is still the gate's.
+    { id: 'G2-1', action: 'thanks', replyId: 81 },
+  ]))
+  const rec = await recordOf(w)
+  expect(rec.ownReplies).toEqual(['79', '77', '81'])
+  expect((await untriagedFeedback(w.engine, rec))?.map(one => one.id)).toEqual(['comment:80'])
 })

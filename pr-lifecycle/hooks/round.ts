@@ -24,6 +24,7 @@ import {
   readVerify,
   readyPrompt,
   replyIdOf,
+  replyIdsOf,
   reportPrompt,
   reviewPrompt,
   stepDown,
@@ -1164,12 +1165,13 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
       one => one.reviewer === self || isTrusted(one, roster),
     )
     // Of this machine's own comments, only the mod's replies are not feedback (R64): an inline reply in a thread, or a comment
-    // whose id is a recorded reply. The person's other top-level and review comments reach triage. Its inline replies are
-    // its replies, which no turn may post twice (R35).
+    // whose id is a recorded reply or one the agent reported (R91). The person's other top-level and review comments reach
+    // triage. Its inline replies are its replies, which no turn may post twice (R35).
     // A reply recorded as the URL gh printed (before R66) is read as its comment number too.
-    const replied = new Set(Object.values(rec.replies).map(replyIdOf))
+    // Every reply the agent reported is the gate's own, whatever its answer (R91).
+    const replied = new Set([...Object.values(rec.replies).map(replyIdOf), ...(rec.ownReplies ?? [])])
     const isReply = (one: Feedback): boolean =>
-      one.kind === 'inline' ? one.threadId !== one.id.slice('inline:'.length) : replied.has(one.id.slice(one.id.indexOf(':') + 1))
+      (one.kind === 'inline' && one.threadId !== one.id.slice('inline:'.length)) || replied.has(one.id.slice(one.id.indexOf(':') + 1))
     const feedback = all.filter(one => one.reviewer !== self || !isReply(one))
     const own = all.filter(one => one.reviewer === self && one.kind === 'inline' && isReply(one))
     const others = feedback.filter(one => one.reviewer !== self)
@@ -1545,6 +1547,12 @@ async function askTriage($: Engine, id: string, text: string): Promise<void> {
 const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
+/** Keeps every reply id an answer reported as the gate's own (R91), in the order given, once each. */
+const withOwnReplies = (rec: LifecycleRecord, answer: string): Pick<LifecycleRecord, 'ownReplies'> => {
+  const ids = replyIdsOf(answer)
+  return ids.length === 0 ? {} : { ownReplies: [...new Set([...(rec.ownReplies ?? []), ...ids])] }
+}
+
 async function afterTriage($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
   // "acknowledged" counts only with a reply in the thread, on an item that may take it (R82); stored as a rebuttal, so Codex checks it.
@@ -1575,6 +1583,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
   const triaged = (run.triaged ?? []).filter(answered)
   const rec = await updateRecord($, run.root, run.branch, one => ({
     ...one,
+    ...withOwnReplies(one, run.pending[0]?.answer ?? ''),
     findings: mergeFindings(one.findings, after.findings),
     processed: [...new Set([...one.processed, ...triaged])],
     replies: {
@@ -2640,6 +2649,8 @@ async function strayModel($: Engine, run: Run, role: string, ran: string, named:
 async function afterFix($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
   const said = readDispositions(run.pending[0]?.answer ?? '')
+  const answer = run.pending[0]?.answer ?? ''
+  if (replyIdsOf(answer).length > 0) await updateRecord($, run.root, run.branch, one => ({ ...one, ...withOwnReplies(one, answer) }))
   const head = await git($, run.root, ['rev-parse', 'HEAD'])
   const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
   const fromSha = run.headSha

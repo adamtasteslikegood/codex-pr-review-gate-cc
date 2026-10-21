@@ -188,6 +188,8 @@ export type LifecycleRecord = {
   processed: string[]
   /** Feedback id to the id of the reply posted to it. */
   replies: Record<string, string>
+  /** Every reply id the agent reported, in any step and for any answer, accepted or not (R91): never read back as feedback. */
+  ownReplies?: string[]
   waivers: Waiver[]
   phase: LifecyclePhase
   /**

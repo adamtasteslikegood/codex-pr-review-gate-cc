@@ -228,6 +228,16 @@ export function readTriage(answer: string): TriageAnswer[] {
   return out
 }
 
+/** Every reply id in an answer's trailer, whatever its answer and whether or not the answer reads (R91), as comment ids. */
+export function replyIdsOf(answer: string): string[] {
+  const listed = readTrailer(answer)?.dispositions
+  if (!Array.isArray(listed)) return []
+  return listed.flatMap(one => {
+    const raw = (one as { replyId?: unknown } | null)?.replyId
+    return typeof raw === 'string' && raw.trim() !== '' ? [replyIdOf(raw)] : typeof raw === 'number' && Number.isFinite(raw) ? [String(raw)] : []
+  })
+}
+
 /** What the fixer said it did with each finding; "acknowledged" is a post-PR triage answer only (R82). */
 export const readDispositions = (answer: string): Answer[] => readTriage(answer).filter(one => one.action !== 'acknowledged')
 
