@@ -10,6 +10,7 @@ import {
   lastReviewedHead,
   markHeld,
   markVerified,
+  mayAcknowledge,
   mayStartRound,
   isDisputed,
   mergeHolds,
@@ -739,4 +740,12 @@ test('R84: a reviewer\'s own tag and a Codex severity are never lowered', async 
   const tagged = finding({ source: 'github', severity: 'P2', severitySource: 'tag' })
   expect(applyAnswer(tagged, { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
   expect(applyAnswer(finding({ severity: 'P2' }), { id: 'R1-1', action: 'deferred', severity: 'P3' }, 2, 'main', 5).severity).toBe('P2')
+})
+
+test('R82: only an untagged-or-P3, non-security GitHub finding may be acknowledged', async () => {
+  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'hint' }))).toBe(true)
+  expect(mayAcknowledge(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }))).toBe(true)
+  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'tag' }))).toBe(false)
+  expect(mayAcknowledge(finding({ source: 'github', severity: 'P2', severitySource: 'hint', isSecurity: true }))).toBe(false)
+  expect(mayAcknowledge(finding())).toBe(false)
 })

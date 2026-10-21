@@ -3317,3 +3317,64 @@ test('R84: a guessed P2 the agent triages as P3 shows as P3 in the hold', async 
   expect(rec.findings.find(one => one.id === 'G2-1')?.severity).toBe('P3')
   expect(w.prompts.at(-1)).toContain('G2-1 [P3]')
 })
+
+/** Finding 21's shape (cookbook PR 3706, G2-11): an approval answered "fixed", which Codex could not verify and reopened. */
+const reopenedApproval = (): Finding => ({
+  id: 'G1-1', round: 1, source: 'github', reviewer: 'claude[bot]', externalId: 'inline:7', threadId: '7', severity: 'P2',
+  title: 'No blocking findings', headSeen: 'a'.repeat(40), status: 'open',
+  history: [
+    { round: 1, status: 'open', by: 'claude[bot]', at: 1 },
+    { round: 1, status: 'reported-fixed', note: 'nothing to fix', by: 'main', at: 2 },
+    { round: 2, status: 'open', note: 'Codex: no fix to verify', by: 'codex', at: 3 },
+  ],
+})
+
+test('finding 21: an earlier round\'s finding Codex reopened this round is carried into triage', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, findings: [reopenedApproval()], processed: ['inline:7'] })
+  w.gh.comments = [inline(11, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const said = w.prompts.at(-1) ?? ''
+  expect(said).toContain('Carried from earlier rounds, still open')
+  expect(said).toContain('G1-1')
+  expect((await runOf(w)).asked).toContain('G1-1')
+})
+
+test('R82: acknowledged, with a reply, goes to the Codex check and settles when Codex upholds it', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine to me; the retry loop is the same as before.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', severity: 'P3', note: 'a status note, nothing asked', replyId: '992' }]))
+  const run = await runOf(w)
+  expect(run.findings.find(one => one.id === 'G2-1')?.note).toContain('No change requested:')
+  expect(run.phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R82: acknowledged without a reply, or on a tagged P2 or security finding, is unanswered and asked again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'P2: the cache is never cleared')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine', replyId: '992' }]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
+})
+
+test('R82: acknowledged without a reply is unanswered and asked again', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine to me.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'fine' }]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-1')
+})
+
+test('R82: Codex rejecting an acknowledgement reopens the item with its reason', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Looks fine, though the retry loop now never stops.')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'acknowledged', note: 'nothing asked', replyId: '992' }]))
+  await done($, accept('r2-verify', w, { 'G2-1': 'it reports a loop that never stops' }))
+  const found = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.history.at(-1)?.note).toContain('never stops')
+})

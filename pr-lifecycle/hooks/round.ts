@@ -51,6 +51,7 @@ import {
   mergeHolds,
   newRecord,
   nextIds,
+  mayAcknowledge,
   raisedIn,
   readDiff,
   rejections,
@@ -1246,7 +1247,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false): Promis
   // Findings still open from earlier rounds, of either phase and any severity, come back until answered (R32, R39).
   const listedIds = new Set([...listed.map(one => one.findingId), ...codex.map(one => one.id)])
   const carried = mergeHolds({ findings: mergeFindings(ledger, fresh), waivers: rec.waivers }).filter(
-    one => one.status === 'open' && !raisedIn(one, run.round) && !listedIds.has(one.id),
+    // By the round it was raised in, not "touched this round": Codex reopening an earlier finding must not hide it (finding 21, R82).
+    one => one.status === 'open' && one.round !== run.round && !listedIds.has(one.id),
   )
   // Commits on the PR since the record's head, not yet reviewed: fetched first, so the log can read them.
   let others: string[] = []
@@ -1346,7 +1348,13 @@ const rebuttalsOwed = (run: Run): Finding[] => checksOwed(run.findings)
 /** The main agent answered the reviews: record the answers and replies at once, then end the round on the PR head GitHub now reports. */
 async function afterTriage($: Engine, run: Run): Promise<void> {
   const now = await $.clock.now()
-  const said = readTriage(run.pending[0]?.answer ?? '')
+  // "acknowledged" counts only with a reply in the thread, on an item that may take it (R82); stored as a rebuttal, so Codex checks it.
+  const said = readTriage(run.pending[0]?.answer ?? '').flatMap(each => {
+    if (each.action !== 'acknowledged') return [each]
+    const one = run.findings.find(f => f.id === each.id)
+    if (one === undefined || !mayAcknowledge(one) || each.replyId === undefined) return []
+    return [{ ...each, note: `No change requested: ${each.note ?? 'the comment asks for no change'}` }]
+  })
   const after = await patch($, run.id, one => ({
     ...one,
     pending: [],
@@ -1402,7 +1410,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
       run.id,
       `pr-gate: These review items have no answer yet: ${ids}. Answer each one: fix it, rebut it with file:line evidence, or defer it with the reason, ` +
         `replying in its thread where it came from GitHub. Commit and push any fix. End your final message with ${TRAILER} on its own line, then ` +
-        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred","severity":"P2","note":"...","replyId":"123"}]}`,
+        `{"step":"${step}","dispositions":[{"id":"${unanswered[0]}","action":"fixed|rebutted|deferred|acknowledged","severity":"P2","note":"...","replyId":"123"}]}`,
     )
     return
   }

@@ -101,6 +101,12 @@ export const roundOf = (over: Partial<RoundRecord>): RoundRecord => ({
 
 export const isBlocking = (finding: Pick<Finding, 'severity'>): boolean => finding.severity === 'P0' || finding.severity === 'P1'
 
+const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
+
+/** A GitHub item the agent may answer "no change requested" (R82): no security flag, and no explicit P0-P2 from the reviewer. */
+export const mayAcknowledge = (f: Finding): boolean =>
+  f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2)
+
 /** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
 export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
   finding.round === round || finding.history.some(one => one.round === round && one.status === 'open')
@@ -126,8 +132,6 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
     { round, status, ...(note === undefined ? {} : { note }), ...(evidence === undefined ? {} : { evidence }), by, at },
   ],
 })
-
-const RANK: Record<Severity, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 
 /**
  * The fixer's word: fixed is only reported until a check confirms it. A fixer cannot lower a severity a reviewer or Codex set;
