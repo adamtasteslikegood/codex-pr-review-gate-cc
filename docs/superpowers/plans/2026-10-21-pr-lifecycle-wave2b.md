@@ -1697,3 +1697,243 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 ```
 
 ---
+
+### Task 9: A push ends the round on its head (R92, spec §1.2, §1.3, §1.6)
+
+**Why:** In 1.4.0 a push seen while collecting moves the round's start head inside the same round (`pollOnce`: `roundStartHead: got.prHead`). In 1.5.0 a round is one head. A push with no triage turn in flight (someone else's push, or the agent's outside a turn) ends the round on the old head at the poll that sees it. `decideNext` then opens the next round on the new head, with a fresh cap. Task 8 already ends the round for a push made in a turn.
+
+**Plan rulings:**
+- The closed round records `startHead` = the old head and `endHead` = the new one, like a 1.4.0 round whose fix was pushed. `rec.head` becomes the new head. A rolled-over round has no evidence of its own; `diffBase` stays on the last covered head (R60), so the next head's Codex fallback covers the commits between (spec §1.5).
+- After a rollover, `decidePost` sees a changed head, so it returns a round (baseline, discretionary or final-head-check) or, after a final-head check, `exhausted`. It never returns `blocked`.
+- Commits pushed by someone else are no longer listed as "Commits on the PR since …" in the triage prompt: every push now ends the round, and the next round reviews them. The list stays for an answer run and for late triage.
+- Feedback left unanswered when its round rolled over is fresh in the next round (its id is not processed). That round's first quiet poll hands it to the agent again, under its own finding id.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/round.ts` (`pollOnce`)
+- Test: `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `closeCollect($, id, now, detail, extra?)`, `Run.polled`, `Run.handed` (Task 8); `rebuttalsOwed(run)`, `checkRebuttals`, `endRound`, `onNewHead`, `logEvent` (`round.ts`); `isChargedRound` via `endRound` (Task 6).
+- Produces: no new names. Behaviour: a poll with no turn in flight that sees a new PR head ends the round.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `pr-lifecycle/tests/flow.test.ts` (it uses `early`, `ciRunning` and `triageTurns` from Task 8):
+
+```ts
+test('R92 (Review Focus 3): two pushes between polls end one round, on the newest head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(2)
+  // Someone pushes twice before the next poll; the gate only ever sees the second.
+  w.gh.prHead = 'c'.repeat(40)
+  w.gh.prHead = 'd'.repeat(40)
+  w.git.head = 'd'.repeat(40)
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'd'.repeat(40), true]])
+  // Nothing was found in it: the round is free (R88).
+  expect(post[0]?.isCharged).toBe(false)
+  expect(rec.head).toBe('d'.repeat(40))
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind, next.status]).toEqual([3, 'collect', 'd'.repeat(40), 'baseline', 'running'])
+})
+
+test('R92: a poll during a turn never ends the round; the turn\'s own end does', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  // The agent pushes, and a poll runs before its turn ends.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  const during = await runOf(w)
+  expect([during.round, during.phase, during.roundStartHead]).toEqual([2, 'triage', 'a'.repeat(40)])
+  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  const post = (await recordOf(w)).rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40)]])
+  expect((await runOf(w)).round).toBe(3)
+})
+
+test('R92 (Review Focus 4): a finding left unanswered when its round rolled over is answered in the next round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  // No answer, asked once more (R34), no answer again: the round goes on collecting with G2-1 open.
+  await done($, triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
+  expect((await runOf(w)).phase).toBe('collect')
+  // Someone else's push ends round 2.
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.head = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  // Round 3 hands G2-1 to the agent again, under its own id, after one quiet poll.
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r3-triage')[0]).toContain('G2-1')
+  await done($, triaged('r3-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block', replyId: '991' }]))
+  const g = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(g?.status).toBe('rebutted')
+  expect(g?.history.at(-1)?.round).toBe(3)
+  expect((await recordOf(w)).processed).toContain('inline:11')
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `claude plugin test pr-lifecycle -- tests/flow.test.ts`
+Expected: FAIL. In 1.4.0 the poll that sees `d…d` moves round 2's start head and records no round, so `post` is empty.
+
+- [ ] **Step 3: Implement**
+
+In `pr-lifecycle/hooks/round.ts`, in `pollOnce`, directly after the `if (isTurn) { ... }` block from Task 8, add:
+
+```ts
+  // A push with no turn in flight ends the round on the head it had (R92): someone else's push, or the agent's outside a turn.
+  if (isNewHead) {
+    await onNewHead($, run, run.roundStartHead, got.prHead, now)
+    const closed = await closeCollect($, run.id, now, `ended by the push of ${got.prHead.slice(0, 7)}`)
+    if (closed === null) return
+    await logEvent($, run.root, run.branch, 'head', `round ${run.round} ended on ${run.roundStartHead.slice(0, 7)}: the PR moved to ${got.prHead.slice(0, 7)}`)
+    // What Codex owes is checked on the new head first (R72). Then the round ends, and decideNext opens the next one on the new head:
+    // a round, or exhausted after a final-head check, never blocked (the head changed).
+    const owed = rebuttalsOwed(closed)
+    if (owed.length > 0) await checkRebuttals($, { ...closed, headSha: got.prHead }, owed)
+    else await endRound($, { ...closed, headSha: got.prHead }, true)
+    return
+  }
+```
+
+Then remove the 1.4.0 in-round head move, which can no longer happen below this point:
+- Delete the line `if (isNewHead) await onNewHead($, run, run.roundStartHead, got.prHead, now)` and the comment above it.
+- In the `after` patch, delete `roundStartHead: got.prHead,`.
+- Change `const headAt = got.headAt ?? (isNewHead ? now : collect.headAt)` (Task 4) to `const headAt = got.headAt ?? collect.headAt`.
+- Change `const arrived = isNewHead || isArrival` to `const arrived = isArrival`, and delete the comment `// A new head restarts the quiet period: its checks may not be registered yet.` (`beginCollect` starts the new round's collection fresh).
+
+- [ ] **Step 4: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: the new tests pass. Existing tests where a push lands while a round collects now see one more round. Known ones:
+- `pushMidCollect` (R56): after push C the run is round 4 on `c…c`, not round 3. Change its first `expect` after the push to `expect((await runOf(w)).roundStartHead).toBe('c'.repeat(40))` plus `expect((await runOf(w)).round).toBe(4)`.
+- 'when no reviewer covers the head by the wait cap, Codex reviews the delta': the push to `b…b` ends round 2 at the first poll, and round 3's cap starts then. Advance `21 * 60_000` instead of `20 * 60_000`. `diffBase` is still `a…a`.
+
+Fix each failure only where spec §1.2 changes the behaviour, and list every changed test in your report.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: a push ends the round on its head (R92)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
+
+### Task 10: Reviewers are asked again once per turn that pushed (R93, spec §1.5)
+
+**Why:** 1.4.0 re-requests the roster's `requestReview` reviewers at the start of every later post round (`beginCollect`). In 1.5.0 a push ends the round, so that would re-request on every push, including someone else's. Spec §1.5: re-request once, when the agent's turn ends, on the head it ends on.
+
+**Plan ruling:** a push ends the round when the turn ends (Task 8), so one turn can push at most once per round: "the turn pushed" (`endHead !== run.roundStartHead` in `afterTriage`) is the whole condition, and no `Run.requestedHead` is kept. A rollover by someone else's push (Task 9) requests nothing.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/round.ts` (`beginCollect`, `afterTriage`)
+- Test: `pr-lifecycle/tests/flow.test.ts`
+
+**Interfaces:**
+- Consumes: `w.gh.requests` (Task 5: every `-X POST .../requested_reviewers` call, in order); `rosterOf($, root, base)`; Tasks 8 and 9.
+- Produces: no new names.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `pr-lifecycle/tests/flow.test.ts`:
+
+```ts
+test('R93: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  // Someone else pushes: round 2 ends, round 3 starts on c…c, and nobody is asked again.
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.head = 'c'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  expect(w.gh.requests).toHaveLength(0)
+  // Feedback on c…c; the agent's turn pushes three commits, and GitHub reports the last.
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r3-verify', w, { 'G3-1': true }))
+  expect(w.gh.requests).toHaveLength(1)
+  expect(w.gh.requests[0]).toContain('reviewers[]=claude[bot]')
+  // Round 4 on f…f: nobody covers it by the cap, and one Codex review reads from the last covered head, a…a, over c…c and f…f.
+  expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  expect(run.phase).toBe('review')
+  expect(run.diffBase).toBe('a'.repeat(40))
+  expect(w.gh.requests).toHaveLength(1)
+})
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `claude plugin test pr-lifecycle -- tests/flow.test.ts`
+Expected: FAIL. `beginCollect` requests at the start of round 3, so `w.gh.requests` has 1 entry after the first push.
+
+- [ ] **Step 3: Implement**
+
+In `pr-lifecycle/hooks/round.ts`:
+
+1. In `beginCollect`, delete the block from `const rec = await loadRecord($, opened.root, opened.branch)` through the closing `}` of the `if (rec !== undefined && rec.rounds.some(...))` block, with its comment. Change the doc comment to: `/** Post-PR collection: the ticker polls GitHub every 30 s until GitHub's signals, or the wait cap, say it is over (R89). Reviewers are asked again where a turn pushed (R93), not here. */`
+2. In `afterTriage`, inside `if (endHead !== run.roundStartHead) {`, after the exemption writes, add:
+
+```ts
+    // The turn pushed (R93): the roster's reviewers are asked again, once, for the head it ended on, however many commits it pushed.
+    if (rec.pr !== undefined && rec.slug !== undefined) {
+      const roster = await rosterOf($, run.root, run.base)
+      for (const who of roster?.requestReview ?? []) {
+        await $.process.run(['gh', 'api', '-X', 'POST', `repos/${rec.slug}/pulls/${rec.pr}/requested_reviewers`, '-f', `reviewers[]=${who}`], {
+          cwd: run.root,
+          timeoutMs: 30_000,
+        })
+      }
+    }
+```
+
+   (`rec` here is the record `afterTriage` updated above.)
+
+- [ ] **Step 4: Run the tests**
+
+Run: `claude plugin test pr-lifecycle`
+Expected: PASS. A 1.4.0 test that expected a re-request at the start of a later round (search the tests for `requested_reviewers` and `requests`) now expects it at the end of the turn that pushed; update it and list it in your report.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add pr-lifecycle/hooks/round.ts pr-lifecycle/tests/flow.test.ts
+git commit -m "pr-lifecycle 1.5.0: reviewers are asked again once per turn that pushed (R93)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
+```
+
+---
