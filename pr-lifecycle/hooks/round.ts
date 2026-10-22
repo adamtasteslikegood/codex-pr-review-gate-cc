@@ -3084,6 +3084,22 @@ type Filed = { peak: Severity; was: string | undefined; followUp: string | undef
  * review I1). Never through a PR-create command line (spec §5.9).
  */
 export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+  // One filing pass per branch at a time in this process (a pass run again after a waiver can meet the waive command's or a session
+  // start's own pass): a second one files nothing and decides nothing, so no issue is posted twice; the first one's caller decides.
+  const key = `${rec.root}\0${rec.branch}`
+  if (filing.has(key)) return undefined
+  filing.add(key)
+  try {
+    return await fileOnce($, rec)
+  } finally {
+    filing.delete(key)
+  }
+}
+
+/** The branches whose filing pass `fileIssues` runs now, as `<root>\0<branch>`. */
+const filing = new Set<string>()
+
+async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
   if (rec.phase === 'pre' || rec.pr === undefined) return rec
   const now = await $.clock.now()
   const { config: c } = await configFor($, rec.root, rec.base)
