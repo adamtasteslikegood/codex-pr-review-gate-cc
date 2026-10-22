@@ -148,8 +148,8 @@ export type World = {
      * 'unreadable' fails as a 502 does.
      */
     issueStates: Record<number, 'OPEN' | 'CLOSED' | 'missing' | 'unreadable'>
-    /** How `gh issue reopen` answers: 'ok' (default) or 'fail'. */
-    reopenAnswer?: 'ok' | 'fail'
+    /** How `gh issue reopen` answers: 'ok' (default), 'fail', or 'lost' (GitHub reopens it, then gh fails with a 502). */
+    reopenAnswer?: 'ok' | 'fail' | 'lost'
     /** Every reopen the gate ran: its argv after `gh`. */
     reopened: string[][]
     /** Called on each `gh issue view`, before it answers: a test acts while the gate reads an issue after the merge. */
@@ -415,6 +415,9 @@ export function world(on: On): World {
           return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration', isStdoutTruncated: false, isStderrTruncated: false } }
         }
         w.gh.issueStates[Number(e.argv[3])] = 'OPEN'
+        if (w.gh.reopenAnswer === 'lost') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
         return out('')
       }
       if (w.gh.garbage !== undefined && args.startsWith('api ')) return out(w.gh.garbage)

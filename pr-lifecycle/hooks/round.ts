@@ -3572,15 +3572,16 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
   const failure = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
   // Each result is saved as soon as its gh call ends, with its log line (gate R9-1), so an issue GitHub has is never filed twice. Only
   // a reset or a fresh lifecycle stops that save: a stop or a waiver does not undo an issue already filed. Written only where the
-  // follow-up and peak are still the ones filed for: a later answer that moved either is filed anew.
+  // follow-up is still the one filed for: a later answer that moved it is filed anew. A peak that rose while gh ran keeps the issue
+  // GitHub has (wave 2b gate R6-2): its label is the old peak's, so the next pass labels it as a reused issue, never files another.
   const save = async (id: string, got: Filed, line: LogEntry): Promise<boolean> => {
     let isGone = false
     const next = await updateRecord($, rec.root, rec.branch, latest => {
       isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
       if (isGone) return latest
       const findings = latest.findings.map((f): Finding => {
-        if (f.id !== id || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
-        if (got.issueError !== undefined) return { ...f, issueError: got.issueError }
+        if (f.id !== id || got.was !== f.followUp) return f
+        if (got.issueError !== undefined) return got.peak !== filingPeak(f) ? f : { ...f, issueError: got.issueError }
         if (got.labelError !== undefined) {
           return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined, isIssueSent: undefined }
         }
@@ -3893,6 +3894,24 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
         isOpen = true
       } else {
         why = words(reopen)
+        // A failed answer may come after GitHub reopened it (a 502, a timeout: wave 2b gate R6-4): the state is read again, and only
+        // an issue GitHub still shows closed is filed again. A failed read is a failed check: resume reads it again, nothing is filed.
+        if (await isMoved()) return { moved: true }
+        const again = await gh(['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'state'])
+        let now: unknown
+        try {
+          now = again.exitCode === 0 ? (JSON.parse(again.stdout) as { state?: unknown } | null)?.state : undefined
+        } catch {
+          now = undefined
+        }
+        if (now === 'OPEN') {
+          await log(`${f.id}: reopened ${where} after the merge (gh lost the answer)`)
+          isOpen = true
+        } else if (now !== 'CLOSED') {
+          failed.push(`${f.id} (could not reopen ${where}: ${why}; could not read it again: ${again.exitCode === 0 ? `gh read its state as ${String(now)}` : words(again)})`)
+          await log(`${f.id}: could not confirm ${where} after the merge`)
+          continue
+        }
       }
       if (await isMoved()) return { moved: true }
     }

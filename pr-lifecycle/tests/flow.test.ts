@@ -5835,6 +5835,19 @@ test('spec §5.12: when an issue cannot be reopened or filed again, the record i
   expect(archivedOf(w)?.message).toBeUndefined()
 })
 
+test('wave 2b gate R6-4: a reopen whose answer is lost after GitHub reopened the issue is read again: no replacement issue', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.filed).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge (gh lost the answer)')).toBe(true)
+})
+
 test('spec §6.4: a merge GitHub refuses leaves the lifecycle where it was', async ($, on) => {
   const w = world(on)
   await toFiled($, w)
@@ -6089,6 +6102,33 @@ test('wave 2b gate R4-5: an answer after a lost issue POST clears its issueError
   expect(w.gh.issues).toHaveLength(1)
   expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
   expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
+test('wave 2b gate R6-2: a peak that rises while the issue POST runs keeps the issue GitHub filed; the next pass labels it, no second POST', async ($, on) => {
+  const w = world(on)
+  let isRaised = false
+  w.gh.onIssue = async () => {
+    if (isRaised) return
+    isRaised = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P1' })) })
+  }
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isRaised).toBe(true)
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21' })
+  expect(held.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  if (held.phase !== 'ready') {
+    await say($, 'resume')
+    await w.clock.advance(1000)
+  }
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit 21') && one.includes('severity:P1'))).toBe(true)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
 })
 
 test('wave 2b gate R4-7: a finding marked security while the severity label is made is never POSTed or labelled as a public issue', async ($, on) => {
