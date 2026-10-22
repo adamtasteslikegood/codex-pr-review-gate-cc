@@ -5,7 +5,6 @@ import {
   allowanceFor,
   alsoOf,
   applyAnswer,
-  ISSUE_SENT,
   applyLinks,
   dropLink,
   isLinked,
@@ -1660,12 +1659,6 @@ test('R92: a new answer makes an earlier filing failure stale, so it is cleared'
   const fixed = applyAnswer(failed, { id: 'G2-1', action: 'fixed' }, 3, 'main', 9)
   expect(fixed.issueError).toBeUndefined()
   expect(fixed.followUpLabelError).toBeUndefined()
-})
-
-test('wave 2b gate R4-5: an answer keeps the sent marker, so the next pass looks for the issue before it files another', async () => {
-  const sent = finding({ id: 'G2-1', status: 'open', issueError: ISSUE_SENT })
-  expect(applyAnswer(sent, { id: 'G2-1', action: 'deferred', severity: 'P3' }, 3, 'main', 9).issueError).toBe(ISSUE_SENT)
-  expect(applyAnswer(sent, { id: 'G2-1', action: 'fixed' }, 3, 'main', 9).issueError).toBe(ISSUE_SENT)
 })
 
 test('R93: the ready prompt tells the agent to merge with the repository\'s method and report the merge commit', async () => {

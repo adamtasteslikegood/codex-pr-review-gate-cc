@@ -53,7 +53,6 @@ import {
   acceptRebuttal,
   answersOf,
   applyAnswer,
-  ISSUE_SENT,
   applyLinks,
   decideNext,
   dropLink,
@@ -3481,7 +3480,8 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: Merge
 /** The branches whose filing pass `fileIssues` runs now, as `<root>\0<branch>`. */
 const filing = new Set<string>()
 
-/** What a finding's jiraError says while its acli create runs (ISSUE_SENT is its issueError's): only a crash before the answer's save leaves it. */
+/** What a finding's issueError or jiraError says while its POST or acli create runs: only a crash before the answer's save leaves it. */
+const ISSUE_SENT = 'an issue was sent to GitHub, but its answer was not saved (the session may have ended); the next pass looks for it first'
 const TICKET_SENT = 'a ticket was sent to Jira, but its answer was not saved (the session may have ended); the next pass looks for it first'
 
 /**

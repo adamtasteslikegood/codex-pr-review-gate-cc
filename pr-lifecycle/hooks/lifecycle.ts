@@ -211,9 +211,6 @@ const moved = (f: Finding, status: FindingStatus, round: number, by: string, at:
   ],
 })
 
-/** What a finding's issueError says while its POST runs: only a crash before the answer's save leaves it, and an answer keeps it. */
-export const ISSUE_SENT = 'an issue was sent to GitHub, but its answer was not saved (the session may have ended); the next pass looks for it first'
-
 /**
  * The fixer's word: fixed is only reported until a check confirms it. A fixer cannot lower a severity a reviewer or Codex set;
  * disagreement is a rebuttal. A severity only guessed from a GitHub comment's words takes the triaged one, up or down (R84).
@@ -239,9 +236,8 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
     // A deferral without a follow-up clears an earlier one: an old follow-up never settles a later deferral (final review T4).
     ...(a.action === 'deferred' ? { followUp: a.followUp } : {}),
     ...(isNewFollowUp ? { followUpLabel: undefined } : {}),
-    // A new answer makes an earlier filing failure stale: the next filing pass tries again and says what it finds (R92). The sent
-    // marker stays (wave 2b gate R4-5): GitHub may hold that issue, so the next pass looks for it before it files another.
-    issueError: f.issueError === ISSUE_SENT ? ISSUE_SENT : undefined, followUpLabelError: undefined }
+    // A new answer makes an earlier filing failure stale: the next filing pass tries again and says what it finds (R92).
+    issueError: undefined, followUpLabelError: undefined }
 }
 
 /** A rebuttal that is the agent's acknowledgement of a comment asking for no change (R82): named as such in every text (R94). */
