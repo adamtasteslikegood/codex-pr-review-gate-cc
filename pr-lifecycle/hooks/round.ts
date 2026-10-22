@@ -3818,14 +3818,20 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
   }
   const isMoved = async (): Promise<boolean> => isMovedFrom(rec, await loadRecord($, rec.root, rec.branch))
   // A refiled finding's issue fields, written under the lock at once (wave 2b gate R1-6) and kept in `touched` for the close, which
-  // writes them again. True when the record moved meanwhile (A6): nothing is written, and the check ends with `moved`.
-  const keep = async (next: Finding): Promise<boolean> => {
+  // writes them again. True when the record moved meanwhile (A6): nothing is written, and the check ends with `moved`. With
+  // `isPublic` (the mark before a public POST), a finding marked security since the check began is not written and sets `isSecret`,
+  // decided under the lock as markSent decides it (wave 2b gate R5-1): the caller POSTs nothing.
+  let isSecret = false
+  const keep = async (next: Finding, isPublic = false): Promise<boolean> => {
     let isGone = false
     let isChanged = false
+    isSecret = false
     const was = rec.findings.find(one => one.id === next.id)?.followUp
     const saved = await updateRecord($, rec.root, rec.branch, latest => {
       isGone = isMovedFrom(rec, latest)
       if (isGone) return latest
+      isSecret = isPublic && latest.findings.some(f => f.id === next.id && f.isSecurity === true)
+      if (isSecret) return latest
       // A follow-up someone changed while gh ran is kept, never overwritten (wave 2b gate R4-9): the close's late guard holds it.
       isChanged = latest.findings.some(f => f.id === next.id && f.followUp !== was && f.followUp !== next.followUp)
       if (isChanged) return latest
@@ -3837,7 +3843,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       return { ...latest, findings }
     })
     if (saved === undefined) isGone = true
-    if (!isGone && !isChanged) touched.set(next.id, next)
+    if (!isGone && !isChanged && !isSecret) touched.set(next.id, next)
     return isGone
   }
   for (const f of targets) {
@@ -3845,7 +3851,9 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     const label = `severity:${peak}`
     const ref = issueOf(f.followUp, rec.slug)
     if (ref === undefined) {
-      // Unreachable for a filed issue (it needs the record's repository); logged, never a silent skip or a wait no one can end.
+      // A shorthand follow-up (#123) with no repository on the record: a failed check, never a silent skip into the archive (wave 2b
+      // gate R5-2), as the refile below fails with no repository: the record blocks with this reason, and resume checks again.
+      failed.push(`${f.id} (could not check ${f.followUp ?? 'its issue'}: no GitHub repository is known for it)`)
       await log(`${f.id}: could not check ${f.followUp ?? 'its issue'} after the merge: no repository is known for it`)
       continue
     }
@@ -3947,7 +3955,13 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     const body = issueBody(f, rec)
     // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved makes the next check read the list first.
     const sent: Finding = { ...f, issueError: f.issueError ?? ISSUE_SENT, isIssueSent: true }
-    if (await keep(sent)) return { moved: true }
+    if (await keep(sent, true)) return { moved: true }
+    if (isSecret) {
+      // Marked security while gh ran (wave 2b gate R5-1, R5-3): no public issue; a failed check, so the record is not archived.
+      failed.push(`${f.id} (marked security while the merge was checked: no public issue is filed for it)`)
+      await log(`${f.id}: ${where} ${was}; not filed again: it is now marked security`)
+      continue
+    }
     const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close

@@ -6113,6 +6113,42 @@ test('wave 2b gate R4-7: a finding marked security while the severity label is m
   expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
 })
 
+test('wave 2b gate R5-1: a finding marked security while the merge check refiles its gone issue is never POSTed; the record blocks', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  let isMarked = false
+  w.gh.onLabelCreate = async () => {
+    if (isMarked) return
+    isMarked = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, isSecurity: true })) })
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(isMarked).toBe(true)
+  expect(w.gh.filed).toHaveLength(1)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  expect(held.message).toContain('G2-1 (marked security while the merge was checked: no public issue is filed for it)')
+})
+
+test('wave 2b gate R5-2: a shorthand follow-up with no repository on the record fails the merge check; the record is not archived', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, slug: undefined })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-1 (could not check #21: no GitHub repository is known for it)')
+})
+
 test('wave 2b gate R1-10: an issue POST is marked on the record before it is sent, so a crash before its answer looks first', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
