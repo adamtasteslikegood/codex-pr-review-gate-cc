@@ -1314,6 +1314,49 @@ test('R90 A9: a link raises the original\'s severity, recorded as the gate\'s, a
   expect(after[0]?.severity).toBe('P1')
 })
 
+test('R90: an equal tagged duplicate preserves the original\'s authoritative severity', async () => {
+  for (const severity of ['P0', 'P1', 'P2', 'P3'] as const) {
+    const original = finding({ id: 'G2-1', source: 'github', severity, peakSeverity: severity, severitySource: 'hint' })
+    const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', severity, severitySource: 'tag' }), original, 'gate', 2, 5)
+    const raised = withLinkedPeak(original, duplicate)
+    expect(raised.severitySource).toBe('tag')
+    expect(raised.history).toEqual(original.history)
+    expect(applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3' }, 2, 'main', 6).severity).toBe(severity)
+    expect(mayAcknowledge(raised)).toBe(severity === 'P3')
+    // The agent's link uses the same provenance rule.
+    const agent = applyLinks([original, dropLink(duplicate)], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+    expect(agent.findings[0]?.severitySource).toBe('tag')
+  }
+})
+
+test('R90: an equal tagged security duplicate keeps its P1 hold and round charge after triage', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', round: 2, severity: 'P1', peakSeverity: 'P1', severitySource: 'hint' })
+  const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', round: 2, severity: 'P1', severitySource: 'tag', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, duplicate)
+  const answered = applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3', note: 'out of scope' }, 2, 'main', 6)
+  expect(answered.severity).toBe('P1')
+  expect(securityHolds(postRec({ findings: [answered, duplicate] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(isChargedRound([answered, duplicate], 2)).toBe(true)
+  // Raising a guessed advisory to an explicit P1 keeps its existing protection too.
+  expect(withLinkedPeak({ ...original, severity: 'P2' }, duplicate)).toMatchObject({ severity: 'P1', severitySource: 'tag', isSecurity: true })
+})
+
+test('R90: a Codex-rated duplicate preserves its chosen severity instead of the original\'s hint', async () => {
+  for (const source of ['codex-review', 'codex-challenge'] as const) {
+    for (const severity of ['P1', 'P2'] as const) {
+      const original = finding({ id: 'G2-1', source: 'github', severity, peakSeverity: severity, severitySource: 'hint' })
+      const duplicate = finding({ id: 'R2-1', source, severity: 'P1', peakSeverity: 'P1' })
+      const agent = applyLinks([original, duplicate], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+      const raised = agent.findings[0] as Finding
+      expect(raised.severity).toBe('P1')
+      expect(raised.severitySource).toBeUndefined()
+      expect(applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3' }, 2, 'main', 6).severity).toBe('P1')
+      // A Codex link never replaces an existing reviewer tag with a weaker provenance.
+      expect(withLinkedPeak({ ...original, severitySource: 'tag' }, duplicate).severitySource).toBe('tag')
+    }
+  }
+})
+
 test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
   const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
   const rebutted = finding({ id: 'G2-2', source: 'github', severity: 'P2', status: 'rebutted', history: [{ round: 2, status: 'rebutted', note: 'not a bug', by: 'main', at: 4 }] })
@@ -1704,3 +1747,4 @@ test('A9.7: a security finding left for the person owes a Jira ticket where jira
   const fixed = finding({ id: 'R1-1', isSecurity: true, status: 'reported-fixed' })
   expect(planIssues(postRec({ findings: [fixed] }), 9, undefined, { kind: 'outside' }, true)).toMatchObject({ kind: 'file', items: [], tickets: [{ id: 'R1-1' }] })
 })
+

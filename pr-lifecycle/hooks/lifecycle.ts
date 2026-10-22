@@ -287,6 +287,11 @@ export function refuseLink(f: Finding, round: number, at: number, note: string):
 export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   const security = original.isSecurity === true || linked.isSecurity === true ? { isSecurity: true } : {}
   const severity = higher(original.severity, linked.severity)
+  // A tag or Codex rating supplying the chosen severity is authoritative even when it equals the original's guess (R84).
+  // Keep an existing tag; a lower linked rating does not supply the chosen severity and leaves its provenance unchanged.
+  const provenance = linked.severity === severity && (linked.severitySource === 'tag' || linked.source !== 'github')
+    ? { severitySource: original.severitySource === 'tag' ? 'tag' as const : linked.severitySource }
+    : {}
   const when = linked.history.at(-1)
   // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
   // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
@@ -301,7 +306,6 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
       ? {}
       : {
           severity,
-          ...(linked.severitySource === 'tag' && severity !== original.severity ? { severitySource: 'tag' as const } : {}),
           history: [
             ...original.history,
             // Marked as the link's raise, so no status reader takes it for an answer or a ruling (`answersOf`).
@@ -314,8 +318,8 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   // nor a known P0 is lost (wave 2b gate R1-2). An original whose peak is lost stays lost when its link would not raise it past that floor.
   const peak = higher(filingPeak(original), filingPeak(linked))
   return isPeakUnknown(original) && peak === 'P1'
-    ? { ...original, ...security, ...raised, ...recheck }
-    : { ...original, ...security, ...raised, ...recheck, peakSeverity: peak }
+    ? { ...original, ...security, ...provenance, ...raised, ...recheck }
+    : { ...original, ...security, ...provenance, ...raised, ...recheck, peakSeverity: peak }
 }
 
 /** The ids linked to a finding, for "G2-1 (also G2-2)". */
@@ -1431,3 +1435,4 @@ export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15)
   else lines.push('Last events:', ...log.slice(-last).map(one => `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.text}`))
   return lines.join('\n')
 }
+

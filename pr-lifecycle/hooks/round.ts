@@ -1093,7 +1093,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     let failed = done.failed
     // Each hold as the check left it: one that holds now and did not then, or holds with another status or follow-up, was saved
     // while gh ran (wave 2b gate R3-3, R4-3), whether it needs filing or names an issue the check never read.
-    const holdOf = (f: Finding): string => `${f.id}|${f.status}|${f.followUp ?? ''}`
+    const holdOf = (f: Finding): string => `${f.id}|${f.status}|${f.followUp ?? ''}|${filingPeak(f)}`
     const checkedHolds = new Set(mergeHolds({ findings: done.findings, waivers: filed.waivers }).map(holdOf))
     const saved = await updateRecord($, root, branch, latest => {
       isGone = isMovedFrom(rec, latest)
@@ -4416,3 +4416,4 @@ export async function onAnswer($: Engine, agentId: string | undefined, answer: s
   else if (after.phase === 'verify') await afterVerify($, after)
   else if (after.phase === 'triage') await afterTriage($, after)
 }
+

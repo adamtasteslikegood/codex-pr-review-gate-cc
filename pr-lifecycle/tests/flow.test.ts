@@ -6648,6 +6648,33 @@ test('wave 2b gate R4-3: a deferral naming an issue, saved while a website-merge
   expect(w.gh.calls.some(one => one.startsWith('issue view 77 '))).toBe(true)
 })
 
+test('a peak raised while the merge check labels a reported fix holds until the new peak is labelled', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', {
+    severity: 'P1', peakSeverity: 'P1', status: 'reported-fixed', followUp: '#77', followUpLabel: 'P2',
+  })])
+  w.gh.state = 'MERGED'
+  w.gh.onLabel = async () => {
+    w.gh.onLabel = undefined
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-3' ? f : { ...f, severity: 'P0', peakSeverity: 'P0' })) })
+  }
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-3 (saved while the merge was checked; its issue is checked on the next check)')
+  expect(held.findings.find(f => f.id === 'G2-3')).toMatchObject({ peakSeverity: 'P0', followUpLabel: 'P1' })
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(f => f.id === 'G2-3')).toMatchObject({ peakSeverity: 'P0', followUpLabel: 'P0' })
+  expect(w.gh.filed).toHaveLength(before)
+  expect(w.gh.calls.some(one => one.startsWith('issue edit 77 ') && one.includes('severity:P0'))).toBe(true)
+})
+
 test('wave 2b gate R4-9: a follow-up changed while a website-merge close refiles its issue is kept, and the record blocks', async ($, on) => {
   const w = world(on)
   await toFiled($, w)
@@ -7073,3 +7100,4 @@ test('A9.7: after the merge an acli read that fails, or is unauthorized, blocks 
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
   expect(creates(w)).toHaveLength(1)
 })
+
