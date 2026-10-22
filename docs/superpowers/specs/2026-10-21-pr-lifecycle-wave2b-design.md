@@ -294,6 +294,50 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
     A reset or a fresh start while gh runs ends the check with nothing
     written, as for filing (§5.7): no update, no archive of the new
     lifecycle.
+13. **A merge outside the gate (amendment A9, Adam 2026-10-21).** The
+    agent's `gh pr merge` is refused while anything holds. A person on
+    GitHub's website, or a GitHub connector, is not, and the PR can merge
+    at any point of the lifecycle. Two gaps in the build as first written:
+    the gate stops watching GitHub once the record is ready (no run, no
+    ticker), so §5.12's "a poll" never happens; and the post-merge check
+    reads only findings already settled by an issue, so a merge before the
+    filing pass archives every finding still holding, with no issue. Adam:
+    "filing issues is arguably the most important function of the gate …
+    letting known issues silently merge defeats [its] purpose."
+    1. **Findings still holding at the merge are filed.** Before §5.12's
+       check, the post-merge close files an issue for every finding in
+       `mergeHolds` that is not security, through the filing pass (§5.6,
+       §5.7, §5.10), whatever round or phase the record was in. No fix
+       round runs first: the PR is gone. The issue body says that the PR
+       merged before the gate finished, so no fix round ran on the finding.
+       A filing that fails is a failed check: the record is blocked with
+       gh's words, not archived, as in §5.12.
+    2. **Security.** A security finding still holding is never filed in a
+       public issue. The record is blocked, not archived, and the agent and
+       the person are told, naming the finding and the merge. Only the
+       person's waiver of each (`/pr-gate waive <id>`) releases it; the
+       archive follows.
+    3. **Watching while nothing runs.** While this session owns a record
+       that has a PR and no run (ready, awaiting the person, blocked,
+       exhausted, stopped), a slow watcher reads the PR's state every
+       `mergeWatchMinutes` (default 5, from `.github/pr-gate.json`). MERGED
+       or CLOSED runs the post-merge close as the agent's own merge does.
+       One `gh pr view` per record per beat; a failed read is retried at the
+       next beat, never a stop. The watcher stops when no such record is
+       left.
+    4. **Every record at session start.** A new interactive session reads
+       every record under the repository's root, not only the branch
+       checked out: each one with a PR, not owned by a live session
+       elsewhere (#13), gets the PR-state read and, if merged or closed,
+       the close. A merge done while no session ran is caught by the next
+       session in that repository, whichever branch it is on.
+    5. **No manual resume on the happy path.** A person's `/pr-gate` still
+       runs the check, but nothing waits on it: items 3 and 4 run it
+       without being asked. `/pr-gate resume` stays the retry for a failed
+       gh read, as in §5.12.
+    6. **Not prevention.** A required `pr-gate` commit status in the `main`
+       ruleset would block a website merge until the gate is ready. That
+       is wave 3, with the merge link (Adam, 2026-10-21).
 
 ## 6. The agent merges (decision N)
 
@@ -371,6 +415,9 @@ Each with its cost if wrong, in the rulings doc:
   and R85.
 - R93 (N): the agent merges when nothing holds the merge; `mergeMethod`.
 - R94: tags are standalone tokens; acknowledgements are named as such.
+- R95 (A9): a merge outside the gate files what still holds (not security,
+  which blocks for the person); a slow watcher and a whole-repo scan at
+  session start see the merge; prevention by a required status is wave 3.
 
 ## 9. Testing
 
@@ -396,6 +443,16 @@ Each with its cost if wrong, in the rulings doc:
   - a blocker first raised in the round that spent the allowance adds a
     round, twice at most; the third files its issue;
   - ready tells the agent to merge with `mergeMethod`.
+  - A9: a PR merged on GitHub while a P2 is open and a P3 deferral waits
+    for the filing pass: both are filed with the no-fix-round note, then
+    checked, then the record is archived; a filing failure blocks;
+  - A9: a security finding open at such a merge blocks, files nothing, and
+    tells the person; its waiver archives the record;
+  - A9: a ready record whose PR is merged outside the gate is closed by the
+    watcher within `mergeWatchMinutes`, with no `/pr-gate` and no resume;
+  - A9: a session started on another branch closes a merged record of a
+    branch not checked out; a record owned by a live session elsewhere is
+    left alone.
 - `world.ts`: fakes for `requested_reviewers`, check runs per head, issue
   filing (`issues` POST) with a failure knob, and `pr merge`.
 
@@ -406,4 +463,4 @@ Each with its cost if wrong, in the rulings doc:
 - ROADMAP.md: wave 2b items 1-4 done; "one finding per problem" placed here;
   item 5 (lanes) moves to wave 2c.
 - LIFECYCLE_SPEC.md: the round, collection, settle and merge rules.
-- New settings in `.github/pr-gate.json`: `mergeMethod`, `issueSpec`.
+- New settings in `.github/pr-gate.json`: `mergeMethod`, `issueSpec`, `mergeWatchMinutes`.
