@@ -6599,8 +6599,9 @@ test('A9.7: with jiraProject set, a security deferral left for the person files 
   expect(flag('--label')).toBe('security,severity-P1')
   expect(made.at(-1)).toBe('--json')
   // The body went through a file in git's directory, never on the command line, and the file is gone.
-  expect(flag('--description-file')).toBe('/repo/.git/pr-gate-jira-G2-1.txt')
-  expect(w.written.map(one => one.path)).toEqual(['/repo/.git/pr-gate-jira-G2-1.txt'])
+  // Named for the PR, the finding and a nonce: two records sharing git's directory never touch each other's file.
+  expect(flag('--description-file')).toMatch(/^\/repo\/\.git\/pr-gate-jira-1-G2-1-\d+-[a-z0-9]+\.txt$/)
+  expect(w.written.map(one => one.path)).toEqual([flag('--description-file')])
   const body = w.written[0]?.text ?? ''
   expect(body).toContain('Severity: Critical [P1], security.')
   expect(made.some(one => one.includes('needs a key rotation'))).toBe(false)
@@ -6642,13 +6643,22 @@ test('A9.7: acli unauthorized holds the finding with its words and tells the per
   const logins = (): string[] => w.toasts.filter(one => one.includes('acli jira auth login'))
   expect(logins()).toHaveLength(1)
   expect(logins()[0]).toContain('could not file the Jira ticket of security finding G2-1 (unauthorized')
+  expect(logins()[0]).toContain('. Run acli jira auth login. The gate retries on its next pass.')
+  expect(logins()[0]).not.toContain('Install acli')
   expect(w.prompts.at(-1)).toContain("Jira tickets not filed, retried on the gate's next pass: G2-1 (unauthorized")
+  // The toast told the person: the report lists the failure with acli's words and says no more about logging in.
+  expect(w.prompts.at(-1)).toContain('Never file a GitHub issue for a security finding.')
+  expect(w.prompts.at(-1)).not.toContain('Tell the person: Run acli jira auth login')
   expect(w.gh.filed).toEqual([])
   // The second pass fails again, and says nothing new to the person.
   await say($, 'resume')
   await w.clock.advance(1000)
   expect(creates(w)).toHaveLength(2)
   expect(logins()).toHaveLength(1)
+  // The second report lists the failure again, with no login instruction.
+  expect(w.prompts.at(-1)).toContain("Jira tickets not filed, retried on the gate's next pass: G2-1 (unauthorized")
+  expect(w.prompts.at(-1)).not.toContain('auth login. ')
+  expect(w.prompts.at(-1)).not.toContain('Tell the person:')
   // Logged in: the third pass searches Jira first (an earlier answer may have been lost), finds nothing, and files the ticket.
   w.acli.create = 'ok'
   await say($, 'resume')
@@ -6667,8 +6677,12 @@ test('A9.7: acli missing, or a description that cannot be written, holds the fin
   const w = world(on)
   w.acli.create = 'missing'
   await toSecurityDeferral($, w)
-  // The spawn rejected (the test host names no ENOENT of its own): the rejection's words are kept, and the gate goes on.
-  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toBeDefined()
+  // The spawn rejected (the test host names no ENOENT of its own): acli could not be started, with the rejection's words; the gate goes on.
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('acli could not be started (')
+  // Ruling (b): a missing acli is told to install it, then log in, never only to log in.
+  const told = w.toasts.filter(one => one.includes('acli jira auth login'))
+  expect(told).toHaveLength(1)
+  expect(told[0]).toContain('Install acli (the Atlassian CLI), then run acli jira auth login.')
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraTicket).toBeUndefined()
   // The body file is removed even though acli never ran.
   expect(w.files.size).toBe(0)
@@ -6677,7 +6691,8 @@ test('A9.7: acli missing, or a description that cannot be written, holds the fin
   await say($, 'resume')
   await w.clock.advance(1000)
   const rec = await recordOf(w)
-  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toContain("could not write the ticket's description to /repo/.git/pr-gate-jira-G2-1.txt")
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toMatch(/^could not write the ticket's description to \/repo\/\.git\/pr-gate-jira-1-G2-1-/)
+  expect(w.files.size).toBe(0)
   expect(creates(w)).toHaveLength(1)
   expect(rec.postStatus).toBe('awaiting-decision')
   expect((await runOf(w)).status).not.toBe('running')
@@ -6703,7 +6718,9 @@ test('A9.7: a lost create answer, then a retry: Jira is searched and the ticket 
   await w.clock.advance(1000)
   expect(creates(w)).toHaveLength(1)
   const search = w.acli.calls.filter(one => one[2] === 'search').at(-1) ?? []
-  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\""')
+  // Scoped to this PR and the security label, newest first, 50 to a page.
+  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\"" AND summary ~ "\\"#1\\"" AND labels = security ORDER BY created DESC')
+  expect(search[search.indexOf('--limit') + 1]).toBe('50')
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
   expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
@@ -6762,7 +6779,12 @@ test('A9.7: after the merge a ticket Jira says does not exist is filed again; an
   expect((await recordOf(w)).phase).toBe('archived')
   expect(creates(w)).toHaveLength(2)
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-513')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira says KAN-512 does not exist; filing it again, searching Jira first')).toBe(true)
   expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira KAN-512 is gone; filed Jira KAN-513')).toBe(true)
+  // A refile always searches first: Jira says "does not exist" too of a ticket acli's account cannot see.
+  expect(w.acli.calls.filter(one => one[2] === 'search')).toHaveLength(1)
+  // Its body says how the PR merged, not that the review rounds ran out.
+  expect(w.acli.tickets.at(-1)?.description).toContain('PR #1 merged before the gate finished: no fix round ran on this finding.')
   expect(w.prompts.at(-1)).toContain('G2-1 → KAN-513 Critical [P1]')
 })
 

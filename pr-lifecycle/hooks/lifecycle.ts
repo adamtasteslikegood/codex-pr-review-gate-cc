@@ -750,6 +750,26 @@ export const isTicketable = (f: Finding): boolean =>
 /** A security finding's Jira ticket as the hold list and status name it: "S2-1 → KAN-512 Critical [P1]" (spec §5.13.7). */
 export const ticketLine = (f: Finding): string => `${f.id} → ${f.jiraTicket ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
 
+/** The words acli's call gives when its spawn threw: acli could not be started, most often because it is not installed. */
+export const ACLI_NOT_STARTED = 'acli could not be started'
+/** The start of a ticket's error when its description file could not be written: no advice about acli fits it. */
+export const WRITE_FAILED = "could not write the ticket's description"
+
+/** Whether acli's words say acli itself is missing: a spawn that threw, ENOENT, or the shell's or Go's not-found words. */
+export const isAcliMissing = (words: string): boolean =>
+  words.includes(ACLI_NOT_STARTED) || /ENOENT|executable file not found|no such file or directory|command not found/i.test(words)
+
+/**
+ * What to tell the person of a Jira ticket the gate could not file (ruling (b)), as a sentence ending in a space, or empty: install
+ * acli when it is missing, log in when acli says unauthorized, and nothing beyond acli's own words otherwise.
+ */
+export function jiraAdvice(error: string): string {
+  if (error.startsWith(WRITE_FAILED)) return ''
+  if (isAcliMissing(error)) return 'Install acli (the Atlassian CLI), then run acli jira auth login. '
+  if (/unauthorized/i.test(error)) return 'Run acli jira auth login. '
+  return ''
+}
+
 /** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
 export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
 

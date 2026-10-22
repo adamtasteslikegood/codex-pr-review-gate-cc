@@ -97,6 +97,10 @@ import {
   withLinkedPeak,
   withRound,
   isFileable,
+  isAcliMissing,
+  jiraAdvice,
+  ACLI_NOT_STARTED,
+  WRITE_FAILED,
   isFollowUpRef,
   isSettledByIssue,
   issueBody,
@@ -1025,8 +1029,11 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     // through the filing pass, whatever round or phase the record was in. A filing that fails is a failed check, as in §5.12.
     const unfiled: string[] = []
     let filed: LifecycleRecord = rec
-    // A security finding with no Jira ticket gets one there, where the base sets jiraProject (spec §5.13.7); the plan reads the setting.
-    if (mergeHolds(rec).some(f => isMergeFileable(f) || (f.isSecurity === true && f.jiraTicket === undefined))) {
+    // A security finding with no Jira ticket gets one there, only where the base sets jiraProject (spec §5.13.7); without it the
+    // security finding blocks below, and no filing pass runs for it.
+    const isUntracked = mergeHolds(rec).some(f => f.isSecurity === true && f.jiraTicket === undefined)
+    const isJira = isUntracked && (await configFor($, rec.root, rec.base)).config.jiraProject !== undefined
+    if (mergeHolds(rec).some(isMergeFileable) || isJira) {
       let got: LifecycleRecord | undefined
       let threw: string | undefined
       try {
@@ -3324,7 +3331,8 @@ async function acli($: Engine, root: string, args: string[]): Promise<Ran> {
   try {
     return await $.process.run(['acli', ...args], { cwd: root, timeoutMs: 30_000 })
   } catch (e) {
-    return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+    // A spawn that throws is an acli that could not be started, most often one not installed: said so, for the person's advice.
+    return { exitCode: 1, stdout: '', stderr: `${ACLI_NOT_STARTED} (${e instanceof Error ? e.message : String(e)})` }
   }
 }
 
@@ -3343,15 +3351,23 @@ const jiraKeyIn = (stdout: string): string | undefined => {
   }
 }
 
-/** The work item of acli's search answer (an array of `{ key, fields: { summary } }`) whose summary is `title` exactly; an error otherwise. */
-const ticketIn = (stdout: string, title: string): { key?: string; error?: string } => {
-  let list: unknown
+/** Jira's longest summary: a longer one fails every create, so the summary is cut here, and the duplicate search matches the cut. */
+const SUMMARY_MAX = 255
+
+/**
+ * The work item of acli's search answer whose summary is `title` exactly; an error otherwise. The answer is an array of
+ * `{ key, fields: { summary } }`, or an object holding that array under `issues` or `values`; any other shape is a failed search.
+ */
+export const ticketIn = (stdout: string, title: string): { key?: string; error?: string } => {
+  let answer: unknown
   try {
-    list = JSON.parse(stdout)
+    answer = JSON.parse(stdout)
   } catch {
-    list = undefined
+    answer = undefined
   }
-  if (!Array.isArray(list)) return { error: 'acli did not answer with a list of work items' }
+  const held = typeof answer === 'object' && answer !== null && !Array.isArray(answer) ? (answer as { issues?: unknown; values?: unknown }) : {}
+  const list = Array.isArray(answer) ? answer : Array.isArray(held.issues) ? held.issues : Array.isArray(held.values) ? held.values : undefined
+  if (list === undefined) return { error: 'acli did not answer with a list of work items' }
   for (const one of list) {
     const it = typeof one === 'object' && one !== null ? (one as { key?: unknown; fields?: { summary?: unknown } | null }) : {}
     if (typeof it.key === 'string' && JIRA_KEY.test(it.key) && it.fields?.summary === title) return { key: it.key }
@@ -3363,17 +3379,22 @@ const ticketIn = (stdout: string, title: string): { key?: string; error?: string
  * Files a security finding's Jira ticket in `project` (spec §5.13.7) through `acli jira workitem create`, with the issue's title and
  * body; the body goes through a file in git's own directory, never on the command line, and the file is removed afterwards. After a
  * failed attempt (`isRetry`), Jira is searched first and a ticket with this exact summary is taken, never filed twice; a failed
- * search files nothing. `error`: acli's words, or why the body could not be written.
+ * search files nothing. The search names the finding and this PR (`#<pr>`, in the title), newest first, so a busy project's other
+ * PRs, whose ids recur, do not push the ticket off acli's page. `error`: acli's words, or why the body could not be written.
  */
 async function fileTicket(
   $: Engine,
   root: string,
   project: string,
   t: TicketItem,
+  pr: number | undefined,
 ): Promise<{ key: string; isFound: boolean; error?: undefined } | { error: string }> {
+  const summary = t.title.slice(0, SUMMARY_MAX)
   if (t.isRetry) {
-    const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', `project = ${project} AND summary ~ "\\"${t.id}\\""`, '--json'])
-    const found = search.exitCode === 0 ? ticketIn(search.stdout, t.title) : { error: acliWords(search) }
+    const ofPr = pr === undefined ? '' : ` AND summary ~ "\\"#${pr}\\""`
+    const jql = `project = ${project} AND summary ~ "\\"${t.id}\\""${ofPr} AND labels = security ORDER BY created DESC`
+    const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', jql, '--limit', '50', '--json'])
+    const found = search.exitCode === 0 ? ticketIn(search.stdout, summary) : { error: acliWords(search) }
     if (found.error !== undefined) return { error: `could not search Jira for a ticket a lost answer filed: ${found.error}`.slice(0, 200) }
     if (found.key !== undefined) return { key: found.key, isFound: true }
   }
@@ -3385,15 +3406,18 @@ async function fileTicket(
   } catch {
     // The fallback stands.
   }
-  const path = `${dir}/pr-gate-jira-${t.id}.txt`
+  // Named for the PR, the finding and this moment: two records sharing a git directory never write or remove each other's file.
+  const nonce = `${await $.clock.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const path = `${dir}/pr-gate-jira-${pr ?? 'nopr'}-${t.id}-${nonce}.txt`
   try {
-    await $.fs.write(path, t.body)
-  } catch (e) {
-    return { error: `could not write the ticket's description to ${path}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200) }
-  }
-  try {
+    // Inside the try: a write that fails partway (a full disk) leaves a file the finally removes.
+    try {
+      await $.fs.write(path, t.body)
+    } catch (e) {
+      return { error: `${WRITE_FAILED} to ${path}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200) }
+    }
     const made = await acli($, root, [
-      'jira', 'workitem', 'create', '--project', project, '--type', 'Bug', '--summary', t.title, '--description-file', path, '--label', `security,severity-${t.peak}`, '--json',
+      'jira', 'workitem', 'create', '--project', project, '--type', 'Bug', '--summary', summary, '--description-file', path, '--label', `security,severity-${t.peak}`, '--json',
     ])
     if (made.exitCode !== 0) return { error: acliWords(made) }
     const key = jiraKeyIn(made.stdout)
@@ -3583,8 +3607,8 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (current === undefined || isMoved(current)) return undefined
     if (isWaived(current)) return current
     await restamp()
-    const got = await fileTicket($, rec.root, project, t)
-    const text =
+    const got = await fileTicket($, rec.root, project, t, rec.pr)
+    let text =
       got.error === undefined
         ? `${t.id}: ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`} (security, severity-${t.peak})`
         : `${t.id}: could not file its Jira ticket in ${project}: ${got.error}`
@@ -3596,7 +3620,12 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
       isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
       if (isGone) return latest
       const findings = latest.findings.map((f): Finding => {
-        if (f.id !== t.id || f.jiraTicket !== undefined) return f
+        if (f.id !== t.id) return f
+        if (f.jiraTicket !== undefined) {
+          // Another pass saved a ticket first: this one's ticket is kept out of the record, and logged as a possible duplicate.
+          if (got.error === undefined && got.key !== f.jiraTicket) text = `${t.id}: filed Jira ${got.key}, but ${f.jiraTicket} was already saved; ${got.key} may be a duplicate`
+          return f
+        }
         return got.error === undefined ? { ...f, jiraTicket: got.key, jiraError: undefined } : { ...f, jiraError: got.error }
       })
       isFirstFailure = got.error !== undefined && latest.isJiraLoginSaid !== true
@@ -3606,7 +3635,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (next === undefined || isGone) return undefined
     if (isFirstFailure) {
       $.ui.toast(
-        `pr-gate: could not file the Jira ticket of security finding ${t.id} (${got.error ?? ''}). Run acli jira auth login; the gate retries on its next pass.`.slice(0, 280),
+        `pr-gate: could not file the Jira ticket of security finding ${t.id} (${got.error ?? ''}). ${jiraAdvice(got.error ?? '')}The gate retries on its next pass.`.slice(0, 280),
       )
     }
   }
@@ -3866,7 +3895,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       continue
     }
     const said = `${view.stderr} ${view.stdout}`
-    const isGone = view.exitCode !== 0 && /does not exist|not found/i.test(said) && !/command not found|ENOENT|unauthorized/i.test(said)
+    const isGone = view.exitCode !== 0 && /does not exist|not found/i.test(said) && !isAcliMissing(said) && !/unauthorized/i.test(said)
     if (!isGone) {
       failed.push(`${f.id} (could not read Jira ${key}: ${view.exitCode === 0 ? 'acli named no work item' : acliWords(view)})`)
       await log(`${f.id}: could not read Jira ${key} after the merge`)
@@ -3874,8 +3903,10 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     }
     if (await isMoved()) return { moved: true }
     const project = c.jiraProject ?? key.replace(/-\d+$/, '')
-    const again = { id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, c.issueSpec), body: issueBody(f, rec), isRetry: f.jiraError !== undefined }
-    const got = await fileTicket($, rec.root, project, again)
+    // Always searched first: Jira says "does not exist" too of a ticket acli's account may not see, which must not be filed twice.
+    const again = { id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, c.issueSpec), body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true }
+    await log(`${f.id}: Jira says ${key} does not exist; filing it again, searching Jira first`)
+    const got = await fileTicket($, rec.root, project, again, rec.pr)
     if (got.error !== undefined) {
       if (await keep({ ...f, jiraError: got.error })) return { moved: true }
       failed.push(`${f.id} (Jira ${key} is gone; filing it again: ${got.error})`)

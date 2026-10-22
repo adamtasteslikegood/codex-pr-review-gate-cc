@@ -22,6 +22,7 @@ import {
   rejections,
   securityHolds,
   ticketLine,
+  jiraAdvice,
   titleOf,
   unresolvedBlockers,
   usedRounds,
@@ -920,9 +921,11 @@ const personPost = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>, withRoun
  * The Jira side of what holds the merge (spec §5.13.7): each security finding's ticket, which tracks it but never settles it, and
  * each ticket the gate could not file, with acli's words. Empty when there is neither.
  */
-const ticketsOf = (holds: readonly Finding[]): string[] => {
+const ticketsOf = (holds: readonly Finding[], isLoginSaid: boolean): string[] => {
   const filed = holds.filter(one => one.isSecurity === true && one.jiraTicket !== undefined)
   const failed = holds.filter(one => one.isSecurity === true && one.jiraTicket === undefined && one.jiraError !== undefined)
+  // What to do about acli is said once per lifecycle (req 5): once the person was told, by toast or here, only the failures are listed.
+  const advice = isLoginSaid ? [] : [...new Set(failed.map(one => jiraAdvice(one.jiraError ?? '').trim()).filter(one => one !== ''))]
   return [
     ...(filed.length === 0 ? [] : ['', `Tracked by Jira, never settled by it: ${filed.map(one => `${ticketLine(one)}, waiting for the person's waiver`).join('; ')}.`]),
     ...(failed.length === 0
@@ -930,7 +933,8 @@ const ticketsOf = (holds: readonly Finding[]): string[] => {
       : [
           '',
           `Jira tickets not filed, retried on the gate's next pass: ${failed.map(one => `${one.id} (${one.jiraError ?? ''})`).join('; ')}. ` +
-            'Tell the person to run acli jira auth login if acli is not logged in; never file a GitHub issue for a security finding.',
+            (advice.length === 0 ? '' : `Tell the person: ${advice.join(' ')} `) +
+            'Never file a GitHub issue for a security finding.',
         ]),
   ]
 }
@@ -948,7 +952,7 @@ export function reportPrompt(rec: LifecycleRecord, next: Exclude<Next, { kind: '
   // Every finding that holds the merge, at any severity (R39): the same list the merge guard names.
   const holding = mergeHolds(rec)
   const lines = [`pr-gate: the post-PR review of PR #${rec.pr} stopped short of ready at ${rec.head.slice(0, 7)}: ${next.why}.`]
-  if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding), ...ticketsOf(holding))
+  if (holding.length > 0) lines.push('', 'What holds the merge, with the evidence so far:', listFindings(holding), ...ticketsOf(holding, rec.isJiraLoginSaid === true))
   if (standing !== undefined) {
     const rest = holdText(standing, namedIn(holding, next.why, standing))
     if (rest !== '') lines.push('', rest)
@@ -1023,7 +1027,7 @@ export function heldPrompt(rec: LifecycleRecord, why: string, nextStep: string, 
     // After the PR opened: the merge is what is held, by every finding the merge guard names (R39, R46).
     const holds = mergeHolds(rec)
     const post = [`pr-gate: PR #${rec.pr} on ${rec.branch} → ${rec.base} is held from merging at ${rec.head.slice(0, 7)}: ${why}.`]
-    if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds), ...ticketsOf(holds))
+    if (holds.length > 0) post.push('', 'What holds it, with the evidence so far:', listFindings(holds), ...ticketsOf(holds, rec.isJiraLoginSaid === true))
     if (standing !== undefined) {
       const rest = holdText(standing, namedIn(holds, why, standing))
       if (rest !== '') post.push('', rest)
