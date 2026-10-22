@@ -4846,6 +4846,27 @@ test('R92: a P1 comment the gate links to a deferral Codex agreed with sends it 
   expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: at P1 the rename belongs in this PR')
 })
 
+test('wave 2b gate R1-3: a comment the gate would match to a verified fix is never linked to it: it stands alone and holds the merge', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
+  // The same words a line away, on a file the push did not touch: the heuristic match the gate must not turn into a link.
+  w.git.changed = 'src/other.ts'
+  w.gh.comments = [...w.gh.comments, inline(12, '**P1** SQL injection', w.gh.prHead, 5)]
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  const run = await runOf(w)
+  const fresh = run.findings.find(one => one.externalId === 'inline:12')
+  expect(fresh).toBeDefined()
+  expect(fresh?.duplicateOf).toBeUndefined()
+  expect(w.prompts.at(-1)).not.toContain('same problem as G2-1')
+  expect(mergeHolds({ findings: run.findings, waivers: [] }).map(one => one.id)).toContain(fresh?.id)
+})
+
 test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
   const w = world(on)
   w.git.roster = roster
@@ -5726,6 +5747,17 @@ test('spec §5.12: after the agent merges, the gate finds each follow-up issue o
   expect((await recordOf(w)).phase).toBe('archived')
   expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
   expect(w.prompts.at(-1)).toContain('PR #1 merged. Follow-up issues still open: G2-1 → #21 Major [P2].')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('wave 2b gate R1-4: a merge of the same PR number and branch in another repository leaves the local lifecycle open', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --repo other/repo --merge' }))).toBe(false)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(archivesOf(w)).toHaveLength(0)
   expect(w.gh.reopened).toEqual([])
 })
 

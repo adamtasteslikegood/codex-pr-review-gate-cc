@@ -1993,7 +1993,16 @@ async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCo
       history: [{ round: run.round, status: 'open', by: feedback.reviewer, at: now }],
     }
     // The gate's match is a link (R90): the original's peak rises to the new item's, wherever the original is kept.
-    const original = cls === 'duplicate' && matchId !== undefined ? [...ledger, ...fresh].find(one => one.id === matchId) : undefined
+    const found = cls === 'duplicate' && matchId !== undefined ? [...ledger, ...fresh].find(one => one.id === matchId) : undefined
+    // A link never drops a hold (R90): an original that holds nothing once linked (verified fixed, waived, settled) leaves the new
+    // item standing alone, held on its own, since the gate's match is a heuristic (gate R1-3).
+    const isHeld = (one: Finding): boolean =>
+      mergeHolds({ findings: [withLinkedPeak(raised.find(each => each.id === one.id) ?? one, linkTo(finding, one, 'gate', run.round, now))], waivers: rec.waivers }).length > 0
+    const original = found !== undefined && isHeld(found) ? found : undefined
+    if (found !== undefined && original === undefined) {
+      cls = 'new-on-reviewed'
+      matchId = undefined
+    }
     if (original === undefined) fresh.push(finding)
     else {
       const linked = linkTo(finding, original, 'gate', run.round, now)

@@ -382,12 +382,14 @@ export function world(on: On): World {
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
         const owner = w.gh.forkOwner ?? 'me'
+        // Another repository's PR of the same number and branch, merged there (gate R1-4).
+        const isOtherRepo = /(?:-R|--repo)\s+(?!me\/repo\b)\S+/.test(args)
         return out(JSON.stringify({
           number: w.gh.pr,
           baseRefName,
           headRefName: w.gh.headRef,
           headRefOid: w.gh.prHead,
-          state: w.gh.state,
+          state: isOtherRepo ? 'MERGED' : w.gh.state,
           headRepository: { id: 'R_1', name: 'repo', nameWithOwner: `${owner}/repo` },
           headRepositoryOwner: { id: 'U_1', login: owner },
           isCrossRepository: owner !== 'me',

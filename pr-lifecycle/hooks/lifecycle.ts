@@ -310,9 +310,12 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
               raisedBy: linked.id, by: 'gate', at: when?.at ?? 0 },
           ],
         }
-  return isPeakUnknown(original) || isPeakUnknown(linked)
+  // A lost peak counts as Critical [P1] (`filingPeak`): linked with a known one, the higher of the two is kept, so neither the floor
+  // nor a known P0 is lost (gate R1-2). An original whose peak is lost stays lost when its link would not raise it past that floor.
+  const peak = higher(filingPeak(original), filingPeak(linked))
+  return isPeakUnknown(original) && peak === 'P1'
     ? { ...original, ...security, ...raised, ...recheck }
-    : { ...original, ...security, ...raised, ...recheck, peakSeverity: higher(peakOf(original), peakOf(linked)) }
+    : { ...original, ...security, ...raised, ...recheck, peakSeverity: peak }
 }
 
 /** The ids linked to a finding, for "G2-1 (also G2-2)". */

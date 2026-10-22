@@ -36,6 +36,7 @@ import {
   isDeferralOwed,
   mergeHolds,
   filingPeak,
+  isPeakUnknown,
   gateGrant,
   isFileable,
   isSettledByIssue,
@@ -1187,6 +1188,18 @@ test('R90 A1: a link carries security to the original, both ways, and nothing cl
   expect(isFileable(kept)).toBe(false)
   expect(isFileable(agreedBy({ ...kept, status: 'deferred' }))).toBe(false)
   expect(applyLinks([secure, finding({ id: 'G2-5', severity: 'P3' })], [{ id: 'G2-5', duplicateOf: 'G2-4' }], 2, 5).findings[0]?.isSecurity).toBe(true)
+})
+
+test('wave 2b gate R1-2: a link with a lost peak keeps the Critical [P1] floor, and a known P0 beats it', async () => {
+  const lost = finding({ id: 'G2-1', severity: 'P3', history: [{ round: 1, status: 'open', severity: 'P3', by: 'main', at: 1 }] })
+  const minor = finding({ id: 'G2-2', severity: 'P3', peakSeverity: 'P3' })
+  // A known P3 original linked to a lost peak: filed at P1, never P3.
+  expect(filingPeak(withLinkedPeak(minor, linkTo(lost, minor, 'gate', 2, 5)))).toBe('P1')
+  // A lost original linked to a known P0: the P0 is kept.
+  const blocker = finding({ id: 'G2-3', severity: 'P0', peakSeverity: 'P0' })
+  expect(filingPeak(withLinkedPeak(lost, linkTo(blocker, lost, 'gate', 2, 5)))).toBe('P0')
+  // A lost original whose link does not pass the floor stays lost.
+  expect(isPeakUnknown(withLinkedPeak(lost, linkTo(minor, lost, 'gate', 2, 5)))).toBe(true)
 })
 
 test('R90 A2: the agent\'s links are checked on canonical ids over the whole batch: no self-link, no cycle, no chain', async () => {
