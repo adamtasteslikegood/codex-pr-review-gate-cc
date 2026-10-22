@@ -4,7 +4,7 @@ import type { TestBody } from 'claude-code/testing'
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
-import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
+import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -6062,6 +6062,33 @@ test('wave 2b gate R1-5: an issue POST whose answer was lost is found by its tit
   expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
   expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: found me/repo#21, filed by an answer gh lost severity:P2')).toBe(true)
   expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R4-5: an answer after a lost issue POST clears its issueError, never its sent mark: the next pass finds the issue, no second POST', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ isIssueSent: true })
+  // The agent answers again before the next pass, and Codex agrees again: the failure is stale (R92), the mark is not.
+  const again = (f: Finding): Finding => {
+    const next = applyAnswer(f, { id: 'G2-1', action: 'deferred', severity: 'P2', note: 'still later' }, 3, 'main', 31_500)
+    const agreed = f.history.filter(one => one.by === 'codex').at(-1)
+    return agreed === undefined ? next : { ...next, history: [...next.history, { ...agreed, round: 3, at: 31_600 }] }
+  }
+  const answered = held.findings.map(f => (f.id !== 'G2-1' ? f : again(f)))
+  w.store.set(KEY, { ...held, findings: answered })
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
 })
 
 test('wave 2b gate R1-10: an issue POST is marked on the record before it is sent, so a crash before its answer looks first', async ($, on) => {

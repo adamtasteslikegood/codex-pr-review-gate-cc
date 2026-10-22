@@ -1079,6 +1079,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         if (got === undefined) return f
         return {
           ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError,
+          isIssueSent: got.isIssueSent,
           jiraTicket: got.jiraTicket, jiraError: got.jiraError,
         }
       })
@@ -3493,7 +3494,9 @@ async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'iss
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
     isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
     if (isGone) return latest
-    return { ...latest, findings: latest.findings.map(f => (f.id !== id || f[field] !== undefined ? f : { ...f, [field]: text })) }
+    // An issue's POST is marked sent too (wave 2b gate R4-5): an answer clears issueError, never that mark.
+    const sent = field === 'issueError' ? { isIssueSent: true as const } : {}
+    return { ...latest, findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent })) }
   })
   return saved === undefined || isGone
 }
@@ -3566,9 +3569,9 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
         if (f.id !== id || got.was !== f.followUp || got.peak !== filingPeak(f)) return f
         if (got.issueError !== undefined) return { ...f, issueError: got.issueError }
         if (got.labelError !== undefined) {
-          return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined }
+          return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined, isIssueSent: undefined }
         }
-        return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined }
+        return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
       })
       return { ...latest, findings, log: [...(latest.log ?? []), line].slice(-LOG_CAP) }
     })
@@ -3596,7 +3599,8 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (isWaived(after)) return after
     // The last POST's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title is taken, never filed twice. A failed read files nothing: the next pass reads again.
-    const isRetry = item.reuse === undefined && after.findings.find(one => one.id === item.id)?.issueError !== undefined
+    const was = after.findings.find(one => one.id === item.id)
+    const isRetry = item.reuse === undefined && (was?.issueError !== undefined || was?.isIssueSent === true)
     const listed = isRetry ? await listIssues(gh, repo) : undefined
     if (isRetry) {
       // The list is a gh call too: the record is read afresh after it, before the POST or the label edit.
@@ -3803,6 +3807,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       if (isGone) return latest
       const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
         ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
+        isIssueSent: next.isIssueSent,
         jiraTicket: next.jiraTicket, jiraError: next.jiraError,
       })
       return { ...latest, findings }
@@ -3890,7 +3895,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     const title = issueTitle(f, rec, c.issueSpec)
     // The last refile's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title, other than the issue it replaces, is taken. A failed read files nothing this time.
-    const listed = f.issueError === undefined ? undefined : await listIssues(gh, rec.slug)
+    const listed = f.issueError === undefined && f.isIssueSent !== true ? undefined : await listIssues(gh, rec.slug)
     if (listed !== undefined && (await isMoved())) return { moved: true }
     const found = listed?.issues?.find(one => one.title === title && !(ref.repo === rec.slug && one.number === ref.number))
     if (listed?.error !== undefined) {
@@ -3904,12 +3909,12 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
       const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', rec.slug, '--add-label', label])
       if (edit === undefined || edit.exitCode === 0) {
-        const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined }
+        const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
         if (await keep(settled)) return { moved: true }
         await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number} ${label}, filed by an answer gh lost`)
         continue
       }
-      const unlabelled = { ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined }
+      const unlabelled = { ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined, isIssueSent: undefined }
       if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: could not label ${rec.slug}#${found.number} ${label}: ${words(edit)})`)
       await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, filed by an answer gh lost; could not label it ${label}`)
@@ -3917,14 +3922,15 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     }
     const body = issueBody(f, rec)
     // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved makes the next check read the list first.
-    if (f.issueError === undefined && (await keep({ ...f, issueError: ISSUE_SENT }))) return { moved: true }
+    const sent: Finding = { ...f, issueError: f.issueError ?? ISSUE_SENT, isIssueSent: true }
+    if (await keep(sent)) return { moved: true }
     const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close
     // saves never files the issue again, and a lost answer leaves its issueError, so the next check reads the list first.
     if (filed === undefined) {
       const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : words(post)
-      if (await keep({ ...f, issueError })) return { moved: true }
+      if (await keep({ ...sent, issueError })) return { moved: true }
       failed.push(`${f.id} (${why}; filing it again: ${issueError})`)
       await log(`${f.id}: could not confirm ${where} after the merge`)
       continue
@@ -3932,13 +3938,13 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     if (!filed.labels.includes(label)) {
       // Filed, but GitHub dropped the label (A7): the new issue is kept, and the next check labels it instead of filing another.
       const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-      const unlabelled = { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined }
+      const unlabelled = { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined, isIssueSent: undefined }
       if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: ${labelError})`)
       await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} without ${label}`)
       continue
     }
-    const settled = { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined }
+    const settled = { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
     if (await keep(settled)) return { moved: true }
     await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
   }

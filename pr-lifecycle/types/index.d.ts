@@ -70,6 +70,11 @@ export type Finding = {
   /** gh's error when the gate last failed to file the finding's issue (R92): the finding holds until a pass files it. */
   issueError?: string
   /**
+   * The gate sent the finding's issue and has not saved GitHub's number for it (wave 2b gate R4-5): the next pass reads the
+   * repository's issues for it before filing another. Unlike issueError, an answer never clears it; a saved issue number does.
+   */
+  isIssueSent?: true
+  /**
    * The Jira ticket that tracks a security finding (spec §5.13.7), such as `KAN-512`, filed through acli where the base sets
    * `jiraProject`. It tracks the finding but never settles it: before a merge, only the person's waiver releases it.
    */
