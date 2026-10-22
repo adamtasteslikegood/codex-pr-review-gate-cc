@@ -4867,6 +4867,19 @@ test('wave 2b gate R1-3: a comment the gate would match to a verified fix is nev
   expect(mergeHolds({ findings: run.findings, waivers: [] }).map(one => one.id)).toContain(fresh?.id)
 })
 
+test('wave 2b gate R1-3: a comment the gate matches to a finding settled by its issue is still linked, and settles with it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.changed = 'src/other.ts'
+  await say($, 'resume')
+  w.gh.comments = [...w.gh.comments, inline(15, 'Consider renaming this', w.gh.prHead, 5)]
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).findings.find(one => one.externalId === 'inline:15')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+})
+
 test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
   const w = world(on)
   w.git.roster = roster

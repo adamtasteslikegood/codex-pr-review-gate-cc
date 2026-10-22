@@ -823,7 +823,7 @@ const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
     const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
     if (!top.isOk) return
     root = top.out
-    // A merge in another repository (`--repo`, a PR URL) is not this checkout's PR, even with the same number and branch (gate R1-4).
+    // A merge in another repository (`--repo`, a PR URL) is not this checkout's PR, even with the same number and branch (wave 2b gate R1-4).
     if (action.repo !== undefined) {
       const origin = await git($, root, ['remote', 'get-url', 'origin'])
       if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return

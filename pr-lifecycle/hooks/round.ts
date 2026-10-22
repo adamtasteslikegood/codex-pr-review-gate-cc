@@ -718,7 +718,7 @@ export function startTicker($: Engine): void {
         // Collection polls on while a triage turn answers what arrived (R88); only the turn itself has a step timeout.
         await poll($, run)
         // Read afresh after the awaited poll: an afterTriage that saved answers meanwhile is never overwritten by this tick's
-        // snapshot (gate R1-7). A run the poll ended, or another replaced, is the next tick's.
+        // snapshot (wave 2b gate R1-7). A run the poll ended, or another replaced, is the next tick's.
         const after = await getRun($)
         if (after === null || after.id !== run.id || after.status !== 'running') return
         run = after
@@ -1999,10 +1999,13 @@ async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCo
     }
     // The gate's match is a link (R90): the original's peak rises to the new item's, wherever the original is kept.
     const found = cls === 'duplicate' && matchId !== undefined ? [...ledger, ...fresh].find(one => one.id === matchId) : undefined
-    // A link never drops a hold (R90): an original that holds nothing once linked (verified fixed, waived, settled) leaves the new
-    // item standing alone, held on its own, since the gate's match is a heuristic (gate R1-3).
-    const isHeld = (one: Finding): boolean =>
-      mergeHolds({ findings: [withLinkedPeak(raised.find(each => each.id === one.id) ?? one, linkTo(finding, one, 'gate', run.round, now))], waivers: rec.waivers }).length > 0
+    // A link never drops a hold (R90): an original that holds nothing once linked (verified fixed, waived) leaves the new item
+    // standing alone, held on its own, since the gate's match is a heuristic (wave 2b gate R1-3). One settled by its issue still
+    // takes the link, which settles with it there (R92); a raise or security unsettles it.
+    const isHeld = (one: Finding): boolean => {
+      const linked = withLinkedPeak(raised.find(each => each.id === one.id) ?? one, linkTo(finding, one, 'gate', run.round, now))
+      return isSettledByIssue(linked) || mergeHolds({ findings: [linked], waivers: rec.waivers }).length > 0
+    }
     const original = found !== undefined && isHeld(found) ? found : undefined
     if (found !== undefined && original === undefined) {
       cls = 'new-on-reviewed'
