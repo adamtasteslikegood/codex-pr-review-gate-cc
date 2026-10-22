@@ -541,6 +541,8 @@ const touches = (one: Finding, changed: ReadonlySet<string> | ChangedLines | 'al
 /**
  * The findings the person waived. A waiver lapses when its finding's file changed after it was given (R50, R55): the lapse is
  * recorded on the waiver itself, so no later round brings it back. The finding holds again until the person waives it anew.
+ * Only finding waivers, on purpose: a finding the person waived is never filed, not even at a merge (§5.13.1); a post waiver covers
+ * the head, not its findings, and what it let merge is filed.
  */
 export const waivedIds = (rec: Pick<LifecycleRecord, 'waivers'>): Set<string> =>
   new Set(rec.waivers.flatMap(one => (one.scope === 'finding' && one.findingId !== undefined && one.lapsedAt === undefined ? [one.findingId] : [])))
@@ -749,15 +751,26 @@ export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch
   return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
 }
 
-/** The line a finding's issue carries when its PR merged outside the gate (spec §5.13, A9): only the body says it, never the title. */
-export const mergedLine = (pr: number | undefined): string => `PR #${pr ?? '?'} merged before the gate finished: no fix round ran on this finding.`
+/**
+ * How a PR merged while findings still held (spec §5.13.1): outside the gate (GitHub's website, a connector), or under the person's
+ * post waiver of its head (§5.4), whose reason the issue then carries. Either way the gate files what held at the merge.
+ */
+export type MergeKind = { kind: 'outside' } | { kind: 'post-waiver'; reason: string }
+
+/** The line a finding's issue carries when its PR merged while it held (spec §5.13, A9): only the body says it, never the title. */
+export const mergedLine = (pr: number | undefined, merged: MergeKind = { kind: 'outside' }): string =>
+  merged.kind === 'post-waiver'
+    ? `PR #${pr ?? '?'} merged under the person's post waiver (/pr-gate waive post): ${merged.reason.replace(/\s+/g, ' ').trim().slice(0, 300)}. ` +
+      'No fix round ran on this finding.'
+    : `PR #${pr ?? '?'} merged before the gate finished: no fix round ran on this finding.`
 
 /**
  * A filed issue's body (spec §5.6; issues #21-#23 are the model): who raised it and where, its peak severity, the problem, why it
- * was not fixed in the PR, and the findings linked to it. `isMerged`: the PR merged outside the gate while the finding held
- * (spec §5.13), whatever its status, and the body says no fix round ran on it.
+ * was not fixed in the PR, and the findings linked to it. `merged`: the PR merged while the finding held (spec §5.13), whatever its
+ * status, outside the gate or under a post waiver, and the body says how and that no fix round ran on it.
  */
-export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>, isMerged = false): string {
+export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>, merged?: MergeKind): string {
+  const isMerged = merged !== undefined
   const peak = filingPeak(f)
   const at = f.file === undefined ? '' : `, at \`${f.file}${f.line === undefined ? '' : `:${f.line}`}\``
   const thread = f.url === undefined ? '' : ` ([thread](${f.url}))`
@@ -792,7 +805,7 @@ export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'finding
     '',
     why,
     ...named,
-    ...(isMerged ? ['', mergedLine(rec.pr)] : []),
+    ...(merged === undefined ? [] : ['', mergedLine(rec.pr, merged)]),
     ...(linked.length === 0 ? [] : ['', '## Linked findings', '', ...linked.map(id => `- ${id}: the same problem, raised again`)]),
     '',
     isMerged ? `Filed by pr-gate when #${rec.pr ?? '?'} merged.` : `Filed by pr-gate when the review of #${rec.pr ?? '?'} could do no more.`,
@@ -1298,7 +1311,8 @@ export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: 
  * What the filing pass does (R92, spec §5): nothing before the PR or short of a filing point; else a round for a late blocker
  * (`gateGrant`); else an issue for each held finding it files (`isFileable`).
  */
-export function planIssues(rec: LifecycleRecord, at: number, spec?: string, isMerged = false): IssuePlan {
+export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merged?: MergeKind): IssuePlan {
+  const isMerged = merged !== undefined
   if (isMerged) {
     // The PR merged outside the gate (spec §5.13.1): no round can run, so no grant; every finding still holding is filed now.
     if (rec.pr === undefined) return { kind: 'none' }
@@ -1317,7 +1331,7 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, isMe
         ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
         ...(reuse === undefined ? {} : { reuse }),
         title: issueTitle(f, rec, spec),
-        body: issueBody(f, rec, isMerged),
+        body: issueBody(f, rec, merged),
       }
     })
   return items.length === 0 ? { kind: 'none' } : { kind: 'file', items }

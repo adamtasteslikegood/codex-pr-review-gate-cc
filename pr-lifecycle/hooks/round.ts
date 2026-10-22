@@ -107,7 +107,7 @@ import {
   titleOf,
   untrackedSecurity,
 } from './lifecycle'
-import type { Allowances, Next, TriageClass } from './lifecycle'
+import type { Allowances, MergeKind, Next, TriageClass } from './lifecycle'
 import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
@@ -980,14 +980,30 @@ export const isMergeBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'messag
   rec.postStatus === 'blocked' && (rec.message?.includes(MERGE_UNCONFIRMED) === true || rec.message?.includes(MERGE_SECURITY) === true)
 
 /**
- * The person's post waiver covers the record's head (spec §5.4): their whole-head decision let the PR merge with what held, so the
- * merge is not one outside the gate, and nothing is filed for it (§5.13.1). Security still holds: `waive post` never releases it.
+ * How the PR merged, for its issues' bodies (spec §5.13.1): under the person's post waiver of the head, with its reason, or outside
+ * the gate. Either way what held is filed; `waive post` never releases security.
  */
-const isPostWaivedHead = (rec: Pick<LifecycleRecord, 'waivers' | 'head'>): boolean => rec.waivers.some(one => one.scope === 'post' && one.head === rec.head)
+const mergeKindOf = (rec: Pick<LifecycleRecord, 'waivers' | 'head'>): MergeKind => {
+  const waiver = rec.waivers.filter(one => one.scope === 'post' && one.head === rec.head).at(-1)
+  return waiver === undefined ? { kind: 'outside' } : { kind: 'post-waiver', reason: waiver.reason }
+}
 
-/** Blocked only on a security finding the person must waive (spec §5.13.2): nothing for the watcher to retry. */
-const isSecurityOnlyBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'message'>): boolean =>
-  rec.postStatus === 'blocked' && rec.message?.includes(MERGE_SECURITY) === true && rec.message.includes(MERGE_UNCONFIRMED) !== true
+/** The security findings a merged PR's blocked lifecycle waits on the person to waive (spec §5.13.2); none when it is not so blocked. */
+export const securityBlockedIds = (rec: LifecycleRecord): string[] =>
+  isMergeBlocked(rec) && rec.message?.includes(MERGE_SECURITY) === true ? untrackedSecurity(rec).map(f => f.id) : []
+
+/**
+ * Merge-blocked only on a security finding the person must waive (spec §5.13.2), read from the record's state, not its message: one
+ * whose security findings were all waived since, even while a close was in flight, is closed again by the watcher's next beat.
+ */
+const isSecurityOnlyBlocked = (rec: LifecycleRecord): boolean =>
+  isMergeBlocked(rec) && rec.message?.includes(MERGE_UNCONFIRMED) !== true && untrackedSecurity(rec).length > 0
+
+/**
+ * The last merge block said for each record, by key: its generation, the failing ids and the security ids, never gh's words. The
+ * watcher's beat stays quiet while it is the same, so an error text that varies (a request id) is not a new block.
+ */
+const blockSaid = new Map<string, string>()
 
 async function closeOnce($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED', isWatch: boolean): Promise<string> {
   const rec = await loadRecord($, root, branch)
@@ -999,11 +1015,11 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     // through the filing pass, whatever round or phase the record was in. A filing that fails is a failed check, as in §5.12.
     const unfiled: string[] = []
     let filed: LifecycleRecord = rec
-    if (!isPostWaivedHead(rec) && mergeHolds(rec).some(isMergeFileable)) {
+    if (mergeHolds(rec).some(isMergeFileable)) {
       let got: LifecycleRecord | undefined
       let threw: string | undefined
       try {
-        got = await fileIssues($, rec, true)
+        got = await fileIssues($, rec, mergeKindOf(rec))
       } catch (error) {
         threw = (error instanceof Error ? error.message : String(error)).slice(0, 200)
       }
@@ -1030,7 +1046,6 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     }
     if (checked.moved === true) return replaced
     const done = { ...checked, failed: [...unfiled, ...checked.failed] }
-    const security = untrackedSecurity(filed)
     // Only the fields the check changed are written, onto the record as it is now, under the lock.
     const apply = (latest: LifecycleRecord): Finding[] =>
       latest.findings.map(f => {
@@ -1038,25 +1053,35 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         if (got === undefined) return f
         return { ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError }
       })
+    // What still holds is decided under the lock, from the record as it is now: a waiver given while gh ran counts (review I1).
     let isGone = false
-    if (done.failed.length > 0 || security.length > 0) {
+    let security: Finding[] = []
+    let why = ''
+    const saved = await updateRecord($, root, branch, latest => {
+      isGone = isMovedFrom(rec, latest)
+      if (isGone) return latest
+      const findings = apply(latest)
+      const log = [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP)
+      security = untrackedSecurity({ ...latest, findings })
       const named = security.map(f => `${f.id} [${f.severity}] ${titleOf(f)}`)
-      const why = [
+      why = [
         ...(done.failed.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${done.failed.join('; ')}`]),
-        ...(security.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_SECURITY} ${named.join('; ')}`]),
+        ...(security.length === 0 ? [] : [`PR #${pr ?? '?'} from ${branch} ${MERGE_SECURITY} ${named.join('; ')}`]),
       ].join('. ')
-      // The watcher's next beat finding the same failure says nothing new; a resume, a waiver or a session start says it again.
-      const isRepeat = isWatch && rec.postStatus === 'blocked' && rec.message === why.slice(0, 1000)
-      const saved = await updateRecord($, root, branch, latest => {
-        isGone = isMovedFrom(rec, latest)
-        if (isGone) return latest
-        const log = [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP)
-        return { ...latest, findings: apply(latest), postStatus: 'blocked', message: why.slice(0, 1000), log }
-      })
-      if (isGone || saved === undefined) return replaced
+      if (why !== '') return { ...latest, findings, postStatus: 'blocked', message: why.slice(0, 1000), log }
+      // A check that failed before and passes now: its block and message go, so the archive does not keep a stale failure.
+      return { ...latest, findings, log, ...(isMergeBlocked(latest) ? { postStatus: undefined, message: undefined } : {}) }
+    })
+    if (isGone || saved === undefined) return replaced
+    const key = recordKey(root, branch)
+    if (why !== '') {
       // A collection in flight ends here: its next poll would only run the check again. The watcher, or a resume, does that.
       const run = await getRun($)
       if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'blocked', why.slice(0, 300))
+      // The watcher's next beat finding the same block says nothing new; a resume, a waiver or a session start says it again.
+      const kinds = `${saved.generation ?? 0}|${done.failed.map(one => one.split(' (')[0]).join(',')}|${security.map(f => f.id).join(',')}`
+      const isRepeat = isWatch && blockSaid.get(key) === kinds
+      blockSaid.set(key, kinds)
       if (isRepeat) return why
       const steps = [
         ...(done.failed.length === 0
@@ -1065,26 +1090,18 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         ...(security.length === 0
           ? []
           : [
-              `A security finding is never filed as a public issue, so the lifecycle stays open on ${security.map(f => f.id).join(', ')}. Tell the person now: only their ` +
-                `${security.map(f => `/pr-gate waive ${f.id} <reason>`).join(', ')} releases ${security.length === 1 ? 'it' : 'them'}, and the gate then ` +
-                'archives the lifecycle. Never type that command yourself.',
+              `A security finding is never filed as a public issue, so the lifecycle of ${branch} stays open on ${security.map(f => f.id).join(', ')}. Tell the person ` +
+                `now: only their ${security.map(f => `/pr-gate waive ${f.id} <reason>`).join(', ')}, from any checkout of this repository, releases ` +
+                `${security.length === 1 ? 'it' : 'them'}, and the gate then archives the lifecycle. Never type that command yourself.`,
             ]),
       ]
-      if (security.length > 0) $.ui.toast(`pr-gate: ${`PR #${pr ?? '?'} ${MERGE_SECURITY} ${named.join('; ')}`.slice(0, 280)}`)
+      if (security.length > 0) $.ui.toast(`pr-gate: ${`PR #${pr ?? '?'} from ${branch} ${MERGE_SECURITY} ${security.map(f => `${f.id} [${f.severity}] ${titleOf(f)}`).join('; ')}`.slice(0, 280)}`)
       await say($, saved, `pr-gate: ${why}. ${steps.join(' ')}`)
       return why
     }
-    // A check that failed before and passes now: its block and message go, so the archive does not keep a stale failure.
-    const isUnblocked = isMergeBlocked(rec)
-    if (done.lines.length > 0 || done.touched.length > 0 || isUnblocked) {
-      const saved = await updateRecord($, root, branch, latest => {
-        isGone = isMovedFrom(rec, latest)
-        if (isGone) return latest
-        const cleared = isUnblocked ? { postStatus: undefined, message: undefined } : {}
-        return { ...latest, findings: apply(latest), log: [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP), ...cleared }
-      })
-      if (isGone || saved === undefined) return replaced
-      // What the merge outside the gate filed counts too, whatever its status (spec §5.13.1): each names its labelled issue.
+    blockSaid.delete(key)
+    if (done.lines.length > 0 || done.touched.length > 0 || isMergeBlocked(rec)) {
+      // What the merge filed counts too, whatever its status (spec §5.13.1): each names its labelled issue.
       const holding = new Set(mergeHolds(saved).map(f => f.id))
       const isFiledAtMerge = (f: Finding): boolean =>
         holding.has(f.id) && f.isSecurity !== true && isFollowUpRef(f.followUp) && f.followUpLabel === filingPeak(f)
@@ -1124,7 +1141,7 @@ function stopWatcher(): void {
   watched.clear()
 }
 
-/** A record the watcher reads: it has a PR, is not archived, and is not blocked only on a security finding the person must waive. */
+/** A record the watcher reads: it has a PR, is not archived, and is not merge-blocked only on a security finding still unwaived. */
 const isWatchable = (rec: LifecycleRecord): rec is LifecycleRecord & { pr: number } =>
   rec.pr !== undefined && (rec.phase === 'ready' || rec.phase === 'post') && !isSecurityOnlyBlocked(rec)
 
@@ -1147,7 +1164,8 @@ export function startWatcher($: Engine, root: string): void {
 /**
  * One beat: each record of this session's roots that has a PR, no running run and no live owner elsewhere (#13) is read once its
  * minutes have passed; MERGED or CLOSED runs the close (§5.12, §5.13.1) as the agent's own merge does. A failed read waits for the
- * next one, never a stop. The watcher stops itself once no such record is left; a run that ends, or a ready record, starts it again.
+ * next one, never a stop. The watcher stops itself once no record is left to read or wait on; a run that ends, or a ready record,
+ * starts it again.
  */
 async function watchBeat($: Engine): Promise<void> {
   if (isWatchBeating) return
@@ -1156,12 +1174,17 @@ async function watchBeat($: Engine): Promise<void> {
     const now = await $.clock.now()
     const run = await getRun($)
     const seen = new Set<string>()
+    // A record whose run is running, or that another live session owns, is not read now, but keeps the watcher alive: that owner
+    // may die, and the run's end may not restart it (review minor 2).
+    let isWaiting = false
     for (const root of watchRoots) {
       for (const rec of await liveRecords($, root)) {
         try {
           if (!isWatchable(rec)) continue
-          if (run !== null && run.status === 'running' && run.root === rec.root && run.branch === rec.branch) continue
-          if (await isOwnedElsewhere($, rec.root, rec.branch)) continue
+          if ((run !== null && run.status === 'running' && run.root === rec.root && run.branch === rec.branch) || (await isOwnedElsewhere($, rec.root, rec.branch))) {
+            isWaiting = true
+            continue
+          }
           const key = recordKey(rec.root, rec.branch)
           seen.add(key)
           let one = watched.get(key)
@@ -1181,7 +1204,7 @@ async function watchBeat($: Engine): Promise<void> {
       }
     }
     for (const key of [...watched.keys()]) if (!seen.has(key)) watched.delete(key)
-    if (seen.size === 0) stopWatcher()
+    if (seen.size === 0 && !isWaiting) stopWatcher()
   } finally {
     isWatchBeating = false
   }
@@ -3278,14 +3301,14 @@ type Filed = { peak: Severity; was: string | undefined; followUp: string | undef
  * meanwhile ends the filing too, and the record with it goes back to the caller, which runs the pass once more from the top (final
  * review I1). Never through a PR-create command line (spec §5.9).
  */
-export async function fileIssues($: Engine, rec: LifecycleRecord, isMerged = false): Promise<LifecycleRecord | undefined> {
+export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: MergeKind): Promise<LifecycleRecord | undefined> {
   // One filing pass per branch at a time in this process (a pass run again after a waiver can meet the waive command's or a session
   // start's own pass): a second one files nothing and decides nothing, so no issue is posted twice; the first one's caller decides.
   const key = `${rec.root}\0${rec.branch}`
   if (filing.has(key)) return undefined
   filing.add(key)
   try {
-    return await fileOnce($, rec, isMerged)
+    return await fileOnce($, rec, merged)
   } finally {
     filing.delete(key)
   }
@@ -3294,11 +3317,11 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, isMerged = fal
 /** The branches whose filing pass `fileIssues` runs now, as `<root>\0<branch>`. */
 const filing = new Set<string>()
 
-async function fileOnce($: Engine, rec: LifecycleRecord, isMerged: boolean): Promise<LifecycleRecord | undefined> {
-  if ((rec.phase === 'pre' && !isMerged) || rec.pr === undefined) return rec
+async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | undefined): Promise<LifecycleRecord | undefined> {
+  if ((rec.phase === 'pre' && merged === undefined) || rec.pr === undefined) return rec
   const now = await $.clock.now()
   const { config: c } = await configFor($, rec.root, rec.base)
-  const plan = planIssues(rec, now, c.issueSpec, isMerged)
+  const plan = planIssues(rec, now, c.issueSpec, merged)
   if (plan.kind === 'none') return rec
   // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and
   // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
@@ -3509,8 +3532,9 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
   const touched = new Map<string, Finding>()
   const waived = waivedIds(rec)
   // After a merge outside the gate (spec §5.13.1), a finding still holding that names an issue is checked here too, never filed
-  // anew: its issue may be the agent's (R85), or one whose label GitHub dropped, and it may be gone. On the gate's own merge none holds.
-  const held = new Set(isPostWaivedHead(rec) ? [] : mergeHolds(rec).filter(f => f.isSecurity !== true && isFollowUpRef(f.followUp)).map(f => f.id))
+  // anew: its issue may be the agent's (R85), or one whose label GitHub dropped, and it may be gone. The same holds for a merge under
+  // a post waiver; on the gate's own merge with nothing waived, none holds.
+  const held = new Set(mergeHolds(rec).filter(f => f.isSecurity !== true && isFollowUpRef(f.followUp)).map(f => f.id))
   // A finding settled by its issue, or one whose issue this check filed again without its label (A7): that issue gets the label.
   const isLabelOwed = (f: Finding): boolean =>
     !waived.has(f.id) &&

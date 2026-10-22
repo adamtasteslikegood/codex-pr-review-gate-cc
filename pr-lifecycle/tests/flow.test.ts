@@ -6284,8 +6284,9 @@ test('A9: a security finding open at a website merge blocks the record, files no
   expect(held.phase).not.toBe('archived')
   expect(held.postStatus).toBe('blocked')
   const told = w.prompts.at(-1) ?? ''
-  expect(told).toContain('PR #1 merged before the gate finished, with a security finding still holding that no ticket tracks: G2-3 [P1]')
-  expect(told).toContain('/pr-gate waive G2-3 <reason>')
+  expect(told).toContain('PR #1 from feat/x merged before the gate finished, with a security finding still holding that no ticket tracks: G2-3 [P1]')
+  expect(told).toContain('the lifecycle of feat/x stays open on G2-3')
+  expect(told).toContain('/pr-gate waive G2-3 <reason>, from any checkout of this repository')
   expect(told).toContain('Tell the person')
   // Nothing more for the watcher: only the person's waiver releases it.
   const before = w.prompts.length
@@ -6320,7 +6321,7 @@ test('A9: a session started on another branch closes a merged record of a branch
   // Branch feat/z's record, run by another session that beat just now.
   const other = 'lifecycle:/repo:feat/z'
   w.store.set(other, { ...rec, branch: 'feat/z' })
-  w.store.set(`${other}:owner`, { sessionId: 'session-2', beatAt: rec.updatedAt })
+  w.store.set(`${other}:owner`, { sessionId: 'session-2', beatAt: await (w.engine as { clock: { now: () => Promise<number> } }).clock.now() })
   w.gh.state = 'MERGED'
   w.git.branch = 'feat/y'
   w.clearState()
@@ -6329,6 +6330,10 @@ test('A9: a session started on another branch closes a merged record of a branch
   expect((await recordOf(w)).phase).toBe('archived')
   expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
   expect((w.stored(other) as LifecycleRecord).phase).toBe('ready')
+  // That session dies: its record is this watcher's once its owner is stale, with no session start and no command (review minor 2).
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((w.stored(other) as LifecycleRecord).phase).toBe('archived')
 })
 
 test('A9: a watcher read that fails is no stop: the next beat closes the record', async ($, on) => {
@@ -6346,7 +6351,7 @@ test('A9: a watcher read that fails is no stop: the next beat closes the record'
   expect((await recordOf(w)).phase).toBe('archived')
 })
 
-test('A9: a PR merged under the person\'s post waiver for its head is no merge outside the gate: nothing is filed for what the waiver let through', async ($, on) => {
+test('A9: a PR merged under the person\'s post waiver files, at the merge, an issue for each finding still holding; the body names the waiver and its reason', async ($, on) => {
   const w = world(on)
   await toHolding($, w, [holding('G2-3')])
   const rec = await recordOf(w)
@@ -6354,6 +6359,158 @@ test('A9: a PR merged under the person\'s post waiver for its head is no merge o
   w.gh.state = 'MERGED'
   await w.clock.advance(WATCH_MS)
   await w.clock.advance(1000)
-  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.filed).toHaveLength(2)
+  const filed = w.gh.filed[1] ?? []
+  // The title is the finding's own; only the body says how the PR merged.
+  expect(filed.find(arg => arg.startsWith('title='))).toBe('title=G2-3 Major [P2] Problem G2-3 (#1, feat/x)')
+  const body = filed.find(arg => arg.startsWith('body=')) ?? ''
+  expect(body).toContain("PR #1 merged under the person's post waiver (/pr-gate waive post): reviewed by hand. No fix round ran on this finding.")
+  expect(body).not.toContain('merged before the gate finished')
   expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-3')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('A9: a finding the person waived is not filed at a website merge', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3'), holding('G2-4')])
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: 'G2-3', head: rec.head, reason: 'not a bug', by: 'composer', at: 1 }] })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed.slice(1).map(one => one.find(arg => arg.startsWith('title=')))).toEqual(['title=G2-4 Major [P2] Problem G2-4 (#1, feat/x)'])
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('A9 review I1: a waiver given while a close checks the issues leaves no stale security block: the close archives the record, with no resume', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-5', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  // The first close cannot read #21: blocked on both the check and the security finding.
+  w.gh.issueStates[21] = 'unreadable'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('could not confirm the follow-up issue of G2-1')
+  expect(held.message).toContain('G2-5 [P1]')
+  // The watcher's next close reads #21 again; the person's waiver lands while it does, and its own close finds this one running.
+  delete w.gh.issueStates[21]
+  let reply = ''
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    reply = String((await say($, 'waive G2-5 rotated the token by hand')).text)
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(reply).toContain('already closing')
+  const latest = await recordOf(w)
+  expect(latest.phase).toBe('archived')
+  expect(archivedOf(w)?.message).toBeUndefined()
+  expect(archivedOf(w)?.postStatus).toBeUndefined()
+})
+
+test('A9 review I2: /pr-gate waive <id> from another branch waives the one merged lifecycle blocked on that security finding; with two, it names both and waives none', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  expect(blocked.postStatus).toBe('blocked')
+  // The same block on feat/z: the person must say which.
+  const other = 'lifecycle:/repo:feat/z'
+  w.store.set(other, { ...blocked, branch: 'feat/z' })
+  w.git.branch = 'feat/y'
+  const twice = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  expect(twice).toContain('G2-3 holds the merged lifecycles of feat/x, feat/z: nothing was waived')
+  expect((await recordOf(w)).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
+  expect((w.stored(other) as LifecycleRecord).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
+  // With one left, the waiver from feat/y is given on feat/x, and the close archives it.
+  w.store.delete(other)
+  const once = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  await w.clock.advance(1000)
+  expect(once).toContain('waived G2-3 for feat/x')
+  expect(once).toContain('its lifecycle is archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.waivers.some(one => one.findingId === 'G2-3')).toBe(true)
+})
+
+test('A9 review minor 1: the watcher says a merge block once; its next beat, finding the same block, says nothing', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3')])
+  w.gh.issueAnswer = 'fail'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).postStatus).toBe('blocked')
+  const said = w.prompts.filter(one => one.includes('could not confirm the follow-up issue of G2-3')).length
+  expect(said).toBe(1)
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  // The watcher tried again (one more POST), and said nothing new.
+  expect(w.gh.filed.length).toBe(before + 1)
+  expect(w.prompts.filter(one => one.includes('could not confirm the follow-up issue of G2-3')).length).toBe(1)
+})
+
+test('A9 controller point 5: a merge close that meets another filing pass of the branch counts it as a failed check, and the watcher then archives', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  // While the filing pass posts its first issue, the PR merges and a new session starts: its close meets that pass.
+  let isClosed = false
+  w.gh.onIssue = async () => {
+    if (isClosed) return
+    isClosed = true
+    w.gh.state = 'MERGED'
+    w.clearState()
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(isClosed).toBe(true)
+  expect(w.prompts.some(one => one.includes('its findings still holding (another filing pass was running'))).toBe(true)
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  // Each finding filed once, by the pass that was running: the close checked them, never filed them again.
+  expect(w.gh.filed).toHaveLength(2)
+})
+
+test('A9: the watcher skips a record whose run is running; once the run ends, its next beat closes the merged PR', async ($, on) => {
+  const w = world(on)
+  // A post-PR round runs: the triage agent is out, and never answers in this test.
+  await toTriage($, w, 'Consider renaming this')
+  expect((await runOf(w)).status).toBe('running')
+  w.gh.state = 'MERGED'
+  const views = (): number => w.gh.calls.filter(one => one === 'pr view 1 --json state').length
+  const before = views()
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(views()).toBe(before)
+  expect((await recordOf(w)).phase).not.toBe('archived')
+  await say($, 'stop')
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('A9 review minor 3: a session started again runs one merge watcher, not a second one beside the first', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  let reads = 0
+  w.afterRead = key => {
+    if (key === `${KEY}:owner`) reads += 1
+  }
+  await w.clock.advance(60_000)
+  const one = reads
+  expect(one).toBeGreaterThan(0)
+  for (let i = 0; i < 2; i += 1) {
+    w.clearState()
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await w.clock.advance(1000)
+  }
+  reads = 0
+  await w.clock.advance(60_000)
+  expect(reads).toBe(one)
 })

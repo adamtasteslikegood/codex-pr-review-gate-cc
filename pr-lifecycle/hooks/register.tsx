@@ -68,6 +68,7 @@ import {
   patch,
   prStateOf,
   say,
+  securityBlockedIds,
   setLive,
   setSession,
   setup,
@@ -976,10 +977,11 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return 'Not a git repository.'
   const root = top.out
-  const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  // `waive <id>` may move both to another branch's merged lifecycle (spec §5.13.2): see below.
+  let branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
   const stored = await loadRecord($, root, branch)
-  const rec = stored?.phase === 'archived' ? undefined : stored
+  let rec = stored?.phase === 'archived' ? undefined : stored
   const now = await $.clock.now()
   // The person's waive, allow or reset takes the record for this session (#13), once it is accepted: what it starts is this
   // session's to run. A refused one leaves the record with its owner.
@@ -1033,6 +1035,20 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const reason = why.join(' ').trim()
   const isFinding = /^[RG]\d+-\d+$/.test(scope)
   if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|<findingId> <reason>`
+  if (isFinding && rec?.findings.some(each => each.id === scope) !== true) {
+    // A merged PR's lifecycle blocked on this security finding, on a branch not checked out (spec §5.13.2, §5.13.4): the waiver is
+    // given there, when exactly one lifecycle under this root is so blocked; with more, the person checks out the one they mean.
+    const blocked = (await liveRecords($, root)).filter(one => one.branch !== branch && securityBlockedIds(one).includes(scope))
+    if (blocked.length > 1) {
+      return `/${COMMAND}: ${scope} holds the merged lifecycles of ${blocked.map(one => one.branch).join(', ')}: nothing was waived. ` +
+        `Check out the branch you mean and run /${COMMAND} waive ${scope} <reason> there.`
+    }
+    const [only] = blocked
+    if (blocked.length === 1 && only !== undefined) {
+      branch = only.branch
+      rec = only
+    }
+  }
   if (isFinding) {
     // Decided on the read taken under the record's lock (F5): a finding settled meanwhile is not waived.
     const refusalOf = (one: LifecycleRecord | undefined): string | undefined => {
