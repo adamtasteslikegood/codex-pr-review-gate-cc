@@ -901,6 +901,31 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   )
 }
 
+const FINDING_ID = /^[RG]\d+-\d+$/
+
+/**
+ * The branch a `/pr-gate waive <id>` acts on (spec §5.13.2, §5.13.4). `<branch>:<id>` names it. An unqualified id is the checked-out
+ * branch's, or else the one merged lifecycle under this root blocked on that security finding: ids repeat across lifecycles, so one
+ * that could mean more than one is refused, naming each with its qualified command, and nothing is written.
+ */
+async function waiveTarget($: Engine, root: string, checkedOut: string, arg: string): Promise<{ branch: string } | { refusal: string }> {
+  const qualified = /^(\S+):([RG]\d+-\d+)$/.exec(arg)
+  if (qualified !== null) return { branch: qualified[1] ?? checkedOut }
+  if (!FINDING_ID.test(arg)) return { branch: checkedOut }
+  const own = await loadRecord($, root, checkedOut)
+  const isOwn = own !== undefined && own.phase !== 'archived' && own.findings.some(each => each.id === arg)
+  const blocked = (await liveRecords($, root)).filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
+  const all = [...(isOwn ? [checkedOut] : []), ...blocked]
+  if (all.length > 1) {
+    return {
+      refusal: `/${COMMAND}: ${arg} names a finding in the lifecycles of ${all.join(', ')}: nothing was waived. Say which: ` +
+        `${all.map(one => `/${COMMAND} waive ${one}:${arg} <reason>`).join(', ')}.`,
+    }
+  }
+  const [only] = blocked
+  return { branch: !isOwn && only !== undefined ? only : checkedOut }
+}
+
 /** Why a finding is settled, for a waiver that has nothing to release. */
 const settledAs = (rec: LifecycleRecord, one: Finding): string =>
   rec.waivers.some(each => each.scope === 'finding' && each.findingId === one.id)
@@ -949,7 +974,7 @@ async function logCommand($: Engine, args: string, reply: string, origin: string
 }
 
 /**
- * `/pr-gate start|<base>`, `status`, `log`, `stop`, `resume`, `waive pre|post|<findingId> <reason>`, `allow <n> <reason>`, `reset`.
+ * `/pr-gate start|<base>`, `status`, `log`, `stop`, `resume`, `waive pre|post|[<branch>:]<findingId> <reason>`, `allow <n> <reason>`, `reset`.
  * Waivers, `allow` and `reset` are the person's alone. The replies may start with the command; prompts never do (R21).
  */
 const runCommand = async ($: Engine, args: string, origin: string): Promise<string> => {
@@ -977,11 +1002,14 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return 'Not a git repository.'
   const root = top.out
-  // `waive <id>` may move both to another branch's merged lifecycle (spec §5.13.2): see below.
-  let branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  const checkedOut = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
+  // `waive <id>` may act on another branch's merged lifecycle (spec §5.13.2): everything below is about the branch it names.
+  const aimed = verb === 'waive' ? await waiveTarget($, root, checkedOut, rest[0] ?? '') : { branch: checkedOut }
+  if ('refusal' in aimed) return aimed.refusal
+  const { branch } = aimed
   const stored = await loadRecord($, root, branch)
-  let rec = stored?.phase === 'archived' ? undefined : stored
+  const rec = stored?.phase === 'archived' ? undefined : stored
   const now = await $.clock.now()
   // The person's waive, allow or reset takes the record for this session (#13), once it is accepted: what it starts is this
   // session's to run. A refused one leaves the record with its owner.
@@ -1031,24 +1059,12 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
           `${theirs.length === 1 ? 'releases' : 'release'} ${ids(theirs)}.`
     return `/${COMMAND}: ${n} more round${n === 1 ? '' : 's'} allowed for ${branch}: ${reason}.${settles}`
   }
-  const [scope = '', ...why] = rest
+  const [named = '', ...why] = rest
   const reason = why.join(' ').trim()
-  const isFinding = /^[RG]\d+-\d+$/.test(scope)
-  if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|<findingId> <reason>`
-  if (isFinding && rec?.findings.some(each => each.id === scope) !== true) {
-    // A merged PR's lifecycle blocked on this security finding, on a branch not checked out (spec §5.13.2, §5.13.4): the waiver is
-    // given there, when exactly one lifecycle under this root is so blocked; with more, the person checks out the one they mean.
-    const blocked = (await liveRecords($, root)).filter(one => one.branch !== branch && securityBlockedIds(one).includes(scope))
-    if (blocked.length > 1) {
-      return `/${COMMAND}: ${scope} holds the merged lifecycles of ${blocked.map(one => one.branch).join(', ')}: nothing was waived. ` +
-        `Check out the branch you mean and run /${COMMAND} waive ${scope} <reason> there.`
-    }
-    const [only] = blocked
-    if (blocked.length === 1 && only !== undefined) {
-      branch = only.branch
-      rec = only
-    }
-  }
+  // `<branch>:<id>` named the branch above; the finding is the id.
+  const scope = named.replace(/^\S+:(?=[RG]\d+-\d+$)/, '')
+  const isFinding = FINDING_ID.test(scope)
+  if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|[<branch>:]<findingId> <reason>`
   if (isFinding) {
     // Decided on the read taken under the record's lock (F5): a finding settled meanwhile is not waived.
     const refusalOf = (one: LifecycleRecord | undefined): string | undefined => {
@@ -1330,7 +1346,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pr-gate',
       description: "Run /pr-gate: pre-PR Codex review, then the PR's own reviews, under one budget (start, status, log, stop, resume, waive, allow, reset)",
-      argumentHint: '[base] | status | log | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
+      argumentHint: '[base] | status | log | stop | resume | waive pre|post|[<branch>:]<id> <reason> | allow <n> <reason> | reset',
       immediate: true,
     })
     setSession(e.isInteractive)

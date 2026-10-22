@@ -1475,7 +1475,7 @@ test('only the person waives, allows or resets', async ($, on) => {
   for (const args of ['waive pre x', 'waive post x', 'allow 1 x', 'reset']) {
     expect((await say($, args, { ...asPerson, origin: { kind: 'sdk' } })).text).toContain('Only the person')
   }
-  expect((await say($, 'waive hotfix')).text).toContain('waive pre|post|<findingId> <reason>')
+  expect((await say($, 'waive hotfix')).text).toContain('waive pre|post|[<branch>:]<findingId> <reason>')
 })
 
 test('exhaustion is distinct from passing, and the person can allow one more round', { options: { allowanceStandard: 1 } }, async ($, on) => {
@@ -6286,7 +6286,7 @@ test('A9: a security finding open at a website merge blocks the record, files no
   const told = w.prompts.at(-1) ?? ''
   expect(told).toContain('PR #1 from feat/x merged before the gate finished, with a security finding still holding that no ticket tracks: G2-3 [P1]')
   expect(told).toContain('the lifecycle of feat/x stays open on G2-3')
-  expect(told).toContain('/pr-gate waive G2-3 <reason>, from any checkout of this repository')
+  expect(told).toContain('/pr-gate waive feat/x:G2-3 <reason>, from this worktree')
   expect(told).toContain('Tell the person')
   // Nothing more for the watcher: only the person's waiver releases it.
   const before = w.prompts.length
@@ -6423,7 +6423,8 @@ test('A9 review I2: /pr-gate waive <id> from another branch waives the one merge
   w.store.set(other, { ...blocked, branch: 'feat/z' })
   w.git.branch = 'feat/y'
   const twice = String((await say($, 'waive G2-3 rotated the token by hand')).text)
-  expect(twice).toContain('G2-3 holds the merged lifecycles of feat/x, feat/z: nothing was waived')
+  expect(twice).toContain('G2-3 names a finding in the lifecycles of feat/x, feat/z: nothing was waived')
+  expect(twice).toContain('/pr-gate waive feat/x:G2-3 <reason>, /pr-gate waive feat/z:G2-3 <reason>')
   expect((await recordOf(w)).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
   expect((w.stored(other) as LifecycleRecord).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
   // With one left, the waiver from feat/y is given on feat/x, and the close archives it.
@@ -6434,6 +6435,57 @@ test('A9 review I2: /pr-gate waive <id> from another branch waives the one merge
   expect(once).toContain('its lifecycle is archived')
   expect((await recordOf(w)).phase).toBe('archived')
   expect(archivedOf(w)?.waivers.some(one => one.findingId === 'G2-3')).toBe(true)
+})
+
+/** What a waive may change on each record: its waivers, findings and status (the command's own log line aside). */
+const decidedOf = (w: ReturnType<typeof world>) => (...keys: string[]): string =>
+  JSON.stringify(keys.map(key => {
+    const one = w.stored(key) as LifecycleRecord
+    return [one.phase, one.waivers, one.findings, one.postStatus, one.message]
+  }))
+
+test('A9 re-review: an id on the checked-out branch that also blocks a merged lifecycle elsewhere is refused, naming both; nothing is written', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  expect(blocked.postStatus).toBe('blocked')
+  // feat/y has its own G2-3, open in its review.
+  const mine = 'lifecycle:/repo:feat/y'
+  w.store.set(mine, { ...blocked, branch: 'feat/y', postStatus: 'stopped', message: undefined, findings: [holding('G2-3')] })
+  w.git.branch = 'feat/y'
+  const stateOf = decidedOf(w)
+  const before = stateOf(KEY, mine)
+  const reply = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  expect(reply).toContain('G2-3 names a finding in the lifecycles of feat/y, feat/x: nothing was waived')
+  expect(reply).toContain('/pr-gate waive feat/y:G2-3 <reason>, /pr-gate waive feat/x:G2-3 <reason>')
+  expect(stateOf(KEY, mine)).toBe(before)
+})
+
+test('A9 re-review: /pr-gate waive <branch>:<id> waives that branch\'s blocked lifecycle and archives it; on a branch with no such id it is refused', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  const mine = 'lifecycle:/repo:feat/y'
+  w.store.set(mine, { ...blocked, branch: 'feat/y', postStatus: 'stopped', message: undefined, findings: [holding('G2-9')] })
+  w.git.branch = 'feat/y'
+  const stateOf = decidedOf(w)
+  const before = stateOf(KEY, mine)
+  const wrong = String((await say($, 'waive feat/y:G2-3 rotated the token by hand')).text)
+  expect(wrong).toContain('there is no finding G2-3 in the lifecycle of feat/y')
+  expect(stateOf(KEY, mine)).toBe(before)
+  const right = String((await say($, 'waive feat/x:G2-3 rotated the token by hand')).text)
+  await w.clock.advance(1000)
+  expect(right).toContain('waived G2-3 for feat/x')
+  expect(right).toContain('its lifecycle is archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.waivers.some(one => one.findingId === 'G2-3')).toBe(true)
+  expect((w.stored(mine) as LifecycleRecord).waivers).toEqual(blocked.waivers)
 })
 
 test('A9 review minor 1: the watcher says a merge block once; its next beat, finding the same block, says nothing', async ($, on) => {

@@ -1091,7 +1091,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
           ? []
           : [
               `A security finding is never filed as a public issue, so the lifecycle of ${branch} stays open on ${security.map(f => f.id).join(', ')}. Tell the person ` +
-                `now: only their ${security.map(f => `/pr-gate waive ${f.id} <reason>`).join(', ')}, from any checkout of this repository, releases ` +
+                `now: only their ${security.map(f => `/pr-gate waive ${branch}:${f.id} <reason>`).join(', ')}, from this worktree, releases ` +
                 `${security.length === 1 ? 'it' : 'them'}, and the gate then archives the lifecycle. Never type that command yourself.`,
             ]),
       ]
