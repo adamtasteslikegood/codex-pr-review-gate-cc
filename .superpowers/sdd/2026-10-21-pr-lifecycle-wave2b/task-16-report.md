@@ -120,3 +120,33 @@ Task report departures recorded:
 - CLAUDE.md's Git section still says `gh pr create` is held by codex-gate's gate (stale since pr-lifecycle took over); not named
   by the brief, left as is.
 - This report is in the gitignored `.superpowers/` folder; it is force-added in its own commit.
+
+## Fix round 1
+
+Commit `492056c` "docs: wave 2b rulings and README match the post-merge check and the person's holds".
+
+1. **Post-merge check (Important).** Read `round.ts` ~3240-3320. As built: an open issue is logged; a closed one is reopened, and
+   if the reopen fails a new issue is filed (logged "could not be reopened"); "Could not resolve to an issue or pull request"
+   only decides whether a failed *read* means the issue is gone (filed again) or unreadable (blocked); a refile that fails
+   blocks. Reworded:
+   - `pr-lifecycle/README.md`, "Deferrals and issues": "files one again when gh says it no longer exists or the reopen fails".
+   - `pr-lifecycle/README.md`, "The agent merges": the full sequence above.
+   - Rulings doc R92: "a closed one is reopened with a comment, and filed again if the reopen fails; a missing one (its read
+     fails with …) is filed again. Any other failed read, and a refile gh cannot complete, leaves the record blocked …".
+   - Rulings doc, Task 15 I1 line: "treats a failed read of an issue as 'missing' only when gh answers …, and files it again".
+   - Also `LIFECYCLE_SPEC.md`'s R93 bullet, which said the same: "filing it again when it is missing or cannot be reopened".
+2. **Who decides (Important).** Read `lifecycle.ts` ~825-895 (`blockerOf`, `standingOf`) and `isFileable` (~724: not security,
+   not linked, no owed link). The person owns: `disputed` and `deferred`/`security-p1` blockers when the finding is not fileable
+   (in practice a security one, since linked and link-owed ones go to their original or Codex first); `head-unreviewed` when
+   `decideNext` is `exhausted` (allowance spent, head no round reviewed, nothing to file; release `/pr-gate allow 1` or
+   `waive post`); `retargeted` (point it back, or `/pr-gate reset`). The README's "only for security findings" is now a list of
+   those three, plus the pre-PR exhaustion case it already named.
+3. **ROADMAP numbering (Minor).** Wave 2b's items are now 1-6, with "The lanes item moved to wave 2c." after them; the lanes
+   item is item 1 under wave 2c.
+4. **ROADMAP wave 3 item 4 (Minor).** R91 makes every reply id the agent reports the gate's own, whatever its answer, and never
+   read back as feedback; R64 already sent the person's other comments under the same login to triage. Together they are what
+   the item asked for, so I **marked it done in 1.5.0 (R91)** and reworded its sentence to say what is built.
+5. **CLAUDE.md Git (Minor).** "held by codex-gate's pre-PR gate" → "held by pr-lifecycle's pre-PR gate". The "Pre-PR Codex gate"
+   line note stays: pr-lifecycle's open-PR prompt still asks for it (`core.ts:852`).
+
+Checks: `npm run validate` passed for codex-gate and pr-lifecycle; `npm run lint` exit 0. Docs only, so no test run.
