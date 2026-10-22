@@ -170,3 +170,9 @@ Ruling: controller fixes (1) directly (2390763): a per-branch in-process set lik
 - The guard has no flow test: the test kit doesn't expose the plugin's engine to call fileIssues directly (w.engine lacks state/clock; $ is the test engine), and a real concurrent second pass needs a much bigger setup. Recorded as a follow-up. Suite 625/625 + 22/22, lint/typecheck clean.
 - Parked for a follow-up issue: (2) --auto wording; final-review Minors 4, 7, 8; coverage/wording minors per docs/superpowers/plans/2026-10-21-wave2b-final-review.md.
 Final review: complete. Next: finishing-a-development-branch (PR through the gate).
+
+## After the final review: the gate's round 1 and A9 (2026-10-21, evening)
+- The PR create (head 41f762e) was held by pr-lifecycle 1.4.0. Codex round 1 found R1-1..R1-7. The gate's background fixer fixed R1-1/R1-4, R1-2, R1-3 and R1-7 (238a42e, 65f1ebc, a058ffb; 629 tests) and deferred R1-5 and R1-6. It finished at 18:47, after the gate's 30-min step limit (18:40), so the run errored silently. Filed as #26 [P2].
+- Adam approved spec A9 (merge outside the gate, R95) and A9.7 (security → Jira where jiraProject is set, still held). Spec commits d5c2d56 and 4160fe5 were cherry-picked from docs/wave2b-merge-gap. main (#6, a dev-dependency bump) was merged in as 5a413c9.
+- Ruling: R1-5 and R1-6 are fixed rather than filed — both are cheap and Adam's rule is "rulings, not stalls". R1-5 checks the REST issue list for an exact title before re-POSTing; the search API isn't used because it lags. R1-6 saves each refile as it is answered — cost if wrong: one extra GET per retry.
+- The plan gained Tasks 17-19 (9ba3972).
