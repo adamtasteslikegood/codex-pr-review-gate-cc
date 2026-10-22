@@ -104,10 +104,11 @@ import {
   issueOf,
   issueTitle,
   isMergeFileable,
+  ticketLine,
   titleOf,
   untrackedSecurity,
 } from './lifecycle'
-import type { Allowances, MergeKind, Next, TriageClass } from './lifecycle'
+import type { Allowances, MergeKind, Next, TicketItem, TriageClass } from './lifecycle'
 import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
@@ -155,6 +156,8 @@ export type Config = {
   mergeMethod: MergeMethod
   /** How often the merge watcher reads a waiting record's PR state, in minutes (spec §5.13.3, R95). Repository file only. */
   mergeWatchMinutes: number
+  /** The Jira project a security finding's ticket is filed in (spec §5.13.7), such as `KAN`; undefined files none. Repository file only. */
+  jiraProject: string | undefined
   /** Plugin options whose value was invalid, each with why: the default applies to them. */
   badOptions: string[]
 }
@@ -235,6 +238,7 @@ export function configOf(options: PluginOptions): Config {
     issueSpec: undefined,
     mergeMethod: 'merge',
     mergeWatchMinutes: 5,
+    jiraProject: undefined,
     badOptions,
   }
 }
@@ -244,8 +248,8 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths, issueSpec (R92), mergeMethod (R93) and mergeWatchMinutes (R95),
- * and the models and efforts (R68, R69),
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths, issueSpec (R92), mergeMethod (R93), mergeWatchMinutes (R95)
+ * and jiraProject (spec §5.13.7), and the models and efforts (R68, R69),
  * each read as configOf reads the option. A key whose value is invalid is left to the option and named in `ignored`; an empty
  * regular expression turns its match off, and an empty model names none, as the option does.
  */
@@ -294,6 +298,9 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
   const watch = r.mergeWatchMinutes
   const mergeWatchMinutes =
     watch === undefined ? undefined : typeof watch === 'number' && Number.isInteger(watch) && watch >= 1 && watch <= 60 ? watch : bad('mergeWatchMinutes', 'not a whole number of minutes from 1 to 60')
+  const jira = r.jiraProject
+  const jiraProject =
+    jira === undefined ? undefined : typeof jira === 'string' && /^[A-Z][A-Z0-9]+$/.test(jira) ? jira : bad('jiraProject', 'not a Jira project key such as KAN')
   const highRisk = pattern('highRiskPaths')
   // Set or not, and to what: an empty string sets "no model", which undefined alone cannot tell from unset.
   const model = (key: ModelKey): { model: string | undefined } | undefined =>
@@ -322,6 +329,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
       issueSpec: issueSpec ?? c.issueSpec,
       mergeMethod: mergeMethod ?? c.mergeMethod,
       mergeWatchMinutes: mergeWatchMinutes ?? c.mergeWatchMinutes,
+      jiraProject: jiraProject ?? c.jiraProject,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
       effort: efforts.effort ?? c.effort,
@@ -1010,12 +1018,15 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
   const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was stopped, reset or replaced while the gate checked its follow-up issues: ` +
     'nothing was written for it'
   let open: Finding[] = []
+  // Security findings still holding at the merge that their Jira tickets track (spec §5.13.7): archived, and the person is told.
+  let tracked: Finding[] = []
   if (state === 'MERGED' && rec !== undefined && rec.phase !== 'archived') {
     // A merge outside the gate (spec §5.13.1): every finding still holding, but security and any that names an issue, is filed first,
     // through the filing pass, whatever round or phase the record was in. A filing that fails is a failed check, as in §5.12.
     const unfiled: string[] = []
     let filed: LifecycleRecord = rec
-    if (mergeHolds(rec).some(isMergeFileable)) {
+    // A security finding with no Jira ticket gets one there, where the base sets jiraProject (spec §5.13.7); the plan reads the setting.
+    if (mergeHolds(rec).some(f => isMergeFileable(f) || (f.isSecurity === true && f.jiraTicket === undefined))) {
       let got: LifecycleRecord | undefined
       let threw: string | undefined
       try {
@@ -1051,7 +1062,10 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       latest.findings.map(f => {
         const got = done.touched.includes(f.id) ? done.findings.find(one => one.id === f.id) : undefined
         if (got === undefined) return f
-        return { ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError }
+        return {
+          ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError,
+          jiraTicket: got.jiraTicket, jiraError: got.jiraError,
+        }
       })
     // What still holds is decided under the lock, from the record as it is now: a waiver given while gh ran counts (review I1).
     let isGone = false
@@ -1100,6 +1114,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       return why
     }
     blockSaid.delete(key)
+    tracked = mergeHolds(saved).filter(f => f.isSecurity === true && f.jiraTicket !== undefined)
     if (done.lines.length > 0 || done.touched.length > 0 || isMergeBlocked(rec)) {
       // What the merge filed counts too, whatever its status (spec §5.13.1): each names its labelled issue.
       const holding = new Set(mergeHolds(saved).map(f => f.id))
@@ -1117,7 +1132,19 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
   const run = await getRun($)
   if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'stopped', `${said}.`)
   const did = await archiveLifecycle($, root, branch, await $.clock.now(), rec === undefined ? undefined : (rec.generation ?? 0))
-  if (did && open.length > 0) await say($, { root, branch }, `pr-gate: PR #${pr ?? '?'} merged. Follow-up issues still open: ${open.map(issueLine).join('; ')}.`)
+  const still = [
+    ...(open.length === 0 ? [] : [`Follow-up issues still open: ${open.map(issueLine).join('; ')}.`]),
+    ...(tracked.length === 0
+      ? []
+      : [
+          `Security findings still holding at the merge, tracked by their Jira tickets, which never settle them: ${tracked.map(ticketLine).join('; ')}. ` +
+            'Tell the person now, naming each finding and its ticket.',
+        ]),
+  ]
+  if (did && still.length > 0) await say($, { root, branch }, `pr-gate: PR #${pr ?? '?'} merged. ${still.join(' ')}`)
+  if (did && tracked.length > 0) {
+    $.ui.toast(`pr-gate: PR #${pr ?? '?'} from ${branch} merged with security findings tracked in Jira, not settled: ${tracked.map(ticketLine).join('; ')}`.slice(0, 280))
+  }
   return said
 }
 
@@ -3288,6 +3315,94 @@ const isMovedFrom = (rec: LifecycleRecord, latest: LifecycleRecord | undefined):
   (latest.generation ?? 0) !== (rec.generation ?? 0) ||
   latest.postStatus !== rec.postStatus
 
+// ------------------------------------------------------ Jira tickets (spec §5.13.7)
+
+type Ran = { exitCode: number; stdout: string; stderr: string }
+
+/** One acli call, bounded like every gh call (30 s): a hang, or acli missing, ends as a failure with its words, never a wait or a stop. */
+async function acli($: Engine, root: string, args: string[]): Promise<Ran> {
+  try {
+    return await $.process.run(['acli', ...args], { cwd: root, timeoutMs: 30_000 })
+  } catch (e) {
+    return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/** acli's words for a failed call, on one line and cut short. */
+const acliWords = (got: Ran): string => (got.stderr.trim() || got.stdout.trim() || `acli exited ${got.exitCode}`).replace(/\s+/g, ' ').slice(0, 200)
+
+const JIRA_KEY = /^[A-Z][A-Z0-9]+-\d+$/
+
+/** The key of acli's JSON answer for one work item (`{ key: 'KAN-1', … }`); undefined when it named none. */
+const jiraKeyIn = (stdout: string): string | undefined => {
+  try {
+    const key = (JSON.parse(stdout) as { key?: unknown } | null)?.key
+    return typeof key === 'string' && JIRA_KEY.test(key) ? key : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The work item of acli's search answer (an array of `{ key, fields: { summary } }`) whose summary is `title` exactly; an error otherwise. */
+const ticketIn = (stdout: string, title: string): { key?: string; error?: string } => {
+  let list: unknown
+  try {
+    list = JSON.parse(stdout)
+  } catch {
+    list = undefined
+  }
+  if (!Array.isArray(list)) return { error: 'acli did not answer with a list of work items' }
+  for (const one of list) {
+    const it = typeof one === 'object' && one !== null ? (one as { key?: unknown; fields?: { summary?: unknown } | null }) : {}
+    if (typeof it.key === 'string' && JIRA_KEY.test(it.key) && it.fields?.summary === title) return { key: it.key }
+  }
+  return {}
+}
+
+/**
+ * Files a security finding's Jira ticket in `project` (spec §5.13.7) through `acli jira workitem create`, with the issue's title and
+ * body; the body goes through a file in git's own directory, never on the command line, and the file is removed afterwards. After a
+ * failed attempt (`isRetry`), Jira is searched first and a ticket with this exact summary is taken, never filed twice; a failed
+ * search files nothing. `error`: acli's words, or why the body could not be written.
+ */
+async function fileTicket(
+  $: Engine,
+  root: string,
+  project: string,
+  t: TicketItem,
+): Promise<{ key: string; isFound: boolean; error?: undefined } | { error: string }> {
+  if (t.isRetry) {
+    const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', `project = ${project} AND summary ~ "\\"${t.id}\\""`, '--json'])
+    const found = search.exitCode === 0 ? ticketIn(search.stdout, t.title) : { error: acliWords(search) }
+    if (found.error !== undefined) return { error: `could not search Jira for a ticket a lost answer filed: ${found.error}`.slice(0, 200) }
+    if (found.key !== undefined) return { key: found.key, isFound: true }
+  }
+  // git's own directory: `<root>/.git` is a file in a worktree. Read with the 30 s bound; a failed read falls back to `<root>/.git`.
+  let dir = `${root}/.git`
+  try {
+    const read = await git($, root, ['rev-parse', '--absolute-git-dir'])
+    if (read.isOk && read.out !== '') dir = read.out
+  } catch {
+    // The fallback stands.
+  }
+  const path = `${dir}/pr-gate-jira-${t.id}.txt`
+  try {
+    await $.fs.write(path, t.body)
+  } catch (e) {
+    return { error: `could not write the ticket's description to ${path}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200) }
+  }
+  try {
+    const made = await acli($, root, [
+      'jira', 'workitem', 'create', '--project', project, '--type', 'Bug', '--summary', t.title, '--description-file', path, '--label', `security,severity-${t.peak}`, '--json',
+    ])
+    if (made.exitCode !== 0) return { error: acliWords(made) }
+    const key = jiraKeyIn(made.stdout)
+    return key === undefined ? { error: "acli did not give the new ticket's key" } : { key, isFound: false }
+  } finally {
+    await $.process.run(['rm', '-f', path], { cwd: root, timeoutMs: 30_000 }).catch(() => undefined)
+  }
+}
+
 /** What one filing did to a finding, written under the record's lock. */
 type Filed = { peak: Severity; was: string | undefined; followUp: string | undefined; issueError?: string; labelError?: string }
 
@@ -3321,7 +3436,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
   if ((rec.phase === 'pre' && merged === undefined) || rec.pr === undefined) return rec
   const now = await $.clock.now()
   const { config: c } = await configFor($, rec.root, rec.base)
-  const plan = planIssues(rec, now, c.issueSpec, merged)
+  const plan = planIssues(rec, now, c.issueSpec, merged, c.jiraProject !== undefined)
   if (plan.kind === 'none') return rec
   // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and
   // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
@@ -3459,6 +3574,42 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     }
     if (!(await save(item.id, got, { at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) }))) return undefined
   }
+  // Each security finding the review left for the person, or every one still holding at a merge, gets its Jira ticket where the base
+  // sets jiraProject (spec §5.13.7). The ticket tracks it and never settles it. A failure keeps acli's words on the finding and the
+  // next pass retries: never a GitHub issue in its place, never a stop. The person is told once per lifecycle to log acli in.
+  const project = c.jiraProject ?? ''
+  for (const t of project === '' ? [] : (plan.tickets ?? [])) {
+    const current = await loadRecord($, rec.root, rec.branch)
+    if (current === undefined || isMoved(current)) return undefined
+    if (isWaived(current)) return current
+    await restamp()
+    const got = await fileTicket($, rec.root, project, t)
+    const text =
+      got.error === undefined
+        ? `${t.id}: ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`} (security, severity-${t.peak})`
+        : `${t.id}: could not file its Jira ticket in ${project}: ${got.error}`
+    const at = await $.clock.now()
+    let isGone = false
+    let isFirstFailure = false
+    // Saved as soon as acli answers, so a ticket Jira has is never filed twice; a ticket another pass saved meanwhile is kept.
+    const next = await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
+      if (isGone) return latest
+      const findings = latest.findings.map((f): Finding => {
+        if (f.id !== t.id || f.jiraTicket !== undefined) return f
+        return got.error === undefined ? { ...f, jiraTicket: got.key, jiraError: undefined } : { ...f, jiraError: got.error }
+      })
+      isFirstFailure = got.error !== undefined && latest.isJiraLoginSaid !== true
+      const log = [...(latest.log ?? []), { at, kind: 'check' as const, text: text.slice(0, 300) }].slice(-LOG_CAP)
+      return { ...latest, findings, log, ...(isFirstFailure ? { isJiraLoginSaid: true } : {}) }
+    })
+    if (next === undefined || isGone) return undefined
+    if (isFirstFailure) {
+      $.ui.toast(
+        `pr-gate: could not file the Jira ticket of security finding ${t.id} (${got.error ?? ''}). Run acli jira auth login; the gate retries on its next pass.`.slice(0, 280),
+      )
+    }
+  }
   // A stop while gh ran: what was filed is saved, and the caller decides nothing for this pass (gate G7-8, R8-2). Otherwise the
   // caller decides on the record as it is now, with any waiver given meanwhile.
   return ended()
@@ -3541,7 +3692,9 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     isFollowUpRef(f.followUp) &&
     ((isFileable(f) && f.followUpLabelError !== undefined) || (held.has(f.id) && f.followUpLabel !== filingPeak(f)))
   const targets = rec.findings.filter(f => isSettledByIssue(f) || isLabelOwed(f) || held.has(f.id))
-  if (targets.length === 0) return { failed, lines, findings: rec.findings, touched: [] }
+  // Each Jira ticket that tracks a security finding still holding (spec §5.13.7) is read too.
+  const tickets = mergeHolds(rec).filter(f => f.isSecurity === true && f.jiraTicket !== undefined)
+  if (targets.length === 0 && tickets.length === 0) return { failed, lines, findings: rec.findings, touched: [] }
   const { config: c } = await configFor($, rec.root, rec.base)
   // Each gh call is bounded: a hang ends as a failure, with gh's words, never a wait.
   const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
@@ -3565,6 +3718,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       if (isGone) return latest
       const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
         ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
+        jiraTicket: next.jiraTicket, jiraError: next.jiraError,
       })
       return { ...latest, findings }
     })
@@ -3700,6 +3854,36 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     const settled = { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined }
     if (await keep(settled)) return { moved: true }
     await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
+  }
+  // A ticket Jira answers for is logged, whatever its status. One Jira says does not exist is filed again, Jira searched first after a
+  // failed attempt, and saved at once. Any other failed read (acli missing, not logged in, a timeout) is a failed check: the record
+  // is not archived, and the next check reads it again.
+  for (const f of tickets) {
+    const key = f.jiraTicket ?? ''
+    const view = await acli($, rec.root, ['jira', 'workitem', 'view', key, '--json'])
+    if (view.exitCode === 0 && jiraKeyIn(view.stdout) !== undefined) {
+      await log(`${f.id}: Jira ${key} exists after the merge`)
+      continue
+    }
+    const said = `${view.stderr} ${view.stdout}`
+    const isGone = view.exitCode !== 0 && /does not exist|not found/i.test(said) && !/command not found|ENOENT|unauthorized/i.test(said)
+    if (!isGone) {
+      failed.push(`${f.id} (could not read Jira ${key}: ${view.exitCode === 0 ? 'acli named no work item' : acliWords(view)})`)
+      await log(`${f.id}: could not read Jira ${key} after the merge`)
+      continue
+    }
+    if (await isMoved()) return { moved: true }
+    const project = c.jiraProject ?? key.replace(/-\d+$/, '')
+    const again = { id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, c.issueSpec), body: issueBody(f, rec), isRetry: f.jiraError !== undefined }
+    const got = await fileTicket($, rec.root, project, again)
+    if (got.error !== undefined) {
+      if (await keep({ ...f, jiraError: got.error })) return { moved: true }
+      failed.push(`${f.id} (Jira ${key} is gone; filing it again: ${got.error})`)
+      await log(`${f.id}: Jira ${key} is gone; could not file it again`)
+      continue
+    }
+    if (await keep({ ...f, jiraTicket: got.key, jiraError: undefined })) return { moved: true }
+    await log(`${f.id}: Jira ${key} is gone; ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`}`)
   }
   if (await isMoved()) return { moved: true }
   return { failed, lines, findings: rec.findings.map(f => touched.get(f.id) ?? f), touched: [...touched.keys()] }

@@ -39,6 +39,7 @@ import {
   isPeakUnknown,
   gateGrant,
   isFileable,
+  isTicketable,
   isSettledByIssue,
   issueBody,
   issueTitle,
@@ -59,6 +60,8 @@ import {
   roundOf,
   securityHolds,
   standingOf,
+  ticketLine,
+  untrackedSecurity,
   triage,
   unresolvedBlockers,
   usedRounds,
@@ -1662,4 +1665,34 @@ test('R93: the ready prompt tells the agent to merge with the repository\'s meth
   expect(mergeStep(12, 'rebase')).toBe(
     "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; if the merge guard holds it for checks still running, wait for them (gh pr checks 12 --watch) and merge again; never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, and the gate checks them after the merge; if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop: the lifecycle stays where it is",
   )
+})
+
+test('A9.7: a security finding left for the person owes a Jira ticket where jiraProject is set; the ticket tracks it and never settles it', async () => {
+  const deferred = agreedBy(finding({ id: 'G2-1', source: 'github', severity: 'P1', isSecurity: true, status: 'deferred', history: [{ round: 2, status: 'deferred', note: 'later', by: 'main', at: 5 }] }))
+  expect(isTicketable(deferred)).toBe(true)
+  expect(isTicketable({ ...deferred, isSecurity: false })).toBe(false)
+  expect(isTicketable(finding({ isSecurity: true, status: 'reported-fixed' }))).toBe(false)
+  const rec = postRec({ findings: [deferred] })
+  expect(decideNext(rec).kind).toBe('awaiting-decision')
+  // Without the setting no ticket is planned, and nothing else is: security never gets a GitHub issue.
+  expect(planIssues(rec, 9)).toEqual({ kind: 'none' })
+  expect(planIssues(rec, 9, undefined, undefined, true)).toMatchObject({ kind: 'file', items: [], tickets: [{ id: 'G2-1', peak: 'P1', isRetry: false }] })
+  // A failed attempt searches first; a filed ticket is owed no more.
+  expect(planIssues(postRec({ findings: [{ ...deferred, jiraError: 'unauthorized' }] }), 9, undefined, undefined, true)).toMatchObject({ tickets: [{ isRetry: true }] })
+  const filed = { ...deferred, jiraTicket: 'KAN-512' }
+  expect(planIssues(postRec({ findings: [filed] }), 9, undefined, undefined, true)).toEqual({ kind: 'none' })
+  // Still holding, still the person's: only the merge outside the gate counts it as tracked.
+  const tracked = postRec({ findings: [filed] })
+  expect(mergeHolds(tracked).map(one => one.id)).toEqual(['G2-1'])
+  expect(decideNext(tracked).kind).toBe('awaiting-decision')
+  expect(untrackedSecurity(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(untrackedSecurity(tracked)).toEqual([])
+  expect(ticketLine(filed)).toBe('G2-1 → KAN-512 Critical [P1]')
+  expect(standingOf(tracked, { head: 'a', base: 'dev' }).blockers).toEqual([
+    { kind: 'security-p1', id: 'G2-1', said: 'G2-1 → KAN-512 Critical [P1], waiting for your waiver', owner: 'person', release: '/pr-gate waive G2-1 <reason>' },
+  ])
+  expect(standingOf(postRec({ findings: [{ ...deferred, jiraError: 'unauthorized' }] }), { head: 'a', base: 'dev' }).blockers[0]?.said).toContain('(Jira ticket not filed: unauthorized)')
+  // At a merge every security finding still holding is planned, whatever its status.
+  const fixed = finding({ id: 'R1-1', isSecurity: true, status: 'reported-fixed' })
+  expect(planIssues(postRec({ findings: [fixed] }), 9, undefined, { kind: 'outside' }, true)).toMatchObject({ kind: 'file', items: [], tickets: [{ id: 'R1-1' }] })
 })

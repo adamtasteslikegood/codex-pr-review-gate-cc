@@ -69,6 +69,13 @@ export type Finding = {
   followUpLabelError?: string
   /** gh's error when the gate last failed to file the finding's issue (R92): the finding holds until a pass files it. */
   issueError?: string
+  /**
+   * The Jira ticket that tracks a security finding (spec §5.13.7), such as `KAN-512`, filed through acli where the base sets
+   * `jiraProject`. It tracks the finding but never settles it: before a merge, only the person's waiver releases it.
+   */
+  jiraTicket?: string
+  /** acli's words when the gate last failed to file the finding's Jira ticket: the next pass searches Jira before filing again. */
+  jiraError?: string
   /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
   duplicateOf?: string
   /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */
@@ -246,6 +253,8 @@ export type LifecycleRecord = {
   /** Where the PR's head branch lives, as gh last said (#24): a fork's repository for a PR from one, and its branch name. */
   headPlace?: { repo?: string; branch?: string; isCrossRepository?: boolean }
   waivers: Waiver[]
+  /** The person was told to run `acli jira auth login` (spec §5.13.7): once per lifecycle, however often acli fails. */
+  isJiraLoginSaid?: boolean
   phase: LifecyclePhase
   /**
    * Which lifecycle of the branch this is: a reset raises it, and a fresh start keeps the raised one, so work begun before a reset

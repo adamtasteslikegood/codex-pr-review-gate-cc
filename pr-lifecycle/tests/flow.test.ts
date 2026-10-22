@@ -6566,3 +6566,227 @@ test('A9 review minor 3: a session started again runs one merge watcher, not a s
   await w.clock.advance(60_000)
   expect(reads).toBe(one)
 })
+
+// ------------------------------------------------------------- A9.7: security findings open Jira tickets (spec §5.13.7)
+
+/** The roster with `jiraProject` set: security findings get their Jira tickets in KAN. */
+const JIRA = '{"reviewers":["claude[bot]"],"checks":[],"jiraProject":"KAN"}'
+
+/** A security P1 deferral Codex agreed with: the review leaves it for the person. `isJira`: the base sets jiraProject. */
+const toSecurityDeferral = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, isJira = true): Promise<void> => {
+  await toTriage($, w, 'Consider rotating this token')
+  // toTriage sets the roster: the setting goes on after it, before the filing pass reads it.
+  if (isJira) w.git.roster = JIRA
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P1', isSecurity: true, note: 'needs a key rotation', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+}
+
+const creates = (w: ReturnType<typeof world>): string[][] => w.acli.calls.filter(one => one[2] === 'create')
+
+test('A9.7: with jiraProject set, a security deferral left for the person files one Jira ticket; it still holds, and status and the report name it', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  // The ticket tracks it and never settles it: it still holds, for the person's waiver alone.
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(creates(w)).toHaveLength(1)
+  const made = creates(w)[0] ?? []
+  const flag = (name: string): string | undefined => made[made.indexOf(name) + 1]
+  expect(made.slice(0, 7)).toEqual(['jira', 'workitem', 'create', '--project', 'KAN', '--type', 'Bug'])
+  expect(flag('--summary')).toMatch(/^G2-1 Critical \[P1\] .* \(#1, feat\/x\)$/)
+  expect(flag('--label')).toBe('security,severity-P1')
+  expect(made.at(-1)).toBe('--json')
+  // The body went through a file in git's directory, never on the command line, and the file is gone.
+  expect(flag('--description-file')).toBe('/repo/.git/pr-gate-jira-G2-1.txt')
+  expect(w.written.map(one => one.path)).toEqual(['/repo/.git/pr-gate-jira-G2-1.txt'])
+  const body = w.written[0]?.text ?? ''
+  expect(body).toContain('Severity: Critical [P1], security.')
+  expect(made.some(one => one.includes('needs a key rotation'))).toBe(false)
+  expect(w.acli.tickets[0]?.description).toBe(body)
+  expect(w.files.size).toBe(0)
+  // Never a public GitHub issue.
+  expect(w.gh.filed).toEqual([])
+  expect(w.prompts.at(-1)).toContain("G2-1 → KAN-512 Critical [P1], waiting for the person's waiver")
+  expect((await say($, 'status')).text).toContain('G2-1 → KAN-512 Critical [P1], waiting for your waiver.')
+  // The next pass files no second ticket.
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+})
+
+test('A9.7: without jiraProject, no acli call is made and the security deferral waits for the person as before', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w, false)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.acli.calls).toEqual([])
+  expect(w.written).toEqual([])
+  expect(w.gh.filed).toEqual([])
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBeUndefined()
+  expect(rec.postStatus).toBe('awaiting-decision')
+})
+
+test('A9.7: acli unauthorized holds the finding with its words and tells the person once to log in; a later pass files the ticket', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'unauthorized'
+  await toSecurityDeferral($, w)
+  const held = await recordOf(w)
+  const g = held.findings.find(one => one.id === 'G2-1')
+  expect(g?.jiraTicket).toBeUndefined()
+  expect(g?.jiraError).toBe("unauthorized: use 'acli [product] auth login' to authenticate")
+  expect(held.isJiraLoginSaid).toBe(true)
+  const logins = (): string[] => w.toasts.filter(one => one.includes('acli jira auth login'))
+  expect(logins()).toHaveLength(1)
+  expect(logins()[0]).toContain('could not file the Jira ticket of security finding G2-1 (unauthorized')
+  expect(w.prompts.at(-1)).toContain("Jira tickets not filed, retried on the gate's next pass: G2-1 (unauthorized")
+  expect(w.gh.filed).toEqual([])
+  // The second pass fails again, and says nothing new to the person.
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(2)
+  expect(logins()).toHaveLength(1)
+  // Logged in: the third pass searches Jira first (an earlier answer may have been lost), finds nothing, and files the ticket.
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(3)
+  expect(w.acli.calls.filter(one => one[2] === 'search')).toHaveLength(2)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(logins()).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: acli missing, or a description that cannot be written, holds the finding with the words; never a stop or a GitHub issue', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'missing'
+  await toSecurityDeferral($, w)
+  // The spawn rejected (the test host names no ENOENT of its own): the rejection's words are kept, and the gate goes on.
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toBeDefined()
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraTicket).toBeUndefined()
+  // The body file is removed even though acli never ran.
+  expect(w.files.size).toBe(0)
+  w.acli.create = 'ok'
+  w.isWriteBroken = true
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toContain("could not write the ticket's description to /repo/.git/pr-gate-jira-G2-1.txt")
+  expect(creates(w)).toHaveLength(1)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.toasts.filter(one => one.includes('acli jira auth login'))).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: a lost create answer, then a retry: Jira is searched and the ticket found, so there is no second create; a failed search files nothing', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'lost'
+  await toSecurityDeferral($, w)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('context deadline exceeded')
+  expect(w.acli.tickets).toHaveLength(1)
+  w.acli.create = 'ok'
+  // A search that fails files nothing this pass.
+  w.acli.search = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('could not search Jira for a ticket a lost answer filed: Error: the Jira site answered 502')
+  w.acli.search = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  const search = w.acli.calls.filter(one => one[2] === 'search').at(-1) ?? []
+  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\""')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
+  expect(rec.log?.some(one => one.text.startsWith('G2-1: found Jira KAN-512, filed by an answer acli lost'))).toBe(true)
+})
+
+test('A9.7: a website merge with the ticket filed archives the record and tells the person the finding and its ticket', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.prompts.at(-1)).toContain('Security findings still holding at the merge, tracked by their Jira tickets, which never settle them: G2-1 → KAN-512 Critical [P1].')
+  expect(w.prompts.at(-1)).toContain('Tell the person now')
+  expect(w.toasts.at(-1)).toContain('merged with security findings tracked in Jira, not settled: G2-1 → KAN-512 Critical [P1]')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira KAN-512 exists after the merge')).toBe(true)
+  expect(creates(w)).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: a security finding still open at a website merge gets its ticket there and archives; one acli cannot file blocks as before', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged in plain text' })])
+  w.git.roster = JIRA
+  w.acli.create = 'unauthorized'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('with a security finding still holding that no ticket tracks: G2-3 [P1]')
+  expect(held.findings.find(one => one.id === 'G2-3')?.jiraError).toContain('unauthorized')
+  expect(w.gh.filed).toHaveLength(1)
+  // Logged in, and the record blocked only on security is not the watcher's: the person's /pr-gate resume runs the close again.
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  const f = archivedOf(w)?.findings.find(one => one.id === 'G2-3')
+  expect(f?.jiraTicket).toBe('KAN-512')
+  const made = creates(w).at(-1) ?? []
+  expect(made[made.indexOf('--summary') + 1]).toBe('G2-3 Critical [P1] Token logged in plain text (#1, feat/x)')
+  expect(w.prompts.at(-1)).toContain('G2-3 → KAN-512 Critical [P1]')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('A9.7: after the merge a ticket Jira says does not exist is filed again; an acli read that fails blocks the record until it reads', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  // Deleted in Jira before the merge.
+  w.acli.tickets = []
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(creates(w)).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-513')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira KAN-512 is gone; filed Jira KAN-513')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('G2-1 → KAN-513 Critical [P1]')
+})
+
+test('A9.7: after the merge an acli read that fails, or is unauthorized, blocks the record and files nothing; the next beat archives it', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  w.acli.view = 'unauthorized'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain("could not confirm the follow-up issue of G2-1 (could not read Jira KAN-512: unauthorized: use 'acli [product] auth login'")
+  expect(creates(w)).toHaveLength(1)
+  w.acli.view = 'fail'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).message).toContain('could not read Jira KAN-512: Error: the Jira site answered 502')
+  expect(creates(w)).toHaveLength(1)
+  w.acli.view = 'ok'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(creates(w)).toHaveLength(1)
+})

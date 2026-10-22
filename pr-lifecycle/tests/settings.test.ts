@@ -438,3 +438,14 @@ test('R95: mergeWatchMinutes paces the merge watcher; 5 by default, 0, "x" or an
     )
   }
 })
+
+test('A9.7: jiraProject names the Jira project of security tickets; none by default, and anything but a project key is ignored', async () => {
+  expect(configOf({}).jiraProject).toBeUndefined()
+  expect(overrideConfig(configOf({}), '{"jiraProject":"KAN"}').config.jiraProject).toBe('KAN')
+  expect(overrideConfig(configOf({}), '{"jiraProject":"SEC2"}').config.jiraProject).toBe('SEC2')
+  for (const one of ['"kan"', '"K"', '"KAN-1"', '""', '7', '"KAN AND x"']) {
+    const bad = overrideConfig(configOf({}), `{"jiraProject":${one}}`)
+    expect(bad.config.jiraProject).toBeUndefined()
+    expect(bad.ignored).toEqual(['jiraProject (not a Jira project key such as KAN)'])
+  }
+})

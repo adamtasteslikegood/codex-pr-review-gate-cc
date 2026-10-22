@@ -740,6 +740,16 @@ export const isSettledByIssue = (f: Finding): boolean =>
   isFollowUpRef(f.followUp) &&
   f.followUpLabel === filingPeak(f)
 
+/**
+ * A security finding whose Jira ticket the filing pass owes where the base sets `jiraProject` (spec §5.13.7): one the review left
+ * waiting for the person, as `isFileable` names the rest (open, deferred with Codex's agreement, or disputed; not a linked duplicate).
+ */
+export const isTicketable = (f: Finding): boolean =>
+  f.isSecurity === true && !isLinked(f) && !isLinkOwed(f) && (f.status === 'open' || isDeferralAgreed(f) || isDisputed(f))
+
+/** A security finding's Jira ticket as the hold list and status name it: "S2-1 → KAN-512 Critical [P1]" (spec §5.13.7). */
+export const ticketLine = (f: Finding): string => `${f.id} → ${f.jiraTicket ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
+
 /** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
 export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
 
@@ -827,9 +837,10 @@ export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): 
 
 /**
  * Security findings that hold the merge with nothing tracking them (spec §5.13.2): a merge outside the gate leaves the record blocked
- * on each until the person's waiver. Every holding security finding, for now; Task 19 lets a Jira ticket track one.
+ * on each until the person's waiver. One with a Jira ticket is tracked (§5.13.7): it still holds, but no longer blocks the archive.
  */
-export const untrackedSecurity = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] => mergeHolds(rec).filter(one => one.isSecurity === true)
+export const untrackedSecurity = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] =>
+  mergeHolds(rec).filter(one => one.isSecurity === true && one.jiraTicket === undefined)
 
 /**
  * What a merge outside the gate files (spec §5.13.1): every finding still holding the merge, whatever its status, but security and
@@ -865,8 +876,12 @@ const issueFailure = (f: Finding): string => `could not file an issue for ${f.id
 
 /** One finding that holds the merge, as a blocker with its owner and the step that clears it (R79). Never the reviewer's own words (gate R2-3). */
 function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
-  const tag = `${f.id}${also.length === 0 ? '' : ` (also ${also.join(', ')})`} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
+  // A security finding's Jira ticket tracks it, never settles it (spec §5.13.7): named, and so is a filing that failed.
+  const jira = f.isSecurity !== true ? '' : f.jiraTicket !== undefined ? ` → ${f.jiraTicket}` : f.jiraError !== undefined ? ` (Jira ticket not filed: ${f.jiraError})` : ''
+  const tag = `${f.id}${also.length === 0 ? '' : ` (also ${also.join(', ')})`}${jira} [${f.severity}]${f.isSecurity === true ? ' security' : ''} ${titleOf(f)}`
   const waive = `/pr-gate waive ${f.id} <reason>`
+  const theirs = (kind: 'disputed' | 'deferred' | 'security-p1', what: string): Blocker =>
+    ({ kind, id: f.id, said: f.jiraTicket !== undefined && f.isSecurity === true ? `${ticketLine(f)}, waiting for your waiver` : `${tag}: ${what}`, owner: 'person', release: waive })
   const isSecurityP1 = isBlocking(f) && f.isSecurity === true
   // The filing pass failed for it (R92): the agent checks gh; the gate retries on its next pass.
   if (isFileable(f) && f.issueError !== undefined) return { kind: 'issue-failed', id: f.id, said: issueFailure(f), owner: 'agent', release: issueRelease(f.id) }
@@ -876,14 +891,14 @@ function blockerOf(f: Finding, also: readonly string[] = []): Blocker {
   if (isLinkOwed(f)) {
     return { kind: 'link-unchecked', id: f.id, said: `${tag}: linked to ${f.duplicateOf ?? '?'}, Codex has not checked the link`, owner: 'codex', release: "the gate's Codex check rules on it" }
   }
-  if (isDisputed(f)) return isFileable(f) ? issueOwed('disputed') : { kind: 'disputed', id: f.id, said: `${tag}: disputed`, owner: 'person', release: waive }
+  if (isDisputed(f)) return isFileable(f) ? issueOwed('disputed') : theirs('disputed', 'disputed')
   if (f.status === 'deferred') {
     if (isDeferralOwed(f)) {
       return { kind: 'deferral-unchecked', id: f.id, said: `${tag}: deferred, Codex has not checked the deferral`, owner: 'codex', release: "the gate's Codex check rules on it" }
     }
     if (isFileable(f)) return issueOwed('deferred, and Codex agreed it cannot reasonably be fixed in this PR')
   }
-  if (f.status === 'deferred') return { kind: isSecurityP1 ? 'security-p1' : 'deferred', id: f.id, said: `${tag}: deferred`, owner: 'person', release: waive }
+  if (f.status === 'deferred') return theirs(isSecurityP1 ? 'security-p1' : 'deferred', 'deferred')
   if (isReverifyOwed(f)) {
     return { kind: 'reverify-owed', id: f.id, said: `${tag}: fixed, re-verify owed (file changed)`, owner: 'codex', release: "the gate's Codex check re-verifies it" }
   }
@@ -1305,13 +1320,21 @@ export const isFilingPoint = (next: Next): boolean =>
 /** One issue the filing pass owes: a new one, or the one the agent named (`reuse`), labelled `severity:<peak>`. */
 export type IssueItem = { id: string; peak: Severity; followUp?: string; reuse?: { repo: string; number: number }; title: string; body: string }
 
-export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[] }
+/**
+ * One Jira ticket the filing pass owes a security finding (spec §5.13.7): its summary and description are the issue's title and body.
+ * `isRetry`: the last attempt failed, perhaps after Jira filed it, so Jira is searched for it before another is filed.
+ */
+export type TicketItem = { id: string; peak: Severity; title: string; body: string; isRetry: boolean }
+
+/** `tickets` only where the base sets `jiraProject` and a security finding still owes its ticket. */
+export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[]; tickets?: TicketItem[] }
 
 /**
  * What the filing pass does (R92, spec §5): nothing before the PR or short of a filing point; else a round for a late blocker
- * (`gateGrant`); else an issue for each held finding it files (`isFileable`).
+ * (`gateGrant`); else an issue for each held finding it files (`isFileable`). `isJira`: the base sets `jiraProject`, and each security
+ * finding left waiting for the person (`isTicketable`), or every one still holding at a merge, that has no ticket gets one (§5.13.7).
  */
-export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merged?: MergeKind): IssuePlan {
+export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merged?: MergeKind, isJira = false): IssuePlan {
   const isMerged = merged !== undefined
   if (isMerged) {
     // The PR merged outside the gate (spec §5.13.1): no round can run, so no grant; every finding still holding is filed now.
@@ -1334,7 +1357,15 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merg
         body: issueBody(f, rec, merged),
       }
     })
-  return items.length === 0 ? { kind: 'none' } : { kind: 'file', items }
+  const tickets = !isJira
+    ? []
+    : mergeHolds(rec)
+      .filter(f => (isMerged ? f.isSecurity === true : isTicketable(f)) && f.jiraTicket === undefined)
+      .map((f): TicketItem => ({
+        id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, spec), body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
+      }))
+  if (items.length === 0 && tickets.length === 0) return { kind: 'none' }
+  return { kind: 'file', items, ...(tickets.length === 0 ? {} : { tickets }) }
 }
 
 // -------------------------------------------------------------------- log

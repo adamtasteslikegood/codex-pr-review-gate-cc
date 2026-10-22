@@ -31,6 +31,7 @@ import {
   rescope,
   securityHolds,
   logSummary,
+  ticketLine,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -889,9 +890,12 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
   const note = scopeNote(rec)
+  // A security finding's Jira ticket tracks it and never settles it (spec §5.13.7): named with the waiver it still waits for.
+  const tickets = mergeHolds(rec).filter(one => one.isSecurity === true && one.jiraTicket !== undefined)
   const settled = rec.findings
     .filter(isSettledByIssue)
     .map(one => ` ${issueLine(one)}.`)
+    .concat(tickets.map(one => ` ${ticketLine(one)}, waiting for your waiver.`))
     .concat(note === undefined ? [] : [` ${note}`])
     .join('')
   return (

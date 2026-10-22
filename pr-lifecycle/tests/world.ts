@@ -175,6 +175,30 @@ export type World = {
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
     onChecks?: () => void | Promise<void>
   }
+  /**
+   * The `acli` fake (spec §5.13.7): Jira's work items as `acli jira workitem create|view|search --json` reads and makes them. Each
+   * knob is 'ok' (the default), 'fail' (acli's error), 'unauthorized' (not logged in) or 'missing': acli is not installed, so the
+   * spawn throws; for `view`, the ticket does not exist. `create` may also be 'lost': Jira files the ticket, but the answer is a timeout.
+   */
+  acli: {
+    create?: 'ok' | 'fail' | 'unauthorized' | 'missing' | 'lost'
+    view?: 'ok' | 'fail' | 'unauthorized' | 'missing'
+    search?: 'ok' | 'fail' | 'unauthorized' | 'missing'
+    /** Every acli call: its argv after `acli`, in order. */
+    calls: string[][]
+    /** Every ticket the fake's create filed: `view` answers for these, and a key not here does not exist. */
+    tickets: { key: string; summary: string; labels: string[]; description: string }[]
+    /** The number of the next ticket (default 512). */
+    next?: number
+  }
+  /** The files `$.fs.write` wrote that no `rm -f` removed since, by path. */
+  files: Map<string, string>
+  /** Every `$.fs.write`, in order, whether removed since or not. */
+  written: { path: string; text: string }[]
+  /** `$.fs.write` fails, as a full disk or a missing directory would. */
+  isWriteBroken?: boolean
+  /** Every toast the mod showed the person, in order. */
+  toasts: string[]
   /** A stand-in engine for calling the mod's async helpers directly: its `process.run` is the fake `gh` and `git`. */
   engine: never
   /** The run as the mod last wrote it. */
@@ -274,6 +298,10 @@ export function world(on: On): World {
       reopened: [],
       requests: [],
     },
+    acli: { calls: [], tickets: [] },
+    files: new Map(),
+    written: [],
+    toasts: [],
     store: new Map(),
     stored: (key: string) => w.store.get(key),
     clock,
@@ -484,6 +512,41 @@ export function world(on: On): World {
       }
       return out('')
     }
+    // The Jira CLI (spec §5.13.7): its answers as acli gives them, `--json`.
+    if (e.argv[0] === 'acli') {
+      w.acli.calls.push(e.argv.slice(1))
+      const verb = e.argv[3]
+      const knob = verb === 'create' ? w.acli.create : verb === 'view' ? w.acli.view : verb === 'search' ? w.acli.search : undefined
+      const fail = (stderr: string) => ({ value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+      const flag = (name: string): string => e.argv[e.argv.indexOf(name) + 1] ?? ''
+      if (knob === 'missing' && verb !== 'view') throw new Error('spawn acli ENOENT')
+      if (knob === 'unauthorized') return fail("unauthorized: use 'acli [product] auth login' to authenticate")
+      if (knob === 'fail') return fail('Error: the Jira site answered 502 Bad Gateway')
+      if (verb === 'create') {
+        const n = w.acli.next ?? 512
+        w.acli.next = n + 1
+        const key = `${flag('--project')}-${n}`
+        w.acli.tickets.push({ key, summary: flag('--summary'), labels: flag('--label').split(','), description: w.files.get(flag('--description-file')) ?? '' })
+        if (knob === 'lost') return fail('Post "https://example.atlassian.net/rest/api/3/issue": context deadline exceeded')
+        return out(JSON.stringify({ key, id: String(10_000 + n), self: `https://example.atlassian.net/rest/api/3/issue/${10_000 + n}` }))
+      }
+      if (verb === 'view') {
+        const key = e.argv[4] ?? ''
+        const one = knob === 'missing' ? undefined : w.acli.tickets.find(each => each.key === key)
+        if (one === undefined) return fail(`Error: work item ${key} does not exist or you do not have permission to see it`)
+        return out(JSON.stringify({ key, fields: { summary: one.summary, status: { name: 'To Do' } } }))
+      }
+      if (verb === 'search') {
+        const id = /\\"([^"\\]+)\\"/.exec(flag('--jql'))?.[1] ?? ''
+        return out(JSON.stringify(w.acli.tickets.filter(one => one.summary.includes(id)).map(one => ({ key: one.key, fields: { summary: one.summary } }))))
+      }
+      return fail(`Error: unknown command ${args}`)
+    }
+    if (e.argv[0] === 'rm') {
+      for (const one of e.argv.slice(2)) w.files.delete(one)
+      return out('')
+    }
+    if (args.startsWith('rev-parse --absolute-git-dir')) return out('/repo/.git\n')
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
       await w.git.onFetch?.()
@@ -545,10 +608,20 @@ export function world(on: On): World {
     return out('')
   }
   on('process.run', async (_$, e) => fake(e))
+  const write = (path: string, text: string): void => {
+    if (w.isWriteBroken === true) throw new Error(`ENOENT: no such file or directory, open '${path}'`)
+    w.written.push({ path, text })
+    w.files.set(path, text)
+  }
+  on('fs.write', (_$, e) => {
+    write(e.path, e.text)
+    return { value: undefined }
+  })
   // The tests' own `$` has no `process`, and the host refuses it to a module that never calls it: this engine stand-in runs the same fake.
   w.engine = {
     process: { run: async (argv: readonly string[], init?: { cwd?: string }) => (await fake({ argv, init })).value },
     clock: { now: async () => now },
+    fs: { write: async (path: string, text: string) => write(path, text) },
     // The same store the mod's own engine reads: a helper that notes something on the record writes where the test reads it.
     store: {
       get: async (key: string) => w.store.get(key),
@@ -586,7 +659,10 @@ export function world(on: On): World {
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => {
+    w.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: w.sessionId }))
