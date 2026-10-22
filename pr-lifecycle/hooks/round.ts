@@ -1087,16 +1087,21 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     let security: Finding[] = []
     let why = ''
     let failed = done.failed
+    // Each hold as the check left it: one that holds now and did not then, or holds with another status or follow-up, was saved
+    // while gh ran (wave 2b gate R3-3, R4-3), whether it needs filing or names an issue the check never read.
+    const holdOf = (f: Finding): string => `${f.id}|${f.status}|${f.followUp ?? ''}`
+    const checkedHolds = new Set(mergeHolds({ findings: done.findings, waivers: filed.waivers }).map(holdOf))
     const saved = await updateRecord($, root, branch, latest => {
       isGone = isMovedFrom(rec, latest)
       if (isGone) return latest
       const findings = apply(latest)
       const log = [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP)
       security = untrackedSecurity({ ...latest, findings })
-      // A finding saved while gh ran, after the filing pass read the record, holds with no issue: a failed check, never an archive
-      // (wave 2b gate R3-3). The next check files it. With a failure already named, that check runs anyway.
-      const late = done.failed.length === 0 ? mergeHolds({ ...latest, findings }).filter(isMergeFileable) : []
-      failed = [...done.failed, ...late.map(f => `${f.id} (saved while the merge was checked; it is filed on the next check)`)]
+      // A finding saved while gh ran, after the filing pass read the record, holds unchecked: a failed check, never an archive (wave
+      // 2b gate R3-3, R4-3). The next check files it, or reads the issue it names. With a failure already named, that check runs anyway.
+      const late = done.failed.length === 0 ? mergeHolds({ ...latest, findings }).filter(f => f.isSecurity !== true && !checkedHolds.has(holdOf(f))) : []
+      const next = (f: Finding): string => (isMergeFileable(f) ? 'it is filed on the next check' : 'its issue is checked on the next check')
+      failed = [...done.failed, ...late.map(f => `${f.id} (saved while the merge was checked; ${next(f)})`)]
       const named = security.map(f => `${f.id} [${f.severity}] ${titleOf(f)}`)
       why = [
         ...(failed.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${failed.join('; ')}`]),
