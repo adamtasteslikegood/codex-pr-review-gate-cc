@@ -1052,6 +1052,9 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       } else {
         filed = got
         for (const f of mergeHolds(filed).filter(isMergeFileable)) unfiled.push(`${f.id} (could not file its issue: ${f.issueError ?? 'the filing stopped before it'})`)
+        // A Jira ticket that failed is a failed check too (wave 2b gate R1-8): the watcher and a resume file it again, so a fix of
+        // acli's login, or Jira back up, releases the record without the person's waiver.
+        if (isJira) for (const f of untrackedSecurity(filed)) if (f.jiraError !== undefined) unfiled.push(`${f.id} (could not file its Jira ticket: ${f.jiraError})`)
       }
     }
     // §5.12's check runs even when a filing failed: both run in this close, and either failing blocks the record.
@@ -1113,7 +1116,8 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
           ? []
           : [
               `A security finding is never filed as a public issue, so the lifecycle of ${branch} stays open on ${security.map(f => f.id).join(', ')}. Tell the person ` +
-                `now: only their ${security.map(f => `/pr-gate waive ${branch}:${f.id} <reason>`).join(', ')}, from this worktree, releases ` +
+                `now: ${isJira ? 'the gate files its Jira ticket again on each check (fix acli\'s login if that is what failed), and a filed ticket releases it; otherwise ' : ''}` +
+                `only their ${security.map(f => `/pr-gate waive ${branch}:${f.id} <reason>`).join(', ')}, from this worktree, releases ` +
                 `${security.length === 1 ? 'it' : 'them'}, and the gate then archives the lifecycle. Never type that command yourself.`,
             ]),
       ]
@@ -3457,6 +3461,24 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: Merge
 /** The branches whose filing pass `fileIssues` runs now, as `<root>\0<branch>`. */
 const filing = new Set<string>()
 
+/** What a finding's issueError or jiraError says while its POST or acli create runs: only a crash before the answer's save leaves it. */
+const ISSUE_SENT = 'an issue was sent to GitHub, but its answer was not saved (the session may have ended); the next pass looks for it first'
+const TICKET_SENT = 'a ticket was sent to Jira, but its answer was not saved (the session may have ended); the next pass looks for it first'
+
+/**
+ * Marks a finding as filed-but-unanswered before the call that files it (wave 2b gate R1-10), unless an error is already there,
+ * which makes the next pass look first anyway. True when the lifecycle was reset or replaced: the caller files nothing.
+ */
+async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'issueError' | 'jiraError', text: string): Promise<boolean> {
+  let isGone = false
+  const saved = await updateRecord($, rec.root, rec.branch, latest => {
+    isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
+    if (isGone) return latest
+    return { ...latest, findings: latest.findings.map(f => (f.id !== id || f[field] !== undefined ? f : { ...f, [field]: text })) }
+  })
+  return saved === undefined || isGone
+}
+
 async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | undefined): Promise<LifecycleRecord | undefined> {
   if ((rec.phase === 'pre' && merged === undefined) || rec.pr === undefined) return rec
   const now = await $.clock.now()
@@ -3581,6 +3603,9 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
       got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }) }
       text = `${item.id}: found ${repo}#${found.number}, filed by an answer gh lost${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
     } else {
+      // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved leaves an issueError, so the next pass reads the
+      // list first and never files the issue twice. The answer's save below replaces it.
+      if (await markSent($, rec, item.id, 'issueError', ISSUE_SENT)) return undefined
       const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
       if (filed === undefined) {
@@ -3608,6 +3633,8 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (current === undefined || isMoved(current)) return undefined
     if (isWaived(current)) return current
     await restamp()
+    // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
+    if (await markSent($, rec, t.id, 'jiraError', TICKET_SENT)) return undefined
     const got = await fileTicket($, rec.root, project, t, rec.pr)
     let text =
       got.error === undefined
@@ -3861,6 +3888,8 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       continue
     }
     const body = issueBody(f, rec)
+    // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved makes the next check read the list first.
+    if (f.issueError === undefined && (await keep({ ...f, issueError: ISSUE_SENT }))) return { moved: true }
     const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close

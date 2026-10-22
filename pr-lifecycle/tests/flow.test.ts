@@ -6053,6 +6053,22 @@ test('wave 2b gate R1-5: an issue POST whose answer was lost is found by its tit
   expect(rec.phase).toBe('ready')
 })
 
+test('wave 2b gate R1-10: an issue POST is marked on the record before it is sent, so a crash before its answer looks first', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let during: string | undefined
+  w.gh.onIssue = async () => {
+    during = (await recordOf(w)).findings.find(one => one.id === 'G2-1')?.issueError
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(during).toContain('an issue was sent to GitHub, but its answer was not saved')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(w.gh.filed).toHaveLength(1)
+})
+
 test('wave 2b gate R1-5: a failed issue list after a lost answer files nothing and keeps the issueError; the next pass finds the issue', async ($, on) => {
   const w = world(on)
   w.gh.issueAnswer = 'lost'
@@ -6755,9 +6771,12 @@ test('A9.7: a security finding still open at a website merge gets its ticket the
   expect(held.message).toContain('with a security finding still holding that no ticket tracks: G2-3 [P1]')
   expect(held.findings.find(one => one.id === 'G2-3')?.jiraError).toContain('unauthorized')
   expect(w.gh.filed).toHaveLength(1)
-  // Logged in, and the record blocked only on security is not the watcher's: the person's /pr-gate resume runs the close again.
+  // A failed ticket is a failed check (wave 2b gate R1-8): the record stays the watcher's, and the message names the retry.
+  expect(held.message).toContain('merged, but the gate could not confirm the follow-up issue of G2-3 (could not file its Jira ticket: unauthorized')
+  expect(w.prompts.at(-1)).toContain('the gate files its Jira ticket again on each check')
+  // Logged in: the watcher's next read files the ticket and archives the record, with no resume and no waiver.
   w.acli.create = 'ok'
-  await say($, 'resume')
+  await w.clock.advance(WATCH_MS)
   await w.clock.advance(1000)
   expect((await recordOf(w)).phase).toBe('archived')
   const f = archivedOf(w)?.findings.find(one => one.id === 'G2-3')
