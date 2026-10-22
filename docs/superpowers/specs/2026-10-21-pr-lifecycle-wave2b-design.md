@@ -362,17 +362,40 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
          --summary <title> --description-file <body> --label
          security,severity-<peak> --json`, with the title and body of §5.6
          (the body names the PR, round and thread, and says the finding is
-         security). The record keeps the key as `followUp` (`KAN-512`), and
-         `followUpLabel` once the answer shows both labels. Bounded like
-         every gh call (30 s), never a wait.
+         security). The record keeps the key as `jiraTicket` (`KAN-512`),
+         not `followUp`: `followUp` is the agent's link to a GitHub issue
+         (R85) and settles a finding, and a ticket never does. The ticket's
+         labels are not checked after filing. Bounded like every gh call
+         (30 s), never a wait. Before it files again after an error, the
+         gate searches Jira for a ticket with the same summary and reuses
+         it.
        - **Failure.** acli missing, not authenticated, or refusing: the
-         finding holds with acli's words, the person is told once to run
-         `acli jira auth login`, and the next pass retries. Never a stop,
-         never a GitHub issue in its place.
+         finding holds with acli's words, the person is told once (install
+         acli, or run `acli jira auth login`), and the next pass retries.
+         Never a stop, never a GitHub issue in its place.
        - **After the merge.** §5.12's check reads each ticket with `acli
          jira workitem view <key> --json`. An existing ticket is logged,
          whatever its status. A missing one is filed again. Any other failed
-         read blocks the record, as for a GitHub issue.
+         read blocks the record, as for a GitHub issue. At a merge outside
+         the gate, a finding with a ticket counts as tracked (item 2).
+    8. **A merge under `waive post` files too.** A post waiver covers a
+       head's review, not the findings left holding. A merge under it,
+       whether on the website or by the agent, files an issue for each
+       non-security finding still holding. The body names the post waiver
+       and its reason instead of the no-fix-round line: "PR #n merged under
+       the person's post waiver (/pr-gate waive post): <reason>. No fix
+       round ran on this finding." Security is as in item 2.
+    9. **A finding the person waived by id is not filed.** The waiver was
+       the person's decision about that finding. Only findings still
+       holding are filed.
+    10. **The qualified waive.** A security finding that blocks a merged
+        lifecycle may belong to a branch that is not checked out.
+        `/pr-gate waive <branch>:<id> <reason>` names the branch. An
+        unqualified `/pr-gate waive <id>` that matches a finding on the
+        checked-out branch and a blocked merged lifecycle elsewhere, or
+        several blocked lifecycles, is refused. The refusal names each one
+        with its qualified command, and nothing is written. An id that only
+        one blocked lifecycle has falls through to that lifecycle.
 
 ## 6. The agent merges (decision N)
 

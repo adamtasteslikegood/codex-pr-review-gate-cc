@@ -217,6 +217,9 @@ Serves goal 2. Makes the gate legible and reachable from anywhere.
    other comments under that login still reach triage (R64).
 5. **Announce background work (finding 23).** The pane names the Codex
    verification and final-head sub-agents while they run.
+6. **Prevent merges outside the gate.** A required `pr-gate` commit status in
+   the `main` ruleset (pending until ready), with the merge link. Since 1.5.0
+   the gate sees such a merge and files what still held (R95); this stops it.
 
 ## Wave 4 and later: findings that are never lost, and the exhausted decision
 
@@ -226,6 +229,8 @@ Serves goals 3 and 4. It starts once waves 1-3 run live without errors.
   - An unresolved finding becomes a Jira ticket where the repo has a Jira
     project, and a GitHub issue otherwise.
   - The ticket is linked back from the PR thread.
+  - Security findings already go to Jira since 1.5.0 (R95), where
+    `jiraProject` is set. The rest follow in wave 4.
 - **Redefine "exhausted"** to fit how rounds actually run once the loop is
   smooth.
 - **At exhaustion,** the gate either blocks the merge or allows it with an issue

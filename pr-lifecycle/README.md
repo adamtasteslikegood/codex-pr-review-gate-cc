@@ -314,7 +314,9 @@ overrides; the mod never falls back to HEAD.
   "rereviewEffort": "low",
   "runnerModel": "sonnet",
   "mergeMethod": "merge",
-  "issueSpec": "docs/spec.md"
+  "issueSpec": "docs/spec.md",
+  "mergeWatchMinutes": 5,
+  "jiraProject": "KAN"
 }
 ```
 
@@ -330,8 +332,12 @@ letters, digits, dots and dashes, starting with a letter or digit, where `""`
 names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
 `rereviewEffort`) are `low`, `medium` or `high` (see Models and effort).
 `mergeMethod` is `merge` (default), `squash` or `rebase`. `issueSpec` is a
-spec handle, cut to 80 characters, named in each filed issue's title. Both are
-read from the base's file only.
+spec handle, cut to 80 characters, named in each filed issue's title.
+`mergeWatchMinutes` is how often the gate reads the PR state of a record with
+no run, a whole number of minutes from 1 to 60 (default 5; see Merged outside
+the gate). `jiraProject` is a Jira project key such as `KAN`; with it set, a
+security finding gets a Jira Bug through `acli` (see Merged outside the gate).
+All four are read from the base's file only.
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
@@ -616,7 +622,7 @@ transcript or above the prompt, depending on the host.
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now, or with no record the repository's default branch (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
 | `/pr-gate waive post <reason>` | let this head merge without the review, and stop the post-PR review in flight; a security P1 needs its own waiver first |
-| `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test; the usual case is a finding the gate cannot file, a security one (R92) |
+| `/pr-gate waive [<branch>:]<findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test; the usual case is a finding the gate cannot file, a security one (R92). `<branch>:` names a merged lifecycle of another branch whose security finding blocks its archive; an id that matches more than one lifecycle is refused, and the refusal names each with its qualified command |
 | `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds |
 | `/pr-gate reset` | archive the record under its own key, history kept, and start fresh |
 
@@ -631,13 +637,36 @@ poll, the triage step, a session start, `/pr-gate` or `resume` reads it merged
 or closed, the run in flight stops and the record is archived. Collection does
 not start again for it.
 
+### Merged outside the gate
+
+A person on GitHub's website, a connector, or a merge under `waive post` can
+merge a PR at any point of its lifecycle. The gate sees it without a command.
+A watcher reads the PR state of every record with a PR and no run every
+`mergeWatchMinutes`, and a session start reads every record under the
+repository's root, not only the checked-out branch. Then the close files a
+GitHub issue for each non-security finding still holding. The body says no fix
+round ran, or names the post waiver and its reason. A finding the person
+waived by id is not filed.
+
+A security finding is never filed in a GitHub issue. With `jiraProject` set,
+it gets a Jira Bug through `acli`, labelled `security` and `severity-P<n>`.
+The ticket tracks the finding and never settles it: before a merge, only the
+person's waiver releases it. At a merge outside the gate, a finding with a
+ticket counts as tracked and the record is archived. One with no ticket blocks
+the record until the person runs `/pr-gate waive <id>`, or
+`/pr-gate waive <branch>:<id> <reason>` from another checkout. After the
+merge the ticket is viewed and filed again if it is missing. If `acli` fails,
+the finding holds, with one notice: install `acli`, or log in with
+`acli jira auth login`. A required `pr-gate` status that would stop such a
+merge is on the roadmap (wave 3).
+
 ## Options
 
 Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
 repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
 `allowanceHigh`, `allowanceLight`, `onExhausted`, `highRiskPaths`, `lightBranches`,
 `waitCapMinutes`, `quietMinutes`, the four models and the four efforts (see
-Settings per repository); `mergeMethod` and `issueSpec` are set there only:
+Settings per repository); `mergeMethod`, `issueSpec`, `mergeWatchMinutes` and `jiraProject` are set there only:
 
 | Option | Default | |
 | --- | --- | --- |

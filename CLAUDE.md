@@ -29,13 +29,14 @@ the project's goals and their order.
   When the review can do no more, it files a GitHub issue for each finding
   still holding the merge, except security (R92), and once nothing holds the
   merge, the agent merges (R93). The GitHub issue queue is Adam's list of what
-  to fix, highest severity first.
+  to fix, highest severity first. A merge outside the gate files what still
+  held, and security findings go to Jira where `jiraProject` is set (R95).
   Per-repo settings live in `.github/pr-gate.json`, read from the base
   branch, never the PR's HEAD:
   - Design: `docs/superpowers/specs/2026-10-16-pr-lifecycle-design.md`.
   - Every ruling made while building it, R1–R66, Adam's rulings on
     codex-gate's deferred items R1-5 to R1-10, R67–R70 after 1.0.0,
-    R71–R78 after the first live run, R79–R87 in wave 2a, and R88–R94 in
+    R71–R78 after the first live run, R79–R87 in wave 2a, and R88–R95 in
     wave 2b:
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it. The goals are in
@@ -101,7 +102,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 629)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 666)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four
