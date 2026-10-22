@@ -158,3 +158,6 @@ Task 15: complete (b69a7f8, 9e1b3c4)
 Task 16: dispatching (opus): rulings R88-R94 + every ledger ruling (incl. A5, A8), README/LIFECYCLE_SPEC/ROADMAP/CLAUDE.md, version 1.5.0.
 Task 16: implemented 06ca87b (+report efed907), 619+22 pass, validate/lint/typecheck clean; ruling texts adjusted to the as-built behaviour (A8 in R88, A1-A3/A9 in R90, refile-only-missing in R92, as-built merge step in R93). Task review (sonnet) dispatched.
 - Task 16 review (sonnet): spec ✅ (28/28 ledger rulings recorded, A1-A9, version x3, counts). Needs fixes: post-merge check described stricter than code (a failed reopen refiles; blocks only if the refile fails too); README 'names the person only for security' overstates (head-unreviewed at exhaustion, retarget, unfileable disputes/deferrals). Minors: ROADMAP 2b numbering gap; Wave 3 item 4 overlaps R91; CLAUDE.md Git line names codex-gate as PR-create holder. Fix round 1 sent (all five).
+- Task 16 fix round 1: 492056c (+report 4a88aee); controller checked the README diff against round.ts/lifecycle.ts: matches.
+Task 16: complete (06ca87b, 492056c)
+All tasks complete. Final whole-branch review next (opus), carrying every deferred minor in this ledger.
