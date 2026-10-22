@@ -163,6 +163,9 @@ const bash = (command: string) => readPrAction('Bash', { command })
 test('gh pr create and gh pr merge, with and without a number or --auto', async () => {
   expect(bash('gh pr create --base dev --title x')).toMatchObject({ action: 'create', base: 'dev', via: 'gh pr create' })
   expect(bash('cd /repo && gh pr merge 12 --squash')).toMatchObject({ action: 'merge', number: 12, cwd: '/repo' })
+  // The merge step pins the reviewed head (wave 2b gate R2-4): the sha is the flag's value, never read as the PR.
+  expect(bash('gh pr merge 12 --merge --match-head-commit 0123abc')).toMatchObject({ action: 'merge', number: 12 })
+  expect(bash('gh pr merge --match-head-commit 0123abc 12 --merge')).toMatchObject({ action: 'merge', number: 12 })
   expect(bash('gh pr merge --auto --squash')).toMatchObject({ action: 'merge', number: undefined })
   expect(bash('gh pr merge https://github.com/me/repo/pull/9')).toMatchObject({ action: 'merge', number: 9 })
   expect(bash('gh pr view 12')).toBeUndefined()

@@ -878,8 +878,9 @@ export function prPrompt(run: Run, rec: LifecycleRecord, status: 'passed' | 'exh
  * A closing keyword (Closes, Fixes, Resolves #n) in the PR, a commit or the merge would close a follow-up issue on merge; the gate's
  * own issue text never has one, and the agent is told not to write one. The post-merge check (Task 15) reopens any that closed anyway.
  */
-export const mergeStep = (pr: number | undefined, method: MergeMethod): string =>
-  `merge it now with gh pr merge ${pr ?? '<n>'} --${method} and tell the person the merge commit; ` +
+export const mergeStep = (pr: number | undefined, method: MergeMethod, head?: string): string =>
+  // The reviewed head is pinned where it is known (wave 2b gate R2-4): a push between the checks and the merge makes GitHub refuse it.
+  `merge it now with gh pr merge ${pr ?? '<n>'} --${method}${head === undefined || head === '' ? '' : ` --match-head-commit ${head}`} and tell the person the merge commit; ` +
   `if the merge guard holds it for checks still running, wait for them (gh pr checks ${pr ?? '<n>'} --watch) and merge again; ` +
   "never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, " +
   'and the gate checks them after the merge; ' +
@@ -897,7 +898,7 @@ export function readyPrompt(rec: LifecycleRecord, method: MergeMethod = 'merge')
     settled.length === 0 ? 'no follow-up issues' : `follow-up issues: ${settled.map(issueLine).join('; ')}`,
   ].join('; ')
   const note = scopeNote(rec)
-  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. ${note === undefined ? '' : `${note} `}No review finding holds the merge: ${mergeStep(rec.pr, method)}.`
+  return `pr-gate: the lifecycle review of PR #${rec.pr} is complete at ${rec.head.slice(0, 7)}: ${summary}. ${note === undefined ? '' : `${note} `}No review finding holds the merge: ${mergeStep(rec.pr, method, rec.head)}.`
 }
 
 /**

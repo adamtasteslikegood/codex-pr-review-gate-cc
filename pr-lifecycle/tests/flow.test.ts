@@ -838,7 +838,18 @@ test('a clean first post-PR round does not force a second', async ($, on) => {
   await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')
+  // The step pins the reviewed head (wave 2b gate R2-4).
+  expect(w.prompts.at(-1)).toContain(`gh pr merge 1 --merge --match-head-commit ${(await recordOf(w)).head} and`)
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+
+test('wave 2b gate R2-4: the merge guard lets the ready prompt\'s pinned merge command through', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const head = (await recordOf(w)).head
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: `gh pr merge 1 --merge --match-head-commit ${head}` }))).toBe(false)
 })
 
 test('another agent pushing during triage makes the PR head the round\'s end head', async ($, on) => {
@@ -6093,6 +6104,31 @@ test('wave 2b gate R1-5: a failed issue list after a lost answer files nothing a
   expect(rec.phase).toBe('ready')
 })
 
+test('wave 2b gate R2-2, R2-6: the issue a lost answer filed is found past the first page; a list past the page bound files nothing', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.issueAnswer = 'ok'
+  // Far more than the bound: the list fails, and nothing is filed a second time.
+  w.gh.issueListFiller = 5000
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('more than 1000 open issues')
+  // 150 newer issues push it to the second page, which is read.
+  w.gh.issueListFiller = 150
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
 test('wave 2b gate R1-5: a refile after the merge whose answer was lost is found on resume: one replacement issue in all', async ($, on) => {
   const w = world(on)
   await toFiled($, w)
@@ -6350,6 +6386,25 @@ test('A9: a session started on another branch closes a merged record of a branch
   await w.clock.advance(WATCH_MS)
   await w.clock.advance(1000)
   expect((w.stored(other) as LifecycleRecord).phase).toBe('archived')
+})
+
+test('wave 2b gate R2-3: a reset and a new PR while the watcher reads the old PR\'s state: the old merge never archives the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  let isSwapped = false
+  w.gh.onPrView = async () => {
+    if (isSwapped) return
+    isSwapped = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, pr: (rec.pr ?? 0) + 1, generation: (rec.generation ?? 0) + 1 })
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(isSwapped).toBe(true)
+  const after = await recordOf(w)
+  expect(after.phase).toBe('ready')
+  expect(archivedOf(w)).toBeUndefined()
 })
 
 test('A9: a watcher read that fails is no stop: the next beat closes the record', async ($, on) => {

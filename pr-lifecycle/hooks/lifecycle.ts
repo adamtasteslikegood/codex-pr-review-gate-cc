@@ -773,12 +773,18 @@ export function jiraAdvice(error: string): string {
 /** A settled finding as status and the ready prompt name it: "R4-3 → #21 Major [P2]". */
 export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?'} ${SEVERITY_NAMES[filingPeak(f)]} [${filingPeak(f)}]`
 
+/** The longest issue title the gate sends: Jira's summary limit, one under GitHub's 256. */
+const TITLE_MAX = 255
+
 /** A filed issue's title (spec §5.6): `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`. */
 export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string): string {
   const peak = filingPeak(f)
   const jira = jiraKeyOf(rec.branch)
   const where = [`#${rec.pr ?? '?'}`, rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
-  return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
+  const title = `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
+  // The whole title is bounded (wave 2b gate R2-1): GitHub refuses one over 256 characters and Jira a summary over 255, whatever a
+  // long branch or spec handle adds. The filing and the retry's match both use this value, so they stay the same.
+  return [...title].slice(0, TITLE_MAX).join('')
 }
 
 /**

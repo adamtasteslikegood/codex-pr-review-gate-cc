@@ -131,6 +131,8 @@ export type World = {
     issueAnswer?: 'ok' | 'fail' | 'lost'
     /** How `gh api repos/<slug>/issues?state=all&…` lists the issues filed (wave 2b gate R1-5): 'ok' (default) or 'fail'. */
     issueListAnswer?: 'ok' | 'fail'
+    /** Unrelated open issues GitHub's list shows before the gate's own, newest first: a list longer than one page (gate R2-2). */
+    issueListFiller?: number
     /** Every issue the fake's POST filed, as the REST list gives it; its state is read from `issueStates`, and a 'missing' one is not listed. */
     issues: { number: number; title: string; labels: string[] }[]
     /** The number the next filed issue gets (default 21); each filing adds one. */
@@ -152,6 +154,8 @@ export type World = {
     reopened: string[][]
     /** Called on each `gh issue view`, before it answers: a test acts while the gate reads an issue after the merge. */
     onIssueView?: () => void | Promise<void>
+    /** Called on each `gh pr view`, before it answers: a test acts while the gate reads a PR's state. */
+    onPrView?: () => void | Promise<void>
     /** Called on each `gh issue reopen`, before it answers: a test acts while the gate reopens an issue. */
     onReopen?: () => void | Promise<void>
     /** How the agent's `gh pr merge` answers in the Bash fake: 'ok' (default) merges the PR, 'fail' refuses as GitHub would. */
@@ -377,7 +381,7 @@ export function world(on: On): World {
         return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}`, labels: names.map(name => ({ name })) }))
       }
       // The check for an issue a lost answer filed (wave 2b gate R1-5): GitHub's REST list, newest first; a PR in it is skipped.
-      if (/^api repos\/[^/\s]+\/[^/\s]+\/issues\?state=all&per_page=100&sort=created&direction=desc$/.test(args)) {
+      if (/^api repos\/[^/\s]+\/[^/\s]+\/issues\?state=open&per_page=100&sort=created&direction=desc(&page=\d+)?$/.test(args)) {
         if (w.gh.issueListAnswer === 'fail') {
           return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
         }
@@ -387,7 +391,10 @@ export function world(on: On): World {
           state: (w.gh.issueStates[one.number] ?? 'OPEN') === 'CLOSED' ? 'closed' : 'open',
           labels: one.labels.map(name => ({ name })),
         }))
-        return out(JSON.stringify([{ number: 99, title: 'a pull request', pull_request: { url: 'x' } }, ...listed]))
+        const filler = Array.from({ length: w.gh.issueListFiller ?? 0 }, (_, i) => ({ number: 1000 + i, title: `other work ${i}`, state: 'open', labels: [] }))
+        const all = [{ number: 99, title: 'a pull request', pull_request: { url: 'x' } }, ...filler, ...listed]
+        const page = Number(/&page=(\d+)$/.exec(args)?.[1] ?? '1')
+        return out(JSON.stringify(all.slice((page - 1) * 100, page * 100)))
       }
       // The post-merge check (spec §5.12): gh issue view <n> --repo <r> --json state, and gh issue reopen <n> --repo <r> --comment <text>.
       if (e.argv[1] === 'issue' && e.argv[2] === 'view') {
@@ -432,6 +439,7 @@ export function world(on: On): World {
         return out(JSON.stringify({ contexts: ['legacy'], checks: [] }))
       }
       if (args.startsWith('pr view')) {
+        await w.gh.onPrView?.()
         if (w.gh.isHeadReadBroken === true && /--json headRefOid(,baseRefName)?$/.test(args)) throw new Error('spawn failed')
         if (w.gh.isMergedReadBroken === true && args.endsWith('--json number,headRefName,state')) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)

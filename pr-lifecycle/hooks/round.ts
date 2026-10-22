@@ -1021,6 +1021,9 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
   const rec = await loadRecord($, root, branch)
   const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was stopped, reset or replaced while the gate checked its follow-up issues: ` +
     'nothing was written for it'
+  // The state read was of PR `pr` (wave 2b gate R2-3): a record that now names another PR, or none, is a reset and a fresh start
+  // since that read, and the old PR's merge or close never ends it.
+  if (rec !== undefined && rec.phase !== 'archived' && pr !== undefined && rec.pr !== pr) return replaced
   let open: Finding[] = []
   // Security findings still holding at the merge that their Jira tickets track (spec §5.13.7): archived, and the person is told.
   let tracked: Finding[] = []
@@ -1235,6 +1238,11 @@ async function watchBeat($: Engine): Promise<void> {
           one.readAt = now
           const state = await prStateOf($, rec.root, rec.pr).catch(() => undefined)
           if (state !== 'MERGED' && state !== 'CLOSED') continue
+          // Read again after gh (wave 2b gate R2-5): a session that took the record while gh ran keeps it, and this one waits.
+          if (await isOwnedElsewhere($, rec.root, rec.branch)) {
+            isWaiting = true
+            continue
+          }
           await claimRecord($, rec.root, rec.branch)
           await holdingPrompts($, () => closeLifecycle($, rec.root, rec.branch, rec.pr, state, true))
         } catch {
@@ -3694,31 +3702,40 @@ const filedIssueOf = (stdout: string): { number: number; labels: string[] } | un
 }
 
 /**
- * The repository's open issues, newest first, as GitHub's REST list gives them (wave 2b gate R1-5): its first 100, pull requests
- * and closed issues left out. An issue a lost answer filed is open; a closed one of the same title is older work, perhaps of a reset
- * lifecycle, and never taken. The list reads its own writes; the search API does not, so it is never used for this. `error`: gh's
- * words when it failed.
+ * The repository's open issues, newest first, as GitHub's REST list gives them (wave 2b gate R1-5): every page of 100, read until
+ * one is short (gate R2-2, R2-6), pull requests left out. An issue a lost answer filed is open; a closed one of the same title is
+ * older work, perhaps of a reset lifecycle, and never taken. The list reads its own writes; the search API does not, so it is never
+ * used for this. `error`: gh's words when it failed, or the page bound when the list is longer: an incomplete list never authorizes
+ * a second POST.
  */
 async function listIssues(
   gh: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
   repo: string,
 ): Promise<{ issues: { number: number; title: string; labels: string[] }[]; error?: undefined } | { issues?: undefined; error: string }> {
-  const got = await gh(['api', `repos/${repo}/issues?state=all&per_page=100&sort=created&direction=desc`])
-  if (got.exitCode !== 0) return { error: (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200) }
-  try {
-    const said = JSON.parse(got.stdout) as unknown
+  const issues: { number: number; title: string; labels: string[] }[] = []
+  for (let page = 1; page <= ISSUE_PAGES; page += 1) {
+    const got = await gh(['api', `repos/${repo}/issues?state=open&per_page=100&sort=created&direction=desc${page === 1 ? '' : `&page=${page}`}`])
+    if (got.exitCode !== 0) return { error: (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200) }
+    let said: unknown
+    try {
+      said = JSON.parse(got.stdout)
+    } catch {
+      return { error: 'gh did not answer with a list of issues' }
+    }
     if (!Array.isArray(said)) return { error: 'gh did not answer with a list of issues' }
-    const issues = said.flatMap(one => {
-      if (typeof one !== 'object' || one === null) return []
+    for (const one of said) {
+      if (typeof one !== 'object' || one === null) continue
       const it = one as { number?: unknown; title?: unknown; state?: unknown; labels?: unknown; pull_request?: unknown }
-      if (it.pull_request !== undefined || it.state !== 'open' || typeof it.number !== 'number' || typeof it.title !== 'string') return []
-      return [{ number: it.number, title: it.title, labels: labelNamesOf(it.labels) }]
-    })
-    return { issues }
-  } catch {
-    return { error: 'gh did not answer with a list of issues' }
+      if (it.pull_request !== undefined || it.state !== 'open' || typeof it.number !== 'number' || typeof it.title !== 'string') continue
+      issues.push({ number: it.number, title: it.title, labels: labelNamesOf(it.labels) })
+    }
+    if (said.length < 100) return { issues }
   }
+  return { error: `the repository has more than ${ISSUE_PAGES * 100} open issues and pull requests to read` }
 }
+
+/** The most pages of 100 `listIssues` reads before it fails rather than miss an issue a lost answer filed. */
+const ISSUE_PAGES = 10
 
 /**
  * What the post-merge check found (spec §5.12): each finding whose issue it could not confirm, with gh's words (`failed`), the log

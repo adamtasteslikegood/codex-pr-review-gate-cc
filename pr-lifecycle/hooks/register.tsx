@@ -1133,7 +1133,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         : standing.mayProceed
           ? hasMergeStep
             ? 'no review finding holds the merge: the gate has just sent you the merge step; follow that one.'
-            : `no review finding holds the merge: ${mergeStep(pr?.number, method)}.`
+            : `no review finding holds the merge: ${mergeStep(pr?.number, method, pr?.headRefOid)}.`
           : 'answer what is yours in the list above, and leave the rest to who it names.',
       standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
@@ -1252,7 +1252,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
             'Check it with gh pr view before telling the person anything; do not merge.'
         : standing.mayProceed
-          ? `no other review finding holds the merge: ${mergeStep(pr?.number, method)}.`
+          ? `no other review finding holds the merge: ${mergeStep(pr?.number, method, at)}.`
           : 'the waiver covers the review only: wait for what is listed, then tell the person.',
       standing)
   }

@@ -1511,6 +1511,10 @@ test('R92: the issue title names the finding, its peak severity, the PR, the bra
   )
   expect(jiraKeyOf('feat/x')).toBeUndefined()
   expect(jiraKeyOf('fix/ABC2-77-retry')).toBe('ABC2-77')
+  // A long branch and spec handle never take the title past GitHub's 256 characters or Jira's 255 (wave 2b gate R2-1).
+  const long = issueTitle({ ...f, title: 'x'.repeat(200) }, { pr: 20, branch: `feat/KAN-12-${'b'.repeat(200)}` }, `docs/${'s'.repeat(200)}.md`)
+  expect(long).toHaveLength(255)
+  expect(long.startsWith('R4-3 Major [P2] xxx')).toBe(true)
 })
 
 test('R92: the issue body says who raised it and where, its severity, the problem, why it waits, and what is linked', async () => {
@@ -1656,7 +1660,7 @@ test('R92: a new answer makes an earlier filing failure stale, so it is cleared'
 test('R93: the ready prompt tells the agent to merge with the repository\'s method and report the merge commit', async () => {
   const rec = { ...fresh(), pr: 7 }
   const said = readyPrompt(rec)
-  expect(said).toContain('No review finding holds the merge: merge it now with gh pr merge 7 --merge and tell the person the merge commit')
+  expect(said).toContain(`No review finding holds the merge: merge it now with gh pr merge 7 --merge --match-head-commit ${rec.head} and tell the person the merge commit`)
   expect(said).toContain('wait for them (gh pr checks 7 --watch) and merge again')
   expect(said).toContain("if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop")
   expect(said).not.toContain("the person's")
