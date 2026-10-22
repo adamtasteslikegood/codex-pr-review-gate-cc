@@ -6091,6 +6091,28 @@ test('wave 2b gate R4-5: an answer after a lost issue POST clears its issueError
   expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
 })
 
+test('wave 2b gate R4-7: a finding marked security while the severity label is made is never POSTed or labelled as a public issue', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isMarked = false
+  w.gh.onLabelCreate = async () => {
+    if (isMarked) return
+    isMarked = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, isSecurity: true })) })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isMarked).toBe(true)
+  expect(w.gh.filed).toEqual([])
+  expect(w.gh.issues).toEqual([])
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUp).toBeUndefined()
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
 test('wave 2b gate R1-10: an issue POST is marked on the record before it is sent, so a crash before its answer looks first', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
@@ -6550,6 +6572,26 @@ test('wave 2b gate R4-3: a deferral naming an issue, saved while a website-merge
   expect(w.gh.calls.some(one => one.startsWith('issue view 77 '))).toBe(true)
 })
 
+test('wave 2b gate R4-9: a follow-up changed while a website-merge close refiles its issue is kept, and the record blocks', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'missing'
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    const rec = await recordOf(w)
+    // As applyAnswer saves another follow-up: the old issue's label goes with it.
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, followUp: '#88', followUpLabel: undefined })) })
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUp).toBe('#88')
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-1 (saved while the merge was checked; its issue is checked on the next check)')
+})
+
 test('A9 review I2: /pr-gate waive <id> from another branch waives the one merged lifecycle blocked on that security finding; with two, it names both and waives none', async ($, on) => {
   const w = world(on)
   await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
@@ -6858,8 +6900,8 @@ test('A9.7: a lost create answer, then a retry: Jira is searched and the ticket 
   await w.clock.advance(1000)
   expect(creates(w)).toHaveLength(1)
   const search = w.acli.calls.filter(one => one[2] === 'search').at(-1) ?? []
-  // Scoped to this PR and the security label, newest first, 50 to a page.
-  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\"" AND summary ~ "\\"#1\\"" AND labels = security ORDER BY created DESC')
+  // Scoped to this PR, its repository (wave 2b gate R4-6) and the security label, newest first, 50 to a page.
+  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\"" AND summary ~ "\\"#1\\"" AND summary ~ "\\"me/repo\\"" AND labels = security ORDER BY created DESC')
   expect(search[search.indexOf('--limit') + 1]).toBe('50')
   const rec = await recordOf(w)
   expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')

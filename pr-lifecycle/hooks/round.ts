@@ -1077,6 +1077,9 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       latest.findings.map(f => {
         const got = done.touched.includes(f.id) ? done.findings.find(one => one.id === f.id) : undefined
         if (got === undefined) return f
+        // A follow-up changed while gh ran is kept, never reverted to the checked one (wave 2b gate R4-9): the late guard below holds it.
+        // The check's own refiling writes its follow-up as it goes (keep), so only a third value is someone else's.
+        if (f.followUp !== got.followUp && f.followUp !== filed.findings.find(one => one.id === f.id)?.followUp) return f
         return {
           ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError,
           isIssueSent: got.isIssueSent,
@@ -3413,11 +3416,15 @@ async function fileTicket(
   project: string,
   t: TicketItem,
   pr: number | undefined,
+  slug?: string,
 ): Promise<{ key: string; isFound: boolean; error?: undefined } | { error: string }> {
   const summary = t.title.slice(0, SUMMARY_MAX)
   if (t.isRetry) {
     const ofPr = pr === undefined ? '' : ` AND summary ~ "\\"#${pr}\\""`
-    const jql = `project = ${project} AND summary ~ "\\"${t.id}\\""${ofPr} AND labels = security ORDER BY created DESC`
+    // The summary names the repository (R4-4), so the search does too (wave 2b gate R4-6): another repository's tickets in a shared
+    // project never fill the page and push this one off it.
+    const ofRepo = slug === undefined ? '' : ` AND summary ~ "\\"${slug}\\""`
+    const jql = `project = ${project} AND summary ~ "\\"${t.id}\\""${ofPr}${ofRepo} AND labels = security ORDER BY created DESC`
     const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', jql, '--limit', '50', '--json'])
     const found = search.exitCode === 0 ? ticketIn(search.stdout, summary) : { error: acliWords(search) }
     if (found.error !== undefined) return { error: `could not search Jira for a ticket a lost answer filed: ${found.error}`.slice(0, 200) }
@@ -3487,18 +3494,23 @@ const TICKET_SENT = 'a ticket was sent to Jira, but its answer was not saved (th
 
 /**
  * Marks a finding as filed-but-unanswered before the call that files it (wave 2b gate R1-10), unless an error is already there,
- * which makes the next pass look first anyway. True when the lifecycle was reset or replaced: the caller files nothing.
+ * which makes the next pass look first anyway. 'gone' when the lifecycle was reset or replaced: the caller files nothing. 'secret' when
+ * the finding is now security-classified: the caller files no public issue for it.
  */
-async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'issueError' | 'jiraError', text: string): Promise<boolean> {
+async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'issueError' | 'jiraError', text: string): Promise<'gone' | 'secret' | 'sent'> {
   let isGone = false
+  let isSecret = false
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
     isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
     if (isGone) return latest
+    // A finding marked security since the pass was planned is never POSTed as a public issue (wave 2b gate R4-7): decided under the lock.
+    isSecret = field === 'issueError' && latest.findings.some(f => f.id === id && f.isSecurity === true)
+    if (isSecret) return latest
     // An issue's POST is marked sent too (wave 2b gate R4-5): an answer clears issueError, never that mark.
     const sent = field === 'issueError' ? { isIssueSent: true as const } : {}
     return { ...latest, findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent })) }
   })
-  return saved === undefined || isGone
+  return saved === undefined || isGone ? 'gone' : isSecret ? 'secret' : 'sent'
 }
 
 async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | undefined): Promise<LifecycleRecord | undefined> {
@@ -3513,6 +3525,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
   // A waiver given while a round runs leaves the deciding to that round (the waive command does not advance it): the pass files
   // nothing more and hands back the record with the waiver, which the caller decides, so the run never waits on no one.
   const isWaived = (latest: LifecycleRecord): boolean => latest.waivers.length !== rec.waivers.length
+  const isSecretNow = (latest: LifecycleRecord, id: string): boolean => latest.findings.some(f => f.id === id && f.isSecurity === true)
   const ended = async (): Promise<LifecycleRecord | undefined> => {
     const latest = await loadRecord($, rec.root, rec.branch)
     return latest === undefined || isMoved(latest) ? undefined : latest
@@ -3597,6 +3610,9 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     const after = await loadRecord($, rec.root, rec.branch)
     if (after === undefined || isMoved(after)) return undefined
     if (isWaived(after)) return after
+    // A triage turn may mark the finding security while gh runs (wave 2b gate R4-7): its text never goes into a public issue, and the
+    // next pass plans it as a Jira ticket instead.
+    if (isSecretNow(after, item.id)) continue
     // The last POST's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title is taken, never filed twice. A failed read files nothing: the next pass reads again.
     const was = after.findings.find(one => one.id === item.id)
@@ -3607,6 +3623,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
       const latest = await loadRecord($, rec.root, rec.branch)
       if (latest === undefined || isMoved(latest)) return undefined
       if (isWaived(latest)) return latest
+      if (isSecretNow(latest, item.id)) continue
     }
     const found = listed?.issues?.find(one => one.title === item.title)
     let got: Filed
@@ -3628,7 +3645,9 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     } else {
       // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved leaves an issueError, so the next pass reads the
       // list first and never files the issue twice. The answer's save below replaces it.
-      if (await markSent($, rec, item.id, 'issueError', ISSUE_SENT)) return undefined
+      const sent = await markSent($, rec, item.id, 'issueError', ISSUE_SENT)
+      if (sent === 'gone') return undefined
+      if (sent === 'secret') continue
       const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
       if (filed === undefined) {
@@ -3657,8 +3676,8 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (isWaived(current)) return current
     await restamp()
     // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
-    if (await markSent($, rec, t.id, 'jiraError', TICKET_SENT)) return undefined
-    const got = await fileTicket($, rec.root, project, t, rec.pr)
+    if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT)) === 'gone') return undefined
+    const got = await fileTicket($, rec.root, project, t, rec.pr, rec.slug)
     let text =
       got.error === undefined
         ? `${t.id}: ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`} (security, severity-${t.peak})`
@@ -3802,9 +3821,14 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
   // writes them again. True when the record moved meanwhile (A6): nothing is written, and the check ends with `moved`.
   const keep = async (next: Finding): Promise<boolean> => {
     let isGone = false
+    let isChanged = false
+    const was = rec.findings.find(one => one.id === next.id)?.followUp
     const saved = await updateRecord($, rec.root, rec.branch, latest => {
       isGone = isMovedFrom(rec, latest)
       if (isGone) return latest
+      // A follow-up someone changed while gh ran is kept, never overwritten (wave 2b gate R4-9): the close's late guard holds it.
+      isChanged = latest.findings.some(f => f.id === next.id && f.followUp !== was && f.followUp !== next.followUp)
+      if (isChanged) return latest
       const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
         ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
         isIssueSent: next.isIssueSent,
@@ -3813,7 +3837,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       return { ...latest, findings }
     })
     if (saved === undefined) isGone = true
-    if (!isGone) touched.set(next.id, next)
+    if (!isGone && !isChanged) touched.set(next.id, next)
     return isGone
   }
   for (const f of targets) {
@@ -3970,7 +3994,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     // Always searched first: Jira says "does not exist" too of a ticket acli's account may not see, which must not be filed twice.
     const again = { id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, c.issueSpec), body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true }
     await log(`${f.id}: Jira says ${key} does not exist; filing it again, searching Jira first`)
-    const got = await fileTicket($, rec.root, project, again, rec.pr)
+    const got = await fileTicket($, rec.root, project, again, rec.pr, rec.slug)
     if (got.error !== undefined) {
       if (await keep({ ...f, jiraError: got.error })) return { moved: true }
       failed.push(`${f.id} (Jira ${key} is gone; filing it again: ${got.error})`)
