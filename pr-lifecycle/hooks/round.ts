@@ -979,6 +979,12 @@ const MERGE_SECURITY = 'merged before the gate finished, with a security finding
 export const isMergeBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'message'>): boolean =>
   rec.postStatus === 'blocked' && (rec.message?.includes(MERGE_UNCONFIRMED) === true || rec.message?.includes(MERGE_SECURITY) === true)
 
+/**
+ * The person's post waiver covers the record's head (spec §5.4): their whole-head decision let the PR merge with what held, so the
+ * merge is not one outside the gate, and nothing is filed for it (§5.13.1). Security still holds: `waive post` never releases it.
+ */
+const isPostWaivedHead = (rec: Pick<LifecycleRecord, 'waivers' | 'head'>): boolean => rec.waivers.some(one => one.scope === 'post' && one.head === rec.head)
+
 /** Blocked only on a security finding the person must waive (spec §5.13.2): nothing for the watcher to retry. */
 const isSecurityOnlyBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'message'>): boolean =>
   rec.postStatus === 'blocked' && rec.message?.includes(MERGE_SECURITY) === true && rec.message.includes(MERGE_UNCONFIRMED) !== true
@@ -993,7 +999,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     // through the filing pass, whatever round or phase the record was in. A filing that fails is a failed check, as in §5.12.
     const unfiled: string[] = []
     let filed: LifecycleRecord = rec
-    if (mergeHolds(rec).some(isMergeFileable)) {
+    if (!isPostWaivedHead(rec) && mergeHolds(rec).some(isMergeFileable)) {
       let got: LifecycleRecord | undefined
       let threw: string | undefined
       try {
@@ -3504,7 +3510,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
   const waived = waivedIds(rec)
   // After a merge outside the gate (spec §5.13.1), a finding still holding that names an issue is checked here too, never filed
   // anew: its issue may be the agent's (R85), or one whose label GitHub dropped, and it may be gone. On the gate's own merge none holds.
-  const held = new Set(mergeHolds(rec).filter(f => f.isSecurity !== true && isFollowUpRef(f.followUp)).map(f => f.id))
+  const held = new Set(isPostWaivedHead(rec) ? [] : mergeHolds(rec).filter(f => f.isSecurity !== true && isFollowUpRef(f.followUp)).map(f => f.id))
   // A finding settled by its issue, or one whose issue this check filed again without its label (A7): that issue gets the label.
   const isLabelOwed = (f: Finding): boolean =>
     !waived.has(f.id) &&

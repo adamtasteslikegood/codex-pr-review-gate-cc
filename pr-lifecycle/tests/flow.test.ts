@@ -6345,3 +6345,15 @@ test('A9: a watcher read that fails is no stop: the next beat closes the record'
   await w.clock.advance(1000)
   expect((await recordOf(w)).phase).toBe('archived')
 })
+
+test('A9: a PR merged under the person\'s post waiver for its head is no merge outside the gate: nothing is filed for what the waiver let through', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3')])
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'post', head: rec.head, reason: 'reviewed by hand', by: 'composer', at: 1 }] })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
