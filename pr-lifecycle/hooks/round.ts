@@ -697,7 +697,7 @@ export function startTicker($: Engine): void {
   ticker = $.clock.every(1000, () => {
     void (async () => {
       const now = await $.clock.now()
-      const run = await getRun($)
+      let run = await getRun($)
       if (run === null || run.status !== 'running') {
         stopTicker()
         isLive = false
@@ -717,6 +717,11 @@ export function startTicker($: Engine): void {
       if (run.collect !== undefined) {
         // Collection polls on while a triage turn answers what arrived (R88); only the turn itself has a step timeout.
         await poll($, run)
+        // Read afresh after the awaited poll: an afterTriage that saved answers meanwhile is never overwritten by this tick's
+        // snapshot (gate R1-7). A run the poll ended, or another replaced, is the next tick's.
+        const after = await getRun($)
+        if (after === null || after.id !== run.id || after.status !== 'running') return
+        run = after
         if (run.phase === 'collect') return // waiting on reviewers is not a step: no step timeout while collecting
         // afterTriage settling a turn taken while collecting (A4): the poll clears a stale flag, so the step timeout does not apply.
         if (run.isSettling !== undefined && run.pending.length === 0) return
