@@ -110,6 +110,7 @@ import {
   issueTitle,
   isMergeFileable,
   ticketLine,
+  ticketTitle,
   titleOf,
   untrackedSecurity,
 } from './lifecycle'
@@ -3961,7 +3962,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     if (await isMoved()) return { moved: true }
     const project = c.jiraProject ?? key.replace(/-\d+$/, '')
     // Always searched first: Jira says "does not exist" too of a ticket acli's account may not see, which must not be filed twice.
-    const again = { id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, c.issueSpec), body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true }
+    const again = { id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, c.issueSpec), body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true }
     await log(`${f.id}: Jira says ${key} does not exist; filing it again, searching Jira first`)
     const got = await fileTicket($, rec.root, project, again, rec.pr)
     if (got.error !== undefined) {

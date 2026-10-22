@@ -62,6 +62,7 @@ import {
   securityHolds,
   standingOf,
   ticketLine,
+  ticketTitle,
   untrackedSecurity,
   triage,
   unresolvedBlockers,
@@ -1516,6 +1517,9 @@ test('R92: the issue title names the finding, its peak severity, the PR, the bra
   const long = issueTitle({ ...f, title: 'x'.repeat(200) }, { pr: 20, branch: `feat/KAN-12-${'b'.repeat(200)}` }, `docs/${'s'.repeat(200)}.md`)
   expect(long).toHaveLength(255)
   expect(long.startsWith('R4-3 Major [P2] xxx')).toBe(true)
+  // A Jira ticket's summary names the repository too (wave 2b gate R4-4): repositories sharing a project never match each other's.
+  expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: 'me/repo' })).toBe('R4-3 Major [P2] Workflows rules ignored when reading required checks (#20, me/repo, feat/x)')
+  expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: undefined })).toBe(issueTitle(f, { pr: 20, branch: 'feat/x' }))
 })
 
 test('R92: the issue body says who raised it and where, its severity, the problem, why it waits, and what is linked', async () => {

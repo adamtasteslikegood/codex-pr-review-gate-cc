@@ -781,15 +781,21 @@ export const issueLine = (f: Finding): string => `${f.id} → ${f.followUp ?? '?
 const TITLE_MAX = 255
 
 /** A filed issue's title (spec §5.6): `<id> <Name> [P<n>] <title> (#<pr>, <branch><, Jira key><, spec>)`. */
-export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string): string {
+export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch'>, spec?: string, repo?: string): string {
   const peak = filingPeak(f)
   const jira = jiraKeyOf(rec.branch)
-  const where = [`#${rec.pr ?? '?'}`, rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
+  const where = [`#${rec.pr ?? '?'}`, ...(repo === undefined ? [] : [repo]), rec.branch, ...(jira === undefined ? [] : [jira]), ...(spec === undefined || spec === '' ? [] : [spec])]
   const title = `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
   // The whole title is bounded (wave 2b gate R2-1): GitHub refuses one over 256 characters and Jira a summary over 255, whatever a
   // long branch or spec handle adds. The filing and the retry's match both use this value, so they stay the same.
   return [...title].slice(0, TITLE_MAX).join('')
 }
+
+/**
+ * A Jira ticket's summary: the issue title with the repository after the PR (wave 2b gate R4-4). Repositories sharing a Jira project
+ * reuse PR numbers and finding ids, so the lost-answer search, which takes only an exact summary, never adopts another's ticket.
+ */
+export const ticketTitle = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch' | 'slug'>, spec?: string): string => issueTitle(f, rec, spec, rec.slug)
 
 /**
  * How a PR merged while findings still held (spec §5.13.1): outside the gate (GitHub's website, a connector), or under the person's
@@ -1392,7 +1398,7 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merg
     : mergeHolds(rec)
       .filter(f => (isMerged ? f.isSecurity === true : isTicketable(f)) && f.jiraTicket === undefined)
       .map((f): TicketItem => ({
-        id: f.id, peak: filingPeak(f), title: issueTitle(f, rec, spec), body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
+        id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, spec), body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
       }))
   if (items.length === 0 && tickets.length === 0) return { kind: 'none' }
   return { kind: 'file', items, ...(tickets.length === 0 ? {} : { tickets }) }

@@ -6708,7 +6708,7 @@ test('A9.7: with jiraProject set, a security deferral left for the person files 
   const made = creates(w)[0] ?? []
   const flag = (name: string): string | undefined => made[made.indexOf(name) + 1]
   expect(made.slice(0, 7)).toEqual(['jira', 'workitem', 'create', '--project', 'KAN', '--type', 'Bug'])
-  expect(flag('--summary')).toMatch(/^G2-1 Critical \[P1\] .* \(#1, feat\/x\)$/)
+  expect(flag('--summary')).toMatch(/^G2-1 Critical \[P1\] .* \(#1, me\/repo, feat\/x\)$/)
   expect(flag('--label')).toBe('security,severity-P1')
   expect(made.at(-1)).toBe('--json')
   // The body went through a file in git's directory, never on the command line, and the file is gone.
@@ -6879,7 +6879,7 @@ test('A9.7: a security finding still open at a website merge gets its ticket the
   const f = archivedOf(w)?.findings.find(one => one.id === 'G2-3')
   expect(f?.jiraTicket).toBe('KAN-512')
   const made = creates(w).at(-1) ?? []
-  expect(made[made.indexOf('--summary') + 1]).toBe('G2-3 Critical [P1] Token logged in plain text (#1, feat/x)')
+  expect(made[made.indexOf('--summary') + 1]).toBe('G2-3 Critical [P1] Token logged in plain text (#1, me/repo, feat/x)')
   expect(w.prompts.at(-1)).toContain('G2-3 → KAN-512 Critical [P1]')
   expect(w.gh.filed).toHaveLength(1)
 })
