@@ -181,3 +181,9 @@ Final review: complete. Next: finishing-a-development-branch (PR through the gat
 - Carried to Task 18 (from the reviewer): choose what to file only from mergeHolds; the flag changes only the body; a finding that already names an issue (label owed, issue gone) is left to the post-merge check, which still runs after a failed filing.
 Task 17: complete (62c5c12, 6ca9620; 636 tests). Re-review: all addressed. Parked Minors: no test for the issueError clear; a redundant ref.number exclusion.
 - Task 18: implemented 1aec7a4, 6887fc0 (644 tests); review dispatched. Ruling: a merge under waive post still files each holding non-security finding, with the waiver and its reason in the body — Adam: every point he had to waive is where an issue is filed — cost if wrong: extra issues he closes by hand.
+- Task 18 review: spec ❌ (the post-waiver skip, already ruled), quality needs fixes. Rulings:
+  - waive post files at the merge, with the waiver and its reason in the body;
+  - a per-finding waive is the person's explicit dismissal, so it is not filed — cost if wrong: a finding Adam waived isn't tracked, and he files it by hand;
+  - the security block is decided from record state, not message text;
+  - waive <id> falls back to the one blocked record under the root.
+  Fix round 1 sent.
