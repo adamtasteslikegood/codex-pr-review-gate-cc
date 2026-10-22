@@ -161,3 +161,6 @@ Task 16: implemented 06ca87b (+report efed907), 619+22 pass, validate/lint/typec
 - Task 16 fix round 1: 492056c (+report 4a88aee); controller checked the README diff against round.ts/lifecycle.ts: matches.
 Task 16: complete (06ca87b, 492056c)
 All tasks complete. Final whole-branch review next (opus), carrying every deferred minor in this ledger.
+Final review (opus): With fixes. No Critical. Important 1: a filing pass that hits a waiver or refused in-lock grant ends exhausted ("needs your allowance", wrong) or blocked, re-run only by a manual resume (Task 12 deferred minors confirmed). Minors 1-8 + per-task deferred verdicts in docs/superpowers/plans/2026-10-21-wave2b-final-review.md.
+Ruling: the one final fix dispatch covers Important 1 and Minors 1, 2, 3, 5, 6 — each removes a forced manual resume, a wrong stop, or silence toward the agent (owner rules 1 and 3); Minors 4, 7, 8 and the coverage/wording minors are parked for a follow-up — cost if wrong: the parked ones stay as the review describes (none drops a hold or sticks the gate).
+Final fix dispatched (opus, fresh implementer a3f7203756a01d20d).
