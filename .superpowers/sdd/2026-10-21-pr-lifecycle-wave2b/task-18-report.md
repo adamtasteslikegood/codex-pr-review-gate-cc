@@ -100,3 +100,24 @@ Against the pre-fix hooks, these new or changed tests fail: the post waiver, rev
 **Concerns:**
 - `blockSaid` lives in memory, so a reload or a new session says a block once more. That is intended: a session start says it.
 - The always-written merge-close update now runs even when the check changed nothing. It is harmless, because the record is archived right after.
+
+## Fix round 2 (re-review: qualified waive)
+
+Commit `723d415` (pr-lifecycle 1.5.0: Task 18 review fixes, qualified waive).
+
+1. **Qualified waive.**
+   - A new `waiveTarget` in register.tsx resolves the branch before anything else is read. It handles three cases:
+     - `<branch>:<id>` names the branch.
+     - An unqualified id that matches a finding on the checked-out branch and also a security-blocked merged lifecycle elsewhere under the root (`securityBlockedIds`) is refused. So is an id that matches several blocked lifecycles. The refusal names each branch and gives `/pr-gate waive <branch>:<id> <reason>` for each, and nothing is written.
+     - An id only one blocked lifecycle has keeps the fallback.
+   - The finding id is the part after `<branch>:`. The usage line and the argument hint show `[<branch>:]<findingId>`.
+   - The waive then runs the same refusal check under the lock, the same claim and the same close as before. A qualified id on a branch with no such finding is refused by that existing check ("there is no finding G2-3 in the lifecycle of feat/y").
+2. **`isOurs` and `none`** now follow the resolved branch, because `branch` and `rec` are `const` again and resolved first. A waive aimed at another branch never reaches the checked-out branch's run.
+3. **Wording.** The block message gives `/pr-gate waive <branch>:<id> <reason>, from this worktree`. "any checkout" is gone from the hooks.
+
+Tests:
+- New: the ambiguous id is refused, naming both qualified commands, and leaves the waivers, findings and status of both records unchanged (the command's own log line is the only write, as for any person command).
+- New: `feat/y:G2-3` is refused when feat/y has no G2-3, and `feat/x:G2-3` from feat/y waives and archives feat/x.
+- Updated: the I2 two-records test expects the new refusal text, and the usage-text test expects `[<branch>:]`.
+
+**Results:** `npm run test`: codex-gate 22 pass and pr-lifecycle **653 pass, 0 fail**. Lint is clean and typecheck has 0 errors.
