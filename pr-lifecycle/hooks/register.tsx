@@ -909,7 +909,8 @@ const FINDING_ID = /^[RG]\d+-\d+$/
  * that could mean more than one is refused, naming each with its qualified command, and nothing is written.
  */
 async function waiveTarget($: Engine, root: string, checkedOut: string, arg: string): Promise<{ branch: string } | { refusal: string }> {
-  const qualified = /^(\S+):([RG]\d+-\d+)$/.exec(arg)
+  // A branch name never holds a colon (git refuses one), so a colon in it could only reach another root's key: refused.
+  const qualified = /^([^\s:]+):([RG]\d+-\d+)$/.exec(arg)
   if (qualified !== null) return { branch: qualified[1] ?? checkedOut }
   if (!FINDING_ID.test(arg)) return { branch: checkedOut }
   const own = await loadRecord($, root, checkedOut)
