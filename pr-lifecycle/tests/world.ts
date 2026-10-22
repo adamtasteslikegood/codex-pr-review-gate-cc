@@ -124,8 +124,15 @@ export type World = {
     onLabel?: () => void | Promise<void>
     /** Every label call the gate made (its `label` and `issue edit` calls), in order. */
     labelled: string[]
-    /** How `gh api -X POST repos/<slug>/issues` answers when the gate files an issue (R92): 'ok' (default) or 'fail'. */
-    issueAnswer?: 'ok' | 'fail'
+    /**
+     * How `gh api -X POST repos/<slug>/issues` answers when the gate files an issue (R92): 'ok' (default) or 'fail'; 'lost' files the
+     * issue but answers as a timeout does, so the gate never learns its number (wave 2b gate R1-5).
+     */
+    issueAnswer?: 'ok' | 'fail' | 'lost'
+    /** How `gh api repos/<slug>/issues?state=all&…` lists the issues filed (wave 2b gate R1-5): 'ok' (default) or 'fail'. */
+    issueListAnswer?: 'ok' | 'fail'
+    /** Every issue the fake's POST filed, as the REST list gives it; its state is read from `issueStates`, and a 'missing' one is not listed. */
+    issues: { number: number; title: string; labels: string[] }[]
     /** The number the next filed issue gets (default 21); each filing adds one. */
     issueNumber?: number
     /** The label names the POST's answer carries (A7); undefined echoes the labels asked for. GitHub drops them without push access. */
@@ -262,6 +269,7 @@ export function world(on: On): World {
       calls: [],
       labelled: [],
       filed: [],
+      issues: [],
       issueStates: {},
       reopened: [],
       requests: [],
@@ -331,8 +339,27 @@ export function world(on: On): World {
         w.gh.issueNumber = number + 1
         const repo = (e.argv[4] ?? '').split('/').slice(1, 3).join('/')
         const asked = e.argv.flatMap(one => (one.startsWith('labels[]=') ? [one.slice('labels[]='.length)] : []))
-        const labels = (w.gh.issueLabels ?? asked).map(name => ({ name }))
-        return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}`, labels }))
+        const names = w.gh.issueLabels ?? asked
+        const title = e.argv.find(one => one.startsWith('title='))?.slice('title='.length) ?? ''
+        w.gh.issues.push({ number, title, labels: names })
+        if (w.gh.issueAnswer === 'lost') {
+          const stderr = 'Post "https://api.github.com/repos/me/repo/issues": context deadline exceeded'
+          return { value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        return out(JSON.stringify({ number, html_url: `https://github.com/${repo}/issues/${number}`, labels: names.map(name => ({ name })) }))
+      }
+      // The check for an issue a lost answer filed (wave 2b gate R1-5): GitHub's REST list, newest first; a PR in it is skipped.
+      if (/^api repos\/[^/\s]+\/[^/\s]+\/issues\?state=all&per_page=100&sort=created&direction=desc$/.test(args)) {
+        if (w.gh.issueListAnswer === 'fail') {
+          return { value: { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway', isStdoutTruncated: false, isStderrTruncated: false } }
+        }
+        const listed = [...w.gh.issues].reverse().filter(one => w.gh.issueStates[one.number] !== 'missing').map(one => ({
+          number: one.number,
+          title: one.title,
+          state: (w.gh.issueStates[one.number] ?? 'OPEN') === 'CLOSED' ? 'closed' : 'open',
+          labels: one.labels.map(name => ({ name })),
+        }))
+        return out(JSON.stringify([{ number: 99, title: 'a pull request', pull_request: { url: 'x' } }, ...listed]))
       }
       // The post-merge check (spec §5.12): gh issue view <n> --repo <r> --json state, and gh issue reopen <n> --repo <r> --comment <text>.
       if (e.argv[1] === 'issue' && e.argv[2] === 'view') {

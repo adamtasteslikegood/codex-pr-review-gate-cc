@@ -3212,6 +3212,11 @@ async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecor
     const after = await loadRecord($, rec.root, rec.branch)
     if (after === undefined || isMoved(after)) return undefined
     if (isWaived(after)) return after
+    // The last POST's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
+    // first, and one with this exact title is taken, never filed twice. A failed read files nothing: the next pass reads again.
+    const isRetry = item.reuse === undefined && after.findings.find(one => one.id === item.id)?.issueError !== undefined
+    const listed = isRetry ? await listIssues(gh, repo) : undefined
+    const found = listed?.issues?.find(one => one.title === item.title)
     let got: Filed
     let text: string
     if (item.reuse !== undefined) {
@@ -3219,6 +3224,15 @@ async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecor
       const labelError = edit.exitCode === 0 ? undefined : failure(edit)
       got = { ...base, ...(labelError === undefined ? {} : { labelError }) }
       text = labelError === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
+    } else if (listed?.error !== undefined) {
+      got = { ...base, issueError: `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200) }
+      text = `${item.id}: could not read the issues of ${repo} before filing again`
+    } else if (found !== undefined) {
+      // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
+      const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', repo, '--add-label', label])
+      const labelError = edit === undefined || edit.exitCode === 0 ? undefined : failure(edit)
+      got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }) }
+      text = `${item.id}: found ${repo}#${found.number}, filed by an answer gh lost${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
     } else {
       const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
@@ -3259,6 +3273,34 @@ const filedIssueOf = (stdout: string): { number: number; labels: string[] } | un
 }
 
 /**
+ * The repository's issues, newest first, as GitHub's REST list gives them (wave 2b gate R1-5): its first 100, pull requests left
+ * out. The list reads its own writes; the search API does not, so it is never used for this. `error`: gh's words when it failed.
+ */
+async function listIssues(
+  gh: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+  repo: string,
+): Promise<{ issues: { number: number; title: string; labels: string[] }[]; error?: undefined } | { issues?: undefined; error: string }> {
+  const got = await gh(['api', `repos/${repo}/issues?state=all&per_page=100&sort=created&direction=desc`])
+  if (got.exitCode !== 0) return { error: (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200) }
+  try {
+    const said = JSON.parse(got.stdout) as unknown
+    if (!Array.isArray(said)) return { error: 'gh did not answer with a list of issues' }
+    const issues = said.flatMap(one => {
+      if (typeof one !== 'object' || one === null) return []
+      const it = one as { number?: unknown; title?: unknown; labels?: unknown; pull_request?: unknown }
+      if (it.pull_request !== undefined || typeof it.number !== 'number' || typeof it.title !== 'string') return []
+      const labels = Array.isArray(it.labels)
+        ? it.labels.flatMap(each => (typeof each === 'object' && each !== null && typeof (each as { name?: unknown }).name === 'string' ? [(each as { name: string }).name] : []))
+        : []
+      return [{ number: it.number, title: it.title, labels }]
+    })
+    return { issues }
+  } catch {
+    return { error: 'gh did not answer with a list of issues' }
+  }
+}
+
+/**
  * What the post-merge check found (spec §5.12): each finding whose issue it could not confirm, with gh's words (`failed`), the log
  * lines, the findings with any issue filed again (`touched` names them). `moved`: the lifecycle was reset or replaced while gh ran,
  * and the caller writes, says and archives nothing (A6).
@@ -3295,6 +3337,22 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     lines.push({ at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) })
   }
   const isMoved = async (): Promise<boolean> => isMovedFrom(rec, await loadRecord($, rec.root, rec.branch))
+  // A refiled finding's issue fields, written under the lock at once (wave 2b gate R1-6) and kept in `touched` for the close, which
+  // writes them again. True when the record moved meanwhile (A6): nothing is written, and the check ends with `moved`.
+  const keep = async (next: Finding): Promise<boolean> => {
+    let isGone = false
+    const saved = await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = isMovedFrom(rec, latest)
+      if (isGone) return latest
+      const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
+        ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
+      })
+      return { ...latest, findings }
+    })
+    if (saved === undefined) isGone = true
+    if (!isGone) touched.set(next.id, next)
+    return isGone
+  }
   for (const f of targets) {
     const peak = filingPeak(f)
     const label = `severity:${peak}`
@@ -3362,23 +3420,52 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     }
     await gh(['label', 'create', label, '--repo', rec.slug, '--color', LABEL_COLOURS[peak]])
     if (await isMoved()) return { moved: true }
-    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${issueTitle(f, rec, c.issueSpec)}`, '-f', `body=${issueBody(f, rec)}`, '-f', `labels[]=${label}`])
-    const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     const was = state === 'CLOSED' ? 'could not be reopened' : 'is gone'
+    const title = issueTitle(f, rec, c.issueSpec)
+    // The last refile's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
+    // first, and one with this exact title, other than the issue it replaces, is taken. A failed read files nothing this time.
+    const listed = f.issueError === undefined ? undefined : await listIssues(gh, rec.slug)
+    const found = listed?.issues?.find(one => one.title === title && !(ref.repo === rec.slug && one.number === ref.number))
+    if (listed?.error !== undefined) {
+      const issueError = `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200)
+      if (await keep({ ...f, issueError })) return { moved: true }
+      failed.push(`${f.id} (${why}; filing it again: ${issueError})`)
+      await log(`${f.id}: could not confirm ${where} after the merge`)
+      continue
+    }
+    if (found !== undefined) {
+      // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
+      const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', rec.slug, '--add-label', label])
+      if (edit === undefined || edit.exitCode === 0) {
+        if (await keep({ ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })) return { moved: true }
+        await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number} ${label}, filed by an answer gh lost`)
+        continue
+      }
+      if (await keep({ ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined })) return { moved: true }
+      failed.push(`${f.id} (label-failed: could not label ${rec.slug}#${found.number} ${label}: ${words(edit)})`)
+      await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, filed by an answer gh lost; could not label it ${label}`)
+      continue
+    }
+    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${issueBody(f, rec)}`, '-f', `labels[]=${label}`])
+    const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
+    // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close
+    // saves never files the issue again, and a lost answer leaves its issueError, so the next check reads the list first.
     if (filed === undefined) {
-      failed.push(`${f.id} (${why}; filing it again: ${post.exitCode === 0 ? "GitHub did not give the new issue's number" : words(post)})`)
+      const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : words(post)
+      if (await keep({ ...f, issueError })) return { moved: true }
+      failed.push(`${f.id} (${why}; filing it again: ${issueError})`)
       await log(`${f.id}: could not confirm ${where} after the merge`)
       continue
     }
     if (!filed.labels.includes(label)) {
       // Filed, but GitHub dropped the label (A7): the new issue is kept, and the next check labels it instead of filing another.
       const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-      touched.set(f.id, { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined })
+      if (await keep({ ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined })) return { moved: true }
       failed.push(`${f.id} (label-failed: ${labelError})`)
       await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} without ${label}`)
       continue
     }
-    touched.set(f.id, { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })
+    if (await keep({ ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })) return { moved: true }
     await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
   }
   if (await isMoved()) return { moved: true }

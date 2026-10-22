@@ -6028,3 +6028,110 @@ test('fix round 1 (M1): a second close while the first checks the issues does no
   expect((await recordOf(w)).phase).toBe('archived')
   expect(archivesOf(w)).toHaveLength(1)
 })
+
+// ------------------------------------------------------------- wave 2b gate round 1 (R1-5, R1-6)
+
+test('wave 2b gate R1-5: an issue POST whose answer was lost is found by its title on the next pass: one issue, no second POST', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('context deadline exceeded')
+  expect(w.gh.issues).toHaveLength(1)
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: found me/repo#21, filed by an answer gh lost severity:P2')).toBe(true)
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R1-5: a failed issue list after a lost answer files nothing and keeps the issueError; the next pass finds the issue', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.issueAnswer = 'ok'
+  w.gh.issueListAnswer = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('HTTP 502: Bad Gateway')
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUp).toBeUndefined()
+  w.gh.issueListAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R1-5: a refile after the merge whose answer was lost is found on resume: one replacement issue in all', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('context deadline exceeded')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(2)
+  expect(w.gh.issues).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+})
+
+test('wave 2b gate R1-6: a throw after the first of two refiles is answered: the new number is on the record, and resume files it no second time', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueStates[22] = 'missing'
+  let views = 0
+  // The store fails once the first refile is answered: the second finding's read throws, before the close saves anything.
+  w.gh.onIssueView = () => {
+    views += 1
+    if (views !== 2) return
+    w.beforeRead = key => {
+      if (key === KEY) throw new Error('store down')
+    }
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  w.beforeRead = undefined
+  w.gh.onIssueView = undefined
+  await w.clock.advance(1000)
+  expect(views).toBe(2)
+  expect(w.gh.filed).toHaveLength(3)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(4)
+  expect(w.gh.filed.filter(one => one.some(arg => arg.startsWith('title=G2-1 ')))).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-2')).toMatchObject({ followUp: '#24', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#23 open after the merge')).toBe(true)
+})
