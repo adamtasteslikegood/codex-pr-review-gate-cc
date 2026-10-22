@@ -193,3 +193,4 @@ Task 18: complete (1aec7a4, 6887fc0, ab3dd86, 723d415, plus a controller regex f
 - the watcher's memory of a reported block is lost on reload;
 - a qualified waive also reaches live, unmerged lifecycles — deliberate, the refusal check gates it;
 - README needs mergeWatchMinutes (docs task).
+- Task 19: implemented 43f37e4 (664 tests). Review: no GitHub leak path; Importants: the login hint repeats; a missing acli gets the wrong advice. Rulings: jiraTicket stays its own field (followUp would settle it); search accepts an array or {issues|values}; all Minors fixed. Fix round 1 sent. Still owed: one live acli search against the site to confirm the JSON shape, after Adam logs in again.
