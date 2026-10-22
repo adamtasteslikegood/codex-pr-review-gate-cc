@@ -72,3 +72,31 @@ The tests put findings on the record (`toHolding`) after `toFiled` rather than d
 - `/pr-gate waive <id>` resolves the checked-out branch, so a security-blocked record of another branch must be waived from its own checkout.
 - Docs: the README's `pr-gate.json` key list and sample don't mention `mergeWatchMinutes`. That file is outside this task's list, so it is left for the docs task.
 - No disagreement found between the brief and the spec. §5.13.2's Jira ticket is Task 19, through `untrackedSecurity`.
+
+## Fix round 1 (task-18-review.md, controller rulings)
+
+Commit `ab3dd86` (pr-lifecycle 1.5.0: Task 18 review fixes).
+
+1. **Post waiver.** `isPostWaivedHead` is removed. A merge under `/pr-gate waive post` now files, at the merge, an issue for each non-security finding still holding. This covers a website merge and the agent's own `gh pr merge`, since both go through `closeOnce`. `lifecycle.ts` adds `MergeKind = { kind: 'outside' } | { kind: 'post-waiver'; reason }`, which is threaded through `fileIssues` → `fileOnce` → `planIssues` → `issueBody`/`mergedLine`. Under a post waiver the body says "PR #n merged under the person's post waiver (/pr-gate waive post): <reason>. No fix round ran on this finding." The title is unchanged. In `checkIssuesAfterMerge`, `held` no longer has the post-waiver exception, and its comment is updated. The post-waiver test is flipped: it now expects 2 POSTs, checks the title and the waiver line in the body, and checks the archive. No existing waive-post-then-merge test reached a close with fileable holds, so none needed updating (the suite passes unchanged).
+2. **Per-finding waivers are not filed.** `waivedIds`'s doc comment says so. A test covers a finding waived before a website merge: it gets no issue.
+3. **Stale security block.** The security list and the block message are now computed inside the `updateRecord` updater, from `latest`, after the check's writes (`untrackedSecurity({ ...latest, findings })`). If nothing is left, the same write clears an earlier merge block and the close archives. `isSecurityOnlyBlocked` is now decided from state: `isMergeBlocked`, no `MERGE_UNCONFIRMED`, and `untrackedSecurity(rec).length > 0`. New test: the first close blocks on an unreadable #21 plus a security finding. During the next close's `gh issue view`, the person's `waive G2-5` lands and its own close answers "already closing". The in-flight close then archives the record with no message and no resume.
+4. **Waive from another branch.** `securityBlockedIds(rec)` is exported from round.ts. If the checked-out branch has no such finding, `/pr-gate waive <id>` looks at `liveRecords(root)` on other branches for records merge-blocked with `MERGE_SECURITY` on that id. With exactly one, it waives there and runs the close. With several, it names their branches and waives none. The block message and the agent's instruction now name the branch ("PR #1 from feat/x merged before…", "the lifecycle of feat/x stays open on …", "from any checkout of this repository"). The new test covers both legs.
+5. **Minors.**
+   - `isRepeat` now compares a per-record signature kept in a module map, `blockSaid`. The signature is the generation, the leading id or phrase of each failed entry, and the security ids. A changed gh text is not a new block. The entry is cleared when the close passes.
+   - The watcher stays alive while a record is skipped because its run is running or because another live session owns it (`isWaiting`).
+   - Test 5 sets `beatAt` from the engine clock's now. It is extended so that, once the other owner goes stale, the next beat archives feat/z with no command.
+   - New tests:
+     - a second and a third session start leave one watcher, checked by `:owner` reads per minute against the first minute;
+     - a merge close that meets another filing pass of the branch: the session-start scan during the pass's POST reports "another filing pass was running", the watcher then archives, and 2 POSTs means nothing is filed twice;
+     - the watcher skips a running triage run's record (no `pr view --json state`), and archives after `/pr-gate stop`;
+     - a repeated block (POST failing twice) is said once.
+   - The toast is not asserted: the world doesn't record toasts.
+6. **README:** left for the docs task.
+
+Against the pre-fix hooks, these new or changed tests fail: the post waiver, review I1, review I2, the security block's wording, and test 5's owner-goes-stale leg. The minor-coverage tests pass on both versions, since they guard existing behaviour.
+
+**Results:** `claude plugin test pr-lifecycle` gives **651 pass, 0 fail**. `npm run lint` is clean and `npm run typecheck` has 0 errors.
+
+**Concerns:**
+- `blockSaid` lives in memory, so a reload or a new session says a block once more. That is intended: a session start says it.
+- The always-written merge-close update now runs even when the check changed nothing. It is harmless, because the record is archived right after.
