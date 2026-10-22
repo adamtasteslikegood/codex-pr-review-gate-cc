@@ -56,6 +56,7 @@ import {
   holdingPrompts,
   ignoredNote,
   isLiveNow,
+  isMergeBlocked,
   isOwnedElsewhere,
   isStillCurrent,
   isTurnOf,
@@ -71,12 +72,13 @@ import {
   setSession,
   setup,
   startTicker,
+  startWatcher,
   tellAgent,
   untriagedFeedback,
 } from './round'
 import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
-import { latestArchive, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
+import { latestArchive, liveRecords, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -1053,6 +1055,17 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     })
     if (refusal !== undefined) return refusal
     await take()
+    // A PR merged before the gate finished, blocked on this finding or on an issue it could not confirm (spec §5.12, §5.13.2): the
+    // waiver runs the close again, never a round on a merged PR, and the lifecycle is archived once nothing is left.
+    const merged = await loadRecord($, root, branch)
+    if (merged !== undefined && merged.pr !== undefined && isMergeBlocked(merged)) {
+      const closed = await closeLifecycle($, root, branch, merged.pr, 'MERGED')
+      const isArchived = (await loadRecord($, root, branch))?.phase === 'archived'
+      if (isArchived) {
+        await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`, `${closed}. Nothing more is needed from you for PR #${merged.pr}.`)
+      }
+      return `/${COMMAND} waived ${scope} for ${branch}: ${reason}. ${closed}.`
+    }
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will. After a push no
@@ -1307,8 +1320,9 @@ export const register: Register = (on, options) => {
     setSession(e.isInteractive)
     const run = await getRun($)
     if (run !== null && run.status === 'running') {
-      // A reload dropped the module's timer, not the run: the host kept it.
+      // A reload dropped the module's timers, not the run: the host kept it.
       startTicker($)
+      startWatcher($, run.root)
       void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
     } else {
       setLive(false)
@@ -1317,20 +1331,32 @@ export const register: Register = (on, options) => {
       try {
         const top = await git($, e.cwd, ['rev-parse', '--show-toplevel'])
         const branch = top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : ''
+        // Every record under the repository's root, not only the branch checked out (spec §5.13.4): a merge done while no session ran
+        // is caught by the next one, whichever branch it is on. A PR merged or closed meanwhile is closed here, after the issue check
+        // (spec §5.12) and the filing of what still holds (§5.13.1), whatever the record waits on (final review m1); it is not
+        // collected again (R62). Only a session a person is at does this, and never on a record a live session elsewhere owns (#13).
+        if (top.isOk && e.isInteractive) {
+          for (const one of await liveRecords($, top.out)) {
+            if (one.pr === undefined || (one.phase !== 'ready' && one.phase !== 'post')) continue
+            const pr = one.pr
+            try {
+              if (await isOwnedElsewhere($, top.out, one.branch)) continue
+              const state = await prStateOf($, top.out, pr)
+              if (state !== 'MERGED' && state !== 'CLOSED') continue
+              await claimRecord($, top.out, one.branch)
+              await holdingPrompts($, () => closeLifecycle($, top.out, one.branch, pr, state))
+            } catch {
+              // A failed read is the watcher's to retry; the other records are read all the same.
+            }
+          }
+          // Whatever is left with a PR is watched from now on (spec §5.13.3); the watcher stops itself when nothing is.
+          startWatcher($, top.out)
+        }
         const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
         // A review that stopped on an error (gh down, a step that failed) polls again, as the spec's restart does; a stop is the person's.
         // Only a session a person is at takes a record over, and only once its owner has gone quiet (#13; Adam, decision D): a
         // headless child in the same checkout (a hook's `claude -p`) never runs the lifecycle or gets its prompts.
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
-        // A PR merged or closed meanwhile is closed here, after the issue check (spec §5.12), whatever the record waits on: ready, held,
-        // blocked on an unconfirmed issue, or awaiting the person (final review m1). It is not collected again (R62).
-        const state = rec !== undefined && isMine && (rec.phase === 'ready' || rec.phase === 'post') && rec.pr !== undefined
-          ? await prStateOf($, top.out, rec.pr)
-          : undefined
-        if (rec !== undefined && (state === 'MERGED' || state === 'CLOSED')) {
-          await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, state))
-          return next(e)
-        }
         // One still open is left as it is, unless its review was under way or stopped on an error.
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
           if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))

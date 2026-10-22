@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
-import { configOf, overrideConfig } from '../hooks/round'
+import { configOf, ignoredNote, overrideConfig } from '../hooks/round'
 import type { LifecycleRecord } from '../types'
 
 // R67: a repository's `.github/pr-gate.json` on the base sets its own round settings, over the plugin options. The file is read from
@@ -423,4 +423,18 @@ test('R93: mergeMethod picks how the agent merges; merge by default, anything el
   const bad = overrideConfig(configOf({}), '{"mergeMethod":"fast-forward"}')
   expect(bad.config.mergeMethod).toBe('merge')
   expect(bad.ignored).toEqual(['mergeMethod (not merge, squash or rebase)'])
+})
+
+test('R95: mergeWatchMinutes paces the merge watcher; 5 by default, 0, "x" or anything outside 1-60 is ignored with the usual warning', async () => {
+  expect(configOf({}).mergeWatchMinutes).toBe(5)
+  expect(overrideConfig(configOf({}), '{"mergeWatchMinutes":10}').config.mergeWatchMinutes).toBe(10)
+  expect(overrideConfig(configOf({}), '{"mergeWatchMinutes":60}').config.mergeWatchMinutes).toBe(60)
+  for (const value of ['0', '"x"', '61', '2.5']) {
+    const bad = overrideConfig(configOf({}), `{"mergeWatchMinutes":${value}}`)
+    expect(bad.config.mergeWatchMinutes).toBe(5)
+    expect(bad.ignored).toEqual(['mergeWatchMinutes (not a whole number of minutes from 1 to 60)'])
+    expect(ignoredNote('dev', bad.ignored)).toBe(
+      'The base\'s .github/pr-gate.json (origin/dev): ignored mergeWatchMinutes (not a whole number of minutes from 1 to 60); the plugin options apply instead.',
+    )
+  }
 })

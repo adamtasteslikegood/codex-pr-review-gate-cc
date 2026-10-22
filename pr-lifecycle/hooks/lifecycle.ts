@@ -749,20 +749,33 @@ export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch
   return `${f.id} ${SEVERITY_NAMES[peak]} [${peak}] ${f.title.replace(/\s+/g, ' ').trim().slice(0, 120)} (${where.join(', ')})`
 }
 
+/** The line a finding's issue carries when its PR merged outside the gate (spec §5.13, A9): only the body says it, never the title. */
+export const mergedLine = (pr: number | undefined): string => `PR #${pr ?? '?'} merged before the gate finished: no fix round ran on this finding.`
+
 /**
  * A filed issue's body (spec §5.6; issues #21-#23 are the model): who raised it and where, its peak severity, the problem, why it
- * was not fixed in the PR, and the findings linked to it.
+ * was not fixed in the PR, and the findings linked to it. `isMerged`: the PR merged outside the gate while the finding held
+ * (spec §5.13), whatever its status, and the body says no fix round ran on it.
  */
-export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>): string {
+export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>, isMerged = false): string {
   const peak = filingPeak(f)
   const at = f.file === undefined ? '' : `, at \`${f.file}${f.line === undefined ? '' : `:${f.line}`}\``
   const thread = f.url === undefined ? '' : ` ([thread](${f.url}))`
   const codex = f.history.filter(one => one.by === 'codex').at(-1)?.note
+  const last = codex === undefined ? '' : ` Codex's last word: ${codex}.`
   const why = isDisputed(f)
     ? `${disputeOf(f)}.`
     : f.status === 'deferred'
-      ? `Deferred by the agent: ${f.note ?? 'no reason given'}. Codex agreed it cannot reasonably be fixed in this PR.`
-      : `Still open when the review rounds ran out.${codex === undefined ? '' : ` Codex's last word: ${codex}.`}`
+      ? `Deferred by the agent: ${f.note ?? 'no reason given'}.${isDeferralAgreed(f) ? ' Codex agreed it cannot reasonably be fixed in this PR.' : ' Codex had not ruled on the deferral.'}`
+      : !isMerged
+        ? `Still open when the review rounds ran out.${last}`
+        : f.status === 'reported-fixed'
+          ? `Reported fixed by the agent; Codex had not verified the fix.${last}`
+          : f.status === 'verified-fixed'
+            ? `Verified fixed once, but its file changed since and the fix was not verified again.${last}`
+            : f.status === 'rebutted'
+              ? `Rebutted by the agent: ${f.note ?? 'no reason given'}; Codex had not accepted the rebuttal.${last}`
+              : `Still open.${last}`
   const named = f.followUp !== undefined && !isFollowUpRef(f.followUp) ? [`Follow-up named by the agent: ${f.followUp}.`] : []
   const linked = alsoOf(rec.findings, f.id)
   return [
@@ -779,9 +792,10 @@ export function issueBody(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'finding
     '',
     why,
     ...named,
+    ...(isMerged ? ['', mergedLine(rec.pr)] : []),
     ...(linked.length === 0 ? [] : ['', '## Linked findings', '', ...linked.map(id => `- ${id}: the same problem, raised again`)]),
     '',
-    `Filed by pr-gate when the review of #${rec.pr ?? '?'} could do no more.`,
+    isMerged ? `Filed by pr-gate when #${rec.pr ?? '?'} merged.` : `Filed by pr-gate when the review of #${rec.pr ?? '?'} could do no more.`,
   ].join('\n')
 }
 
@@ -797,6 +811,18 @@ export function mergeHolds(rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): 
     one => !waived.has(one.id) && (one.status !== 'verified-fixed' || isReverifyOwed(one)) && !isAcceptedRebuttal(one) && !isSettledByIssue(one) && !isLinked(one),
   )
 }
+
+/**
+ * Security findings that hold the merge with nothing tracking them (spec §5.13.2): a merge outside the gate leaves the record blocked
+ * on each until the person's waiver. Every holding security finding, for now; Task 19 lets a Jira ticket track one.
+ */
+export const untrackedSecurity = (rec: Pick<LifecycleRecord, 'findings' | 'waivers'>): Finding[] => mergeHolds(rec).filter(one => one.isSecurity === true)
+
+/**
+ * What a merge outside the gate files (spec §5.13.1): every finding still holding the merge, whatever its status, but security and
+ * any that already names an issue. That one is the post-merge check's (`checkIssuesAfterMerge`): it labels, reopens or files it again.
+ */
+export const isMergeFileable = (f: Finding): boolean => f.isSecurity !== true && !isFollowUpRef(f.followUp)
 
 /** A held verified fix in words, as the merge refusal and the texts name it (R58). */
 export const reverifyOwed = (f: Pick<Finding, 'id' | 'severity'>): string => `${f.id} [${f.severity}] fixed, re-verify owed (file changed)`
@@ -1272,12 +1298,17 @@ export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: 
  * What the filing pass does (R92, spec §5): nothing before the PR or short of a filing point; else a round for a late blocker
  * (`gateGrant`); else an issue for each held finding it files (`isFileable`).
  */
-export function planIssues(rec: LifecycleRecord, at: number, spec?: string): IssuePlan {
-  if (rec.phase === 'pre' || rec.pr === undefined || !isFilingPoint(decideNext(rec))) return { kind: 'none' }
-  const grant = gateGrant(rec, at)
-  if (grant !== undefined) return { kind: 'grant', grant, late: lateBlockers(rec).map(one => one.id) }
+export function planIssues(rec: LifecycleRecord, at: number, spec?: string, isMerged = false): IssuePlan {
+  if (isMerged) {
+    // The PR merged outside the gate (spec §5.13.1): no round can run, so no grant; every finding still holding is filed now.
+    if (rec.pr === undefined) return { kind: 'none' }
+  } else {
+    if (rec.phase === 'pre' || rec.pr === undefined || !isFilingPoint(decideNext(rec))) return { kind: 'none' }
+    const grant = gateGrant(rec, at)
+    if (grant !== undefined) return { kind: 'grant', grant, late: lateBlockers(rec).map(one => one.id) }
+  }
   const items = mergeHolds(rec)
-    .filter(isFileable)
+    .filter(isMerged ? isMergeFileable : isFileable)
     .map((f): IssueItem => {
       const reuse = issueOf(f.followUp, rec.slug)
       return {
@@ -1286,7 +1317,7 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string): Iss
         ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
         ...(reuse === undefined ? {} : { reuse }),
         title: issueTitle(f, rec, spec),
-        body: issueBody(f, rec),
+        body: issueBody(f, rec, isMerged),
       }
     })
   return items.length === 0 ? { kind: 'none' } : { kind: 'file', items }

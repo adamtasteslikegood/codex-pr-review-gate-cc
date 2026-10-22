@@ -103,9 +103,12 @@ import {
   issueLine,
   issueOf,
   issueTitle,
+  isMergeFileable,
+  titleOf,
+  untrackedSecurity,
 } from './lifecycle'
 import type { Allowances, Next, TriageClass } from './lifecycle'
-import { archiveRecord, isHeldByOther, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, saveRecord, setOwner, updateRecord } from './store'
+import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -150,6 +153,8 @@ export type Config = {
   issueSpec: string | undefined
   /** How the agent merges once nothing holds the merge (R93). Repository file only. */
   mergeMethod: MergeMethod
+  /** How often the merge watcher reads a waiting record's PR state, in minutes (spec §5.13.3, R95). Repository file only. */
+  mergeWatchMinutes: number
   /** Plugin options whose value was invalid, each with why: the default applies to them. */
   badOptions: string[]
 }
@@ -229,6 +234,7 @@ export function configOf(options: PluginOptions): Config {
     codexModelHigh: model('codexModelHigh'),
     issueSpec: undefined,
     mergeMethod: 'merge',
+    mergeWatchMinutes: 5,
     badOptions,
   }
 }
@@ -238,7 +244,8 @@ export const badOptionsNote = (bad: readonly string[]): string => `Plugin option
 
 /**
  * A repository's own round settings over the plugin options (R67): `.github/pr-gate.json` on the base may set allowanceStandard,
- * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths, issueSpec (R92) and mergeMethod (R93), and the models and efforts (R68, R69),
+ * allowanceHigh, allowanceLight, lightBranches, onExhausted, highRiskPaths, issueSpec (R92), mergeMethod (R93) and mergeWatchMinutes (R95),
+ * and the models and efforts (R68, R69),
  * each read as configOf reads the option. A key whose value is invalid is left to the option and named in `ignored`; an empty
  * regular expression turns its match off, and an empty model names none, as the option does.
  */
@@ -284,6 +291,9 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
     r.mergeMethod === undefined || r.mergeMethod === 'merge' || r.mergeMethod === 'squash' || r.mergeMethod === 'rebase'
       ? r.mergeMethod
       : bad('mergeMethod', 'not merge, squash or rebase')
+  const watch = r.mergeWatchMinutes
+  const mergeWatchMinutes =
+    watch === undefined ? undefined : typeof watch === 'number' && Number.isInteger(watch) && watch >= 1 && watch <= 60 ? watch : bad('mergeWatchMinutes', 'not a whole number of minutes from 1 to 60')
   const highRisk = pattern('highRiskPaths')
   // Set or not, and to what: an empty string sets "no model", which undefined alone cannot tell from unset.
   const model = (key: ModelKey): { model: string | undefined } | undefined =>
@@ -311,6 +321,7 @@ export function overrideConfig(c: Config, text: string | undefined): { config: C
       onExhausted: onExhausted ?? c.onExhausted,
       issueSpec: issueSpec ?? c.issueSpec,
       mergeMethod: mergeMethod ?? c.mergeMethod,
+      mergeWatchMinutes: mergeWatchMinutes ?? c.mergeWatchMinutes,
       highRisk: highRisk === undefined ? c.highRisk : highRisk.re,
       light: light === undefined ? c.light : light.re,
       effort: efforts.effort ?? c.effort,
@@ -356,6 +367,9 @@ export function setup(c: Config): void {
   config = c
   queued = []
   required.clear()
+  // A reload drops the module's timers: the merge watcher starts afresh when something needs it.
+  stopWatcher()
+  watchRoots.clear()
 }
 
 // This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
@@ -860,6 +874,8 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
   })
   $.ui.status(undefined)
   $.ui.toast(`pr-gate ${status}: ${message}`.slice(0, 300))
+  // A post-PR run that ends leaves a record with a PR and no run: the merge watcher reads its state from now on (spec §5.13.3).
+  if (ended.lifecycle === 'post') startWatcher($, ended.root)
   return ended
 }
 
@@ -927,14 +943,21 @@ export async function prStateOf($: Engine, root: string, pr: number): Promise<Pr
  * the agent gets gh's words, and `/pr-gate resume` checks again. A reset or a fresh start while gh ran ends it with nothing written,
  * said or archived (A6).
  */
-export async function closeLifecycle($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+export async function closeLifecycle(
+  $: Engine,
+  root: string,
+  branch: string,
+  pr: number | undefined,
+  state: 'MERGED' | 'CLOSED',
+  isWatch = false,
+): Promise<string> {
   // One close of a branch's lifecycle at a time in this process (the agent's merge and a poll's R62 close can meet): a second one
   // while the first runs does nothing, so no issue is reopened or filed twice. The first one archives the record or blocks it.
   const key = `${root}\0${branch}`
   if (closing.has(key)) return `PR #${pr ?? '?'} from ${branch}: the gate is already closing its lifecycle`
   closing.add(key)
   try {
-    return await closeOnce($, root, branch, pr, state)
+    return await closeOnce($, root, branch, pr, state, isWatch)
   } finally {
     closing.delete(key)
   }
@@ -946,22 +969,62 @@ const closing = new Set<string>()
 /** The message a failed post-merge check leaves on the record (spec §5.12); a check that passes later clears it before the archive. */
 const MERGE_UNCONFIRMED = 'merged, but the gate could not confirm the follow-up issue of'
 
-async function closeOnce($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED'): Promise<string> {
+/**
+ * The message a merge outside the gate leaves while a security finding holds with nothing tracking it (spec §5.13.2): the record is
+ * blocked, not archived, until the person waives each one; `/pr-gate waive <id>` then runs the close again.
+ */
+const MERGE_SECURITY = 'merged before the gate finished, with a security finding still holding that no ticket tracks:'
+
+/** Whether a merged PR's close left the record blocked (spec §5.12, §5.13): a waiver or resume runs the close again, never a round. */
+export const isMergeBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'message'>): boolean =>
+  rec.postStatus === 'blocked' && (rec.message?.includes(MERGE_UNCONFIRMED) === true || rec.message?.includes(MERGE_SECURITY) === true)
+
+/** Blocked only on a security finding the person must waive (spec §5.13.2): nothing for the watcher to retry. */
+const isSecurityOnlyBlocked = (rec: Pick<LifecycleRecord, 'postStatus' | 'message'>): boolean =>
+  rec.postStatus === 'blocked' && rec.message?.includes(MERGE_SECURITY) === true && rec.message.includes(MERGE_UNCONFIRMED) !== true
+
+async function closeOnce($: Engine, root: string, branch: string, pr: number | undefined, state: 'MERGED' | 'CLOSED', isWatch: boolean): Promise<string> {
   const rec = await loadRecord($, root, branch)
   const replaced = `PR #${pr ?? '?'} from ${branch} was merged, but its lifecycle was stopped, reset or replaced while the gate checked its follow-up issues: ` +
     'nothing was written for it'
   let open: Finding[] = []
   if (state === 'MERGED' && rec !== undefined && rec.phase !== 'archived') {
+    // A merge outside the gate (spec §5.13.1): every finding still holding, but security and any that names an issue, is filed first,
+    // through the filing pass, whatever round or phase the record was in. A filing that fails is a failed check, as in §5.12.
+    const unfiled: string[] = []
+    let filed: LifecycleRecord = rec
+    if (mergeHolds(rec).some(isMergeFileable)) {
+      let got: LifecycleRecord | undefined
+      let threw: string | undefined
+      try {
+        got = await fileIssues($, rec, true)
+      } catch (error) {
+        threw = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+      }
+      if (got === undefined) {
+        // A reset or a fresh start while gh ran: nothing more is written (A6). Otherwise another filing pass of this branch held it,
+        // or the filing threw: a failed check, which the next watcher beat or a resume runs again, never a success.
+        const latest = await loadRecord($, root, branch)
+        if (latest === undefined || isMovedFrom(rec, latest)) return replaced
+        filed = latest
+        unfiled.push(`its findings still holding (${threw === undefined ? 'another filing pass was running' : `the filing itself failed: ${threw}`}; they are filed on the next check)`)
+      } else {
+        filed = got
+        for (const f of mergeHolds(filed).filter(isMergeFileable)) unfiled.push(`${f.id} (could not file its issue: ${f.issueError ?? 'the filing stopped before it'})`)
+      }
+    }
+    // §5.12's check runs even when a filing failed: both run in this close, and either failing blocks the record.
     let checked: MergeCheck
     try {
-      checked = await checkIssuesAfterMerge($, rec)
+      checked = await checkIssuesAfterMerge($, filed)
     } catch (error) {
       // Never silent (the gate can't get stuck): a check that threw is a failed check, and resume runs it again.
       const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
-      checked = { failed: [`its findings (the check itself failed: ${said})`], lines: [], findings: rec.findings, touched: [] }
+      checked = { failed: [`its findings (the check itself failed: ${said})`], lines: [], findings: filed.findings, touched: [] }
     }
     if (checked.moved === true) return replaced
-    const done = checked
+    const done = { ...checked, failed: [...unfiled, ...checked.failed] }
+    const security = untrackedSecurity(filed)
     // Only the fields the check changed are written, onto the record as it is now, under the lock.
     const apply = (latest: LifecycleRecord): Finding[] =>
       latest.findings.map(f => {
@@ -970,8 +1033,14 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         return { ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError }
       })
     let isGone = false
-    if (done.failed.length > 0) {
-      const why = `PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${done.failed.join('; ')}`
+    if (done.failed.length > 0 || security.length > 0) {
+      const named = security.map(f => `${f.id} [${f.severity}] ${titleOf(f)}`)
+      const why = [
+        ...(done.failed.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${done.failed.join('; ')}`]),
+        ...(security.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_SECURITY} ${named.join('; ')}`]),
+      ].join('. ')
+      // The watcher's next beat finding the same failure says nothing new; a resume, a waiver or a session start says it again.
+      const isRepeat = isWatch && rec.postStatus === 'blocked' && rec.message === why.slice(0, 1000)
       const saved = await updateRecord($, root, branch, latest => {
         isGone = isMovedFrom(rec, latest)
         if (isGone) return latest
@@ -979,14 +1048,28 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         return { ...latest, findings: apply(latest), postStatus: 'blocked', message: why.slice(0, 1000), log }
       })
       if (isGone || saved === undefined) return replaced
-      // A collection in flight ends here: its next poll would only run the check again. Resume does that.
+      // A collection in flight ends here: its next poll would only run the check again. The watcher, or a resume, does that.
       const run = await getRun($)
       if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'blocked', why.slice(0, 300))
-      await say($, saved, `pr-gate: ${why}. Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again.`)
+      if (isRepeat) return why
+      const steps = [
+        ...(done.failed.length === 0
+          ? []
+          : ['Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again (its merge watcher also retries on its own).']),
+        ...(security.length === 0
+          ? []
+          : [
+              `A security finding is never filed as a public issue, so the lifecycle stays open on ${security.map(f => f.id).join(', ')}. Tell the person now: only their ` +
+                `${security.map(f => `/pr-gate waive ${f.id} <reason>`).join(', ')} releases ${security.length === 1 ? 'it' : 'them'}, and the gate then ` +
+                'archives the lifecycle. Never type that command yourself.',
+            ]),
+      ]
+      if (security.length > 0) $.ui.toast(`pr-gate: ${`PR #${pr ?? '?'} ${MERGE_SECURITY} ${named.join('; ')}`.slice(0, 280)}`)
+      await say($, saved, `pr-gate: ${why}. ${steps.join(' ')}`)
       return why
     }
     // A check that failed before and passes now: its block and message go, so the archive does not keep a stale failure.
-    const isUnblocked = rec.postStatus === 'blocked' && rec.message?.includes(MERGE_UNCONFIRMED) === true
+    const isUnblocked = isMergeBlocked(rec)
     if (done.lines.length > 0 || done.touched.length > 0 || isUnblocked) {
       const saved = await updateRecord($, root, branch, latest => {
         isGone = isMovedFrom(rec, latest)
@@ -995,7 +1078,11 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         return { ...latest, findings: apply(latest), log: [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP), ...cleared }
       })
       if (isGone || saved === undefined) return replaced
-      open = saved.findings.filter(isSettledByIssue)
+      // What the merge outside the gate filed counts too, whatever its status (spec §5.13.1): each names its labelled issue.
+      const holding = new Set(mergeHolds(saved).map(f => f.id))
+      const isFiledAtMerge = (f: Finding): boolean =>
+        holding.has(f.id) && f.isSecurity !== true && isFollowUpRef(f.followUp) && f.followUpLabel === filingPeak(f)
+      open = saved.findings.filter(f => isSettledByIssue(f) || isFiledAtMerge(f))
     }
   }
   const said = `PR #${pr ?? '?'} from ${branch} was ${state === 'MERGED' ? 'merged' : 'closed'}: its lifecycle is archived, its history kept`
@@ -1009,6 +1096,89 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
   const did = await archiveLifecycle($, root, branch, await $.clock.now(), rec === undefined ? undefined : (rec.generation ?? 0))
   if (did && open.length > 0) await say($, { root, branch }, `pr-gate: PR #${pr ?? '?'} merged. Follow-up issues still open: ${open.map(issueLine).join('; ')}.`)
   return said
+}
+
+// ------------------------------------------------------ the merge watcher
+
+// While this session owns a record with a PR and no run, a slow watcher reads the PR's state (spec §5.13.3, R95): a merge on GitHub's
+// website, or by a connector, is never left unseen until a resume. It wakes every minute, and reads each record every
+// `mergeWatchMinutes` of the record's own base settings: one `gh pr view` per record per read.
+const WATCH_TICK_MS = 60_000
+let watcher: { cancel: () => void } | undefined
+let watchSince: number | undefined
+let isWatchBeating = false
+const watchRoots = new Set<string>()
+/** Each watched record, by its key: its base's minutes, read once, and when its PR state was last read. */
+const watched = new Map<string, { minutes: number; readAt: number }>()
+
+function stopWatcher(): void {
+  watcher?.cancel()
+  watcher = undefined
+  watchSince = undefined
+  watched.clear()
+}
+
+/** A record the watcher reads: it has a PR, is not archived, and is not blocked only on a security finding the person must waive. */
+const isWatchable = (rec: LifecycleRecord): rec is LifecycleRecord & { pr: number } =>
+  rec.pr !== undefined && (rec.phase === 'ready' || rec.phase === 'post') && !isSecurityOnlyBlocked(rec)
+
+/**
+ * Starts the merge watcher for the records under `root`, unless it runs already. Interactive sessions only: a headless one (a
+ * hook's `claude -p`) never runs a lifecycle. Called at session start, when a record reaches ready, and when a post-PR run ends.
+ */
+export function startWatcher($: Engine, root: string): void {
+  if (!isInteractive) return
+  watchRoots.add(root)
+  if (watcher !== undefined) return
+  void $.clock.now().then(now => {
+    watchSince ??= now
+  }, () => undefined)
+  watcher = $.clock.every(WATCH_TICK_MS, () => {
+    void watchBeat($).catch(() => undefined)
+  })
+}
+
+/**
+ * One beat: each record of this session's roots that has a PR, no running run and no live owner elsewhere (#13) is read once its
+ * minutes have passed; MERGED or CLOSED runs the close (§5.12, §5.13.1) as the agent's own merge does. A failed read waits for the
+ * next one, never a stop. The watcher stops itself once no such record is left; a run that ends, or a ready record, starts it again.
+ */
+async function watchBeat($: Engine): Promise<void> {
+  if (isWatchBeating) return
+  isWatchBeating = true
+  try {
+    const now = await $.clock.now()
+    const run = await getRun($)
+    const seen = new Set<string>()
+    for (const root of watchRoots) {
+      for (const rec of await liveRecords($, root)) {
+        try {
+          if (!isWatchable(rec)) continue
+          if (run !== null && run.status === 'running' && run.root === rec.root && run.branch === rec.branch) continue
+          if (await isOwnedElsewhere($, rec.root, rec.branch)) continue
+          const key = recordKey(rec.root, rec.branch)
+          seen.add(key)
+          let one = watched.get(key)
+          if (one === undefined) {
+            one = { minutes: (await configFor($, rec.root, rec.base)).config.mergeWatchMinutes, readAt: watchSince ?? now }
+            watched.set(key, one)
+          }
+          if (now - one.readAt < one.minutes * 60_000) continue
+          one.readAt = now
+          const state = await prStateOf($, rec.root, rec.pr).catch(() => undefined)
+          if (state !== 'MERGED' && state !== 'CLOSED') continue
+          await claimRecord($, rec.root, rec.branch)
+          await holdingPrompts($, () => closeLifecycle($, rec.root, rec.branch, rec.pr, state, true))
+        } catch {
+          // One record's failure is not the others': it is read again at its next beat.
+        }
+      }
+    }
+    for (const key of [...watched.keys()]) if (!seen.has(key)) watched.delete(key)
+    if (seen.size === 0) stopWatcher()
+  } finally {
+    isWatchBeating = false
+  }
 }
 
 // ----------------------------------------------------------- the steps
@@ -3031,6 +3201,8 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: no review finding holds the merge.`)
     else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready to merge at ${at}`)
     if (saved !== undefined) await say($, saved, readyPrompt(saved, method))
+    // A ready record has no run to poll GitHub: the merge watcher sees a merge on the website (spec §5.13.3).
+    startWatcher($, root)
     return
   }
   const isPre = rec.phase === 'pre'
@@ -3100,14 +3272,14 @@ type Filed = { peak: Severity; was: string | undefined; followUp: string | undef
  * meanwhile ends the filing too, and the record with it goes back to the caller, which runs the pass once more from the top (final
  * review I1). Never through a PR-create command line (spec §5.9).
  */
-export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+export async function fileIssues($: Engine, rec: LifecycleRecord, isMerged = false): Promise<LifecycleRecord | undefined> {
   // One filing pass per branch at a time in this process (a pass run again after a waiver can meet the waive command's or a session
   // start's own pass): a second one files nothing and decides nothing, so no issue is posted twice; the first one's caller decides.
   const key = `${rec.root}\0${rec.branch}`
   if (filing.has(key)) return undefined
   filing.add(key)
   try {
-    return await fileOnce($, rec)
+    return await fileOnce($, rec, isMerged)
   } finally {
     filing.delete(key)
   }
@@ -3116,11 +3288,11 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
 /** The branches whose filing pass `fileIssues` runs now, as `<root>\0<branch>`. */
 const filing = new Set<string>()
 
-async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
-  if (rec.phase === 'pre' || rec.pr === undefined) return rec
+async function fileOnce($: Engine, rec: LifecycleRecord, isMerged: boolean): Promise<LifecycleRecord | undefined> {
+  if ((rec.phase === 'pre' && !isMerged) || rec.pr === undefined) return rec
   const now = await $.clock.now()
   const { config: c } = await configFor($, rec.root, rec.base)
-  const plan = planIssues(rec, now, c.issueSpec)
+  const plan = planIssues(rec, now, c.issueSpec, isMerged)
   if (plan.kind === 'none') return rec
   // A reset, a fresh lifecycle or a stop since this pass began ends it (gate G7-8, R8-2): checked before each issue and
   // after its gh calls, so nothing more is filed and no log line lands in another lifecycle's log.
@@ -3330,9 +3502,15 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
   const lines: LogEntry[] = []
   const touched = new Map<string, Finding>()
   const waived = waivedIds(rec)
+  // After a merge outside the gate (spec §5.13.1), a finding still holding that names an issue is checked here too, never filed
+  // anew: its issue may be the agent's (R85), or one whose label GitHub dropped, and it may be gone. On the gate's own merge none holds.
+  const held = new Set(mergeHolds(rec).filter(f => f.isSecurity !== true && isFollowUpRef(f.followUp)).map(f => f.id))
   // A finding settled by its issue, or one whose issue this check filed again without its label (A7): that issue gets the label.
-  const isLabelOwed = (f: Finding): boolean => isFileable(f) && !waived.has(f.id) && isFollowUpRef(f.followUp) && f.followUpLabelError !== undefined
-  const targets = rec.findings.filter(f => isSettledByIssue(f) || isLabelOwed(f))
+  const isLabelOwed = (f: Finding): boolean =>
+    !waived.has(f.id) &&
+    isFollowUpRef(f.followUp) &&
+    ((isFileable(f) && f.followUpLabelError !== undefined) || (held.has(f.id) && f.followUpLabel !== filingPeak(f)))
+  const targets = rec.findings.filter(f => isSettledByIssue(f) || isLabelOwed(f) || held.has(f.id))
   if (targets.length === 0) return { failed, lines, findings: rec.findings, touched: [] }
   const { config: c } = await configFor($, rec.root, rec.base)
   // Each gh call is bounded: a hang ends as a failure, with gh's words, never a wait.
