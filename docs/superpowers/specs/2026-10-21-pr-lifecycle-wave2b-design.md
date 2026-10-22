@@ -312,11 +312,16 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
        merged before the gate finished, so no fix round ran on the finding.
        A filing that fails is a failed check: the record is blocked with
        gh's words, not archived, as in §5.12.
-    2. **Security.** A security finding still holding is never filed in a
-       public issue. The record is blocked, not archived, and the agent and
-       the person are told, naming the finding and the merge. Only the
-       person's waiver of each (`/pr-gate waive <id>`) releases it; the
-       archive follows.
+    2. **Security.** A security finding is never filed in a public GitHub
+       issue. Where the repository links a Jira project, it gets a Jira
+       ticket instead (item 7). At a merge outside the gate, a security
+       finding still holding whose Jira ticket exists counts as tracked:
+       the record is archived and the person is told, naming the finding
+       and its ticket. One with no ticket (no Jira project, or the ticket
+       could not be filed) blocks the record, not archived, and the agent
+       and the person are told, naming the finding and the merge. Only the
+       person's waiver of each (`/pr-gate waive <id>`) or a filed ticket
+       releases it; the archive follows.
     3. **Watching while nothing runs.** While this session owns a record
        that has a PR and no run (ready, awaiting the person, blocked,
        exhausted, stopped), a slow watcher reads the PR's state every
@@ -338,6 +343,36 @@ finding, it files a GitHub issue instead, and the issue settles the finding.
     6. **Not prevention.** A required `pr-gate` commit status in the `main`
        ruleset would block a website merge until the gate is ready. That
        is wave 3, with the merge link (Adam, 2026-10-21).
+    7. **Security findings open Jira tickets (Adam, 2026-10-21).** "Security
+       findings SHOULD open Jira tickets for repos that have a linked Jira
+       project (eventually they all will)." His rulings: the ticket tracks
+       the finding but does not settle it; the project is a setting; only
+       security goes to Jira in 1.5.0, the rest stays wave 4 (ROADMAP).
+       - **Link.** `jiraProject` in `.github/pr-gate.json` (a project key,
+         such as `KAN`), read from the base branch like every setting. No
+         setting: no ticket, and security waits for the person as in §5.4.
+       - **When.** Where the filing pass (§5.2) would leave a security
+         finding waiting for the person, it files the finding's Jira ticket
+         first. It also files one at a merge outside the gate (item 2).
+       - **Still holds.** The ticket does not settle the finding: before a
+         merge, only the person's waiver releases it (§5.4). The hold list
+         and `/pr-gate status` name the ticket ("S2-1 → KAN-512 Critical
+         [P1], waiting for your waiver").
+       - **How.** `acli jira workitem create --project <key> --type Bug
+         --summary <title> --description-file <body> --label
+         security,severity-<peak> --json`, with the title and body of §5.6
+         (the body names the PR, round and thread, and says the finding is
+         security). The record keeps the key as `followUp` (`KAN-512`), and
+         `followUpLabel` once the answer shows both labels. Bounded like
+         every gh call (30 s), never a wait.
+       - **Failure.** acli missing, not authenticated, or refusing: the
+         finding holds with acli's words, the person is told once to run
+         `acli jira auth login`, and the next pass retries. Never a stop,
+         never a GitHub issue in its place.
+       - **After the merge.** §5.12's check reads each ticket with `acli
+         jira workitem view <key> --json`. An existing ticket is logged,
+         whatever its status. A missing one is filed again. Any other failed
+         read blocks the record, as for a GitHub issue.
 
 ## 6. The agent merges (decision N)
 
@@ -417,7 +452,9 @@ Each with its cost if wrong, in the rulings doc:
 - R94: tags are standalone tokens; acknowledgements are named as such.
 - R95 (A9): a merge outside the gate files what still holds (not security,
   which blocks for the person); a slow watcher and a whole-repo scan at
-  session start see the merge; prevention by a required status is wave 3.
+  session start see the merge; prevention by a required status is wave 3;
+  a security finding opens a Jira ticket where `jiraProject` is set, and
+  still holds for the person's waiver (amends R92's security clause).
 
 ## 9. Testing
 
@@ -453,8 +490,13 @@ Each with its cost if wrong, in the rulings doc:
   - A9: a session started on another branch closes a merged record of a
     branch not checked out; a record owned by a live session elsewhere is
     left alone.
+  - A9.7: with `jiraProject` set, a security deferral at exhaustion files a
+    Jira ticket (fake acli) and still holds; without it, nothing is filed;
+    acli unauthorized holds with its words and retries next pass; a merge
+    outside the gate with the ticket filed archives and tells the person.
 - `world.ts`: fakes for `requested_reviewers`, check runs per head, issue
-  filing (`issues` POST) with a failure knob, and `pr merge`.
+  filing (`issues` POST) with a failure knob, and `pr merge`; an `acli`
+  fake for `jira workitem create` and `view` with failure knobs.
 
 ## 10. Housekeeping
 
@@ -463,4 +505,4 @@ Each with its cost if wrong, in the rulings doc:
 - ROADMAP.md: wave 2b items 1-4 done; "one finding per problem" placed here;
   item 5 (lanes) moves to wave 2c.
 - LIFECYCLE_SPEC.md: the round, collection, settle and merge rules.
-- New settings in `.github/pr-gate.json`: `mergeMethod`, `issueSpec`, `mergeWatchMinutes`.
+- New settings in `.github/pr-gate.json`: `mergeMethod`, `issueSpec`, `mergeWatchMinutes`, `jiraProject`.
