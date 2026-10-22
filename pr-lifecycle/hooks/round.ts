@@ -1032,7 +1032,8 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     // A security finding with no Jira ticket gets one there, only where the base sets jiraProject (spec §5.13.7); without it the
     // security finding blocks below, and no filing pass runs for it.
     const isUntracked = mergeHolds(rec).some(f => f.isSecurity === true && f.jiraTicket === undefined)
-    const isJira = isUntracked && (await configFor($, rec.root, rec.base)).config.jiraProject !== undefined
+    // A settings read that throws never escapes the close: the security finding then blocks below, and the person is told.
+    const isJira = isUntracked && (await configFor($, rec.root, rec.base).then(got => got.config.jiraProject !== undefined, () => false))
     if (mergeHolds(rec).some(isMergeFileable) || isJira) {
       let got: LifecycleRecord | undefined
       let threw: string | undefined
