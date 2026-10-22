@@ -187,3 +187,4 @@ Task 17: complete (62c5c12, 6ca9620; 636 tests). Re-review: all addressed. Parke
   - the security block is decided from record state, not message text;
   - waive <id> falls back to the one blocked record under the root.
   Fix round 1 sent.
+- Task 18 re-review: items 1-3, 5, 6 addressed; item 4 has a gap (repeated ids across branches). Ruling: a qualified `waive <branch>:<id>`; an ambiguous unqualified id is refused, naming both — cost if wrong: one extra command when an id repeats. Fix round 2 sent.
