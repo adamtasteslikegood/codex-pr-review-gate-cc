@@ -163,6 +163,8 @@ export type World = {
     isRequestPostBroken?: boolean
     /** `gh pr view <n> --json headRefOid` (the PR head read alone) throws, as a spawn failure does. */
     isHeadReadBroken?: boolean
+    /** The read of a merged PR after the agent's merge (`--json number,headRefName,state`) throws, as a failed spawn does. */
+    isMergedReadBroken?: boolean
     /** Called on each `gh pr checks`, before it answers: a test acts while the standing is gathered. */
     onChecks?: () => void | Promise<void>
   }
@@ -376,6 +378,7 @@ export function world(on: On): World {
       }
       if (args.startsWith('pr view')) {
         if (w.gh.isHeadReadBroken === true && /--json headRefOid(,baseRefName)?$/.test(args)) throw new Error('spawn failed')
+        if (w.gh.isMergedReadBroken === true && args.endsWith('--json number,headRefName,state')) throw new Error('spawn failed')
         if (!w.gh.hasPr) return out('', 1)
         const baseRefName = w.gh.baseSeq?.shift() ?? w.gh.base
         const owner = w.gh.forkOwner ?? 'me'

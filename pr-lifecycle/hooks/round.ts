@@ -1787,6 +1787,10 @@ async function closeCollect(
     if (!isClosed) return one
     return {
       ...one,
+      // The tail after collection (rollOver, endCollect) gets its own step clock, never collection's (final review M2). A turn taken
+      // while collecting keeps its active time.
+      phaseStartedAt: now,
+      activeMs: one.activeMs + (one.phase === 'collect' ? 0 : now - one.phaseStartedAt),
       ...extra,
       waitMs: one.waitMs + (one.collect === undefined ? 0 : now - one.collect.startedAt),
       collect: undefined,
@@ -2895,9 +2899,10 @@ export const hasSecurityBlocker = (rec: LifecycleRecord): boolean => [...unresol
 
 /**
  * After a round, or at start: the controller reads the record and does what `decideNext` says. `isResume`: the person or agent ran
- * /pr-gate or resume, which alone re-opens a pre-PR fix step on the same head (R63); a held create or a grant does not.
+ * /pr-gate or resume, which alone re-opens a pre-PR fix step on the same head (R63); a held create or a grant does not. `pass`: 1 when
+ * a filing pass cut short by a waiver re-entered it (final review I1); it re-enters at most once, then decides on what it has.
  */
-export async function advance($: Engine, root: string, branch: string, isResume = false): Promise<void> {
+export async function advance($: Engine, root: string, branch: string, isResume = false, pass = 0): Promise<void> {
   let rec = await loadRecord($, root, branch)
   if (rec === undefined) return
   // Every prompt the controller sends (open the PR, ready, held) comes from here: none while another session holds the record (#13).
@@ -2911,6 +2916,13 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   const tip = rec.pr !== undefined && posts.length > 0 ? await prTipOf($, root, rec.pr) : undefined
   const at = tip?.head ?? rec.head
   if (rec.pr !== undefined && posts.some(one => one.head === at)) {
+    // Re-entered after a filing pass (final review I1): the post waiver landed during it, and `waive post` has told the agent what it
+    // covers and finished a post run of this branch. Only a run still going is ended here, so nothing waits on it; nothing is said twice.
+    if (pass > 0) {
+      const live = await getRun($)
+      if (live !== null && live.status === 'running' && live.root === root && live.branch === branch) await finish($, live.id, 'waived', 'Waived by the person.')
+      return
+    }
     const standing = await gatherStanding($, rec, { number: rec.pr, baseRefName: tip?.base ?? rec.base, headRefOid: at })
     if (!(await isStillCurrent($, rec))) return
     await say($, rec, `pr-gate: the person's post waiver covers PR #${rec.pr} at ${at.slice(0, 7)}.\n\n${holdText(standing)}`)
@@ -2931,6 +2943,10 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   // security; it then decides again from what it wrote (R92).
   const filed = await fileIssues($, rec)
   if (filed === undefined) return
+  // A waiver given while the pass ran cut it short: a grant refused, or issues left unfiled. Neither the waive command (a run is going)
+  // nor anything else runs the pass again, so the controller re-enters once from the top, where a post waiver is read too (final
+  // review I1). A second cut decides on what it has: blocked or exhausted with its resume line, so the run never waits on no one.
+  if (pass === 0 && filed.waivers.length !== rec.waivers.length) return advance($, root, branch, isResume, pass + 1)
   rec = filed
   const next = decideNext(rec)
   // Each write checks its decision again on the read taken under the record's lock (F5); a record changed since this read is
@@ -2954,7 +2970,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   }
   if (next.kind === 'open-pr') {
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, preStatus: next.status, preHead: one.head })))
-    if (isStale) return advance($, root, branch, isResume)
+    if (isStale) return advance($, root, branch, isResume, pass)
     const seen = saved ?? rec
     const hasSecurity = hasSecurityBlocker(seen)
     // The base's own setting, if it has one (R67).
@@ -2993,7 +3009,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     // Read before the currency check below, so no await sits between that check and the say.
     const method = (await configFor($, rec.root, rec.base)).config.mergeMethod
     const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
-    if (isStale) return advance($, root, branch, isResume)
+    if (isStale) return advance($, root, branch, isResume, pass)
     const at = (saved ?? rec).head.slice(0, 7)
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: no review finding holds the merge.`)
     else if (saved !== undefined) await logEvent($, root, branch, 'end', `ready to merge at ${at}`)
@@ -3024,7 +3040,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     branch,
     ifStill(one => (isPre ? { ...one, preStatus: runStatus, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why })),
   )
-  if (isStale) return advance($, root, branch, isResume)
+  if (isStale) return advance($, root, branch, isResume, pass)
   if (id !== undefined) await finish($, id, runStatus, `${next.why}. Next: ${next.nextStep}`)
   if (saved === undefined) return
   // Before the PR: only the round that just ended says so; a rerun on the same record says nothing new.
@@ -3064,7 +3080,8 @@ type Filed = { peak: Severity; was: string | undefined; followUp: string | undef
  * (A7): GitHub drops the labels of a POST from an account without push access, so a filed issue without it holds as a failed label,
  * and the next pass labels that issue rather than filing another. Each result is saved as its gh call ends. Undefined when the
  * lifecycle was reset, replaced or stopped while gh ran: the caller decides nothing for it (gate G7-8, R8-2). A waiver given
- * meanwhile ends the filing too, and the record with it goes back to the caller. Never through a PR-create command line (spec §5.9).
+ * meanwhile ends the filing too, and the record with it goes back to the caller, which runs the pass once more from the top (final
+ * review I1). Never through a PR-create command line (spec §5.9).
  */
 export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
   if (rec.phase === 'pre' || rec.pr === undefined) return rec
@@ -3100,6 +3117,19 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
     if (text !== undefined) $.ui.toast(`pr-gate: ${text}.`)
     return saved ?? rec
   }
+  // The filing runs in the step that ended the round, whose clock may be near the step timeout (a verify phase started long ago): it
+  // gets a fresh one, so the ticker never stops it as that step (final review M3). Restamped before each issue, as each one is bounded.
+  const restamp = async (): Promise<void> => {
+    const live = await getRun($)
+    if (live === null || live.status !== 'running' || live.root !== rec.root || live.branch !== rec.branch) return
+    const at = await $.clock.now()
+    await patch($, live.id, one => ({
+      ...one,
+      phaseStartedAt: at,
+      activeMs: one.activeMs + (one.phase === 'collect' ? 0 : at - one.phaseStartedAt),
+      activity: 'filing follow-up issues…',
+    }))
+  }
   // Each gh call is bounded: a hang ends as a failure, recorded on the finding, never a wait.
   const gh = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
     try {
@@ -3133,6 +3163,7 @@ export async function fileIssues($: Engine, rec: LifecycleRecord): Promise<Lifec
     const current = await loadRecord($, rec.root, rec.branch)
     if (current === undefined || isMoved(current)) return undefined
     if (isWaived(current)) return current
+    await restamp()
     const label = `severity:${item.peak}`
     const base = { peak: item.peak, was: item.followUp, followUp: item.followUp }
     const repo = item.reuse?.repo ?? rec.slug

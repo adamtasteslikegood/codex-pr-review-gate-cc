@@ -4,7 +4,7 @@ import type { TestBody } from 'claude-code/testing'
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
-import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
+import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -5560,6 +5560,128 @@ test('R92: an issue filed while the person stops the gate is kept, and the resum
   expect((await recordOf(w)).phase).toBe('ready')
 })
 
+// ------------------------------------------------------------- wave 2b final review fixes (I1, m3)
+
+/** Two P2 deferrals Codex agreed with: the filing pass owes an issue for each (I1). */
+const toTwoDeferred = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): Promise<void> => {
+  await toTwo($, w)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '991' },
+    { id: 'G2-2', action: 'deferred', severity: 'P2', note: 'needs a migration', replyId: '992' },
+  ]))
+}
+
+test('wave 2b final review I1: a finding waived while the filing pass runs leaves no issue unfiled: the pass runs again, with no resume', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  let waived = ''
+  // The person waives G2-1 while GitHub files its issue: a run is going, so the waive command leaves the deciding to it.
+  w.gh.onIssue = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive G2-1 tracked by hand')).text)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived G2-1')
+  expect(w.gh.filed).toHaveLength(2)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+  expect((await runOf(w)).status).toBe('passed')
+  expect(w.prompts.some(one => one.includes('wait for their GitHub issue') || one.includes('waits for its GitHub issue'))).toBe(false)
+})
+
+test('wave 2b final review I1: a waive post given while the filing pass runs is honoured: no hold, no blocked record, one message', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  let waived = ''
+  const prompts = w.prompts.length
+  w.gh.onIssue = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  // The issue being filed when the waiver landed is kept; the waived head owes no other.
+  expect(w.gh.filed).toHaveLength(1)
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBeUndefined()
+  expect(rec.message).toBeUndefined()
+  const sent = w.prompts.slice(prompts)
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
+  expect(sent.some(one => one.includes('GitHub issue'))).toBe(false)
+  expect(sent.some(one => one.includes('covers PR #'))).toBe(false)
+})
+
+test('wave 2b final review I1: a gate round refused in the lock because a waiver just landed is granted when the pass runs again, not exhausted', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await say($, 'stop')
+  const rec = await recordOf(w)
+  const head = rec.head
+  const before = 'c'.repeat(40)
+  // The allowance spent, and the final-head check, run on a push, raised a blocker: the gate adds a round for it (R92).
+  const late: Finding = {
+    id: 'R7-1', round: 7, source: 'codex-review', reviewer: 'codex', severity: 'P1', title: 'Unvalidated redirect in login', file: 'src/app.ts',
+    line: 12, headSeen: head, status: 'open', history: [],
+  }
+  const spent: LifecycleRecord = {
+    ...rec,
+    postStatus: undefined,
+    message: undefined,
+    allowance: 4,
+    grants: [],
+    rounds: [
+      roundOf({ n: 2, phase: 'post', kind: 'baseline', startHead: before, endHead: before }),
+      ...[3, 4, 5, 6].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true, startHead: before, endHead: before })),
+      roundOf({ n: 7, phase: 'post', kind: 'final-head-check', startHead: before, endHead: head, raised: { blocking: 1, advisory: 0 } }),
+    ],
+    findings: [late],
+  }
+  expect(decideNext(spent).kind).toBe('exhausted')
+  expect(planIssues(spent, 0).kind).toBe('grant')
+  w.store.set(KEY, spent)
+  // A waiver of another finding lands after the controller read the record, before the filing pass takes its lock: the pass reads
+  // the base's settings in between.
+  let isWaived = false
+  w.git.onRoster = () => {
+    if (isWaived) return
+    isWaived = true
+    const now = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...now, waivers: [...now.waivers, { scope: 'finding', findingId: 'G9-9', head, reason: 'not this one', by: 'person', at: 1 }] })
+  }
+  const prompts = w.prompts.length
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect(isWaived).toBe(true)
+  const after = await recordOf(w)
+  expect(after.grants.filter(one => one.by === 'gate')).toHaveLength(1)
+  expect(after.postStatus).not.toBe('exhausted')
+  expect((await runOf(w)).status).toBe('running')
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+  expect(w.prompts.slice(prompts).some(one => one.includes('needs their allowance'))).toBe(false)
+})
+
+test('wave 2b final review m3: the filing pass gets its own step clock: a verify step near its timeout does not stop it', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  // Codex took 50 s of the minute to check the deferrals; each issue then takes 40 s at GitHub.
+  await w.clock.advance(50_000)
+  w.gh.onIssue = async () => {
+    await w.clock.advance(40_000)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  expect((await runOf(w)).status).toBe('passed')
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.some(one => one.includes('did not finish'))).toBe(false)
+})
+
 test('R93: the base\'s mergeMethod reaches the ready prompt', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
@@ -5677,6 +5799,37 @@ test('spec §5.12: a merge the session finds at its start runs the check before 
   await w.clock.advance(1000)
   expect(w.gh.reopened).toHaveLength(1)
   expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('wave 2b final review m1: a session start checks a blocked post record whose PR merged on GitHub, and archives it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  // The record is back in post-PR review and blocked (a hold the agent was told of), and the person merges the PR on GitHub.
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, phase: 'post', postStatus: 'blocked', message: 'G2-3 waits for its GitHub issue' })
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  // Its start runs the issue check (spec §5.12) and closes the lifecycle, with no /pr-gate.
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.issueStates[21]).toBe('OPEN')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivesOf(w)).toHaveLength(1)
+})
+
+test('wave 2b final review m5: a gh spawn that fails after GitHub took the merge tells the agent the issue check did not run', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.isMergedReadBroken = true
+  const ran = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  expect(isHeld(ran)).toBe(false)
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the merge went through, but the gate failed before it could check the follow-up issues (')
+  expect(w.prompts.at(-1)).toContain('The issue check did not run')
+  expect(w.prompts.at(-1)).toContain('run /pr-gate')
+  expect((await recordOf(w)).phase).toBe('ready')
 })
 
 /** A reset and a fresh start, run while the post-merge check awaits gh (A6): the check must write nothing into what follows. */

@@ -74,7 +74,7 @@ import {
   tellAgent,
   untriagedFeedback,
 } from './round'
-import type { Config } from './round'
+import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
 import { latestArchive, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
 
@@ -809,12 +809,33 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
  * A merge not yet done (`--auto`), or a `gh pr view` that fails here, is left to the next poll, session start or /pr-gate (R62).
  */
 const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
-  const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
-  if (!top.isOk) return
-  const view = await $.process.run(
-    ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'number,headRefName,state'],
-    { cwd: top.out, timeoutMs: 30_000 },
-  )
+  // A say that throws must not hide the error that brought the gate here (final review m6).
+  const tell = async (key: RecordKey, text: string): Promise<void> => {
+    try {
+      await say($, key, text)
+    } catch {
+      // The original error is rethrown below.
+    }
+  }
+  let root = action.cwd ?? ''
+  let view: Awaited<ReturnType<Engine['process']['run']>>
+  try {
+    const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
+    if (!top.isOk) return
+    root = top.out
+    view = await $.process.run(
+      ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'number,headRefName,state'],
+      { cwd: top.out, timeoutMs: 30_000 },
+    )
+  } catch (error) {
+    // A git or gh spawn threw before the gate knew the PR: the merge went through, and the agent is told the issue check did not run
+    // (final review m5). The checkout's record, if any, is the one the prompt is about.
+    const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+    const branch = await git($, root === '' ? undefined : root, ['rev-parse', '--abbrev-ref', 'HEAD']).then(got => (got.isOk ? got.out : ''), () => '')
+    await tell({ root, branch }, `pr-gate: the merge went through, but the gate failed before it could check the follow-up issues (${said}). ` +
+      'The issue check did not run, and the lifecycle is not closed: run /pr-gate.')
+    throw error
+  }
   let pr: { number?: unknown; headRefName?: unknown; state?: unknown } | undefined
   try {
     pr = view.exitCode === 0 ? (JSON.parse(view.stdout) as { number?: unknown; headRefName?: unknown; state?: unknown } | null) ?? undefined : undefined
@@ -822,7 +843,7 @@ const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
     pr = undefined
   }
   if (pr?.state !== 'MERGED' || typeof pr.headRefName !== 'string' || typeof pr.number !== 'number') return
-  const key = { root: top.out, branch: pr.headRefName }
+  const key = { root, branch: pr.headRefName }
   const number = pr.number
   try {
     const rec = await loadRecord($, key.root, key.branch)
@@ -833,7 +854,7 @@ const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
     // GitHub took the merge, but the gate failed closing it: the agent is told, never left with a toast alone (the gate can't go
     // silent). The record, unarchived, is checked again by /pr-gate resume, or at the next session start.
     const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
-    await say($, key, `pr-gate: PR #${number} merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (${said}). ` +
+    await tell(key, `pr-gate: PR #${number} merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (${said}). ` +
       'The follow-up issues are not confirmed yet. Run /pr-gate resume: the gate checks them again (a new session does too).')
     throw error
   }
@@ -1296,18 +1317,17 @@ export const register: Register = (on, options) => {
         // Only a session a person is at takes a record over, and only once its owner has gone quiet (#13; Adam, decision D): a
         // headless child in the same checkout (a hook's `claude -p`) never runs the lifecycle or gets its prompts.
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
-        // A ready record's PR merged meanwhile is closed too, after the issue check (spec §5.12); one still open is left as it is.
-        if (rec !== undefined && isMine && rec.phase === 'ready' && rec.pr !== undefined && (await prStateOf($, top.out, rec.pr)) === 'MERGED') {
-          await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, 'MERGED'))
+        // A PR merged or closed meanwhile is closed here, after the issue check (spec §5.12), whatever the record waits on: ready, held,
+        // blocked on an unconfirmed issue, or awaiting the person (final review m1). It is not collected again (R62).
+        const state = rec !== undefined && isMine && (rec.phase === 'ready' || rec.phase === 'post') && rec.pr !== undefined
+          ? await prStateOf($, top.out, rec.pr)
+          : undefined
+        if (rec !== undefined && (state === 'MERGED' || state === 'CLOSED')) {
+          await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, state))
           return next(e)
         }
+        // One still open is left as it is, unless its review was under way or stopped on an error.
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
-          // A PR merged or closed meanwhile is not collected again: its record is archived (R62).
-          const state = rec.pr === undefined ? undefined : await prStateOf($, top.out, rec.pr)
-          if (state === 'MERGED' || state === 'CLOSED') {
-            await holdingPrompts($, () => closeLifecycle($, top.out, branch, rec.pr, state))
-            return next(e)
-          }
           if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
           await holdingPrompts($, () => advance($, top.out, branch))
         }
