@@ -6099,7 +6099,7 @@ test('wave 2b gate R1-5: a refile after the merge whose answer was lost is found
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
 })
 
-test('wave 2b gate R1-6: a throw after the first of two refiles is answered: the new number is on the record, and resume files it no second time', async ($, on) => {
+test('wave 2b gate R1-6: a throw after the first of two refiles is answered: the new number is on the record; resume files it no more', async ($, on) => {
   const w = world(on)
   await toTwoDeferred($, w)
   await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
@@ -6134,4 +6134,62 @@ test('wave 2b gate R1-6: a throw after the first of two refiles is answered: the
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
   expect(archivedOf(w)?.findings.find(one => one.id === 'G2-2')).toMatchObject({ followUp: '#24', followUpLabel: 'P2' })
   expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#23 open after the merge')).toBe(true)
+})
+
+test('wave 2b gate R1-5 (fix round 1): a failed issue list after the merge files nothing, the record stays blocked; the next check finds it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  w.gh.issueAnswer = 'ok'
+  w.gh.issueListAnswer = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('HTTP 502: Bad Gateway')
+  expect(w.prompts.at(-1)).toContain('HTTP 502: Bad Gateway')
+  w.gh.issueListAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('wave 2b gate R1-5 (fix round 1): a closed issue of the same title is older work: the filing pass ignores it and files a new one', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // The issue the lost answer filed is closed meanwhile: it is not this finding's open follow-up.
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R1-5 (fix round 1): after the merge, a closed issue of the same title is ignored and the refile files a new one', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  w.gh.issueStates[22] = 'CLOSED'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(3)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
 })

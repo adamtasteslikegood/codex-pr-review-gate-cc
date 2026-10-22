@@ -3216,6 +3216,12 @@ async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecor
     // first, and one with this exact title is taken, never filed twice. A failed read files nothing: the next pass reads again.
     const isRetry = item.reuse === undefined && after.findings.find(one => one.id === item.id)?.issueError !== undefined
     const listed = isRetry ? await listIssues(gh, repo) : undefined
+    if (isRetry) {
+      // The list is a gh call too: the record is read afresh after it, before the POST or the label edit.
+      const latest = await loadRecord($, rec.root, rec.branch)
+      if (latest === undefined || isMoved(latest)) return undefined
+      if (isWaived(latest)) return latest
+    }
     const found = listed?.issues?.find(one => one.title === item.title)
     let got: Filed
     let text: string
@@ -3257,24 +3263,32 @@ async function fileOnce($: Engine, rec: LifecycleRecord): Promise<LifecycleRecor
   return ended()
 }
 
+/** The label names in GitHub's `labels` field of an issue: the names of its label objects, anything else left out. */
+const labelNamesOf = (labels: unknown): string[] =>
+  Array.isArray(labels)
+    ? labels.flatMap(one => {
+        const name = typeof one === 'object' && one !== null ? (one as { name?: unknown }).name : undefined
+        return typeof name === 'string' ? [name] : []
+      })
+    : []
+
 /** The number and label names in GitHub's answer to an issue POST; undefined when it gave no number. */
 const filedIssueOf = (stdout: string): { number: number; labels: string[] } | undefined => {
   try {
     const said = JSON.parse(stdout) as { number?: unknown; labels?: unknown }
     const n = said.number
     if (typeof n !== 'number' || !Number.isInteger(n) || n <= 0) return undefined
-    const labels = Array.isArray(said.labels)
-      ? said.labels.flatMap(one => (typeof one === 'object' && one !== null && typeof (one as { name?: unknown }).name === 'string' ? [(one as { name: string }).name] : []))
-      : []
-    return { number: n, labels }
+    return { number: n, labels: labelNamesOf(said.labels) }
   } catch {
     return undefined
   }
 }
 
 /**
- * The repository's issues, newest first, as GitHub's REST list gives them (wave 2b gate R1-5): its first 100, pull requests left
- * out. The list reads its own writes; the search API does not, so it is never used for this. `error`: gh's words when it failed.
+ * The repository's open issues, newest first, as GitHub's REST list gives them (wave 2b gate R1-5): its first 100, pull requests
+ * and closed issues left out. An issue a lost answer filed is open; a closed one of the same title is older work, perhaps of a reset
+ * lifecycle, and never taken. The list reads its own writes; the search API does not, so it is never used for this. `error`: gh's
+ * words when it failed.
  */
 async function listIssues(
   gh: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
@@ -3287,12 +3301,9 @@ async function listIssues(
     if (!Array.isArray(said)) return { error: 'gh did not answer with a list of issues' }
     const issues = said.flatMap(one => {
       if (typeof one !== 'object' || one === null) return []
-      const it = one as { number?: unknown; title?: unknown; labels?: unknown; pull_request?: unknown }
-      if (it.pull_request !== undefined || typeof it.number !== 'number' || typeof it.title !== 'string') return []
-      const labels = Array.isArray(it.labels)
-        ? it.labels.flatMap(each => (typeof each === 'object' && each !== null && typeof (each as { name?: unknown }).name === 'string' ? [(each as { name: string }).name] : []))
-        : []
-      return [{ number: it.number, title: it.title, labels }]
+      const it = one as { number?: unknown; title?: unknown; state?: unknown; labels?: unknown; pull_request?: unknown }
+      if (it.pull_request !== undefined || it.state !== 'open' || typeof it.number !== 'number' || typeof it.title !== 'string') return []
+      return [{ number: it.number, title: it.title, labels: labelNamesOf(it.labels) }]
     })
     return { issues }
   } catch {
@@ -3378,7 +3389,12 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       await log(`${f.id}: could not read ${where} after the merge`)
       continue
     }
+    // An issueError left by an earlier failed refile is stale once the issue is open: it goes, so the archive shows no failure.
+    const cleared = (): void => {
+      if (f.issueError !== undefined) touched.set(f.id, { ...f, issueError: undefined })
+    }
     if (state === 'OPEN' && !isLabelOwed(f)) {
+      cleared()
       await log(`${f.id}: ${where} open after the merge`)
       continue
     }
@@ -3396,7 +3412,10 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       }
       if (await isMoved()) return { moved: true }
     }
-    if (isOpen && !isLabelOwed(f)) continue
+    if (isOpen && !isLabelOwed(f)) {
+      cleared()
+      continue
+    }
     if (isOpen) {
       // Filed again by an earlier check without its label (A7): labelled now, as the filing pass labels an issue it reuses.
       await gh(['label', 'create', label, '--repo', ref.repo, '--color', LABEL_COLOURS[peak]])
@@ -3425,6 +3444,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     // The last refile's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title, other than the issue it replaces, is taken. A failed read files nothing this time.
     const listed = f.issueError === undefined ? undefined : await listIssues(gh, rec.slug)
+    if (listed !== undefined && (await isMoved())) return { moved: true }
     const found = listed?.issues?.find(one => one.title === title && !(ref.repo === rec.slug && one.number === ref.number))
     if (listed?.error !== undefined) {
       const issueError = `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200)
@@ -3437,16 +3457,19 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
       const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', rec.slug, '--add-label', label])
       if (edit === undefined || edit.exitCode === 0) {
-        if (await keep({ ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })) return { moved: true }
+        const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined }
+        if (await keep(settled)) return { moved: true }
         await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number} ${label}, filed by an answer gh lost`)
         continue
       }
-      if (await keep({ ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined })) return { moved: true }
+      const unlabelled = { ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined }
+      if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: could not label ${rec.slug}#${found.number} ${label}: ${words(edit)})`)
       await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, filed by an answer gh lost; could not label it ${label}`)
       continue
     }
-    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${issueBody(f, rec)}`, '-f', `labels[]=${label}`])
+    const body = issueBody(f, rec)
+    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close
     // saves never files the issue again, and a lost answer leaves its issueError, so the next check reads the list first.
@@ -3460,12 +3483,14 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     if (!filed.labels.includes(label)) {
       // Filed, but GitHub dropped the label (A7): the new issue is kept, and the next check labels it instead of filing another.
       const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-      if (await keep({ ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined })) return { moved: true }
+      const unlabelled = { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined }
+      if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: ${labelError})`)
       await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} without ${label}`)
       continue
     }
-    if (await keep({ ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })) return { moved: true }
+    const settled = { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined }
+    if (await keep(settled)) return { moved: true }
     await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
   }
   if (await isMoved()) return { moved: true }
