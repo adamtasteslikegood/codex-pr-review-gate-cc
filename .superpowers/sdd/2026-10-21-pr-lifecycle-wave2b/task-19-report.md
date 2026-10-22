@@ -103,3 +103,43 @@ I wrote the tests after the implementation. I then ran the whole suite with `hoo
 8. **A blocked record needs the person.** A record blocked only on an untracked security finding is not the watcher's (Task 18). Once acli is logged in, the person's `/pr-gate resume`, or a waiver, files the ticket and archives the record. The 4b test uses resume.
 9. **Refiling with no setting.** A refile after the merge uses `jiraProject`, or, when the setting was removed, the old key's project prefix.
 10. **Checked after the commit.** Every place that copies findings field by field carries `jiraTicket` and `jiraError`: `apply` in round.ts:1067, the filing apply at round.ts:3721, and `keep`. The answer merge in lifecycle.ts spreads the finding, so it keeps both fields too. `rev-parse --absolute-git-dir` goes through `git()`, which is bounded at 30 s.
+
+## Fix round 1 (commit `5fd1415`)
+
+This round answers task-19-review.md and the controller's rulings.
+
+1. **Login advice once (core.ts `ticketsOf`).**
+   - `ticketsOf(holds, isLoginSaid)` now gives the "Tell the person: …" advice only while the record's `isJiraLoginSaid` is unset. The failure list, with acli's words, and "Never file a GitHub issue for a security finding." always show.
+   - The filing pass sets the flag with its toast, so in practice the person is told by the toast alone. The agent's line carries the advice only where a `jiraError` was saved without the toast, which is the refile after the merge.
+   - Flow 3 now asserts that neither the first nor the second report has a login instruction.
+2. **Ruling (b).**
+   - lifecycle.ts gains:
+     - `ACLI_NOT_STARTED`, which `acli()` puts in front of a spawn throw: "acli could not be started (<words>)";
+     - `WRITE_FAILED`;
+     - `isAcliMissing`: the not-started words, ENOENT, "executable file not found", "no such file or directory" or "command not found";
+     - `jiraAdvice`:
+       - a missing acli gets "Install acli (the Atlassian CLI), then run acli jira auth login.";
+       - "unauthorized" gets "Run acli jira auth login.";
+       - anything else, including a write failure whose OS text says "no such file", gets acli's words alone.
+   - The toast and the agent line both use `jiraAdvice`.
+   - The not-found check after the merge uses `isAcliMissing` too, so "executable file not found" is not taken for a deleted ticket.
+   - Flow 3b now asserts the install wording and the "acli could not be started (" error. Flow 3 asserts the login wording without the install one.
+3. **Search answer shape.**
+   - `ticketIn`, now exported, takes an array, or an object holding the array under `issues` or `values`. Any other shape is an error: nothing is filed, and the next pass searches again.
+   - A new unit test in round.test.ts covers the array, `issues`, `values`, no match, an empty list, six bad shapes and a malformed key.
+4. **The minor items.**
+   - The JQL is now `project = P AND summary ~ "\"<id>\"" AND summary ~ "\"#<pr>\"" AND labels = security ORDER BY created DESC`, with `--limit 50`. `acli jira workitem search --help` lists `-l, --limit int`. Flow 6 asserts both.
+   - A refile after the merge always searches first (`isRetry: true`) and logs "<id>: Jira says KEY does not exist; filing it again, searching Jira first". Flow 5a asserts the log and the single search.
+   - The temp file is `<git-dir>/pr-gate-jira-<pr>-<id>-<now>-<random6>.txt`. Flow 1 asserts the shape.
+   - `$.fs.write` now runs inside the `try`/`finally`, so a partly written file is removed. Flow 3b asserts `w.files.size === 0` after a broken write.
+   - The refile passes `mergeKindOf(rec)` to `issueBody`. Flow 5a asserts the "merged before the gate finished" line in the new ticket.
+   - A ticket dropped because another pass saved one first is logged: "<id>: filed Jira NEW, but OLD was already saved; NEW may be a duplicate". Not covered by a test, because the race between two passes is hard to stage in the flow harness.
+   - The summary is cut at 255 characters in `fileTicket` (`SUMMARY_MAX`), and the same cut value is what the search matches. Not covered by a test.
+   - closeOnce runs the filing pass for an untracked security finding only when `configFor(...).jiraProject` is set. The other filing reasons (`isMergeFileable`) are unchanged. The Task 18 tests for security without Jira still pass.
+
+Results:
+- `npm run test`: codex-gate 22 pass, 0 fail; pr-lifecycle 666 pass, 0 fail. Two tests are new.
+- `npm run lint`: clean.
+- `npm run typecheck`: clean.
+
+Still open: acli's real `--json` shapes, and how the real engine rejects a missing binary, need one live check against a Jira site. Both are handled defensively; a search answer in an unknown shape stops retries from filing, but never stops the gate.
