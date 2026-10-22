@@ -194,3 +194,6 @@ Task 18: complete (1aec7a4, 6887fc0, ab3dd86, 723d415, plus a controller regex f
 - a qualified waive also reaches live, unmerged lifecycles — deliberate, the refusal check gates it;
 - README needs mergeWatchMinutes (docs task).
 - Task 19: implemented 43f37e4 (664 tests). Review: no GitHub leak path; Importants: the login hint repeats; a missing acli gets the wrong advice. Rulings: jiraTicket stays its own field (followUp would settle it); search accepts an array or {issues|values}; all Minors fixed. Fix round 1 sent. Still owed: one live acli search against the site to confirm the JSON shape, after Adam logs in again.
+
+Task 19: complete — 43f37e4, 5fd1415, controller fix 9958653 (configFor read in closeOnce can't escape; 666 tests pass)
+Task 20 (docs for Tasks 17-19, R95): complete — 611a1be
