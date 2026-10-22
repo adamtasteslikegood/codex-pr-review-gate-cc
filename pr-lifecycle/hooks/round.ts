@@ -1085,15 +1085,20 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
     let isGone = false
     let security: Finding[] = []
     let why = ''
+    let failed = done.failed
     const saved = await updateRecord($, root, branch, latest => {
       isGone = isMovedFrom(rec, latest)
       if (isGone) return latest
       const findings = apply(latest)
       const log = [...(latest.log ?? []), ...done.lines].slice(-LOG_CAP)
       security = untrackedSecurity({ ...latest, findings })
+      // A finding saved while gh ran, after the filing pass read the record, holds with no issue: a failed check, never an archive
+      // (wave 2b gate R3-3). The next check files it. With a failure already named, that check runs anyway.
+      const late = done.failed.length === 0 ? mergeHolds({ ...latest, findings }).filter(isMergeFileable) : []
+      failed = [...done.failed, ...late.map(f => `${f.id} (saved while the merge was checked; it is filed on the next check)`)]
       const named = security.map(f => `${f.id} [${f.severity}] ${titleOf(f)}`)
       why = [
-        ...(done.failed.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${done.failed.join('; ')}`]),
+        ...(failed.length === 0 ? [] : [`PR #${pr ?? '?'} ${MERGE_UNCONFIRMED} ${failed.join('; ')}`]),
         ...(security.length === 0 ? [] : [`PR #${pr ?? '?'} from ${branch} ${MERGE_SECURITY} ${named.join('; ')}`]),
       ].join('. ')
       if (why !== '') return { ...latest, findings, postStatus: 'blocked', message: why.slice(0, 1000), log }
@@ -1107,12 +1112,12 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       const run = await getRun($)
       if (run !== null && run.status === 'running' && run.root === root && run.branch === branch) await finish($, run.id, 'blocked', why.slice(0, 300))
       // The watcher's next beat finding the same block says nothing new; a resume, a waiver or a session start says it again.
-      const kinds = `${saved.generation ?? 0}|${done.failed.map(one => one.split(' (')[0]).join(',')}|${security.map(f => f.id).join(',')}`
+      const kinds = `${saved.generation ?? 0}|${failed.map(one => one.split(' (')[0]).join(',')}|${security.map(f => f.id).join(',')}`
       const isRepeat = isWatch && blockSaid.get(key) === kinds
       blockSaid.set(key, kinds)
       if (isRepeat) return why
       const steps = [
-        ...(done.failed.length === 0
+        ...(failed.length === 0
           ? []
           : ['Check that gh can read and create issues in the repository (gh auth status), then run /pr-gate resume: the gate checks them again (its merge watcher also retries on its own).']),
         ...(security.length === 0

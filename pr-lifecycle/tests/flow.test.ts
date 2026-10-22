@@ -6481,6 +6481,28 @@ test('A9 review I1: a waiver given while a close checks the issues leaves no sta
   expect(archivedOf(w)?.postStatus).toBeUndefined()
 })
 
+test('wave 2b gate R3-3: a finding saved while a website-merge close checks the issues blocks the record; the next beat files it and archives', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: [...rec.findings, holding('G3-1')] })
+  }
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G3-1 (saved while the merge was checked')
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed.length).toBe(before + 1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
 test('A9 review I2: /pr-gate waive <id> from another branch waives the one merged lifecycle blocked on that security finding; with two, it names both and waives none', async ($, on) => {
   const w = world(on)
   await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
