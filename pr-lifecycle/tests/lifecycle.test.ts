@@ -62,6 +62,7 @@ import {
   standingOf,
   ticketLine,
   ticketTitle,
+  titlesAtAnyPeak,
   untrackedSecurity,
   triage,
   unresolvedBlockers,
@@ -1586,6 +1587,21 @@ test('R92: the issue title names the finding, its peak severity, the PR, the bra
   // A Jira ticket's summary names the repository too (wave 2b gate R4-4): repositories sharing a project never match each other's.
   expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: 'me/repo' })).toBe('R4-3 Major [P2] Workflows rules ignored when reading required checks (#20, me/repo, feat/x)')
   expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: undefined })).toBe(issueTitle(f, { pr: 20, branch: 'feat/x' }))
+})
+
+test('PR #28 review: retry titles retain earlier peaks after a real link raise records severity in history', async () => {
+  const f = finding({ id: 'G2-1', severity: 'P2', peakSeverity: 'P2', title: 'Lost task' })
+  const raised = withLinkedPeak(f, finding({ id: 'R3-1', round: 3, severity: 'P1', peakSeverity: 'P1' }))
+  const rec = { pr: 20, branch: 'feat/x', slug: 'me/repo' }
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2' })
+  for (const title of [(one: Finding) => issueTitle(one, rec), (one: Finding) => ticketTitle(one, rec)]) {
+    const titles = titlesAtAnyPeak(raised, title)
+    expect(titles).toContain(title(f))
+    expect(titles.map(one => one.match(/\[P[0-3]\]/)?.[0])).toEqual(['[P0]', '[P1]', '[P2]', '[P3]'])
+  }
+  // Rendering historical titles must not lower the actual finding or erase its history.
+  expect(filingPeak(raised)).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2' })
 })
 
 test('R92: the issue body says who raised it and where, its severity, the problem, why it waits, and what is linked', async () => {

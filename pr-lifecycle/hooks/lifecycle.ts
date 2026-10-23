@@ -818,7 +818,8 @@ export const ticketTitle = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branc
  * attempts. A lost POST's issue, filed at a lower peak, is still found after the peak rises (PR #28 review, round.ts:3629).
  */
 export const titlesAtAnyPeak = (f: Finding, title: (one: Finding) => string): string[] =>
-  (['P0', 'P1', 'P2', 'P3'] as const).map(peak => title({ ...f, severity: peak, peakSeverity: peak }))
+  // These are presentation-only copies: peakOf would otherwise reapply a later severity from the real finding's history.
+  (['P0', 'P1', 'P2', 'P3'] as const).map(peak => title({ ...f, severity: peak, peakSeverity: peak, history: [] }))
 
 /**
  * The hidden last line of a GitHub issue the gate files: the finding and its PR, the same at every attempt whatever the peak or the
