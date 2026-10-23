@@ -6131,6 +6131,50 @@ test('wave 2b gate R6-2: a peak that rises while the issue POST runs keeps the i
   expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
 })
 
+test('PR #28 review: a lost issue POST, then a peak rise before the retry: the issue is found by its filing mark, relabelled and retitled, never filed twice', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.issues).toHaveLength(1)
+  expect(w.gh.issues[0]?.title).toContain('G2-1 Major [P2]')
+  expect(w.gh.issues[0]?.body).toContain('<!-- pr-gate filing: G2-1 of #1 -->')
+  // The peak rises before the next pass: the title the retry would send is no longer the one GitHub filed.
+  const held = await recordOf(w)
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P1' })) })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  const edit = w.gh.labelled.find(one => one.startsWith('issue edit 21 ')) ?? ''
+  expect(edit).toContain('--add-label severity:P1')
+  expect(edit).toContain('--remove-label severity:P2')
+  expect(edit).toContain('--title G2-1 Critical [P1]')
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
+test('PR #28 review: an issue a lost POST filed before the filing mark is still found by its title at the peak it was filed at', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // As an earlier version filed it: no mark in the body.
+  w.gh.issues = w.gh.issues.map(one => ({ ...one, body: 'filed before the mark' }))
+  const held = await recordOf(w)
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P0' })) })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit 21 ') && one.includes('--add-label severity:P0'))).toBe(true)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P0' })
+})
+
 test('wave 2b gate R4-7: a finding marked security while the severity label is made is never POSTed or labelled as a public issue', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
@@ -7010,6 +7054,25 @@ test('A9.7: a lost create answer, then a retry: Jira is searched and the ticket 
   expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
   expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
   expect(rec.log?.some(one => one.text.startsWith('G2-1: found Jira KAN-512, filed by an answer acli lost'))).toBe(true)
+})
+
+test('PR #28 review: a lost Jira create, then a peak rise before the retry: the ticket is found by its summary at the earlier peak, no second create', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'lost'
+  await toSecurityDeferral($, w)
+  expect(w.acli.tickets).toHaveLength(1)
+  const was = w.acli.tickets[0]?.summary ?? ''
+  const held = await recordOf(w)
+  const peak = held.findings.find(one => one.id === 'G2-1')?.peakSeverity
+  const higher = peak === 'P0' ? undefined : peak === 'P1' ? 'P0' : 'P1'
+  expect(higher).toBeDefined()
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: higher })) })
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect(w.acli.tickets[0]?.summary).toBe(was)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
 })
 
 test('A9.7: a website merge with the ticket filed archives the record and tells the person the finding and its ticket', async ($, on) => {

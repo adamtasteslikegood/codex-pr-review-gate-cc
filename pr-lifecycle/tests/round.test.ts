@@ -99,6 +99,9 @@ test('A9.7: acli search answers as an array, or an object holding it under issue
   }
   // A malformed key is never taken.
   expect(ticketIn(JSON.stringify([{ key: 'kan-12', fields: { summary: title } }]), title)).toEqual({})
+  // A set of summaries (PR #28 review): the ticket an earlier attempt filed at another peak is found by any of them.
+  expect(ticketIn(JSON.stringify(items), ['G2-1 Critical [P1] other', title])).toEqual({ key: 'KAN-12' })
+  expect(ticketIn(JSON.stringify(items), ['G2-1 Critical [P1] other'])).toEqual({})
 })
 
 test('A9.7 ruling (b): a missing acli is told to install it, unauthorized to log in, and anything else gets only acli\'s words', async () => {

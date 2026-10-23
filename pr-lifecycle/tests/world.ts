@@ -134,7 +134,7 @@ export type World = {
     /** Unrelated open issues GitHub's list shows before the gate's own, newest first: a list longer than one page (gate R2-2). */
     issueListFiller?: number
     /** Every issue the fake's POST filed, as the REST list gives it; its state is read from `issueStates`, and a 'missing' one is not listed. */
-    issues: { number: number; title: string; labels: string[] }[]
+    issues: { number: number; title: string; body?: string; labels: string[] }[]
     /** The number the next filed issue gets (default 21); each filing adds one. */
     issueNumber?: number
     /** The label names the POST's answer carries (A7); undefined echoes the labels asked for. GitHub drops them without push access. */
@@ -373,7 +373,8 @@ export function world(on: On): World {
         const asked = e.argv.flatMap(one => (one.startsWith('labels[]=') ? [one.slice('labels[]='.length)] : []))
         const names = w.gh.issueLabels ?? asked
         const title = e.argv.find(one => one.startsWith('title='))?.slice('title='.length) ?? ''
-        w.gh.issues.push({ number, title, labels: names })
+        const body = e.argv.find(one => one.startsWith('body='))?.slice('body='.length) ?? ''
+        w.gh.issues.push({ number, title, body, labels: names })
         if (w.gh.issueAnswer === 'lost') {
           const stderr = 'Post "https://api.github.com/repos/me/repo/issues": context deadline exceeded'
           return { value: { exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false } }
@@ -388,6 +389,7 @@ export function world(on: On): World {
         const listed = [...w.gh.issues].reverse().filter(one => w.gh.issueStates[one.number] !== 'missing').map(one => ({
           number: one.number,
           title: one.title,
+          body: one.body ?? '',
           state: (w.gh.issueStates[one.number] ?? 'OPEN') === 'CLOSED' ? 'closed' : 'open',
           labels: one.labels.map(name => ({ name })),
         }))

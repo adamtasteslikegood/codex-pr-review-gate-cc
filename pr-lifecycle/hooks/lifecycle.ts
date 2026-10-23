@@ -814,6 +814,23 @@ export function issueTitle(f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch
 export const ticketTitle = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'branch' | 'slug'>, spec?: string): string => issueTitle(f, rec, spec, rec.slug)
 
 /**
+ * Every title a finding's issue or ticket may carry from an earlier attempt: one per peak, the only part of it that moves between
+ * attempts. A lost POST's issue, filed at a lower peak, is still found after the peak rises (PR #28 review, round.ts:3629).
+ */
+export const titlesAtAnyPeak = (f: Finding, title: (one: Finding) => string): string[] =>
+  (['P0', 'P1', 'P2', 'P3'] as const).map(peak => title({ ...f, severity: peak, peakSeverity: peak }))
+
+/**
+ * The hidden last line of a GitHub issue the gate files: the finding and its PR, the same at every attempt whatever the peak or the
+ * spec handle in the title, so the lost-answer search knows the issue by it (PR #28 review, round.ts:3629).
+ */
+export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr'>): string => `<!-- pr-gate filing: ${id} of #${rec.pr ?? '?'} -->`
+
+/** A GitHub issue's body: the shared body (`issueBody`), then its filing mark. A Jira ticket's description is the body without it. */
+export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>, merged?: MergeKind): string =>
+  `${issueBody(f, rec, merged)}\n\n${filingMark(f.id, rec)}`
+
+/**
  * How a PR merged while findings still held (spec §5.13.1): outside the gate (GitHub's website, a connector), or under the person's
  * post waiver of its head (§5.4), whose reason the issue then carries. Either way the gate files what held at the merge.
  */
@@ -1370,13 +1387,22 @@ export const isFilingPoint = (next: Next): boolean =>
   next.kind === 'exhausted' || next.kind === 'awaiting-decision' || (next.kind === 'blocked' && (next.issues ?? []).length > 0)
 
 /** One issue the filing pass owes: a new one, or the one the agent named (`reuse`), labelled `severity:<peak>`. */
-export type IssueItem = { id: string; peak: Severity; followUp?: string; reuse?: { repo: string; number: number }; title: string; body: string }
+export type IssueItem = {
+  id: string
+  peak: Severity
+  followUp?: string
+  reuse?: { repo: string; number: number }
+  title: string
+  /** The titles an earlier attempt may have filed it under (`titlesAtAnyPeak`). */
+  titles: string[]
+  body: string
+}
 
 /**
  * One Jira ticket the filing pass owes a security finding (spec §5.13.7): its summary and description are the issue's title and body.
  * `isRetry`: the last attempt failed, perhaps after Jira filed it, so Jira is searched for it before another is filed.
  */
-export type TicketItem = { id: string; peak: Severity; title: string; body: string; isRetry: boolean }
+export type TicketItem = { id: string; peak: Severity; title: string; titles: string[]; body: string; isRetry: boolean }
 
 /** `tickets` only where the base sets `jiraProject` and a security finding still owes its ticket. */
 export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[]; tickets?: TicketItem[] }
@@ -1406,7 +1432,8 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merg
         ...(f.followUp === undefined ? {} : { followUp: f.followUp }),
         ...(reuse === undefined ? {} : { reuse }),
         title: issueTitle(f, rec, spec),
-        body: issueBody(f, rec, merged),
+        titles: titlesAtAnyPeak(f, one => issueTitle(one, rec, spec)),
+        body: githubBody(f, rec, merged),
       }
     })
   const tickets = !isJira
@@ -1414,7 +1441,8 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merg
     : mergeHolds(rec)
       .filter(f => (isMerged ? f.isSecurity === true : isTicketable(f)) && f.jiraTicket === undefined)
       .map((f): TicketItem => ({
-        id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, spec), body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
+        id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, spec), titles: titlesAtAnyPeak(f, one => ticketTitle(one, rec, spec)),
+        body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
       }))
   if (items.length === 0 && tickets.length === 0) return { kind: 'none' }
   return { kind: 'file', items, ...(tickets.length === 0 ? {} : { tickets }) }

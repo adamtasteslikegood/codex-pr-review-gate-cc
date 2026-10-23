@@ -95,6 +95,9 @@ import {
   waivedIds,
   linkTo,
   withLinkedPeak,
+  titlesAtAnyPeak,
+  filingMark,
+  githubBody,
   withRound,
   isFileable,
   isAcliMissing,
@@ -3386,7 +3389,8 @@ const SUMMARY_MAX = 255
  * The work item of acli's search answer whose summary is `title` exactly; an error otherwise. The answer is an array of
  * `{ key, fields: { summary } }`, or an object holding that array under `issues` or `values`; any other shape is a failed search.
  */
-export const ticketIn = (stdout: string, title: string): { key?: string; error?: string } => {
+export const ticketIn = (stdout: string, title: string | readonly string[]): { key?: string; error?: string } => {
+  const titles: readonly string[] = typeof title === 'string' ? [title] : title
   let answer: unknown
   try {
     answer = JSON.parse(stdout)
@@ -3398,7 +3402,7 @@ export const ticketIn = (stdout: string, title: string): { key?: string; error?:
   if (list === undefined) return { error: 'acli did not answer with a list of work items' }
   for (const one of list) {
     const it = typeof one === 'object' && one !== null ? (one as { key?: unknown; fields?: { summary?: unknown } | null }) : {}
-    if (typeof it.key === 'string' && JIRA_KEY.test(it.key) && it.fields?.summary === title) return { key: it.key }
+    if (typeof it.key === 'string' && JIRA_KEY.test(it.key) && typeof it.fields?.summary === 'string' && titles.includes(it.fields.summary)) return { key: it.key }
   }
   return {}
 }
@@ -3426,7 +3430,9 @@ async function fileTicket(
     const ofRepo = slug === undefined ? '' : ` AND summary ~ "\\"${slug}\\""`
     const jql = `project = ${project} AND summary ~ "\\"${t.id}\\""${ofPr}${ofRepo} AND labels = security ORDER BY created DESC`
     const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', jql, '--limit', '50', '--json'])
-    const found = search.exitCode === 0 ? ticketIn(search.stdout, summary) : { error: acliWords(search) }
+    // Its summary at any peak (PR #28 review): a lost create filed at a lower peak is still this finding's ticket.
+    const summaries = [summary, ...t.titles.map(one => one.slice(0, SUMMARY_MAX))]
+    const found = search.exitCode === 0 ? ticketIn(search.stdout, summaries) : { error: acliWords(search) }
     if (found.error !== undefined) return { error: `could not search Jira for a ticket a lost answer filed: ${found.error}`.slice(0, 200) }
     if (found.key !== undefined) return { key: found.key, isFound: true }
   }
@@ -3626,7 +3632,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
       if (isWaived(latest)) return latest
       if (isSecretNow(latest, item.id)) continue
     }
-    const found = listed?.issues?.find(one => one.title === item.title)
+    const found = listed?.issues === undefined ? undefined : issueFiledFor(listed.issues, filingMark(item.id, rec), item.titles)
     let got: Filed
     let text: string
     if (item.reuse !== undefined) {
@@ -3638,8 +3644,8 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
       got = { ...base, issueError: `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200) }
       text = `${item.id}: could not read the issues of ${repo} before filing again`
     } else if (found !== undefined) {
-      // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
-      const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', repo, '--add-label', label])
+      // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
+      const edit = await relabelFound(gh, repo, found, label, item.title)
       const labelError = edit === undefined || edit.exitCode === 0 ? undefined : failure(edit)
       got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }) }
       text = `${item.id}: found ${repo}#${found.number}, filed by an answer gh lost${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
@@ -3746,8 +3752,8 @@ const filedIssueOf = (stdout: string): { number: number; labels: string[] } | un
 async function listIssues(
   gh: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
   repo: string,
-): Promise<{ issues: { number: number; title: string; labels: string[] }[]; error?: undefined } | { issues?: undefined; error: string }> {
-  const issues: { number: number; title: string; labels: string[] }[] = []
+): Promise<{ issues: ListedIssue[]; error?: undefined } | { issues?: undefined; error: string }> {
+  const issues: ListedIssue[] = []
   for (let page = 1; page <= ISSUE_PAGES; page += 1) {
     const got = await gh(['api', `repos/${repo}/issues?state=open&per_page=100&sort=created&direction=desc${page === 1 ? '' : `&page=${page}`}`])
     if (got.exitCode !== 0) return { error: (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200) }
@@ -3760,13 +3766,43 @@ async function listIssues(
     if (!Array.isArray(said)) return { error: 'gh did not answer with a list of issues' }
     for (const one of said) {
       if (typeof one !== 'object' || one === null) continue
-      const it = one as { number?: unknown; title?: unknown; state?: unknown; labels?: unknown; pull_request?: unknown }
+      const it = one as { number?: unknown; title?: unknown; body?: unknown; state?: unknown; labels?: unknown; pull_request?: unknown }
       if (it.pull_request !== undefined || it.state !== 'open' || typeof it.number !== 'number' || typeof it.title !== 'string') continue
-      issues.push({ number: it.number, title: it.title, labels: labelNamesOf(it.labels) })
+      issues.push({ number: it.number, title: it.title, body: typeof it.body === 'string' ? it.body : '', labels: labelNamesOf(it.labels) })
     }
     if (said.length < 100) return { issues }
   }
   return { error: `the repository has more than ${ISSUE_PAGES * 100} open issues and pull requests to read` }
+}
+
+/** An open issue as `listIssues` reads it. */
+type ListedIssue = { number: number; title: string; body: string; labels: string[] }
+
+/**
+ * The open issue an earlier attempt filed for a finding, by its filing mark, or, for one filed before the mark, by its title at any
+ * peak (PR #28 review): the peak may have risen since the POST whose answer was lost, so its exact title is not this one's.
+ */
+const issueFiledFor = (issues: readonly ListedIssue[], mark: string, titles: readonly string[]): ListedIssue | undefined =>
+  issues.find(one => one.body.includes(mark)) ?? issues.find(one => titles.includes(one.title))
+
+/**
+ * Brings an issue a lost answer filed up to the finding's current peak: its label, with any other `severity:` label the gate put
+ * there taken off, and its title. Undefined when GitHub's list shows it as it should be, so nothing is sent.
+ */
+async function relabelFound(
+  gh: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+  repo: string,
+  found: ListedIssue,
+  label: string,
+  title: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string } | undefined> {
+  const stale = found.labels.filter(one => one.startsWith('severity:') && one !== label)
+  if (found.labels.includes(label) && stale.length === 0 && found.title === title) return undefined
+  return gh([
+    'issue', 'edit', String(found.number), '--repo', repo, '--add-label', label,
+    ...(stale.length === 0 ? [] : ['--remove-label', stale.join(',')]),
+    ...(found.title === title ? [] : ['--title', title]),
+  ])
 }
 
 /** The most pages of 100 `listIssues` reads before it fails rather than miss an issue a lost answer filed. */
@@ -3948,7 +3984,9 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     // first, and one with this exact title, other than the issue it replaces, is taken. A failed read files nothing this time.
     const listed = f.issueError === undefined && f.isIssueSent !== true ? undefined : await listIssues(gh, rec.slug)
     if (listed !== undefined && (await isMoved())) return { moved: true }
-    const found = listed?.issues?.find(one => one.title === title && !(ref.repo === rec.slug && one.number === ref.number))
+    const others = (listed?.issues ?? []).filter(one => !(ref.repo === rec.slug && one.number === ref.number))
+    const titles = titlesAtAnyPeak(f, one => issueTitle(one, rec, c.issueSpec))
+    const found = listed?.issues === undefined ? undefined : issueFiledFor(others, filingMark(f.id, rec), titles)
     if (listed?.error !== undefined) {
       const issueError = `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200)
       if (await keep({ ...f, issueError })) return { moved: true }
@@ -3957,8 +3995,8 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       continue
     }
     if (found !== undefined) {
-      // Labelled as the R85 reuse path labels an issue, only where GitHub's list shows it without the label.
-      const edit = found.labels.includes(label) ? undefined : await gh(['issue', 'edit', String(found.number), '--repo', rec.slug, '--add-label', label])
+      // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
+      const edit = await relabelFound(gh, rec.slug, found, label, title)
       if (edit === undefined || edit.exitCode === 0) {
         const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
         if (await keep(settled)) return { moved: true }
@@ -3971,7 +4009,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, filed by an answer gh lost; could not label it ${label}`)
       continue
     }
-    const body = issueBody(f, rec)
+    const body = githubBody(f, rec)
     // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved makes the next check read the list first.
     const sent: Finding = { ...f, issueError: f.issueError ?? ISSUE_SENT, isIssueSent: true }
     if (await keep(sent, true)) return { moved: true }
@@ -4025,7 +4063,10 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     if (await isMoved()) return { moved: true }
     const project = c.jiraProject ?? key.replace(/-\d+$/, '')
     // Always searched first: Jira says "does not exist" too of a ticket acli's account may not see, which must not be filed twice.
-    const again = { id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, c.issueSpec), body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true }
+    const again = {
+      id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, c.issueSpec), titles: titlesAtAnyPeak(f, one => ticketTitle(one, rec, c.issueSpec)),
+      body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true,
+    }
     await log(`${f.id}: Jira says ${key} does not exist; filing it again, searching Jira first`)
     const got = await fileTicket($, rec.root, project, again, rec.pr, rec.slug)
     if (got.error !== undefined) {
