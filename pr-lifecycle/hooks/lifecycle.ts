@@ -182,7 +182,8 @@ export const isPeakUnknown = (f: Pick<Finding, 'peakSeverity' | 'history'>): boo
 
 /** A GitHub item the agent may answer "no change requested" (R82): no security flag, and no explicit P0-P2 from the reviewer. */
 export const mayAcknowledge = (f: Finding): boolean =>
-  f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2)
+  f.source === 'github' && f.isSecurity !== true && !(f.severitySource === 'tag' && RANK[f.severity] <= 2) &&
+  !(f.severityFloor !== undefined && RANK[f.severityFloor] <= 2)
 
 /** Raised in this round, or held open again by this round's reviewer: what the round's fix step answers. */
 export const raisedIn = (finding: Pick<Finding, 'round' | 'history'>, round: number): boolean =>
@@ -219,14 +220,25 @@ export function applyAnswer(f: Finding, a: Answer, round: number, by: string, at
   const status: FindingStatus = a.action === 'fixed' ? 'reported-fixed' : a.action === 'acknowledged' ? 'rebutted' : a.action
   const next = moved(f, status, round, by, at, a.note, a.evidence)
   const isGuessed = f.severitySource === 'hint'
-  const severity = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
+  const wanted = a.severity === undefined ? f.severity : isGuessed || RANK[a.severity] < RANK[f.severity] ? a.severity : f.severity
+  // A guess goes down only as far as the rating a linked tag or Codex gave (`severityFloor`): a guessed P0 linked to a tagged P1 is
+  // answered to P1 at the lowest.
+  const floor = f.severityFloor
+  const isClamped = floor !== undefined && RANK[wanted] > RANK[floor]
+  const severity = isClamped ? floor : wanted
   const security = f.isSecurity === true || a.isSecurity === true
   // A changed severity is recorded with the one before it, so a lowering is known for what it was (R85).
   const last = next.history.length - 1
+  const kept = `answered ${a.severity ?? wanted}, kept at ${floor ?? wanted}: a linked reviewer tag or Codex rated it so`
   const history = next.history.map((one, i) =>
     i !== last
       ? one
-      : { ...one, ...(severity === f.severity ? {} : { severity, from: f.severity }), ...(a.action === 'acknowledged' ? { answer: 'acknowledged' as const } : {}) },
+      : {
+          ...one,
+          ...(severity === f.severity ? {} : { severity, from: f.severity }),
+          ...(isClamped ? { note: one.note === undefined ? kept : `${one.note} (${kept})` } : {}),
+          ...(a.action === 'acknowledged' ? { answer: 'acknowledged' as const } : {}),
+        },
   )
   // Another follow-up, or none, was never labelled: the label was the old issue's.
   const isNewFollowUp = a.action === 'deferred' && a.followUp !== f.followUp
@@ -292,6 +304,10 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   const provenance = linked.severity === severity && (linked.severitySource === 'tag' || linked.source !== 'github')
     ? { severitySource: original.severitySource === 'tag' ? 'tag' as const : linked.severitySource }
     : {}
+  // A lower tag or Codex rating does not supply the severity, but no answer may take a guess below it (`severityFloor`).
+  const rated = linked.severitySource === 'tag' || linked.source !== 'github' ? [linked.severity] : []
+  const floors = [original.severityFloor, linked.severityFloor, ...rated].filter((one): one is Severity => one !== undefined)
+  const floor = floors.length === 0 ? {} : { severityFloor: floors.reduce(higher) }
   const when = linked.history.at(-1)
   // Raised into blocking range, or made security, an accepted rebuttal or acknowledgement goes back to Codex at the new severity, at
   // no round's cost (ruling on 6b concern 1): the flag Codex's check reads and clears, so its time (R33) and its wording stay. Once per
@@ -318,8 +334,8 @@ export function withLinkedPeak(original: Finding, linked: Finding): Finding {
   // nor a known P0 is lost (wave 2b gate R1-2). An original whose peak is lost stays lost when its link would not raise it past that floor.
   const peak = higher(filingPeak(original), filingPeak(linked))
   return isPeakUnknown(original) && peak === 'P1'
-    ? { ...original, ...security, ...provenance, ...raised, ...recheck }
-    : { ...original, ...security, ...provenance, ...raised, ...recheck, peakSeverity: peak }
+    ? { ...original, ...security, ...provenance, ...floor, ...raised, ...recheck }
+    : { ...original, ...security, ...provenance, ...floor, ...raised, ...recheck, peakSeverity: peak }
 }
 
 /** The ids linked to a finding, for "G2-1 (also G2-2)". */

@@ -48,6 +48,11 @@ export type Finding = {
   isSecurity?: boolean
   /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
   severitySource?: 'tag' | 'hint'
+  /**
+   * The lowest severity a linked reviewer's tag or Codex's rating gave it (R84, R90): a guessed severity is answered down to it, never
+   * below. It stays after the link is dropped or refused, as the link's security does.
+   */
+  severityFloor?: Severity
   title: string
   file?: string
   line?: number

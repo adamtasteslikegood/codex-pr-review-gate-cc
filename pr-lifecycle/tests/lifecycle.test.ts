@@ -1357,6 +1357,30 @@ test('R90: a Codex-rated duplicate preserves its chosen severity instead of the 
   }
 })
 
+test('R90: a guessed P0 linked to a lower tagged security P1 is answered down to P1, never below', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', round: 2, severity: 'P0', peakSeverity: 'P0', severitySource: 'hint' })
+  const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', round: 2, severity: 'P1', severitySource: 'tag', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, duplicate)
+  // The guess stays the severity and stays a guess: a tag does not freeze an overestimate.
+  expect(raised).toMatchObject({ severity: 'P0', severitySource: 'hint', severityFloor: 'P1', isSecurity: true })
+  expect(applyAnswer(raised, { id: raised.id, action: 'fixed', severity: 'P1' }, 2, 'main', 6).severity).toBe('P1')
+  for (const lower of ['P2', 'P3'] as const) {
+    const answered = applyAnswer(raised, { id: raised.id, action: 'deferred', severity: lower, note: 'out of scope' }, 2, 'main', 6)
+    expect(answered.severity).toBe('P1')
+    expect(answered.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P0' })
+    expect(answered.history.at(-1)?.note).toContain(`answered ${lower}, kept at P1`)
+    expect(securityHolds(postRec({ findings: [answered, duplicate] })).map(one => one.id)).toEqual(['G2-1'])
+    expect(isChargedRound([answered, duplicate], 2)).toBe(true)
+  }
+  // The agent's link sets the same floor, and a Codex rating does too; a floor of P2 or above also refuses an acknowledgement.
+  const agent = applyLinks([original, dropLink(duplicate)], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+  expect(agent.findings[0]?.severityFloor).toBe('P1')
+  const codex = finding({ id: 'R2-1', source: 'codex-review', severity: 'P2', peakSeverity: 'P2' })
+  expect(withLinkedPeak(original, linkTo(codex, original, 'gate', 2, 5)).severityFloor).toBe('P2')
+  expect(mayAcknowledge({ ...original, severity: 'P2', severityFloor: 'P2' })).toBe(false)
+  expect(mayAcknowledge({ ...original, severity: 'P2', severityFloor: 'P3' })).toBe(true)
+})
+
 test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
   const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
   const rebutted = finding({ id: 'G2-2', source: 'github', severity: 'P2', status: 'rebutted', history: [{ round: 2, status: 'rebutted', note: 'not a bug', by: 'main', at: 4 }] })
