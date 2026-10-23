@@ -167,6 +167,12 @@ summary G2-1 stayed a separate blocker beside its own inline G2-2.
    to a P2 or P3 original keeps its P1 hold, and a P3 deferral of that
    original waits for the person. A raised severity is lowered only through
    R85's Codex-checked lowering. A refused agent link leaves it raised.
+   A reviewer's tag or Codex's rating on the link that is lower than the
+   original's guessed severity sets a floor (`severityFloor`, PR #28 review):
+   the guess stays a guess and may be answered down, but never below the
+   floor. A guessed P0 linked to a tagged security P1 may become P1, never P2
+   or P3. The floor stays when the link is dropped or refused, as security
+   does.
 7. **No match through an unchecked link (A9).** The gate never matches new
    feedback through the agent's link that Codex has not checked: the new item
    stands alone. Otherwise a later refusal would leave it settling with the
