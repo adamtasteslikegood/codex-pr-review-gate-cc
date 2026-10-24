@@ -277,6 +277,12 @@ export type LifecycleRecord = {
    * can tell the record replaced even when the new one has no rounds yet (gate G7-7). Absent means 0.
    */
   generation?: number
+  /**
+   * This lifecycle's own random id (#29), in the filing mark of every issue it files: made with the record, again at a reset, and
+   * by the first filing pass for a record from before it. Another checkout's record of the same PR, at the same generation, has
+   * another, so its findings of the same ids never take this one's issues.
+   */
+  lifecycleId?: string
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string

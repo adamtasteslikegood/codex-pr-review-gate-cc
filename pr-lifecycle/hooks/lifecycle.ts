@@ -56,6 +56,9 @@ export function rescope(rec: LifecycleRecord, tier: Tier, why: string, a: Allowa
   return { ...rec, tier, tierWhy: why, lane, allowance: Math.max(rec.allowance, allowanceFor(tier, lane, a)) }
 }
 
+/** A fresh lifecycle id (#29): random, so no two checkouts or lifecycles share one. */
+export const newLifecycleId = (): string => crypto.randomUUID()
+
 export function newRecord(init: {
   root: string
   branch: string
@@ -71,6 +74,7 @@ export function newRecord(init: {
   return {
     version: 1,
     ...rest,
+    lifecycleId: newLifecycleId(),
     grants: [],
     attempts: 0,
     activeMs: 0,
@@ -825,16 +829,17 @@ export const titlesAtAnyPeak = (f: Finding, title: (one: Finding) => string): st
 export const FILING_MARK = '<!-- pr-gate filing:'
 
 /**
- * The hidden last line of a GitHub issue the gate files: the finding, its PR and the lifecycle's generation, the same at every attempt
+ * The hidden last line of a GitHub issue the gate files: the finding, its PR and the lifecycle's own id, the same at every attempt
  * whatever the peak or the spec handle in the title, so the lost-answer search knows the issue by it (PR #28 review, round.ts:3629).
- * The generation keeps a reset lifecycle, whose ids start again, from taking an earlier lifecycle's issue (PR #28 review,
- * lifecycle.ts:828): a mark of another generation, or one without a generation, is never this finding's.
+ * The id keeps a reset lifecycle, or another checkout's record of the same PR, whose finding ids start again, from taking this one's
+ * issue (#29). Earlier marks, by generation or with neither, are never matched: a POST lost just before the upgrade may file its
+ * issue once more, never take another lifecycle's.
  */
-export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr' | 'generation'>): string =>
-  `${FILING_MARK} ${id} of #${rec.pr ?? '?'} gen ${rec.generation ?? 0} -->`
+export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr' | 'lifecycleId'>): string =>
+  `${FILING_MARK} ${id} of #${rec.pr ?? '?'} lc ${rec.lifecycleId ?? '?'} -->`
 
 /** A GitHub issue's body: the shared body (`issueBody`), then its filing mark. A Jira ticket's description is the body without it. */
-export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings' | 'generation'>, merged?: MergeKind): string =>
+export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings' | 'lifecycleId'>, merged?: MergeKind): string =>
   `${issueBody(f, rec, merged)}\n\n${filingMark(f.id, rec)}`
 
 /**
