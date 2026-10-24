@@ -86,6 +86,12 @@ export type Finding = {
   jiraTicket?: string
   /** acli's words when the gate last failed to file the finding's Jira ticket: the next pass searches Jira before filing again. */
   jiraError?: string
+  /**
+   * The exact summaries sent to Jira by creates whose answer was not saved, each saved before its create (PR #28 review,
+   * round.ts:3434): the search after a lost answer matches them as well as today's titles, so a summary the base's issueSpec has
+   * changed since is still found and never filed twice. Cleared once a ticket is saved.
+   */
+  jiraSummaries?: string[]
   /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
   duplicateOf?: string
   /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */

@@ -821,14 +821,20 @@ export const titlesAtAnyPeak = (f: Finding, title: (one: Finding) => string): st
   // These are presentation-only copies: peakOf would otherwise reapply a later severity from the real finding's history.
   (['P0', 'P1', 'P2', 'P3'] as const).map(peak => title({ ...f, severity: peak, peakSeverity: peak, history: [] }))
 
+/** How every filing mark starts: an issue whose body has none was filed before marks, and only it is matched by title. */
+export const FILING_MARK = '<!-- pr-gate filing:'
+
 /**
- * The hidden last line of a GitHub issue the gate files: the finding and its PR, the same at every attempt whatever the peak or the
- * spec handle in the title, so the lost-answer search knows the issue by it (PR #28 review, round.ts:3629).
+ * The hidden last line of a GitHub issue the gate files: the finding, its PR and the lifecycle's generation, the same at every attempt
+ * whatever the peak or the spec handle in the title, so the lost-answer search knows the issue by it (PR #28 review, round.ts:3629).
+ * The generation keeps a reset lifecycle, whose ids start again, from taking an earlier lifecycle's issue (PR #28 review,
+ * lifecycle.ts:828): a mark of another generation, or one without a generation, is never this finding's.
  */
-export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr'>): string => `<!-- pr-gate filing: ${id} of #${rec.pr ?? '?'} -->`
+export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr' | 'generation'>): string =>
+  `${FILING_MARK} ${id} of #${rec.pr ?? '?'} gen ${rec.generation ?? 0} -->`
 
 /** A GitHub issue's body: the shared body (`issueBody`), then its filing mark. A Jira ticket's description is the body without it. */
-export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings'>, merged?: MergeKind): string =>
+export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings' | 'generation'>, merged?: MergeKind): string =>
   `${issueBody(f, rec, merged)}\n\n${filingMark(f.id, rec)}`
 
 /**
@@ -1403,7 +1409,7 @@ export type IssueItem = {
  * One Jira ticket the filing pass owes a security finding (spec §5.13.7): its summary and description are the issue's title and body.
  * `isRetry`: the last attempt failed, perhaps after Jira filed it, so Jira is searched for it before another is filed.
  */
-export type TicketItem = { id: string; peak: Severity; title: string; titles: string[]; body: string; isRetry: boolean }
+export type TicketItem = { id: string; peak: Severity; title: string; titles: string[]; sent: string[]; body: string; isRetry: boolean }
 
 /** `tickets` only where the base sets `jiraProject` and a security finding still owes its ticket. */
 export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: string[] } | { kind: 'file'; items: IssueItem[]; tickets?: TicketItem[] }
@@ -1443,7 +1449,7 @@ export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merg
       .filter(f => (isMerged ? f.isSecurity === true : isTicketable(f)) && f.jiraTicket === undefined)
       .map((f): TicketItem => ({
         id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, spec), titles: titlesAtAnyPeak(f, one => ticketTitle(one, rec, spec)),
-        body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
+        sent: f.jiraSummaries ?? [], body: issueBody(f, rec, merged), isRetry: f.jiraError !== undefined,
       }))
   if (items.length === 0 && tickets.length === 0) return { kind: 'none' }
   return { kind: 'file', items, ...(tickets.length === 0 ? {} : { tickets }) }

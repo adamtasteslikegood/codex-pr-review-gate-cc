@@ -96,6 +96,7 @@ import {
   linkTo,
   withLinkedPeak,
   titlesAtAnyPeak,
+  FILING_MARK,
   filingMark,
   githubBody,
   withRound,
@@ -1086,7 +1087,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         return {
           ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError,
           isIssueSent: got.isIssueSent,
-          jiraTicket: got.jiraTicket, jiraError: got.jiraError,
+          jiraTicket: got.jiraTicket, jiraError: got.jiraError, jiraSummaries: got.jiraSummaries,
         }
       })
     // What still holds is decided under the lock, from the record as it is now: a waiver given while gh ran counts (review I1).
@@ -3430,8 +3431,9 @@ async function fileTicket(
     const ofRepo = slug === undefined ? '' : ` AND summary ~ "\\"${slug}\\""`
     const jql = `project = ${project} AND summary ~ "\\"${t.id}\\""${ofPr}${ofRepo} AND labels = security ORDER BY created DESC`
     const search = await acli($, root, ['jira', 'workitem', 'search', '--jql', jql, '--limit', '50', '--json'])
-    // Its summary at any peak (PR #28 review): a lost create filed at a lower peak is still this finding's ticket.
-    const summaries = [summary, ...t.titles.map(one => one.slice(0, SUMMARY_MAX))]
+    // Its summary at any peak (PR #28 review): a lost create filed at a lower peak is still this finding's ticket. The summaries
+    // saved before earlier creates count too, so one filed under an issueSpec the base has changed since is still found.
+    const summaries = [...t.sent, summary, ...t.titles.map(one => one.slice(0, SUMMARY_MAX))]
     const found = search.exitCode === 0 ? ticketIn(search.stdout, summaries) : { error: acliWords(search) }
     if (found.error !== undefined) return { error: `could not search Jira for a ticket a lost answer filed: ${found.error}`.slice(0, 200) }
     if (found.key !== undefined) return { key: found.key, isFound: true }
@@ -3503,7 +3505,14 @@ const TICKET_SENT = 'a ticket was sent to Jira, but its answer was not saved (th
  * which makes the next pass look first anyway. 'gone' when the lifecycle was reset or replaced: the caller files nothing. 'secret' when
  * the finding is now security-classified: the caller files no public issue for it.
  */
-async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'issueError' | 'jiraError', text: string): Promise<'gone' | 'secret' | 'sent'> {
+async function markSent(
+  $: Engine,
+  rec: LifecycleRecord,
+  id: string,
+  field: 'issueError' | 'jiraError',
+  text: string,
+  summary?: string,
+): Promise<'gone' | 'secret' | 'sent'> {
   let isGone = false
   let isSecret = false
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
@@ -3514,7 +3523,13 @@ async function markSent($: Engine, rec: LifecycleRecord, id: string, field: 'iss
     if (isSecret) return latest
     // An issue's POST is marked sent too (wave 2b gate R4-5): an answer clears issueError, never that mark.
     const sent = field === 'issueError' ? { isIssueSent: true as const } : {}
-    return { ...latest, findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent })) }
+    // A Jira create's exact summary is saved with its mark (PR #28 review): the search after a lost answer matches it.
+    const summaries = (f: Finding): Partial<Finding> =>
+      summary === undefined || (f.jiraSummaries ?? []).includes(summary) ? {} : { jiraSummaries: [...(f.jiraSummaries ?? []), summary] }
+    return {
+      ...latest,
+      findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent, ...summaries(f) })),
+    }
   })
   return saved === undefined || isGone ? 'gone' : isSecret ? 'secret' : 'sent'
 }
@@ -3683,7 +3698,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
     if (isWaived(current)) return current
     await restamp()
     // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
-    if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT)) === 'gone') return undefined
+    if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT, t.title.slice(0, SUMMARY_MAX))) === 'gone') return undefined
     const got = await fileTicket($, rec.root, project, t, rec.pr, rec.slug)
     let text =
       got.error === undefined
@@ -3703,7 +3718,7 @@ async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | und
           if (got.error === undefined && got.key !== f.jiraTicket) text = `${t.id}: filed Jira ${got.key}, but ${f.jiraTicket} was already saved; ${got.key} may be a duplicate`
           return f
         }
-        return got.error === undefined ? { ...f, jiraTicket: got.key, jiraError: undefined } : { ...f, jiraError: got.error }
+        return got.error === undefined ? { ...f, jiraTicket: got.key, jiraError: undefined, jiraSummaries: undefined } : { ...f, jiraError: got.error }
       })
       isFirstFailure = got.error !== undefined && latest.isJiraLoginSaid !== true
       const log = [...(latest.log ?? []), { at, kind: 'check' as const, text: text.slice(0, 300) }].slice(-LOG_CAP)
@@ -3779,11 +3794,12 @@ async function listIssues(
 type ListedIssue = { number: number; title: string; body: string; labels: string[] }
 
 /**
- * The open issue an earlier attempt filed for a finding, by its filing mark, or, for one filed before the mark, by its title at any
- * peak (PR #28 review): the peak may have risen since the POST whose answer was lost, so its exact title is not this one's.
+ * The open issue an earlier attempt filed for a finding, by its filing mark, or, for one whose body has no mark at all (filed before
+ * marks), by its title at any peak (PR #28 review): the peak may have risen since the POST whose answer was lost. An issue with
+ * another mark, of an earlier lifecycle's finding of the same id, is never taken (PR #28 review, lifecycle.ts:828).
  */
 const issueFiledFor = (issues: readonly ListedIssue[], mark: string, titles: readonly string[]): ListedIssue | undefined =>
-  issues.find(one => one.body.includes(mark)) ?? issues.find(one => titles.includes(one.title))
+  issues.find(one => one.body.includes(mark)) ?? issues.find(one => !one.body.includes(FILING_MARK) && titles.includes(one.title))
 
 /**
  * Brings an issue a lost answer filed up to the finding's current peak: its label, with any other `severity:` label the gate put
@@ -3875,7 +3891,7 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
       const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
         ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
         isIssueSent: next.isIssueSent,
-        jiraTicket: next.jiraTicket, jiraError: next.jiraError,
+        jiraTicket: next.jiraTicket, jiraError: next.jiraError, jiraSummaries: next.jiraSummaries,
       })
       return { ...latest, findings }
     })
@@ -4063,19 +4079,24 @@ export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Pr
     if (await isMoved()) return { moved: true }
     const project = c.jiraProject ?? key.replace(/-\d+$/, '')
     // Always searched first: Jira says "does not exist" too of a ticket acli's account may not see, which must not be filed twice.
+    const title = ticketTitle(f, rec, c.issueSpec)
     const again = {
-      id: f.id, peak: filingPeak(f), title: ticketTitle(f, rec, c.issueSpec), titles: titlesAtAnyPeak(f, one => ticketTitle(one, rec, c.issueSpec)),
-      body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true,
+      id: f.id, peak: filingPeak(f), title, titles: titlesAtAnyPeak(f, one => ticketTitle(one, rec, c.issueSpec)),
+      sent: f.jiraSummaries ?? [], body: issueBody(f, rec, mergeKindOf(rec)), isRetry: true,
     }
     await log(`${f.id}: Jira says ${key} does not exist; filing it again, searching Jira first`)
+    // The summary acli may file is saved first (PR #28 review): a create whose answer is lost is found by it, whatever issueSpec says next.
+    const summary = title.slice(0, SUMMARY_MAX)
+    const marked: Finding = again.sent.includes(summary) ? f : { ...f, jiraSummaries: [...again.sent, summary] }
+    if (marked !== f && (await keep(marked))) return { moved: true }
     const got = await fileTicket($, rec.root, project, again, rec.pr, rec.slug)
     if (got.error !== undefined) {
-      if (await keep({ ...f, jiraError: got.error })) return { moved: true }
+      if (await keep({ ...marked, jiraError: got.error })) return { moved: true }
       failed.push(`${f.id} (Jira ${key} is gone; filing it again: ${got.error})`)
       await log(`${f.id}: Jira ${key} is gone; could not file it again`)
       continue
     }
-    if (await keep({ ...f, jiraTicket: got.key, jiraError: undefined })) return { moved: true }
+    if (await keep({ ...marked, jiraTicket: got.key, jiraError: undefined, jiraSummaries: undefined })) return { moved: true }
     await log(`${f.id}: Jira ${key} is gone; ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`}`)
   }
   if (await isMoved()) return { moved: true }
