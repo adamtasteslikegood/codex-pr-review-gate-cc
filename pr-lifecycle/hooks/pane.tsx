@@ -5,7 +5,7 @@ import type { EngineInterface, RenderInput } from 'claude-code'
 
 import type { Finding, LifecycleRecord, Run, Step } from '../types'
 import { isBlocking } from './core'
-import { isAcceptedRebuttal, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
+import { answersOf, raiseOf, isAcceptedRebuttal, isAcknowledged, isDisputed, isReverifyOwed, mergeHolds, usedRounds, waivedIds } from './lifecycle'
 import { elapsed, SPINNER } from './round'
 
 type Engine = EngineInterface
@@ -59,7 +59,8 @@ type Mark = { glyph: string; said: string; isSettled: boolean; isOwed: boolean; 
 
 /** One finding in words: the mark, what stands, and whether it is settled, owed a check, or struck through (only a verified fix is). */
 const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
-  const last = one.history.at(-1)
+  // A link's severity raise (A9) is no ruling: Codex's acceptance is the last answer or ruling.
+  const last = answersOf(one).at(-1)
   const wasAccepted = one.status === 'rebutted' && last?.by === 'codex' && last.status === 'rebutted'
   const isWaived = rec !== undefined && waivedIds(rec).has(one.id)
   const waived = isWaived ? rec.waivers.find(w => w.scope === 'finding' && w.findingId === one.id && w.lapsedAt === undefined) : undefined
@@ -68,18 +69,31 @@ const markOf = (one: Finding, rec: LifecycleRecord | undefined): Mark => {
   if (waived !== undefined) return { glyph: '⊘', said: ` — waived: ${waived.reason}`, isSettled: true, isOwed: false, isStruck: false }
   if (isReverifyOwed(one) || (wasAccepted && one.needsRecheck === true)) {
     const glyph = one.status === 'rebutted' ? '↩' : '✔'
-    return { glyph, said: ' — re-verify owed (file changed)', isSettled: false, isOwed: true, isStruck: false, isVerify: true }
+    // A link's raise is its own cause (6b fix 1), not a file change.
+    const raise = raiseOf(one)
+    const why = raise === undefined
+      ? 're-verify owed (file changed)'
+      : `re-check owed (raised to ${one.severity}${one.isSecurity === true ? ', security,' : ''} by ${raise.raisedBy ?? '?'})`
+    return { glyph, said: ` — ${why}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
   }
   if (one.status === 'verified-fixed') return { glyph: '✔', said: ' — verified fixed', isSettled: true, isOwed: false, isStruck: true }
   if (one.status === 'reported-fixed') {
     return { glyph: '✓', said: ` — reported fixed, unverified${lapse}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
   }
   if (one.status === 'rebutted') {
-    if (isAcceptedRebuttal(one)) return { glyph: '↩', said: ' — rebuttal accepted', isSettled: true, isOwed: false, isStruck: false }
+    if (isAcceptedRebuttal(one)) return { glyph: '↩', said: isAcknowledged(one) ? ' — acknowledgement confirmed' : ' — rebuttal accepted', isSettled: true, isOwed: false, isStruck: false }
     if (isDisputed(one)) return { glyph: '↩', said: ` — disputed: awaiting the person${lapse}`, isSettled: false, isOwed: true, isStruck: false }
-    return { glyph: '↩', said: ` — rebuttal awaiting Codex${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+    return { glyph: '↩', said: ` — ${isAcknowledged(one) ? 'acknowledgement' : 'rebuttal'} awaiting Codex${lapse}`, isSettled: false, isOwed: false, isStruck: false }
   }
-  if (one.status === 'deferred') return { glyph: '⏸', said: ` — deferred${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+  if (one.status === 'deferred') {
+    // An agreed deferral a link raised (R92 M2): Codex checks it again at the new severity.
+    const raise = raiseOf(one)
+    if (raise !== undefined) {
+      const why = `re-check owed (raised to ${one.severity}${one.isSecurity === true ? ', security,' : ''} by ${raise.raisedBy ?? '?'})`
+      return { glyph: '⏸', said: ` — ${why}`, isSettled: false, isOwed: true, isStruck: false, isVerify: true }
+    }
+    return { glyph: '⏸', said: ` — deferred${lapse}`, isSettled: false, isOwed: false, isStruck: false }
+  }
   return { glyph: isBlocking(one) ? '●' : '·', said: lapse, isSettled: false, isOwed: false, isStruck: false }
 }
 

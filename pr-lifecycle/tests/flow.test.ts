@@ -3,8 +3,8 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
-import { requiredChecksOf } from '../hooks/round'
-import { decideNext, invalidate, isAcceptedRebuttal, mergeHolds, unresolvedBlockers } from '../hooks/lifecycle'
+import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
+import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
@@ -365,13 +365,15 @@ test('a merge to an ungated base, or of a promotion, is not held', async ($, on)
 
 test('a ready lifecycle lets its own head merge; a later push holds it again', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))
   await $.tool.call(createPr)
   // Ready through the controller (R65): nobody posts by the wait cap, and the pre-PR Codex review already covered the head.
   await w.clock.advance(20 * 60_000)
   expect((await recordOf(w)).phase).toBe('ready')
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.prHead = 'e'.repeat(40)
   const held = await $.tool.call(merge)
   expect(held.deny).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
@@ -544,7 +546,8 @@ test('with a roster, collection waits for the listed reviewers, then needs no Co
   expect(rec.phase).toBe('ready')
 })
 
-test('when no reviewer covers the head by the wait cap, Codex reviews the delta', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('when no reviewer covers the head by the wait cap, Codex reviews the delta', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   // A push after the PR opened: a head no review has covered (the pre-PR round reviewed a...a), checked out here.
@@ -693,7 +696,8 @@ test('a new head mid-collection restarts the quiet period', async ($, on) => {
   expect(w.spawned.filter(one => one.prompt.includes('after it opened'))).toHaveLength(0)
 })
 
-test('a pass-through round whose only feedback is a human comment sends it to triage, not to an error', async ($, on) => {
+// Machine load: 1 engine step, no real wait (spec §7.3).
+test('a pass-through round whose only feedback is a human comment sends it to triage, not to an error', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
@@ -707,7 +711,8 @@ test('a pass-through round whose only feedback is a human comment sends it to tr
   expect(w.spawned).toHaveLength(0)
 })
 
-test('at the wait cap with nobody covering the head, fresh findings still go to triage', async ($, on) => {
+// Machine load: 1 engine step, no real wait (spec §7.3).
+test('at the wait cap with nobody covering the head, fresh findings still go to triage', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   w.git.roster = '{"reviewers":["copilot"],"checks":[]}'
@@ -742,7 +747,8 @@ test('R72: a fix only reported on a covered head gets the Codex check, not a ful
   expect((round?.evidence ?? []).map(one => `${one.source}:${one.reviewer}`)).toEqual(['github:claude[bot]'])
 })
 
-test('a roster reviewer who never posted is recorded as missing evidence', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('a roster reviewer who never posted is recorded as missing evidence', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["claude[bot]","copilot"],"checks":[]}'
   await toPost($, w)
@@ -778,7 +784,8 @@ test('an unknown gh login found again is kept on the record', async ($, on) => {
 })
 
 const inline = (id: number, body: string, head: string, line = 4) => ({
-  id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, created_at: '1970-01-01T00:01:00Z', html_url: `u${id}`,
+  id, user: { login: 'claude[bot]' }, body, path: 'src/app.ts', line, commit_id: head, original_commit_id: head, created_at: '1970-01-01T00:01:00Z',
+  html_url: `u${id}`,
 })
 const roster = '{"reviewers":["claude[bot]"],"checks":[]}'
 const covers = (head: string) => [
@@ -830,8 +837,19 @@ test('a clean first post-PR round does not force a second', async ($, on) => {
   // R39: Codex checks the rebuttal on the same head first.
   await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
-  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')
+  // The step pins the reviewed head (wave 2b gate R2-4).
+  expect(w.prompts.at(-1)).toContain(`gh pr merge 1 --merge --match-head-commit ${(await recordOf(w)).head} and`)
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+
+test('wave 2b gate R2-4: the merge guard lets the ready prompt\'s pinned merge command through', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const head = (await recordOf(w)).head
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: `gh pr merge 1 --merge --match-head-commit ${head}` }))).toBe(false)
 })
 
 test('another agent pushing during triage makes the PR head the round\'s end head', async ($, on) => {
@@ -996,7 +1014,7 @@ test('R33: in the protected round, a comment on the lines just fixed is not call
   await w.clock.advance(30_000)
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('G3-1')
-  expect(said).not.toContain('duplicate of an answered finding')
+  expect(said).not.toContain('same problem as G2-1;')
 })
 
 test('R34: an item left without an answer is asked about once more, and does not reach ready silently', async ($, on) => {
@@ -1125,17 +1143,20 @@ test('R37: resuming a blocked post-PR review re-opens triage; a security rebutta
   expect(rec.rounds.filter(one => one.kind === 'discretionary' && one.isCompleted)).toHaveLength(1)
 })
 
-test('R37: a deferred P2 answered on resume ends awaiting the person\'s decision, with no new round', async ($, on) => {
+test('R37, R92: a deferred P2 answered on resume gets its GitHub issue, with no new round', async ($, on) => {
   const w = world(on)
   await toBlocked($, w, 'Consider renaming this')
   const before = postRounds(await recordOf(w))
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
-  // R39: a deferral is an answer, but only the person's waiver lets it into the merge.
-  expect(rec.phase).not.toBe('ready')
-  expect(rec.postStatus).toBe('awaiting-decision')
+  // R39: a deferral is an answer that holds the merge; R92: the gate files its issue, which settles it.
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
   expect(rec.processed).toContain('inline:11')
   expect(postRounds(rec)).toBe(before)
 })
@@ -1176,10 +1197,13 @@ test('M3: resuming a post-PR record reports the post-PR status', async ($, on) =
 
 // ------------------------------------------------------------- task 12 fix round 3 (R39)
 
-test('R39: a deferred P3 after the PR opened is not ready, and the merge is held naming it', async ($, on) => {
+test('R39: a deferred security P3 after the PR opened is not ready, and the merge is held naming it', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).not.toBe('ready')
   expect(rec.postStatus).toBe('awaiting-decision')
@@ -1213,7 +1237,8 @@ test('R39: a rebutted P2 that Codex rejects is open again', async ($, on) => {
   expect(isHeld(await $.tool.call(merge))).toBe(true)
 })
 
-test('R39: a pre-PR deferred advisory carried into the PR holds the merge', async ($, on) => {
+// Machine load: 4 engine steps, no real wait (spec §7.3).
+test('R39, R92: a pre-PR deferred advisory carried into the PR holds the merge until its issue is filed', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS', [P2])))
@@ -1221,12 +1246,15 @@ test('R39: a pre-PR deferred advisory carried into the PR holds the merge', asyn
   expect((await recordOf(w)).preStatus).toBe('passed')
   await $.tool.call(createPr)
   await w.clock.advance(21 * 60_000)
+  // Codex checks the carried deferral in the first post round's free check (R92 M2).
+  await done($, accept('r2-verify', w, { 'R1-1': true }))
   const rec = await recordOf(w)
   expect(rec.rounds.filter(one => one.phase === 'post' && one.isCompleted)).toHaveLength(1)
-  expect(rec.phase).not.toBe('ready')
-  const held = await $.tool.call(merge)
-  expect(isHeld(held)).toBe(true)
-  expect(held.deny).toContain('R1-1 [P2] deferred')
+  // Not dropped: the gate files its issue, and only that settles it (R92).
+  expect(w.gh.filed).toHaveLength(1)
+  expect((w.gh.filed[0] ?? []).find(one => one.startsWith('title='))).toMatch(/^title=R1-1 Major \[P2\] /)
+  expect(rec.findings.find(one => one.id === 'R1-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
 })
 
 // ------------------------------------------------------------- task 12 fix round 4 (R40–R44)
@@ -1278,7 +1306,7 @@ test('R41: a verdict missing for one id holds that id only', async ($, on) => {
   expect(mergeHolds(rec).map(f => f.id)).toEqual(['G2-2'])
 })
 
-test('R40: rebut, reject, rebut again costs one Codex check, and the dispute goes to the person', async ($, on) => {
+test('R40: rebut, reject, rebut again costs one Codex check, and the dispute gets its GitHub issue with both sides (R92)', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
   const spawned = w.spawned.length
@@ -1294,15 +1322,13 @@ test('R40: rebut, reject, rebut again costs one Codex check, and the dispute goe
   expect(w.spawned).toHaveLength(spawned + 1)
   const rec = await recordOf(w)
   expect(rec.findings.find(f => f.id === 'G2-1')?.status).toBe('rebutted')
-  expect(rec.postStatus).toBe('awaiting-decision')
-  const said = w.prompts.at(-1) ?? ''
-  expect(said).toContain('renaming breaks the public API')
-  expect(said).toContain('the name misleads callers')
-  expect(said).toContain('/pr-gate waive G2-1 <reason>')
-  expect(said).not.toContain('allow 1')
-  const held = await $.tool.call(merge)
-  expect(isHeld(held)).toBe(true)
-  expect(held.deny).toContain('disputed')
+  // Not security: the gate files the dispute, with both sides in its body, and the issue settles it.
+  expect(w.gh.filed).toHaveLength(1)
+  const body = (w.gh.filed[0] ?? []).find(one => one.startsWith('body=')) ?? ''
+  expect(body).toContain('renaming breaks the public API')
+  expect(body).toContain('the name misleads callers')
+  expect(rec.findings.find(f => f.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
 })
 
 test('a re-check flag is cleared only for this run\'s answers: an accepted rebuttal whose file a later fix touched is checked again', async ($, on) => {
@@ -1356,14 +1382,16 @@ test('R44: before the PR, a rebuttal Codex accepts stays rebutted with Codex\'s 
   expect(isAcceptedRebuttal(invalidate([one], new Set(['src/app.ts']))[0]!)).toBe(false)
 })
 
-test('R40: a dispute a later Codex review rules on stays the person\'s', async ($, on) => {
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R40: a security dispute a later Codex review rules on stays the person\'s', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992' }]))
+  // Security, so the dispute waits for the person: any other gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'the name is the API\'s', replyId: '992', isSecurity: true }]))
   await done($, accept('r2-verify', w, { 'G2-1': 'the name misleads callers' }))
   await $.command.run(cmd('resume'))
   await w.clock.advance(1000)
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993' }]))
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', note: 'renaming breaks the public API', replyId: '993', isSecurity: true }]))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // Someone pushes; no reviewer covers the new head, so Codex reviews it and holds G2-1 again.
   w.git.head = 'e'.repeat(40)
@@ -1378,10 +1406,14 @@ test('R40: a dispute a later Codex review rules on stays the person\'s', async (
   expect(one?.history.at(-1)?.by).toBe('main')
 })
 
-test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R45: a deferral a later Codex review calls verified stays deferred, and the merge stays held', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'Consider renaming this')
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // Someone pushes; no reviewer covers the new head, so Codex reviews it and calls G2-1 verified.
   w.git.head = 'e'.repeat(40)
@@ -1419,13 +1451,15 @@ const say = ($: Parameters<TestBody>[0], args: string, as: object = asPerson) =>
 
 test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   expect(isHeld(await $.tool.call(createPr))).toBe(true)
   expect((await say($, 'waive pre hotfix for the outage')).text).toContain('post-PR review still runs')
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   expect((await recordOf(w)).phase).toBe('post')
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(true)
   await say($, 'waive post reviewed by hand')
-  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })).deny).toBeUndefined()
   const waivers = (await recordOf(w)).waivers
   expect(waivers.map(one => [one.scope, one.reason, one.by])).toEqual([
     ['pre', 'hotfix for the outage', 'composer'],
@@ -1435,10 +1469,12 @@ test('a pre-PR waiver does not waive the post-PR lifecycle', async ($, on) => {
 
 test('gate R4-1: a post waiver given while the PR targeted dev does not release a merge after it is retargeted to main', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await say($, 'waive pre hotfix for the outage')
   expect(isHeld(await $.tool.call(createPr))).toBe(false)
   await say($, 'waive post reviewed by hand')
-  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' }))).toBe(false)
+  expect((await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })).deny).toBeUndefined()
   w.gh.base = 'main'
   const held = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1' })
   expect(isHeld(held)).toBe(true)
@@ -1450,7 +1486,7 @@ test('only the person waives, allows or resets', async ($, on) => {
   for (const args of ['waive pre x', 'waive post x', 'allow 1 x', 'reset']) {
     expect((await say($, args, { ...asPerson, origin: { kind: 'sdk' } })).text).toContain('Only the person')
   }
-  expect((await say($, 'waive hotfix')).text).toContain('waive pre|post|<findingId> <reason>')
+  expect((await say($, 'waive hotfix')).text).toContain('waive pre|post|[<branch>:]<findingId> <reason>')
 })
 
 test('exhaustion is distinct from passing, and the person can allow one more round', { options: { allowanceStandard: 1 } }, async ($, on) => {
@@ -1502,7 +1538,10 @@ test('a session start leaves a ready, held or awaiting record alone', async ($, 
   await toBlocked($, w, 'Consider renaming this')
   await say($, 'resume')
   await w.clock.advance(1000)
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '996', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   const prompts = w.prompts.length
   const spawned = w.spawned.length
@@ -1517,7 +1556,10 @@ test('a session start leaves a ready, held or awaiting record alone', async ($, 
 /** Probe: a deferred finding after the PR opened leaves the record awaiting the person's decision. */
 const toAwaiting = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, body = 'Consider renaming this', extra: object = {}) => {
   await toTriage($, w, body)
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', ...extra }]))
+  // Security: only a security deferral waits for the person; any other gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', isSecurity: true, ...extra }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
 }
 
@@ -1545,7 +1587,7 @@ test('waiving the last deferral makes the record ready, delivers the ready promp
   expect(rec.postStatus).toBeUndefined()
   expect(rec.waivers.map(one => [one.scope, one.findingId, one.by])).toEqual([['finding', 'G2-1', 'composer']])
   await w.clock.advance(1000)
-  expect(w.prompts.at(-1)).toContain('ready for the merge decision')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --merge')
   expect(isHeld(await $.tool.call(merge))).toBe(false)
 })
 
@@ -2258,6 +2300,7 @@ const paneFinding = (id: string, change: Partial<Finding>): Finding => ({
 
 const codexSaid = (status: 'rebutted' | 'open'): FindingEvent => ({ round: 2, status, note: 'checked', by: 'codex', at: 1 })
 const agentRebutted: FindingEvent = { round: 2, status: 'rebutted', note: 'not reachable', by: 'agent', at: 1 }
+const agentAcked: FindingEvent = { ...agentRebutted, note: 'No change requested', answer: 'acknowledged' }
 
 test('the pane shows the phase, the shared budget, who is awaited, and reported vs verified fixes', async ($, on) => {
   const w = world(on)
@@ -2273,7 +2316,10 @@ test('the pane shows the phase, the shared budget, who is awaited, and reported 
 test('the pane counts a deferred P3 as holding the merge and says what the person is awaited for', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.postStatus).toBe('awaiting-decision')
   expect(mergeHolds(rec)).toHaveLength(1)
@@ -2304,6 +2350,10 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
       paneFinding('A8', { status: 'deferred' }),
       paneFinding('A9', { status: 'deferred' }),
       paneFinding('B1', { status: 'deferred', severity: 'P3' }),
+      paneFinding('B2', { status: 'rebutted', severity: 'P3', history: [agentAcked, codexSaid('rebutted')] }),
+      paneFinding('B3', { status: 'rebutted', severity: 'P3', history: [agentAcked] }),
+      paneFinding('B4', { status: 'rebutted', severity: 'P1', needsRecheck: true, history: [agentRebutted, codexSaid('rebutted'),
+        { round: 3, status: 'rebutted', severity: 'P1', from: 'P3', raisedBy: 'G3-1', note: 'raised by its link G3-1', by: 'gate', at: 2 }] }),
     ],
     waivers: [
       { scope: 'finding', findingId: 'A8', head, reason: 'tracked in KAN-9', by: 'composer', at: 1 },
@@ -2313,9 +2363,9 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   w.store.set(key, next)
   const holds = mergeHolds(next).map(one => one.id)
   // A2 and A4 settled, A8 waived; the rest hold.
-  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1'])
+  expect(holds).toEqual(['A1', 'A3', 'A5', 'A6', 'A7', 'A9', 'B1', 'B3', 'B4'])
   const ui = await mountPane($)
-  expect(await ui.find({ type: 'Text', text: 'Findings (10, 7 holding the merge' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Findings (13, 9 holding the merge' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A1 [P1] Title of A1 — re-verify owed (file changed)' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A2 [P2] Title of A2 — verified fixed' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A3 [P1] Title of A3 — reported fixed, unverified' })).toBeDefined()
@@ -2325,6 +2375,10 @@ test('the pane names each finding state, and its hold count is what mergeHolds r
   expect(await ui.find({ type: 'Text', text: 'A7 [P2] Title of A7 — disputed: awaiting the person' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A8 [P2] Title of A8 — waived: tracked in KAN-9' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'A9 [P2] Title of A9 — deferred (waiver lapsed)' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'B2 [P3] Title of B2 — acknowledgement confirmed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'B3 [P3] Title of B3 — acknowledgement awaiting Codex' })).toBeDefined()
+  // A link's raise is its own cause, not a file change (6b fix 1).
+  expect(await ui.find({ type: 'Text', text: 'B4 [P1] Title of B4 — re-check owed (raised to P1 by G3-1)' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -2348,6 +2402,8 @@ test('rendering the pane starts no run and writes no state', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const snapshot = (): string => JSON.stringify({ store: [...w.store.entries()], run: w.run, spawned: w.spawned.length, prompts: w.prompts, opened: w.opened })
   const before = snapshot()
   const ui = await mountPane($)
@@ -2484,7 +2540,8 @@ test('a resume keeps the base the lifecycle was started for', async ($, on) => {
 
 // ------------------------------------------------------------- final fix wave (R60-R65)
 
-test('R60: the post-PR Codex fallback reviews from the last head a review covered, not one pushed during triage', async ($, on) => {
+// Machine load: 4 engine steps, no real wait (spec §7.3).
+test('R60: the post-PR Codex fallback reviews from the last head a review covered, not one pushed during triage', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   // A reviewer comments on a...a; the agent pushes e...e while it answers.
   await toTriage($, w)
@@ -2604,7 +2661,8 @@ test('R63: resuming a pre-PR block on the same head re-opens the fix step; a reb
   expect((await runOf(w)).round).toBe(2)
 })
 
-test('R64: the person\'s own top-level comment reaches triage; the mod\'s recorded reply and inline replies do not', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('R64: the person\'s own top-level comment reaches triage; the mod\'s recorded reply and inline replies do not', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.store.set(KEY, { ...(await recordOf(w)), replies: { 'inline:9': '41' } })
@@ -2665,7 +2723,8 @@ test('R63: a fix committed in a resumed pre-PR fix step is a new head: a waiver 
   expect(rec.waivers.find(one => one.findingId === 'R1-2')?.lapsedAt).toBeDefined()
 })
 
-test('R66: a reply reported as the URL gh prints does not come back as feedback in the next round', async ($, on) => {
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R66: a reply reported as the URL gh prints does not come back as feedback in the next round', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Typo in the heading.', created_at: '1970-01-01T00:01:00Z' }]
@@ -2854,7 +2913,8 @@ test('R76: a trusted reviewer\'s P1 posted after ready holds the merge until a r
   expect((await recordOf(w)).rounds.length).toBe(rounds)
 })
 
-test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', async ($, on) => {
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 too, at no round', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.numstat = '3\t1\tdocs/guide.md'
   w.git.roster = '{"reviewers":[],"trusted":["claude[bot]"],"checks":[]}'
@@ -2862,6 +2922,8 @@ test('R76: on a pass-through PR, a resume triages a trusted reviewer\'s late P1 
   w.gh.issueComments = [{ id: 31, user: { login: 'alice' }, body: 'Looks fine.', created_at: '1970-01-01T00:01:00Z' }]
   await w.clock.advance(20 * 60_000)
   await done($, triaged('r1-triage', [{ id: 'G1-1', action: 'rebutted', severity: 'P3', note: 'no change asked', replyId: '31' }]))
+  // The comment was answered while collection waited (R88); the cap has passed, so the next poll ends it and Codex checks the rebuttal.
+  await w.clock.advance(30_000)
   await done($, accept('r1-verify', w, { 'G1-1': true }))
   await w.clock.advance(1000)
   expect((await recordOf(w)).phase).toBe('ready')
@@ -2886,13 +2948,15 @@ test('R1-9: a ready PR with CI still running is held', async ($, on) => {
 
 test('R1-9: a ready PR with no checks, or all of them green or skipped, merges', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await toReady($, w)
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.checks = [
     { name: 'ci', status: 'completed', conclusion: 'success' },
     { name: 'deploy', status: 'completed', conclusion: 'skipped' },
   ]
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
 })
 
 test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on) => {
@@ -2908,12 +2972,14 @@ test('R1-9: CI that cannot be read holds the merge, and says why', async ($, on)
 
 test('R1-9: a post waiver does not let a head with failing CI merge', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   w.gh.hasPr = true
   // A post waiver sets aside only what the base does not require (R86): this check is required.
   w.gh.required = ['ci']
   await $.command.run(cmd('waive post shipping it'))
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
   w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'cancelled' }]
   const held = (await $.tool.call(merge)).deny ?? ''
   expect(held).toContain('failing: ci')
@@ -2998,7 +3064,10 @@ test('F5: a security P1 raised between the command\'s read and its write blocks 
 test('F5: the controller does not write ready from a read a finding has since changed', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'follow-up KAN-9', replyId: '992', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
   // The waiver is written; on the controller's next read, a blocker lands that its own read did not see.
   const late = { ...P1, id: 'G2-9', round: 2, source: 'codex-review', reviewer: 'codex', headSeen: 'a', status: 'open', history: [] }
@@ -3126,7 +3195,8 @@ test('#13: a person\'s command that is refused leaves the record with its owner'
 
 // ------------------------------------------- R71: a moved head no longer stops the round
 
-test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('R71: a clean checkout behind the PR head fast-forwards, and the Codex fallback reviews the new head', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await toPost($, w)
   w.gh.prHead = 'b'.repeat(40) // a bot pushed its own fix to the branch
@@ -3408,11 +3478,13 @@ const ISSUE = 'https://github.com/me/repo/issues/9'
 const labelled = (w: ReturnType<typeof world>, n: number, peak: string): boolean =>
   w.gh.labelled.some(one => one === `issue edit ${n} --repo me/repo --add-label severity:${peak}`)
 
-test('R85: a P3 deferred with a recorded follow-up settles without a waiver, once its issue is labelled', async ($, on) => {
+test('R92: a P3 deferral whose follow-up names an issue gets that issue labelled, not a new one', async ($, on) => {
   const w = world(on)
   // The reviewer's own P3.
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
   const found = rec.findings.find(one => one.id === 'G2-1')
@@ -3420,6 +3492,7 @@ test('R85: a P3 deferred with a recorded follow-up settles without a waiver, onc
   expect(found?.followUpLabel).toBe('P3')
   expect(w.gh.labelled).toContain('label create severity:P3 --repo me/repo --color 0e8a16')
   expect(labelled(w, 9, 'P3')).toBe(true)
+  expect(w.gh.filed).toEqual([])
   // The label is logged in the same write as its result (gate R9-1).
   expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: labelled me/repo#9 severity:P3')).toBe(true)
 })
@@ -3429,6 +3502,8 @@ test('gate R7-7: a severity label the repository already has is kept as it is, a
   w.gh.labelCreateAnswer = 'exists'
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect(w.gh.labelled.some(one => one.includes('--force'))).toBe(false)
   expect(labelled(w, 9, 'P3')).toBe(true)
   expect((await recordOf(w)).phase).toBe('ready')
@@ -3444,6 +3519,8 @@ test('gate G7-8, R7-4, R7-5: a reset while an issue is labelled starts nothing f
     await say($, 'reset')
   }
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isResetting).toBe(true)
   const rec = await recordOf(w)
@@ -3466,6 +3543,8 @@ test('gate R8-2: a reset while the severity label is created prevents the issue 
     await say($, 'reset')
   }
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isResetting).toBe(true)
   expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
@@ -3477,62 +3556,86 @@ test('gate R8-2: a reset while the severity label is created prevents the issue 
   expect((await runOf(w)).status).not.toBe('running')
 })
 
-test('R85: a P2 deferral with a follow-up still waits for the person', async ($, on) => {
+test('R92: a P2 deferral whose follow-up names an issue gets it labelled severity:P2 and settles', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2', followUp: ISSUE })
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', followUp: ISSUE, replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(labelled(w, 9, 'P2')).toBe(true)
+  expect(w.gh.filed).toEqual([])
+  expect((await recordOf(w)).phase).toBe('ready')
 })
 
-test('R85: a P3 deferral without a follow-up still waits for the person', async ($, on) => {
+test('R92: a P3 deferral with no follow-up gets a new issue labelled severity:P3', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'Consider renaming this', { severity: 'P3' })
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.filed[0]).toContain('labels[]=severity:P3')
+  expect((await recordOf(w)).phase).toBe('ready')
 })
 
-test('R85: a P3 deferral whose follow-up is a ticket key alone still waits for the person', async ($, on) => {
+test('R92: a ticket key alone is no issue: the gate files one and keeps the key in its body', async ($, on) => {
   const w = world(on)
-  await toAwaiting($, w, 'nit: rename this', { severity: 'P3', followUp: 'KAN-9' })
-  expect(w.gh.labelled).toEqual([])
+  await toTriage($, w, 'nit: rename this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'later', followUp: 'KAN-9', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.filed).toHaveLength(1)
+  expect((w.gh.filed[0] ?? []).find(one => one.startsWith('body='))).toContain('Follow-up named by the agent: KAN-9.')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.followUp).toBe('#21')
 })
 
 test('R85: a security P3 deferral with a follow-up still waits for the person', async ($, on) => {
   const w = world(on)
   await toAwaiting($, w, 'Consider renaming the token variable', { severity: 'P3', isSecurity: true, followUp: ISSUE })
   expect(w.gh.labelled).toEqual([])
+  expect(w.gh.filed).toEqual([])
 })
 
-test('R85: a guessed P1 the agent lowers to P3 waits on Codex; Codex agrees, and the issue carries severity:P1 (Adam, 2026-10-20)', async ($, on) => {
+test('R92: a deferral waits on Codex\'s check; a lowered P3 Codex agrees with carries severity:P1 on its issue (Adam, 2026-10-21)', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: 'KAN-9 #12', replyId: '992' }]))
-  // Not ready: Codex checks the lowering in the round's own check, using no round.
-  const run = await runOf(w)
-  expect(run.phase).toBe('verify')
+  // Not ready: Codex checks the deferral in the round's own check, using no round.
+  expect((await runOf(w)).phase).toBe('verify')
   expect((await recordOf(w)).phase).not.toBe('ready')
   const asked = w.spawned.at(-1)?.prompt ?? ''
-  expect(asked).toContain('The agent lowered it from P1 to P3 and deferred it to KAN-9 #12. Its reason: only the typo is real')
+  expect(asked).toContain('The main agent deferred these findings instead of fixing them in this PR.')
+  expect(asked).toContain('The agent lowered it from P1 to P3. Follow-up: KAN-9 #12. Its reason: only the typo is real')
   expect(asked).toContain('This is a critical bug.')
-  expect(asked).toContain('is P3, with a follow-up issue, right?')
+  expect(asked).toContain('holds is true when it cannot reasonably be fixed in this PR and its severity stands')
   expect(w.gh.labelled).toEqual([])
   await done($, accept('r2-verify', w))
   const rec = await recordOf(w)
   expect(rec.phase).toBe('ready')
-  const found = rec.findings.find(one => one.id === 'G2-1')
-  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', lowering: 'agreed' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
   // The peak, not the lowered severity, goes on the issue.
   expect(labelled(w, 12, 'P1')).toBe(true)
-  expect(w.prompts.at(-1)).toContain('(follow-up at KAN-9 #12, labelled severity:P1)')
+  expect(w.prompts.at(-1)).toContain('follow-up issues: G2-1 → KAN-9 #12 Critical [P1]')
 })
 
-test('R85: Codex disagreeing with a lowering leaves the deferral to the person, with its reason (Adam, 2026-10-20)', async ($, on) => {
+test('R92: Codex refusing a deferral opens it again for the agent, with its reason (Adam, 2026-10-21)', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'This is a critical bug.\n\nNit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'only the typo is real', followUp: '#12', replyId: '992' }]))
   await done($, accept('r2-verify', w, { 'G2-1': 'the comment reports a real crash' }))
   const rec = await recordOf(w)
-  expect(rec.postStatus).toBe('awaiting-decision')
-  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('deferred')
-  expect(w.prompts.at(-1)).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
-  expect((await say($, 'status')).text).toContain('Codex disagrees with lowering G2-1 from P1 to P3: the comment reports a real crash')
+  const found = rec.findings.find(one => one.id === 'G2-1')
+  expect(found?.status).toBe('open')
+  expect(found?.history.at(-1)).toMatchObject({ by: 'codex', status: 'open', deferral: 'refused', note: 'the comment reports a real crash' })
+  // Round 2 is the baseline, which carries no isCharged; the charge is tested on a discretionary round below.
+  // The agent is told, with Codex's words; the person is not asked to waive anything.
+  expect(w.prompts.at(-1)).toContain('Codex says G2-1 can be fixed in this PR: the comment reports a real crash')
+  expect(w.prompts.at(-1)).not.toContain('/pr-gate waive G2-1')
   expect(w.gh.labelled).toEqual([])
+})
+
+test('R92: Codex agreeing with a security P2 deferral leaves it deferred, awaiting the person', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w, 'Consider renaming this', { severity: 'P2' })
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', deferral: 'agreed' })
 })
 
 test('R85: a finding whose advisory label is not at the start, lowered to P3, settles once Codex agrees (final review C1)', async ($, on) => {
@@ -3549,6 +3652,8 @@ test('R85: a mixed comment guessed P3 from a "nit" in its middle, kept P3 and de
   const w = world(on)
   await toTriage($, w, 'This migration drops the users table on rollback, losing data. Also a nit: the comment has a typo.')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'tracked', followUp: ISSUE, replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   expect((await recordOf(w)).phase).toBe('ready')
   expect(labelled(w, 9, 'P3')).toBe(true)
 })
@@ -3558,11 +3663,13 @@ test('R85: an issue the gate could not label holds the merge, and the next pass 
   w.gh.labelAnswer = 'fail'
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: '#12', replyId: '992' }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   const held = await recordOf(w)
   expect(held.phase).not.toBe('ready')
   expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('Could not resolve to an issue')
   expect(w.prompts.at(-1)).toContain('could not label issue #12 severity:P3 (GraphQL: Could not resolve to an issue')
-  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass')
+  expect(w.prompts.at(-1)).toContain('check the issue exists and gh can edit it; the gate retries on the next pass, or the person can /pr-gate waive G2-1 <reason>')
   w.gh.labelAnswer = 'ok'
   await say($, 'resume')
   await w.clock.advance(1000)
@@ -3572,11 +3679,13 @@ test('R85: an issue the gate could not label holds the merge, and the next pass 
   expect(labelled(w, 12, 'P3')).toBe(true)
 })
 
-test('R85: /pr-gate status names the follow-up of a settled deferral and its label', async ($, on) => {
+test('R92: /pr-gate status names each finding settled by its issue', async ($, on) => {
   const w = world(on)
   await toTriage($, w, 'nit: rename this')
   await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P3', note: 'cosmetic', followUp: ISSUE, replyId: '992' }]))
-  expect((await say($, 'status')).text).toContain(`G2-1 deferred, follow-up at ${ISSUE}, labelled severity:P3`)
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
+  expect((await say($, 'status')).text).toContain(`G2-1 → ${ISSUE} Minor [P3].`)
 })
 
 test('R86: the required set is known only when both sources are established (PR #19 review)', async ($, on) => {
@@ -3696,6 +3805,8 @@ test('gate R1-3: a required check that never reported holds a waived merge until
 
 test('R86, gate R2-2 option B: unreadable required checks make every reported check required, with no hold of their own', async ($, on) => {
   const w = world(on)
+  // About the guard: GitHub refuses each merge it lets through, so the lifecycle stays for the next one (spec §5.12 archives a merged one).
+  w.gh.mergeAnswer = 'fail'
   await toPost($, w)
   w.gh.hasPr = true
   w.gh.required = ['check']
@@ -3704,7 +3815,7 @@ test('R86, gate R2-2 option B: unreadable required checks make every reported ch
   // Passing or no checks: nothing holds (GitHub's ruleset still enforces required checks at merge).
   for (const checks of [[{ name: 'check', status: 'completed', conclusion: 'success' }], []]) {
     w.gh.checks = checks
-    expect(isHeld(await $.tool.call(merge))).toBe(false)
+    expect((await $.tool.call(merge)).deny).toBeUndefined()
   }
   // A failing check the base may not require still holds: the waiver can't set it aside while the policy is unknown.
   w.gh.checks = [{ name: 'check', status: 'completed', conclusion: 'success' }, { name: 'lint', status: 'completed', conclusion: 'failure' }]
@@ -3713,7 +3824,7 @@ test('R86, gate R2-2 option B: unreadable required checks make every reported ch
   expect(held.deny ?? '').toContain('lint')
   // Once GitHub answers, the optional failure is set aside by the waiver.
   w.gh.classicAnswer = 'none'
-  expect(isHeld(await $.tool.call(merge))).toBe(false)
+  expect((await $.tool.call(merge)).deny).toBeUndefined()
 })
 
 test('R80: a waive post given while a round is finishing is followed by no hold and no new round', async ($, on) => {
@@ -3747,7 +3858,7 @@ test('R80: a waive post given while a round is finishing is followed by no hold 
   // The late round records nothing and decides nothing: no post-PR round in the record, no ready prompt (finding 29).
   expect(sent).toHaveLength(1)
   // The only message is the waive's own note (R81), sent once.
-  expect(sent.filter(one => one.includes('ready for the merge decision') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
+  expect(sent.filter(one => one.includes('gh pr merge') && !one.startsWith('pr-gate: the person waived post-PR review'))).toEqual([])
   expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
   expect((await recordOf(w)).rounds.some(one => one.phase === 'post')).toBe(false)
 })
@@ -3793,12 +3904,14 @@ test('gate R1-1, R1-5: a resume after someone else pushed past a post waiver nam
   const last = w.prompts.slice(prompts).at(-1) ?? ''
   expect(last).toContain(`the PR head is now ${moved.slice(0, 7)}`)
   expect(last).toContain('pull (or push), then run /pr-gate resume')
-  expect(last).not.toContain('Nothing else holds')
+  expect(last).not.toContain('other review finding holds')
 })
 
 test('R79: a post-PR hold prompt lists CI next to the findings', async ($, on) => {
   const w = world(on)
   w.gh.checks = [{ name: 'check', status: 'in_progress', conclusion: null }]
+  // Not required, so collection does not wait for it (R89); the hold still names it.
+  w.gh.required = []
   await toAwaiting($, w)
   expect(w.prompts.at(-1)).toContain('check check running')
 })
@@ -3909,8 +4022,8 @@ test('R81: waive post tells the agent what it covers and what still holds', asyn
   await w.clock.advance(1000)
   const said = w.prompts.at(-1) ?? ''
   expect(said).toContain('pr-gate: the person waived post-PR review of PR #1')
-  expect(said).toContain('Nothing else holds the merge')
-  expect(said).toContain("the merge decision, which is the person's")
+  expect(said).toContain('no other review finding holds the merge')
+  expect(said).toContain('merge it now with gh pr merge 1 --merge')
 })
 
 test('R81: waive post sends the agent one message, not a note and a second waiver message', async ($, on) => {
@@ -4007,7 +4120,7 @@ test('R81: waiving a finding after a push no round recorded sends one message', 
   expect(sent).toHaveLength(1)
   expect(sent[0]?.startsWith('pr-gate: the person waived G2-1')).toBe(true)
   // The live head is not the reviewed one: nothing says ready, and the note names the push (final review I1).
-  expect(sent.some(one => one.includes('ready for the merge decision'))).toBe(false)
+  expect(sent.some(one => one.includes('gh pr merge'))).toBe(false)
   expect(sent[0]).toContain('eeeeeee was pushed after the review completed at aaaaaaa')
   expect(sent[0]).toContain('/pr-gate resume reviews it')
 })
@@ -4038,7 +4151,10 @@ test('M1: a post waiver given while the standing is gathered is not followed by 
     await say($, 'waive post reviewed by hand')
   }
   const prompts = w.prompts.length
-  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+  // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', isSecurity: true }]))
+  // Codex checks the deferral first, in the round's free check (R92 M2).
+  await done($, accept('r2-verify', w))
   await w.clock.advance(1000)
   expect(isWaiving).toBe(true)
   const sent = w.prompts.slice(prompts)
@@ -4057,7 +4173,10 @@ for (const action of ['reset'] as const) {
       await say($, action)
     }
     const prompts = w.prompts.length
-    await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992' }]))
+    // Security, so it waits for the person: any other deferral gets its GitHub issue (R92).
+    await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', note: 'tracked in KAN-9', replyId: '992', isSecurity: true }]))
+    // Codex checks the deferral first, in the round's free check (R92 M2).
+    await done($, accept('r2-verify', w))
     await w.clock.advance(1000)
     expect(isActing).toBe(true)
     const sent = w.prompts.slice(prompts)
@@ -4104,7 +4223,7 @@ test('gate G7-7: a reset and a fresh start while waive post gathers the standing
   const sent = w.prompts.slice(prompts)
   // The new lifecycle reports for itself; the old waiver's note, which the new record no longer carries, is not sent.
   expect(sent.some(one => one.includes('waived post-PR review'))).toBe(false)
-  expect(sent.some(one => one.includes('Nothing else holds the merge') || one.includes('nothing else holds the merge'))).toBe(false)
+  expect(sent.some(one => one.includes('other review finding holds the merge'))).toBe(false)
   expect((await recordOf(w)).waivers).toEqual([])
   expect((await recordOf(w)).generation).toBe(1)
 })
@@ -4131,7 +4250,7 @@ test('R81: waive post with no PR from gh says the standing is unknown, not ready
   expect(sent).toHaveLength(1)
   expect(sent[0]).toContain('what else holds the merge is unknown')
   expect(sent[0]).not.toContain('PR #?')
-  expect(sent[0]).not.toContain('ready for the merge decision')
+  expect(sent[0]).not.toContain('gh pr merge')
 })
 
 test('R87: a hold on a chained command says nothing in it ran; a lone PR command gets no such line', async ($, on) => {
@@ -4148,3 +4267,2959 @@ test('R87: a hold on a chained command says nothing in it ran; a lone PR command
   expect(isHeld(chainedMerge)).toBe(true)
   expect(chainedMerge.deny ?? '').toContain('Nothing in this Bash command ran')
 })
+
+test('R91: every reply id the agent reports is the gate\'s own, whatever the answer, and never comes back as feedback (PR #20 G7-4, G7-9, G11-2)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  const mine = (id: number, body: string) => ({ id, user: { login: 'me' }, body, created_at: '1970-01-01T00:02:00Z', html_url: `c${id}` })
+  w.gh.issueComments = [
+    mine(77, 'Same as G7-2 [P2 thread]: no change asked'),
+    mine(79, 'Round 2: R1-9 rebutted, see src/app.ts:4'),
+    mine(81, 'Thanks, noted'),
+    // The person's own note, under the same gh login: still feedback.
+    mine(80, 'Please also rename the flag'),
+  ]
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'parameterised' },
+    // A Codex finding: no GitHub item, so 1.4.0 recorded no reply.
+    { id: 'R1-9', action: 'rebutted', note: 'not reachable', replyId: '79' },
+    // A P1 may not be acknowledged (R82): the answer is dropped, its reply is still the gate's.
+    { id: 'G2-1', action: 'acknowledged', note: 'nothing asked', replyId: 'https://github.com/me/repo/pull/1#issuecomment-77' },
+    // Not an answer the gate can read at all: its reply is still the gate's.
+    { id: 'G2-1', action: 'thanks', replyId: 81 },
+  ]))
+  const rec = await recordOf(w)
+  expect(rec.ownReplies).toEqual(['79', '77', '81'])
+  expect((await untriagedFeedback(w.engine, rec))?.map(one => one.id)).toEqual(['comment:80'])
+})
+
+test('R91: a reset keeps the reply ids the agent reported, so a fresh start does not read them as feedback', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.gh.issueComments = [{ id: 79, user: { login: 'me' }, body: 'Round 2: R1-9 rebutted', created_at: '1970-01-01T00:02:00Z', html_url: 'c79' }]
+  await done($, triaged('r2-triage', [{ id: 'R1-9', action: 'rebutted', note: 'not reachable', replyId: '79' }]))
+  expect((await recordOf(w)).ownReplies).toEqual(['79'])
+  await say($, 'reset')
+  await say($, '')
+  const fresh = await recordOf(w)
+  expect(fresh.ownReplies).toEqual(['79'])
+  expect((await untriagedFeedback(w.engine, fresh))?.map(one => one.id) ?? []).not.toContain('comment:79')
+})
+
+test('R91: a fix step\'s reply ids land in ownReplies too', async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  const said = `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed', note: 'done', replyId: '55' }] })}`
+  await done($, turn(said))
+  expect((await recordOf(w)).ownReplies).toEqual(['55'])
+})
+
+// ------------------------------------------------- #24: a head's time is when it reached the PR (A5)
+
+const A = 'a'.repeat(40)
+const B = 'b'.repeat(40)
+/** A second on the 1970 clock the world starts on, as GitHub prints it. */
+const iso = (s: number) => new Date(s * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+const pushed = (after: string, s: number) => ({ after, timestamp: iso(s) })
+const remark = (id: number, s: number, login = 'claude[bot]') => ({ id, user: { login }, body: '', created_at: iso(s), html_url: `c${id}` })
+/** The gate first sees the PR at second `s`: it adopts the open PR then. */
+const adoptAt = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, s: number) => {
+  await w.clock.advance(s * 1000 - 1000)
+  w.gh.hasPr = true
+  await $.command.run(cmd(''))
+}
+const logOf = async (w: ReturnType<typeof world>): Promise<string[]> => ((await recordOf(w)).log ?? []).map(one => one.text)
+
+test('#24 (1): after a resume, a roster reviewer\'s comment on the head since its push still covers it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  await $.command.run(cmd('stop'))
+  w.gh.issueComments = [remark(31, 61)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.headArrival).toMatchObject({ head: A, at: 1000, isPushTime: true })
+  expect(rec.phase).toBe('ready')
+})
+
+test('#24 (2): a push the gate never saw: a comment after it covers the head the gate first sees later', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.issueComments = [remark(31, 120)]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 100_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('#24 (3): a comment before the push does not cover the head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 50)]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (4): a check run that starts after the comment does not move the head\'s time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.issueComments = [remark(31, 120)]
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success', started_at: iso(200) }]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('#24 (5): with no push time, a requestReview reviewer whose comment may predate the head is asked again once, and its reply covers it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 600_000, isPushTime: false })
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect(w.gh.requests).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=alice'])
+  expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z may predate aaaaaaa; asked again')
+  expect((await recordOf(w)).headArrival?.asked).toEqual(['alice'])
+  w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.requests).toHaveLength(1)
+})
+
+test('#24 (5b): with no push time, a roster reviewer the gate cannot ask has its comment counted, and the log says so', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(await logOf(w)).toContain('alice: comment at 1970-01-01T00:02:00Z counted for aaaaaaa; GitHub gave no push time')
+  expect(w.gh.requests).toEqual([])
+})
+
+test('#24 (6): a push time GitHub gives at a later poll replaces the first-seen time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isActivityBroken = true
+  w.gh.pushes = [pushed(A, 100)]
+  await adoptAt($, w, 600)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 600_000, isPushTime: false })
+  w.gh.isActivityBroken = false
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 100_000, isPushTime: true })
+  expect((await runOf(w)).collect?.headAt).toBe(100_000)
+})
+
+test('#24 (7): a new head is looked up afresh; the old head\'s time is never reused', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  expect((await recordOf(w)).headArrival?.head).toBe(A)
+  await $.command.run(cmd('stop'))
+  w.gh.prHead = B
+  w.git.head = B
+  w.gh.pushes = [pushed(A, 1), pushed(B, 1800)]
+  w.gh.issueComments = [remark(31, 60)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: B, at: 1_800_000, isPushTime: true })
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (8): A→B→A: the latest push into the head is its arrival, so a comment on B does not cover A', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 40), pushed(B, 20), pushed(A, 10)]
+  w.gh.issueComments = [remark(31, 30)]
+  await adoptAt($, w, 50)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 40_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (9): a resume reads the push time again: a head that left and came back while no session ran takes the later time', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 1)]
+  await toPost($, w)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 1000, isPushTime: true })
+  await $.command.run(cmd('stop'))
+  w.gh.pushes = [pushed(A, 1), pushed(B, 20), pushed(A, 40)]
+  w.gh.issueComments = [remark(31, 30)]
+  await w.clock.advance(60 * 60_000)
+  await $.command.run(cmd('resume'))
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 40_000, isPushTime: true })
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+})
+
+test('#24 (10): A→B→A between two polls: before a comment ends collection, the push time is read again, and the comment on B does not cover A', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 15)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  w.gh.pushes = [pushed(A, 10), pushed(B, 50), pushed(A, 60)]
+  w.gh.issueComments = [remark(31, 55)]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 60_000, isPushTime: true })
+  expect((await runOf(w)).collect?.headAt).toBe(60_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+test('#24 (11): a failed re-read keeps the stored time: collection ends on the comment, and the log notes the failed check', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 15)
+  await w.clock.advance(30_000)
+  w.gh.pushes = [pushed(A, 10), pushed(B, 50), pushed(A, 60)]
+  w.gh.issueComments = [remark(31, 55)]
+  w.gh.isActivityBroken = true
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 10_000, isPushTime: true })
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.includes('could not read when aaaaaaa was last pushed'))).toBe(true)
+})
+
+test('#24 (12): the newest push is another head, read after the comment: collection does not end on it, and the next poll opens on that head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 20)
+  // The poll reads head A and a roster comment at 25; by the re-read, B was pushed at 26.
+  w.gh.issueComments = [remark(31, 25)]
+  w.gh.pushes = [pushed(A, 10), pushed(B, 26)]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).roundStartHead).toBe(A)
+  w.gh.prHead = B
+  w.git.head = B
+  await w.clock.advance(30_000)
+  const run = await runOf(w)
+  expect(run.roundStartHead).toBe(B)
+  expect(run.phase).toBe('collect')
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: B, at: 26_000, isPushTime: true })
+})
+
+test('#24 (13): the newest push is the head again, read after the comment: the head\'s time moves to it, and the comment does not cover it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 20)
+  w.gh.issueComments = [remark(31, 25)]
+  w.gh.pushes = [pushed(A, 30), pushed(B, 22), pushed(A, 10)]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).collect?.headAt).toBe(30_000)
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, at: 30_000, isPushTime: true })
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+})
+
+// ------------------------------------------------- #24 fix round 1
+
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('#24 (14): round 2, no push time and no commit date: a roster comment from round 1 does not count for the new head, and the cap still ends collection', { timeoutMs: 15_000 }, async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isActivityBroken = true
+  // Round 1 on A: the reviewer's comment at 20 s covers it (A was first seen at 1 s), and the round ends ready.
+  await toPost($, w)
+  w.gh.issueComments = [remark(31, 20)]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: A, seenAt: 30_000 })
+  // A new head B, round 2; GitHub gives neither its push time nor its commit date.
+  w.gh.prHead = B
+  w.git.head = B
+  await w.clock.advance(60_000)
+  await $.command.run(cmd(''))
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: B, isPushTime: false, since: 30_000 })
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toBe('waiting on claude[bot]')
+  expect((await logOf(w)).some(one => one.includes('counted for'))).toBe(false)
+  // Never stuck: the wait cap ends collection, and Codex covers the head nobody reviewed.
+  await w.clock.advance(20 * 60_000)
+  expect((await runOf(w)).phase).not.toBe('collect')
+})
+
+test('#24 (15): a PR from a fork: the push is in the fork\'s activity log only, and the head\'s time comes from it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.forkOwner = 'forker'
+  w.gh.pushes = [pushed(A, 100)]
+  w.gh.issueComments = [remark(31, 120)]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  expect(rec.headPlace).toEqual({ branch: 'feat/x', repo: 'forker/repo', isCrossRepository: true })
+  expect(rec.headArrival).toMatchObject({ head: A, at: 100_000, isPushTime: true })
+  expect(w.gh.calls.some(one => one.startsWith('api repos/forker/repo/activity?ref=refs/heads/feat/x'))).toBe(true)
+  expect(rec.phase).toBe('ready')
+})
+
+// Machine load: 3 engine steps, no real wait (spec §7.3).
+test('#24 (16): the wait cap ends collection on the "moved" path while the newest push stays on another sha', { timeoutMs: 15_000 }, async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.pushes = [pushed(A, 10)]
+  await adoptAt($, w, 20)
+  w.gh.issueComments = [remark(31, 25)]
+  // The log says B is newest, but the PR head stays A.
+  w.gh.pushes = [pushed(A, 10), pushed(B, 26)]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await runOf(w)).activity).toContain('the branch moved to bbbbbbb')
+  await w.clock.advance(20 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('#24 (17): a re-request for a head is remembered across stop and resume: no second POST', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect(w.gh.requests).toHaveLength(1)
+  expect((await recordOf(w)).headArrival).toMatchObject({ asked: ['alice'], committedAt: 10_000 })
+  await $.command.run(cmd('stop'))
+  await w.clock.advance(60_000)
+  await $.command.run(cmd('resume'))
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  expect(w.gh.requests).toHaveLength(1)
+})
+
+test('R89: a pending review request holds the round until that reviewer reviews the head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['alice']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on alice')
+  // Her review of the head answers the request even while GitHub still lists it (the list can lag the review).
+  const approval = { id: 6, user: { login: 'alice' }, body: '', state: 'APPROVED', commit_id: w.gh.prHead, submitted_at: '1970-01-01T00:01:00Z' }
+  w.gh.reviews = [...covers(w.gh.prHead), approval]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89 (Review Focus 2): a review requested from this machine\'s own login is never waited for', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.requested = ['me']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: without a roster, a completed required check ends collection with no quiet wait; a running check not required is not waited for', async (
+  $,
+  on,
+) => {
+  const w = world(on)
+  w.gh.required = ['ci']
+  await toPost($, w)
+  w.gh.checks = [
+    { name: 'ci', status: 'completed', conclusion: 'success' },
+    { name: 'preview', status: 'in_progress', conclusion: null },
+  ]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).not.toBe('collect')
+})
+
+test('R89 with #24 (5): the request the gate made stays pending on GitHub; the reviewer\'s reply in a comment still answers it', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["alice"],"requestReview":["alice"],"checks":[]}'
+  w.gh.isActivityBroken = true
+  w.gh.commitDate = iso(10)
+  w.gh.issueComments = [remark(31, 120, 'alice')]
+  await adoptAt($, w, 600)
+  await w.clock.advance(30_000)
+  expect(w.gh.requests).toHaveLength(1)
+  // GitHub lists alice as requested from now on: a comment never clears a request.
+  w.gh.requested = ['alice']
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on alice')
+  w.gh.issueComments = [remark(31, 120, 'alice'), remark(32, 650, 'alice')]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: unknown required checks make every reported check stand in: a running one holds collection until it completes', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.rulesAnswer = 500
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.checks = [{ name: 'preview', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on preview')
+  w.gh.checks = [{ name: 'preview', status: 'completed', conclusion: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: a failed read of the review requests is logged and the round goes on by its other signals', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isRequestedBroken = true
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.startsWith('could not read requested reviewers: gh: Server Error (HTTP 502)'))).toBe(true)
+})
+
+test('R89: a required context posted only as a commit status ends collection once it is final, with no wait on the cap', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.required = ['deploy/ci']
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.statuses = [{ context: 'deploy/ci', state: 'pending' }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).activity).toBe('waiting on deploy/ci')
+  w.gh.statuses = [{ context: 'deploy/ci', state: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R89: a failed read of commit statuses is logged and collection falls back to check runs', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  w.gh.isStatusBroken = true
+  await toPost($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  await w.clock.advance(30_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect((await logOf(w)).some(one => one.startsWith('could not read commit statuses: gh: Server Error (HTTP 502)'))).toBe(true)
+})
+
+/** Rounds 2 and 3, the protected baseline pair, each fix a finding and push: round 4, the first discretionary one, is collecting on g. */
+const toDiscretionary = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.comments = [inline(11, '**P1** SQL injection', 'a'.repeat(40)), inline(12, 'nit: rename this', w.gh.prHead)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P3', replyId: '993' }]))
+  await done($, accept('r3-verify', w, { 'G2-1': true, 'G3-1': true }))
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+}
+
+/** The post rounds' isCharged, round by round. */
+const chargedOf = async (w: ReturnType<typeof world>) =>
+  (await recordOf(w)).rounds.filter(one => one.phase === 'post' && one.isCompleted).map(one => [one.n, one.kind, one.isCharged])
+
+test('R88: only a discretionary post round says whether it was charged: a baseline round carries nothing', async ($, on) => {
+  const clean = world(on)
+  clean.git.roster = roster
+  await toPost($, clean)
+  clean.gh.reviews = covers(clean.gh.prHead)
+  await clean.clock.advance(30_000)
+  // A baseline round never draws on the allowance, so it carries no isCharged.
+  expect(await chargedOf(clean)).toEqual([[2, 'baseline', undefined]])
+})
+
+test('R88: a clean discretionary round is free', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect(await chargedOf(w)).toEqual([[2, 'baseline', undefined], [3, 'baseline', undefined], [4, 'discretionary', false]])
+})
+
+test('R88: a discretionary round that raises a new blocker is charged', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, '**P1** token leaks into logs', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'rebutted', note: 'not reachable', replyId: '994' }]))
+  await done($, accept('r4-verify', w, { 'G4-1': true }))
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+})
+
+test('A8: a discretionary round whose P3 the agent fixes is charged; the clean round after it is free', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, 'nit: this helper name is unclear', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  w.git.head = '9'.repeat(40)
+  w.gh.prHead = '9'.repeat(40)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'fixed', severity: 'P3', replyId: '994' }]))
+  await done($, accept('r4-verify', w, { 'G2-1': true, 'G3-1': true, 'G4-1': true }))
+  // The fix is stamped with the round that raised it and asked about it, and the push ended that round.
+  const fixed = (await recordOf(w)).findings.find(one => one.id === 'G4-1')
+  expect(fixed?.history.find(one => one.status === 'reported-fixed')).toMatchObject({ round: 4, by: 'main' })
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+  // Round 5 reviews the fix's head and finds nothing: free.
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await chargedOf(w)).at(-1)).toEqual([5, 'discretionary', false])
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+/** Round 4, discretionary: a new P3 the agent defers, and Codex's ruling on the deferral (R92 M2). */
+const toDeferralRuling = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, said: true | string) => {
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, 'nit: this helper name is unclear', w.gh.prHead, 30)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [{ id: 'G4-1', action: 'deferred', severity: 'P3', note: 'a rename touches the public API', replyId: '994' }]))
+  expect((await runOf(w)).rechecks).toEqual(['G4-1'])
+  await done($, accept('r4-verify', w, { 'G4-1': said }))
+}
+
+test('R92: in a discretionary round, Codex agreeing with a deferral charges nothing', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, true)
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', false])
+})
+
+test('R92: in a discretionary round, Codex refusing a deferral charges the round, and the agent is sent to fix it', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, 'a one-line rename fixes it')
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', true])
+  expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: a one-line rename fixes it')
+})
+
+test('R92: a P1 comment the gate links to a deferral Codex agreed with sends it back to Codex; a refusal reopens it and charges the round', async ($, on) => {
+  const w = world(on)
+  await toDeferralRuling($, w, true)
+  // Round 5, on a push to another file: a reviewer reports the same problem at P1, a line away; the gate links it to G4-1 and raises G4-1 to P1.
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.changed = 'src/other.ts'
+  await say($, 'resume')
+  w.gh.comments = [...w.gh.comments, inline(15, '**P1** this helper name is unclear and misleads callers', w.gh.prHead, 31)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  const run = await runOf(w)
+  expect(run.round).toBe(5)
+  expect(run.findings.find(one => one.id === 'G5-1')).toMatchObject({ duplicateOf: 'G4-1', linkBy: 'gate' })
+  expect(run.findings.find(one => one.id === 'G4-1')).toMatchObject({ status: 'deferred', severity: 'P1', needsRecheck: true })
+  await done($, triaged('r5-triage', [{ id: 'G5-1', duplicateOf: 'G4-1', replyId: '995' }]))
+  // Codex's agreement was given at P3: it checks the deferral again, told why.
+  expect((await runOf(w)).rechecks).toEqual(['G4-1'])
+  const asked = w.spawned.at(-1)?.prompt ?? ''
+  expect(asked).toContain('(raised to P1 by its linked item G5-1: re-check)')
+  expect(asked).toContain('You agreed before that G4-1 cannot reasonably be fixed in this PR: does that still hold at P1, given that report?')
+  await done($, accept('r5-verify', w, { 'G4-1': 'at P1 the rename belongs in this PR' }))
+  const g4 = (await recordOf(w)).findings.find(one => one.id === 'G4-1')
+  expect(g4?.status).toBe('open')
+  expect(g4?.history.at(-1)).toMatchObject({ round: 5, status: 'open', deferral: 'refused', by: 'codex' })
+  expect((await chargedOf(w)).at(-1)).toEqual([5, 'discretionary', true])
+  expect(w.prompts.at(-1)).toContain('Codex says G4-1 can be fixed in this PR: at P1 the rename belongs in this PR')
+})
+
+test('wave 2b gate R1-3: a comment the gate would match to a verified fix is never linked to it: it stands alone and holds the merge', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', isSecurity: true, replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('verified-fixed')
+  // The same words a line away, on a file the push did not touch: the heuristic match the gate must not turn into a link.
+  w.git.changed = 'src/other.ts'
+  w.gh.comments = [...w.gh.comments, inline(12, '**P1** SQL injection', w.gh.prHead, 5)]
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  const run = await runOf(w)
+  const fresh = run.findings.find(one => one.externalId === 'inline:12')
+  expect(fresh).toBeDefined()
+  expect(fresh?.duplicateOf).toBeUndefined()
+  expect(w.prompts.at(-1)).not.toContain('same problem as G2-1')
+  expect(mergeHolds({ findings: run.findings, waivers: [] }).map(one => one.id)).toContain(fresh?.id)
+})
+
+test('wave 2b gate R1-3: a comment the gate matches to a finding settled by its issue is still linked, and settles with it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.git.head = 'b'.repeat(40)
+  w.gh.prHead = 'b'.repeat(40)
+  w.git.changed = 'src/other.ts'
+  await say($, 'resume')
+  w.gh.comments = [...w.gh.comments, inline(15, 'Consider renaming this', w.gh.prHead, 5)]
+  w.gh.reviews = covers(w.gh.prHead)
+  for (let i = 0; i < 12 && (await runOf(w)).phase === 'collect'; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).findings.find(one => one.externalId === 'inline:15')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+})
+
+test('R90: a reviewer\'s second comment on the same problem is linked, answered with a pointer reply, and holds as one finding', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [
+    inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10),
+    inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12),
+  ]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  const prompt = w.prompts.at(-1) ?? ''
+  expect(prompt).toContain('G2-2 from claude[bot] (src/app.ts:12), same problem as G2-1')
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'deferred', note: 'needs a store change', replyId: '901' },
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' },
+  ]))
+  // Codex checks the deferral of the original alone; the gate's link is no answer of its own (R92 M2).
+  expect((await runOf(w)).rechecks).toEqual(['G2-1'])
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(rec.replies['inline:12']).toBe('902')
+  // One issue, the original's, naming its duplicate; the duplicate settles with it (R92).
+  expect(w.gh.filed).toHaveLength(1)
+  expect((w.gh.filed[0] ?? []).find(one => one.startsWith('title='))).toMatch(/^title=G2-1 Major \[P2\] /)
+  expect((w.gh.filed[0] ?? []).find(one => one.startsWith('body='))).toContain('- G2-2: the same problem, raised again')
+  expect(mergeHolds(rec)).toEqual([])
+  expect(rec.phase).toBe('ready')
+})
+
+test('R90: the agent refuses the gate\'s link by answering the item on its own', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10), inline(12, '**P2** cache never cleared after logout', w.gh.prHead, 12)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'clear on logout', replyId: '901' },
+    { id: 'G2-2', action: 'fixed', note: 'a second cache, also cleared now', replyId: '902' },
+  ]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-2')?.duplicateOf).toBeUndefined()
+})
+
+test('R90: the agent\'s link goes to Codex at no round\'s cost; a self-link is no answer and the item is asked again', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  w.gh.comments = [inline(11, '**P2** the cache is never cleared on logout', w.gh.prHead, 10), inline(12, '**P2** stale entries survive a sign-out', w.gh.prHead, 40)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).findings.find(one => one.id === 'G2-2')?.duplicateOf).toBeUndefined()
+  // A link to itself is no answer: G2-2 is asked about again.
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'fixed', note: 'clear on logout', replyId: '901' },
+    { id: 'G2-2', duplicateOf: 'G2-2', replyId: '902' },
+  ]))
+  expect(w.prompts.at(-1)).toContain('These review items have no answer yet: G2-2')
+  await done($, triaged('r2-triage', [{ id: 'G2-2', duplicateOf: 'G2-1', replyId: '902' }]))
+  const run = await runOf(w)
+  expect(run.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'agent' })
+  expect(run.rechecks).toEqual(['G2-1', 'G2-2'])
+  expect(w.spawned.at(-1)?.prompt).toContain('Same as: G2-1')
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ duplicateOf: 'G2-1', isLinkChecked: true })
+  expect(rec.replies['inline:12']).toBe('902')
+  expect(mergeHolds(rec)).toEqual([])
+  // Round 2 is the baseline, which carries no isCharged; the charge is tested on a discretionary round below.
+  expect(rec.rounds.filter(one => one.phase === 'post').map(one => one.kind)).toEqual(['baseline'])
+})
+
+test('R90: in a discretionary round, Codex agreeing the agent\'s link, beside an accepted rebuttal, charges nothing', async ($, on) => {
+  const w = world(on)
+  await toDiscretionary($, w)
+  w.gh.comments = [...w.gh.comments, inline(13, '**P2** the cache is never cleared on logout', w.gh.prHead, 40), inline(14, '**P2** stale entries survive a sign-out', w.gh.prHead, 60)]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  await w.clock.advance(1000)
+  await done($, triaged('r4-triage', [
+    { id: 'G4-1', action: 'rebutted', note: 'logout clears it in session.ts', replyId: '901' },
+    { id: 'G4-2', duplicateOf: 'G4-1', replyId: '902' },
+  ]))
+  expect((await runOf(w)).rechecks).toEqual(['G4-1', 'G4-2'])
+  await done($, accept('r4-verify', w, { 'G4-1': true, 'G4-2': true }))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G4-2')).toMatchObject({ duplicateOf: 'G4-1', isLinkChecked: true })
+  expect((await chargedOf(w)).at(-1)).toEqual([4, 'discretionary', false])
+})
+
+// ------------------------------------------------- R88: the agent answers feedback while collection waits
+
+/** Feedback a reviewer posted before the poll that reads it: its time never counts as a later arrival. */
+const early = <T extends object>(one: T): T => ({ ...one, created_at: '1970-01-01T00:00:01Z' })
+const ciRunning = '{"reviewers":["claude[bot]"],"checks":["ci"]}'
+/** The triage prompts of a round's step, a re-ask's own marker (`r2-triage-2`) included. */
+const triageTurns = (w: ReturnType<typeof world>, step: string) => w.prompts.filter(one => one.includes(`"step":"${step}`))
+
+test('R88: feedback is answered while collection waits, after one quiet poll, and the round goes on collecting', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(30_000)
+  // The poll that sees it waits one more, so a reviewer's burst arrives as one turn.
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  w.gh.comments = [...w.gh.comments, early(inline(12, '**P2** and this one too', w.gh.prHead, 9))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(0)
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  const asked = triageTurns(w, 'r2-triage')[0] ?? ''
+  expect(asked).toContain('G2-1')
+  expect(asked).toContain('G2-2')
+  expect(asked).toContain('still coming in')
+  const turnRun = await runOf(w)
+  expect([turnRun.phase, turnRun.collect !== undefined]).toEqual(['triage', true])
+  // Polling goes on during the turn: a comment that arrives now waits for the next turn.
+  w.gh.comments = [...w.gh.comments, early(inline(13, '**P2** a third one', w.gh.prHead, 20))]
+  await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block, src/app.ts:30', replyId: '991' },
+    { id: 'G2-2', action: 'rebutted', severity: 'P2', note: 'same handle, same finally block', replyId: '992' },
+  ]))
+  // No push: the round goes on collecting, nothing is recorded as a round, the answers are kept.
+  const after = await runOf(w)
+  expect([after.phase, after.round, after.status]).toEqual(['collect', 2, 'running'])
+  const rec = await recordOf(w)
+  expect(rec.processed).toEqual(expect.arrayContaining(['inline:11', 'inline:12']))
+  expect(rec.rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+  // The comment that arrived during the turn gets a turn of its own, asking it alone.
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  const second = triageTurns(w, 'r2-triage')[1] ?? ''
+  expect(second).toContain('G2-3')
+  expect(second).not.toContain('- G2-1 from')
+  await done($, triaged('r2-triage', [{ id: 'G2-3', action: 'rebutted', severity: 'P2', note: 'same finally block', replyId: '993' }]))
+  expect((await runOf(w)).phase).toBe('collect')
+  // ci finishes and the reviewer covers the head: the head's end has Codex check the rebuttals, then the round ends.
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('verify')
+})
+
+test('R88: a push in a mid-collection turn ends the round on the old head when the turn ends', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P1** SQL injection', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  // Codex checks the fix on the new head first (R72); then the round on a…a ends and the next one collects on e…e.
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40), true]])
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind]).toEqual([3, 'collect', 'e'.repeat(40), 'baseline'])
+  // A new head restarts the cap (spec §1.6): collection began when the round did.
+  expect(next.collect?.startedAt).toBe(next.roundStartedAt)
+})
+
+/** Round 2 collects on a…a with ci running, and a mid-collection turn asks G2-1. */
+const toMidTurn = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>) => {
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P1** SQL injection', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+}
+
+test('R88 (A4): a poll while afterTriage settles a pushed head opens no round under it; the turn\'s end opens exactly one', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let held = false
+  w.git.onHead = async () => {
+    if (held) return
+    held = true
+    reached()
+    await released
+  }
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  await isReached
+  const settling = await runOf(w)
+  expect([settling.phase, settling.pending, typeof settling.isSettling]).toEqual(['triage', [], 'number'])
+  // Ticks with the pushed head on the PR while afterTriage is held: they only note arrivals.
+  await w.clock.advance(30_000)
+  await w.clock.advance(30_000)
+  const during = await runOf(w)
+  expect([during.round, during.phase, during.roundStartHead]).toEqual([2, 'triage', 'a'.repeat(40)])
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  release()
+  await answering
+  expect((await runOf(w)).phase).toBe('verify')
+  await done($, accept('r2-verify', w))
+  const rec = await recordOf(w)
+  expect(rec.rounds.filter(one => one.phase === 'post').map(one => [one.n, one.startHead, one.endHead])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40)]])
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead]).toEqual([3, 'collect', 'e'.repeat(40)])
+  expect(next.isSettling).toBeUndefined()
+  // The old round's triage step is done; the new round's steps were made by its own start alone.
+  expect(next.steps.find(one => one.id === 'r2-triage')?.state).toBe('done')
+  expect(next.steps.filter(one => one.id.startsWith('r3-')).map(one => [one.id, one.state])).toEqual([['r3-collect', 'running']])
+})
+
+test('R88: a head pushed during a mid-collection turn gets its arrival noted by the poll that sees it', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  const seenAt = (await runOf(w)).collect?.polledAt
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: 'e'.repeat(40), at: seenAt, isPushTime: false })
+  await w.clock.advance(30_000)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  // The next round's collection keeps the first sight, not its own start, as the head's arrival.
+  expect((await recordOf(w)).headArrival).toMatchObject({ head: 'e'.repeat(40), at: seenAt })
+})
+
+test('R88: a mid-collection turn that never answers goes back to collecting once; a second timeout in the round stops it', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  await w.clock.advance(62_000)
+  // The first timeout in the round: back to collecting, no attempt, and the turn's step says why.
+  const back = await runOf(w)
+  expect([back.status, back.phase, back.midTurnTimeouts, back.pending, back.isSettling]).toEqual(['running', 'collect', 1, [], undefined])
+  expect(back.steps.find(one => one.id === 'r2-triage')).toMatchObject({ state: 'done', detail: expect.stringContaining('timed out') })
+  expect((await recordOf(w)).attempts).toBe(0)
+  expect(await logOf(w)).toEqual(expect.arrayContaining([expect.stringContaining('timed out')]))
+  // The next poll asks G2-1 again, in a turn of its own.
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(2)
+  expect(triageTurns(w, 'r2-triage').at(-1)).toContain('G2-1')
+  // The re-ask has a marker of its own, so the timed-out prompt's turn can never arm it.
+  expect(triageTurns(w, 'r2-triage-2')).toHaveLength(1)
+  expect((await runOf(w)).pending[0]?.step).toBe('r2-triage-2')
+  expect((await runOf(w)).phase).toBe('triage')
+  // A second timeout in the same round stops the run, saying how to go on.
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect([run.status, run.phase]).toEqual(['error', 'done'])
+  expect(run.message).toContain('triage step ran past')
+  expect(run.message).toContain('/pr-gate resume to collect again')
+  expect((await recordOf(w)).attempts).toBe(1)
+  // As the message says: a resume collects again on the same head, and the unanswered feedback is asked again.
+  await say($, 'resume')
+  const again = await runOf(w)
+  expect([again.status, again.phase, again.round, again.midTurnTimeouts]).toEqual(['running', 'collect', 2, undefined])
+  const asked = triageTurns(w, 'r2-triage').length
+  await w.clock.advance(90_000)
+  expect(triageTurns(w, 'r2-triage').length).toBe(asked + 1)
+  expect(triageTurns(w, 'r2-triage').at(-1)).toContain('SQL injection')
+})
+
+test('R88: a late answer to a timed-out mid-collection turn is not read as the answer to the turn that asks again', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  await $.turn.start({ text: triageTurns(w, 'r2-triage')[0] ?? '', turnId: 'turn-old' })
+  await w.clock.advance(62_000)
+  expect((await runOf(w)).phase).toBe('collect')
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage').length < 2; i += 1) await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('triage')
+  // The timed-out turn ends now, answering G2-1: the turn that asks again has not started, and this is not it.
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'late', replyId: '990' }]), turnId: 'turn-old' })
+  const still = await runOf(w)
+  expect([still.phase, still.pending.length, still.pending[0]?.answer]).toEqual(['triage', 1, undefined])
+  expect(still.findings.find(one => one.id === 'G2-1')?.status).toBe('open')
+  // The new turn's own answer is the one recorded.
+  await done($, triaged('r2-triage-2', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect((await runOf(w)).phase).toBe('collect')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+})
+
+test('R88: the timed-out prompt\'s turn starting late does not arm the re-ask', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  const old = triageTurns(w, 'r2-triage')[0] ?? ''
+  await w.clock.advance(62_000)
+  for (let i = 0; i < 3 && triageTurns(w, 'r2-triage-2').length < 1; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r2-triage-2')).toHaveLength(1)
+  // The first prompt's turn only starts now, after the re-ask was sent: it carries r2-triage, not the re-ask's marker.
+  await $.turn.start({ text: old, turnId: 'turn-late' })
+  expect((await runOf(w)).pending[0]?.turnId).toBeUndefined()
+  await $.turn.complete({ ...triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'late', replyId: '990' }]), turnId: 'turn-late' })
+  const still = await runOf(w)
+  expect([still.phase, still.pending[0]?.answer]).toEqual(['triage', undefined])
+  // The re-ask's own turn is the one answered.
+  await done($, triaged('r2-triage-2', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.status).toBe('rebutted')
+})
+
+test('R88: an answered mid-collection turn whose afterTriage failed before settling stops at the step timeout, never hangs', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  // The answer is recorded on the run, then afterTriage stalls at its first read, before it clears the turn: what a session that
+  // dies there leaves. (A throw there is no such state: the turn-end hook stops the run with "The gate itself failed".)
+  let isHeld = false
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  w.beforeRead = async key => {
+    if (key !== KEY || isHeld || w.run?.phase !== 'triage' || w.run.pending[0]?.answer === undefined) return
+    isHeld = true
+    reached()
+    await released
+  }
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  await isReached
+  const stuck = await runOf(w)
+  expect([stuck.phase, stuck.pending[0]?.answer !== undefined, stuck.isSettling]).toEqual(['triage', true, undefined])
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect([run.status, run.phase]).toEqual(['error', 'done'])
+  expect(run.message).toContain('triage step ran past')
+  // The stalled afterTriage, let go after the stop, writes nothing over it.
+  release()
+  await answering
+  expect((await runOf(w)).status).toBe('error')
+})
+
+test('R88 (A4): a reset between afterTriage\'s ownership check and its record write writes nothing into the new record', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let isReset = false
+  w.afterRead = key => {
+    if (key !== KEY || isReset || w.run?.isSettling === undefined) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.processed).not.toContain('inline:11')
+  expect(rec.replies['inline:11']).toBeUndefined()
+})
+
+test('R88 (A4): a reset while afterTriage lists the unpushed commits writes no stop over it', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  // A local commit the PR does not have.
+  w.git.head = 'e'.repeat(40)
+  w.git.unpushed = 'eeeeeee by me'
+  let isReset = false
+  w.git.onUnpushed = () => {
+    if (isReset) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  expect(run.message ?? '').not.toContain('are not on the PR')
+  expect((await recordOf(w)).attempts).toBe(0)
+})
+
+test('R88 (A4): a record gone when afterTriage settles a turn while collecting stops the run with a clear message, never a frozen collection', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let isGone = false
+  w.afterRead = key => {
+    if (key !== KEY || isGone || w.run?.isSettling === undefined) return
+    isGone = true
+    w.store.delete(KEY)
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  expect(isGone).toBe(true)
+  const run = await runOf(w)
+  expect([run.status, run.isSettling]).toEqual(['error', undefined])
+  expect(run.message).toContain('The lifecycle record of feat/x is gone')
+})
+
+// Machine load: 5 engine steps, no real wait (spec §7.3).
+test('R88: a settling flag older than the step timeout (at least five minutes) is cleared and collection goes on', { options: { stepTimeoutMinutes: 1 }, timeoutMs: 15_000 }, async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  let held = false
+  let release: () => void = () => undefined
+  const released = new Promise<void>(resolve => (release = resolve))
+  let reached: () => void = () => undefined
+  const isReached = new Promise<void>(resolve => (reached = resolve))
+  w.git.onHead = async () => {
+    if (held) return
+    held = true
+    reached()
+    await released
+  }
+  const answering = done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P1', note: 'parameterised at src/app.ts:4', replyId: '991' }]))
+  await isReached
+  // A slow afterTriage is not stale at the step timeout: the threshold is at least five minutes (a fetch alone can take two).
+  await w.clock.advance(62_000)
+  const slow = await runOf(w)
+  expect([slow.phase, typeof slow.isSettling]).toEqual(['triage', 'number'])
+  // afterTriage never gets past its head read: past five minutes, a poll clears the flag and collection goes on.
+  await w.clock.advance(4 * 60_000)
+  const back = await runOf(w)
+  expect([back.status, back.phase, back.isSettling, back.pending]).toEqual(['running', 'collect', undefined, []])
+  expect(await logOf(w)).toEqual(expect.arrayContaining([expect.stringContaining('settling flag')]))
+  // The held afterTriage, released late, writes nothing: the poll took over.
+  release()
+  await answering
+  expect([(await runOf(w)).phase, (await runOf(w)).round]).toEqual(['collect', 2])
+  // The head's end still has Codex check the rebuttal the turn recorded.
+  w.gh.checks = [{ name: 'ci', status: 'completed', conclusion: 'success' }]
+  w.gh.reviews = covers(w.gh.prHead)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).phase).toBe('verify')
+})
+
+test('R88 (Review Focus 3): two pushes between polls end one round, on the newest head', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(2)
+  // Someone pushes twice before the next poll; the gate only ever sees the second.
+  w.gh.prHead = 'c'.repeat(40)
+  w.gh.prHead = 'd'.repeat(40)
+  w.git.head = 'd'.repeat(40)
+  await w.clock.advance(30_000)
+  const rec = await recordOf(w)
+  const post = rec.rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead, one.isCompleted])).toEqual([[2, 'a'.repeat(40), 'd'.repeat(40), true]])
+  // The round is free (R88): a baseline round never draws on the allowance, so it records no charge either way (Task 6).
+  expect([post[0]?.kind, post[0]?.isCharged]).toEqual(['baseline', undefined])
+  expect(rec.head).toBe('d'.repeat(40))
+  const next = await runOf(w)
+  expect([next.round, next.phase, next.roundStartHead, next.roundKind, next.status]).toEqual([3, 'collect', 'd'.repeat(40), 'baseline', 'running'])
+})
+
+test('R88: a poll during a turn never ends the round; the turn\'s own end does', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  expect(triageTurns(w, 'r2-triage')).toHaveLength(1)
+  // The agent pushes, and a poll runs before its turn ends.
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  const during = await runOf(w)
+  expect([during.round, during.phase, during.roundStartHead]).toEqual([2, 'triage', 'a'.repeat(40)])
+  expect((await recordOf(w)).rounds.filter(one => one.phase === 'post')).toHaveLength(0)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r2-verify', w))
+  const post = (await recordOf(w)).rounds.filter(one => one.phase === 'post')
+  expect(post.map(one => [one.n, one.startHead, one.endHead])).toEqual([[2, 'a'.repeat(40), 'e'.repeat(40)]])
+  expect((await runOf(w)).round).toBe(3)
+})
+
+test('R88 (Review Focus 4): a finding left unanswered when its round rolled over is answered in the next round', async ($, on) => {
+  const w = world(on)
+  w.git.roster = ciRunning
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  await w.clock.advance(60_000)
+  // No answer, asked once more (R34), no answer again: the round goes on collecting with G2-1 open.
+  await done($, triaged('r2-triage', []))
+  await done($, triaged('r2-triage', []))
+  expect((await runOf(w)).phase).toBe('collect')
+  // Someone else's push ends round 2.
+  w.gh.prHead = 'e'.repeat(40)
+  w.git.head = 'e'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  // Round 3 hands G2-1 to the agent again, under its own id, after one quiet poll.
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  expect(triageTurns(w, 'r3-triage')[0]).toContain('G2-1')
+  await done($, triaged('r3-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P2', note: 'closed in the finally block', replyId: '991' }]))
+  const g = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(g?.status).toBe('rebutted')
+  expect(g?.history.at(-1)?.round).toBe(3)
+  expect((await recordOf(w)).processed).toContain('inline:11')
+})
+
+// Machine load: 7 engine steps, no real wait (spec §7.3).
+test('R88: a turn that pushes re-requests the roster reviewers once; another\'s push and a new round request nothing', { timeoutMs: 15_000 }, async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  // Someone else pushes: round 2 ends, round 3 starts on c…c, and nobody is asked again.
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.head = 'c'.repeat(40)
+  await w.clock.advance(30_000)
+  expect((await runOf(w)).round).toBe(3)
+  expect(w.gh.requests).toHaveLength(0)
+  // Feedback on c…c; the agent's turn pushes three commits, and GitHub reports the last.
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r3-verify', w, { 'G3-1': true }))
+  expect(w.gh.requests).toHaveLength(1)
+  expect(w.gh.requests[0]).toContain('reviewers[]=claude[bot]')
+  // Round 4 on f…f: nobody covers it by the cap, and one Codex review reads from the last covered head, a…a, over c…c and f…f.
+  expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
+  await w.clock.advance(21 * 60_000)
+  const run = await runOf(w)
+  expect(run.phase).toBe('review')
+  expect(run.diffBase).toBe('a'.repeat(40))
+  expect(w.gh.requests).toHaveLength(1)
+})
+
+test('R88: a failed re-request is logged and the turn goes on', async ($, on) => {
+  const w = world(on)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.gh.isRequestPostBroken = true
+  await toPost($, w)
+  w.gh.checks = [{ name: 'ci', status: 'in_progress', conclusion: null }]
+  await w.clock.advance(30_000)
+  w.gh.prHead = 'c'.repeat(40)
+  w.git.head = 'c'.repeat(40)
+  await w.clock.advance(30_000)
+  w.gh.comments = [early(inline(11, '**P2** this leaks a file handle', w.gh.prHead))]
+  for (let i = 0; i < 3 && triageTurns(w, 'r3-triage').length === 0; i += 1) await w.clock.advance(30_000)
+  w.git.head = 'f'.repeat(40)
+  w.gh.prHead = 'f'.repeat(40)
+  await done($, triaged('r3-triage', [{ id: 'G3-1', action: 'fixed', severity: 'P2', note: 'closed in finally', replyId: '991' }]))
+  await done($, accept('r3-verify', w, { 'G3-1': true }))
+  expect(w.gh.requests).toHaveLength(1)
+  expect((await logOf(w)).some(one => one.startsWith('could not ask claude[bot] to review again: gh: Server Error (HTTP 502)'))).toBe(true)
+  expect((await runOf(w)).status).toBe('running')
+  expect((await runOf(w)).roundStartHead).toBe('f'.repeat(40))
+})
+
+test('R88: a first post round\'s turn that pushes re-requests the roster reviewers', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(w.gh.requests).toEqual(['api -X POST repos/me/repo/pulls/1/requested_reviewers -f reviewers[]=claude[bot]'])
+})
+
+test('R88: a reset after the push is recorded but before the request sends no request', async ($, on) => {
+  const w = world(on)
+  await toMidTurn($, w)
+  w.git.roster = '{"reviewers":["claude[bot]"],"requestReview":["claude[bot]"],"checks":["ci"]}'
+  w.git.head = 'e'.repeat(40)
+  w.gh.prHead = 'e'.repeat(40)
+  let isReset = false
+  // The gate reads the roster just before it asks: a reset lands then.
+  w.git.onRoster = () => {
+    if (isReset) return
+    isReset = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, generation: (rec.generation ?? 0) + 1 })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'fixed', severity: 'P1', note: 'parameterised', replyId: '991' }]))
+  expect(isReset).toBe(true)
+  expect(w.gh.requests).toEqual([])
+})
+
+test('R92: when the review can do no more, a P2 deferral Codex agreed with gets its GitHub issue, settles, and the lifecycle is ready', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.filed).toHaveLength(1)
+  const argv = w.gh.filed[0] ?? []
+  expect(argv.slice(0, 4)).toEqual(['api', '-X', 'POST', 'repos/me/repo/issues'])
+  expect(argv).toContain(`title=G2-1 Major [P2] Consider renaming this (#${w.gh.pr}, feat/x)`)
+  expect(argv).toContain('labels[]=severity:P2')
+  expect(argv.find(one => one.startsWith('body='))).toContain('Deferred by the agent: needs a schema change.')
+  expect(w.gh.labelled).toContain('label create severity:P2 --repo me/repo --color fbca04')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: filed me/repo#21 severity:P2')).toBe(true)
+  expect((await say($, 'status')).text).toContain('G2-1 → #21 Major [P2].')
+})
+
+test('R92: an issue the gate could not file holds the merge with gh\'s words, and the next pass files it', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'fail'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toBe('HTTP 410: Issues are disabled for this repo')
+  expect(w.prompts.at(-1)).toContain('could not file an issue for G2-1 (HTTP 410: Issues are disabled for this repo)')
+  expect(w.prompts.at(-1)).toContain('check that gh can create issues in the repository (gh auth status)')
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(rec.phase).toBe('ready')
+})
+
+test('R92: a reset while an issue is filed writes nothing for the archived lifecycle (G7-8)', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isResetting = false
+  w.gh.onIssue = async () => {
+    if (isResetting) return
+    isResetting = true
+    await say($, 'reset')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isResetting).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.phase).toBe('archived')
+  expect(rec.findings).toEqual([])
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('filed')
+  expect((await runOf(w)).status).not.toBe('running')
+})
+
+test('A7: an issue GitHub filed without its label holds as a failed label; the next pass labels that issue, never a second one', async ($, on) => {
+  const w = world(on)
+  // An account without push access: GitHub files the issue and drops its labels.
+  w.gh.issueLabels = []
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  const found = held.findings.find(one => one.id === 'G2-1')
+  expect(found).toMatchObject({ followUp: '#21', followUpLabelError: 'GitHub filed #21 without its severity:P2 label (the account may lack push access to label it)' })
+  expect(found?.followUpLabel).toBeUndefined()
+  expect(w.prompts.at(-1)).toContain('could not label issue #21 severity:P2 (GitHub filed #21 without its severity:P2 label')
+  expect(held.log?.some(one => one.kind === 'check' && one.text === 'G2-1: filed me/repo#21 without severity:P2')).toBe(true)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toBeUndefined()
+  expect(labelled(w, 21, 'P2')).toBe(true)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.phase).toBe('ready')
+})
+
+test('A7: an issue GitHub filed with its label settles in one pass', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+test('R92: an issue filed while a waiver lands is saved at once, and the round decides on it: no second issue, no stuck run', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isWaived = false
+  // The person waives something else while GitHub files the issue: the waive command leaves the deciding to the round in flight.
+  w.gh.onIssue = () => {
+    if (isWaived) return
+    isWaived = true
+    const rec = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: 'G9-9', head: rec.head, reason: 'not this one', by: 'person', at: 1 }] })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(isWaived).toBe(true)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: filed me/repo#21 severity:P2')).toBe(true)
+  expect(rec.phase).toBe('ready')
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('R92: an issue filed while the person stops the gate is kept, and the resume files no second one', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isStopped = false
+  w.gh.onIssue = async () => {
+    if (isStopped) return
+    isStopped = true
+    await say($, 'stop')
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(isStopped).toBe(true)
+  expect((await runOf(w)).status).toBe('stopped')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+// ------------------------------------------------------------- wave 2b final review fixes (I1, m3)
+
+/** Two P2 deferrals Codex agreed with: the filing pass owes an issue for each (I1). */
+const toTwoDeferred = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): Promise<void> => {
+  await toTwo($, w)
+  await done($, triaged('r2-triage', [
+    { id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '991' },
+    { id: 'G2-2', action: 'deferred', severity: 'P2', note: 'needs a migration', replyId: '992' },
+  ]))
+}
+
+test('wave 2b final review I1: a finding waived while the filing pass runs leaves no issue unfiled: the pass runs again, with no resume', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  let waived = ''
+  // The person waives G2-1 while GitHub files its issue: a run is going, so the waive command leaves the deciding to it.
+  w.gh.onIssue = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive G2-1 tracked by hand')).text)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived G2-1')
+  expect(w.gh.filed).toHaveLength(2)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-2')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+  expect((await runOf(w)).status).toBe('passed')
+  expect(w.prompts.some(one => one.includes('wait for their GitHub issue') || one.includes('waits for its GitHub issue'))).toBe(false)
+})
+
+test('wave 2b final review I1: a waive post given while the filing pass runs is honoured: no hold, no blocked record, one message', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  let waived = ''
+  const prompts = w.prompts.length
+  w.gh.onIssue = async () => {
+    if (waived !== '') return
+    waived = String((await say($, 'waive post reviewed by hand')).text)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(waived).toContain('waived post-PR review')
+  expect((await runOf(w)).status).toBe('waived')
+  // The issue being filed when the waiver landed is kept; the waived head owes no other.
+  expect(w.gh.filed).toHaveLength(1)
+  const rec = await recordOf(w)
+  expect(rec.postStatus).toBeUndefined()
+  expect(rec.message).toBeUndefined()
+  const sent = w.prompts.slice(prompts)
+  expect(sent.filter(one => one.startsWith('pr-gate: the person waived post-PR review'))).toHaveLength(1)
+  expect(sent.some(one => one.includes('GitHub issue'))).toBe(false)
+  expect(sent.some(one => one.includes('covers PR #'))).toBe(false)
+})
+
+test('wave 2b final review I1: a gate round refused in the lock because a waiver just landed is granted when the pass runs again, not exhausted', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await say($, 'stop')
+  const rec = await recordOf(w)
+  const head = rec.head
+  const before = 'c'.repeat(40)
+  // The allowance spent, and the final-head check, run on a push, raised a blocker: the gate adds a round for it (R92).
+  const late: Finding = {
+    id: 'R7-1', round: 7, source: 'codex-review', reviewer: 'codex', severity: 'P1', title: 'Unvalidated redirect in login', file: 'src/app.ts',
+    line: 12, headSeen: head, status: 'open', history: [],
+  }
+  const spent: LifecycleRecord = {
+    ...rec,
+    postStatus: undefined,
+    message: undefined,
+    allowance: 4,
+    grants: [],
+    rounds: [
+      roundOf({ n: 2, phase: 'post', kind: 'baseline', startHead: before, endHead: before }),
+      ...[3, 4, 5, 6].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true, startHead: before, endHead: before })),
+      roundOf({ n: 7, phase: 'post', kind: 'final-head-check', startHead: before, endHead: head, raised: { blocking: 1, advisory: 0 } }),
+    ],
+    findings: [late],
+  }
+  expect(decideNext(spent).kind).toBe('exhausted')
+  expect(planIssues(spent, 0).kind).toBe('grant')
+  w.store.set(KEY, spent)
+  // A waiver of another finding lands after the controller read the record, before the filing pass takes its lock: the pass reads
+  // the base's settings in between.
+  let isWaived = false
+  w.git.onRoster = () => {
+    if (isWaived) return
+    isWaived = true
+    const now = w.store.get(KEY) as LifecycleRecord
+    w.store.set(KEY, { ...now, waivers: [...now.waivers, { scope: 'finding', findingId: 'G9-9', head, reason: 'not this one', by: 'person', at: 1 }] })
+  }
+  const prompts = w.prompts.length
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect(isWaived).toBe(true)
+  const after = await recordOf(w)
+  expect(after.grants.filter(one => one.by === 'gate')).toHaveLength(1)
+  expect(after.postStatus).not.toBe('exhausted')
+  expect((await runOf(w)).status).toBe('running')
+  expect((await runOf(w)).roundKind).toBe('discretionary')
+  expect(w.prompts.slice(prompts).some(one => one.includes('needs their allowance'))).toBe(false)
+})
+
+test('wave 2b final review m3: the filing pass gets its own step clock: a verify step near its timeout does not stop it', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  // Codex took 50 s of the minute to check the deferrals; each issue then takes 40 s at GitHub.
+  await w.clock.advance(50_000)
+  w.gh.onIssue = async () => {
+    await w.clock.advance(40_000)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  expect((await runOf(w)).status).toBe('passed')
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.some(one => one.includes('did not finish'))).toBe(false)
+})
+
+test('R93: the base\'s mergeMethod reaches the ready prompt', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'nit: rename this')
+  // toTriage sets the roster, so the file is replaced after it, with the same reviewer and checks plus the method.
+  w.git.roster = JSON.stringify({ reviewers: ['claude[bot]'], checks: [], mergeMethod: 'squash' })
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'rebutted', severity: 'P3', note: 'name matches the API', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.prompts.at(-1)).toContain('gh pr merge 1 --squash')
+  // The guard still lets the merge through on the ready head (spec section 6.3).
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --squash' }))).toBe(false)
+})
+
+test('R93: a waiver that makes the lifecycle ready sends the merge step once', async ($, on) => {
+  const w = world(on)
+  await toAwaiting($, w)
+  const prompts = w.prompts.length
+  await say($, 'waive G2-1 the rename lands with KAN-9')
+  await w.clock.advance(1000)
+  const sent = w.prompts.slice(prompts).join('\n')
+  expect(sent.split('gh pr merge ').length - 1).toBe(1)
+})
+
+/** A P2 deferral Codex agreed with, filed as #21 by the gate: the lifecycle is ready (Task 12). */
+const toFiled = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): Promise<void> => {
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'needs a schema change', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).phase).toBe('ready')
+}
+
+/** The branch's archived records, oldest first. */
+const archivesOf = (w: ReturnType<typeof world>): LifecycleRecord[] =>
+  [...w.store.keys()].filter(one => one.startsWith(`${KEY}:archived:`)).map(one => w.stored(one) as LifecycleRecord)
+const archivedOf = (w: ReturnType<typeof world>): LifecycleRecord | undefined => archivesOf(w).at(-1)
+
+test('spec §5.12: after the agent merges, the gate finds each follow-up issue open, logs it, archives the record and says what stays open', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' }))).toBe(false)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
+  expect(w.prompts.at(-1)).toContain('PR #1 merged. Follow-up issues still open: G2-1 → #21 Major [P2].')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('wave 2b gate R1-4: a merge of the same PR number and branch in another repository leaves the local lifecycle open', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --repo other/repo --merge' }))).toBe(false)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(archivesOf(w)).toHaveLength(0)
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a follow-up issue the merge closed is reopened with a comment', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.reopened[0]?.slice(0, 5)).toEqual(['issue', 'reopen', '21', '--repo', 'me/repo'])
+  expect(w.gh.reopened[0]?.at(-1)).toContain('PR #1 merged without fixing G2-1')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge')).toBe(true)
+})
+
+test('spec §5.12: a follow-up issue that is gone is filed again, and the finding names the new one', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(w.gh.filed[1]).toContain(`title=G2-1 Major [P2] Consider renaming this (#${w.gh.pr}, feat/x)`)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.followUp).toBe('#22')
+  expect(w.prompts.at(-1)).toContain('G2-1 → #22 Major [P2]')
+})
+
+test('spec §5.12: when an issue cannot be reopened or filed again, the record is not archived, and resume checks again', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'fail'
+  w.gh.issueAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate could not confirm the follow-up issue of G2-1')
+  expect(w.prompts.at(-1)).toContain('HTTP 403: Resource not accessible by integration')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  w.gh.reopenAnswer = 'ok'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.issueStates[21]).toBe('OPEN')
+  // The passed check clears the failed one's block and message before the archive (fix round 1, M2).
+  expect(archivedOf(w)?.postStatus).toBeUndefined()
+  expect(archivedOf(w)?.message).toBeUndefined()
+})
+
+test('wave 2b gate R6-4: a reopen whose answer is lost after GitHub reopened the issue is read again: no replacement issue', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.filed).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge (gh lost the answer)')).toBe(true)
+})
+
+test('spec §6.4: a merge GitHub refuses leaves the lifecycle where it was', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.mergeAnswer = 'fail'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.reopened).toEqual([])
+})
+
+test('spec §5.12: a merge the session finds at its start runs the check before it archives', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('wave 2b final review m1: a session start checks a blocked post record whose PR merged on GitHub, and archives it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  // The record is back in post-PR review and blocked (a hold the agent was told of), and the person merges the PR on GitHub.
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, phase: 'post', postStatus: 'blocked', message: 'G2-3 waits for its GitHub issue' })
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  // Its start runs the issue check (spec §5.12) and closes the lifecycle, with no /pr-gate.
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.issueStates[21]).toBe('OPEN')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivesOf(w)).toHaveLength(1)
+})
+
+test('wave 2b final review m5: a gh spawn that fails after GitHub took the merge tells the agent the issue check did not run', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.isMergedReadBroken = true
+  const ran = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  expect(isHeld(ran)).toBe(false)
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('the merge went through, but the gate failed before it could check the follow-up issues (')
+  expect(w.prompts.at(-1)).toContain('The issue check did not run')
+  expect(w.prompts.at(-1)).toContain('run /pr-gate')
+  expect((await recordOf(w)).phase).toBe('ready')
+})
+
+/** A reset and a fresh start, run while the post-merge check awaits gh (A6): the check must write nothing into what follows. */
+const replaceWhile = ($: Parameters<TestBody>[0], w: ReturnType<typeof world>): { hook: () => Promise<void>; isDone: () => boolean } => {
+  let isReplaced = false
+  return {
+    hook: async () => {
+      if (isReplaced) return
+      isReplaced = true
+      await say($, 'reset')
+      // The fresh lifecycle adopts the PR as open: a PR read as merged here would be the new lifecycle's own R62 close on its
+      // first poll, not the old check's write (the check read the merge before this hook ran).
+      w.gh.state = 'OPEN'
+      await say($, '')
+    },
+    isDone: () => isReplaced,
+  }
+}
+
+const expectReplaced = async (w: ReturnType<typeof world>, archives: number): Promise<void> => {
+  const rec = await recordOf(w)
+  expect(rec.phase).not.toBe('archived')
+  expect(rec.generation).toBe(1)
+  expect(rec.findings.some(one => one.followUp !== undefined)).toBe(false)
+  expect(JSON.stringify(rec.log ?? [])).not.toContain('after the merge')
+  expect(archivesOf(w)).toHaveLength(archives)
+}
+
+test('A6: a reset and a fresh start while the gate reads an issue after the merge: nothing is reopened, filed or archived for the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  const swap = replaceWhile($, w)
+  w.gh.onIssueView = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.reopened).toEqual([])
+  expect(w.gh.filed).toHaveLength(1)
+  await expectReplaced(w, 1)
+})
+
+test('A6: a reset and a fresh start while the gate reopens an issue: nothing is filed or archived for the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.reopenAnswer = 'fail'
+  const swap = replaceWhile($, w)
+  w.gh.onReopen = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(w.gh.filed).toHaveLength(1)
+  await expectReplaced(w, 1)
+})
+
+test('A6: a reset and a fresh start while the gate files an issue again: the new lifecycle gets no follow-up from it and is not archived', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  const swap = replaceWhile($, w)
+  w.gh.onIssue = swap.hook
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(swap.isDone()).toBe(true)
+  expect(w.gh.filed).toHaveLength(2)
+  await expectReplaced(w, 1)
+})
+
+test('A6, A7: an issue filed again without its label holds the record blocked; resume labels that issue and files no other', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueLabels = []
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22' })
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUpLabelError).toContain('without its severity:P2 label')
+  expect(w.prompts.at(-1)).toContain('label-failed')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueLabels = undefined
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(labelled(w, 22, 'P2')).toBe(true)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('spec §5.12 (I1): an issue gh cannot read is not filed again; the record is blocked with gh\'s words, and resume archives once it reads', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'unreadable'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.reopened).toEqual([])
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('could not read me/repo#21: HTTP 502: Bad Gateway')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  w.gh.issueStates[21] = 'OPEN'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('fix round 1 (I2): a failure after GitHub took the merge tells the agent, leaves the record, and resume closes it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  // The store fails once the gate has begun the check: its next read of the record throws.
+  w.gh.onIssueView = () => {
+    w.beforeRead = key => {
+      if (key === KEY) throw new Error('store down')
+    }
+  }
+  const ran = await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  expect(isHeld(ran)).toBe(false)
+  w.beforeRead = undefined
+  w.gh.onIssueView = undefined
+  await w.clock.advance(1000)
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (')
+  expect(w.prompts.at(-1)).toContain('/pr-gate resume')
+  expect((await recordOf(w)).phase).toBe('ready')
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('fix round 1 (M1): a second close while the first checks the issues does nothing: one reopen, one archive', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'CLOSED'
+  let second: string | undefined
+  w.gh.onIssueView = async () => {
+    if (second !== undefined) return
+    second = 'running'
+    // The person's resume reads the PR as merged and closes it too, while the agent's merge is still checking.
+    second = (await say($, 'resume')).text
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(second).toContain('the gate is already closing its lifecycle')
+  expect(w.gh.reopened).toHaveLength(1)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivesOf(w)).toHaveLength(1)
+})
+
+// ------------------------------------------------------------- wave 2b gate round 1 (R1-5, R1-6)
+
+test('wave 2b gate R1-5: an issue POST whose answer was lost is found by its title on the next pass: one issue, no second POST', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('context deadline exceeded')
+  expect(w.gh.issues).toHaveLength(1)
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(rec.log?.some(one => one.kind === 'check' && one.text === 'G2-1: found me/repo#21, filed by an answer gh lost severity:P2')).toBe(true)
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R4-5: an answer after a lost issue POST clears its issueError, never its sent mark: the next pass finds the issue, no second POST', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ isIssueSent: true })
+  // The agent answers again before the next pass, and Codex agrees again: the failure is stale (R92), the mark is not.
+  const again = (f: Finding): Finding => {
+    const next = applyAnswer(f, { id: 'G2-1', action: 'deferred', severity: 'P2', note: 'still later' }, 3, 'main', 31_500)
+    const agreed = f.history.filter(one => one.by === 'codex').at(-1)
+    return agreed === undefined ? next : { ...next, history: [...next.history, { ...agreed, round: 3, at: 31_600 }] }
+  }
+  const answered = held.findings.map(f => (f.id !== 'G2-1' ? f : again(f)))
+  w.store.set(KEY, { ...held, findings: answered })
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
+test('wave 2b gate R6-2: a peak that rises while the issue POST runs keeps the issue GitHub filed; the next pass labels it, no second POST', async ($, on) => {
+  const w = world(on)
+  let isRaised = false
+  w.gh.onIssue = async () => {
+    if (isRaised) return
+    isRaised = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P1' })) })
+  }
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isRaised).toBe(true)
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21' })
+  expect(held.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  if (held.phase !== 'ready') {
+    await say($, 'resume')
+    await w.clock.advance(1000)
+  }
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit 21') && one.includes('severity:P1'))).toBe(true)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
+})
+
+test('PR #28 review: a lost issue POST, then a peak rise before the retry: the issue is found by its filing mark, relabelled and retitled, never filed twice', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.issues).toHaveLength(1)
+  expect(w.gh.issues[0]?.title).toContain('G2-1 Major [P2]')
+  expect(w.gh.issues[0]?.body).toContain('<!-- pr-gate filing: G2-1 of #1 gen 0 -->')
+  // The peak rises before the next pass: the title the retry would send is no longer the one GitHub filed.
+  const held = await recordOf(w)
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P1' })) })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.issues).toHaveLength(1)
+  const edit = w.gh.labelled.find(one => one.startsWith('issue edit 21 ')) ?? ''
+  expect(edit).toContain('--add-label severity:P1')
+  expect(edit).toContain('--remove-label severity:P2')
+  expect(edit).toContain('--title G2-1 Critical [P1]')
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
+test('PR #28 review: an issue a lost POST filed before the filing mark is still found by its title at the peak it was filed at', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // As an earlier version filed it: no mark in the body.
+  w.gh.issues = w.gh.issues.map(one => ({ ...one, body: 'filed before the mark' }))
+  const held = await recordOf(w)
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P0' })) })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit 21 ') && one.includes('--add-label severity:P0'))).toBe(true)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P0' })
+})
+
+test('PR #28 review: after a reset, a finding of the same id whose POST is lost never takes the earlier lifecycle\'s issue', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(w.gh.issues).toHaveLength(1)
+  const old = w.gh.issues[0]?.number
+  // What a reset leaves: the next lifecycle's generation, whose ids start again, and an unrelated finding that is G2-1 again, still
+  // marked sent because its own POST's answer was lost too. Its title is the same, so only the mark tells the two apart.
+  const held = await recordOf(w)
+  w.store.set(KEY, { ...held, generation: (held.generation ?? 0) + 1 })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  const g = rec.findings.find(one => one.id === 'G2-1')
+  expect(g?.followUp).toBeDefined()
+  expect(g?.followUp).not.toBe(`#${old}`)
+  expect(w.gh.issues).toHaveLength(2)
+  expect(w.gh.issues.at(-1)?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 gen ${(held.generation ?? 0) + 1} -->`)
+  expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${old} `))).toBe(false)
+})
+
+test('PR #28 review: an issue with a filing mark of no generation, or of another, is never matched by title either', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // As this PR's earlier commits marked it: the finding and PR, no generation.
+  w.gh.issues = w.gh.issues.map(one => ({ ...one, body: 'an earlier issue\n\n<!-- pr-gate filing: G2-1 of #1 -->' }))
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.issues).toHaveLength(2)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.followUp).not.toBe('#21')
+})
+
+test('wave 2b gate R4-7: a finding marked security while the severity label is made is never POSTed or labelled as a public issue', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let isMarked = false
+  w.gh.onLabelCreate = async () => {
+    if (isMarked) return
+    isMarked = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, isSecurity: true })) })
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  await w.clock.advance(1000)
+  expect(isMarked).toBe(true)
+  expect(w.gh.filed).toEqual([])
+  expect(w.gh.issues).toEqual([])
+  expect(w.gh.labelled.some(one => one.startsWith('issue edit'))).toBe(false)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.followUp).toBeUndefined()
+  expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+})
+
+test('wave 2b gate R5-1: a finding marked security while the merge check refiles its gone issue is never POSTed; the record blocks', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  let isMarked = false
+  w.gh.onLabelCreate = async () => {
+    if (isMarked) return
+    isMarked = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, isSecurity: true })) })
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  expect(isMarked).toBe(true)
+  expect(w.gh.filed).toHaveLength(1)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  expect(held.message).toContain('G2-1 (marked security while the merge was checked: no public issue is filed for it)')
+})
+
+test('wave 2b gate R5-2: a shorthand follow-up with no repository on the record fails the merge check; the record is not archived', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, slug: undefined })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-1 (could not check #21: no GitHub repository is known for it)')
+})
+
+test('wave 2b gate R1-10: an issue POST is marked on the record before it is sent, so a crash before its answer looks first', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  let during: string | undefined
+  w.gh.onIssue = async () => {
+    during = (await recordOf(w)).findings.find(one => one.id === 'G2-1')?.issueError
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect(during).toContain('an issue was sent to GitHub, but its answer was not saved')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('wave 2b gate R1-5: a failed issue list after a lost answer files nothing and keeps the issueError; the next pass finds the issue', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.issueAnswer = 'ok'
+  w.gh.issueListAnswer = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('HTTP 502: Bad Gateway')
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUp).toBeUndefined()
+  w.gh.issueListAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R2-2, R2-6: the issue a lost answer filed is found past the first page; a list past the page bound files nothing', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  w.gh.issueAnswer = 'ok'
+  // Far more than the bound: the list fails, and nothing is filed a second time.
+  w.gh.issueListFiller = 5000
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(held.phase).not.toBe('ready')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('more than 1000 open issues')
+  // 150 newer issues push it to the second page, which is read.
+  w.gh.issueListFiller = 150
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(1)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R1-5: a refile after the merge whose answer was lost is found on resume: one replacement issue in all', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('context deadline exceeded')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(2)
+  expect(w.gh.issues).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.issueError).toBeUndefined()
+})
+
+test('wave 2b gate R1-6: a throw after the first of two refiles is answered: the new number is on the record; resume files it no more', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  expect(w.gh.filed).toHaveLength(2)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueStates[22] = 'missing'
+  let views = 0
+  // The store fails once the first refile is answered: the second finding's read throws, before the close saves anything.
+  w.gh.onIssueView = () => {
+    views += 1
+    if (views !== 2) return
+    w.beforeRead = key => {
+      if (key === KEY) throw new Error('store down')
+    }
+  }
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  w.beforeRead = undefined
+  w.gh.onIssueView = undefined
+  await w.clock.advance(1000)
+  expect(views).toBe(2)
+  expect(w.gh.filed).toHaveLength(3)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(4)
+  expect(w.gh.filed.filter(one => one.some(arg => arg.startsWith('title=G2-1 ')))).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-2')).toMatchObject({ followUp: '#24', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#23 open after the merge')).toBe(true)
+})
+
+test('wave 2b gate R1-5 (fix round 1): a failed issue list after the merge files nothing, the record stays blocked; the next check finds it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  w.gh.issueAnswer = 'ok'
+  w.gh.issueListAnswer = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.findings.find(one => one.id === 'G2-1')?.issueError).toContain('HTTP 502: Bad Gateway')
+  expect(w.prompts.at(-1)).toContain('HTTP 502: Bad Gateway')
+  w.gh.issueListAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('wave 2b gate R1-5 (fix round 1): a closed issue of the same title is older work: the filing pass ignores it and files a new one', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // The issue the lost answer filed is closed meanwhile: it is not this finding's open follow-up.
+  w.gh.issueStates[21] = 'CLOSED'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(w.gh.filed).toHaveLength(2)
+  expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(rec.phase).toBe('ready')
+})
+
+test('wave 2b gate R1-5 (fix round 1): after the merge, a closed issue of the same title is ignored and the refile files a new one', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.issueStates[21] = 'missing'
+  w.gh.issueAnswer = 'lost'
+  await $.tool.call({ tool: 'Bash', command: 'gh pr merge 1 --merge' })
+  await w.clock.advance(1000)
+  w.gh.issueStates[22] = 'CLOSED'
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(3)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#23', followUpLabel: 'P2' })
+})
+
+// ------------------------------------------------------------- A9: a merge outside the gate (spec §5.13, R95)
+
+/** The minutes the merge watcher waits by default between two reads of a record's PR (spec §5.13.3). */
+const WATCH_MS = 5 * 60_000
+
+/** A finding of post round 2 that still holds the merge, put on the record as a stopped round left it. */
+const holding = (id: string, extra: Partial<Finding> = {}): Finding => ({
+  id, round: 2, source: 'github', reviewer: 'claude[bot]', severity: 'P2', peakSeverity: extra.severity ?? 'P2', title: `Problem ${id}`,
+  file: 'src/app.ts', line: 7, headSeen: 'a'.repeat(40), status: 'open', history: [], ...extra,
+})
+
+/** A P3 deferral Codex agreed with (R92 M2): it waits for the filing pass. */
+const agreedP3 = (id: string): Finding => holding(id, {
+  severity: 'P3', status: 'deferred', note: 'needs a migration',
+  history: [
+    { round: 2, status: 'deferred', note: 'needs a migration', by: 'agent', at: 1 },
+    { round: 2, status: 'deferred', note: 'Codex: it cannot reasonably be fixed in this PR', deferral: 'agreed', by: 'codex', at: 2 },
+  ],
+})
+
+/** toFiled, then post round 2 stopped with `findings` still holding: no run, so only the watcher sees a merge. */
+const toHolding = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, findings: Finding[]): Promise<void> => {
+  await toFiled($, w)
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, phase: 'post', postStatus: 'stopped', findings: [...rec.findings, ...findings] })
+  expect((await runOf(w)).status).not.toBe('running')
+}
+
+test('A9: a PR merged on the website while a P2 is open and a P3 deferral waits: the watcher files both, checks them and archives, with no command', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { title: 'Missing null check' }), agreedP3('G2-4')])
+  // The person merges on GitHub's website: no gh pr merge call, no /pr-gate.
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(3)
+  const titles = w.gh.filed.slice(1).map(one => one.find(arg => arg.startsWith('title=')))
+  expect(titles).toEqual(['title=G2-3 Major [P2] Missing null check (#1, feat/x)', 'title=G2-4 Minor [P3] Problem G2-4 (#1, feat/x)'])
+  for (const one of w.gh.filed.slice(1)) {
+    expect(one.find(arg => arg.startsWith('body='))).toContain('PR #1 merged before the gate finished: no fix round ran on this finding.')
+  }
+  expect((await recordOf(w)).phase).toBe('archived')
+  const archived = archivedOf(w)
+  expect(archived?.findings.find(one => one.id === 'G2-3')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(archived?.findings.find(one => one.id === 'G2-4')).toMatchObject({ followUp: '#23', followUpLabel: 'P3' })
+  // Then checked after the merge (spec §5.12), the earlier issue too.
+  const log = (archived?.log ?? []).map(one => one.text)
+  expect(log).toContain('G2-3: me/repo#22 open after the merge')
+  expect(log).toContain('G2-4: me/repo#23 open after the merge')
+  expect(log).toContain('G2-1: me/repo#21 open after the merge')
+  expect(w.prompts.at(-1)).toContain('PR #1 merged. Follow-up issues still open: G2-1 → #21 Major [P2]; G2-3 → #22 Major [P2]; G2-4 → #23 Minor [P3].')
+})
+
+test('A9: a filing that fails at a website merge blocks the record and tells the agent; the next watcher beat files, checks and archives', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3'), agreedP3('G2-4')])
+  w.gh.issueAnswer = 'fail'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(w.prompts.at(-1)).toContain('PR #1 merged, but the gate could not confirm the follow-up issue of G2-3 (could not file its issue: HTTP 410')
+  expect(w.prompts.at(-1)).toContain('G2-4 (could not file its issue')
+  // GitHub takes issues again: the next beat runs the close again, with no resume.
+  w.gh.issueAnswer = 'ok'
+  const prompts = w.prompts.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  // The fake counts each POST: #21, the two that failed, and the two that filed #22 and #23.
+  expect(w.gh.filed).toHaveLength(5)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-3')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+  expect(archivedOf(w)?.postStatus).toBeUndefined()
+  expect(archivedOf(w)?.message).toBeUndefined()
+  expect(w.prompts.slice(prompts).at(-1)).toContain('Follow-up issues still open: G2-1 → #21 Major [P2]; G2-3 → #22 Major [P2]; G2-4 → #23 Minor [P3].')
+})
+
+test('A9: a security finding open at a website merge blocks the record, files nothing and tells the person; their waiver archives it', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged in plain text' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(1)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain('PR #1 from feat/x merged before the gate finished, with a security finding still holding that no ticket tracks: G2-3 [P1]')
+  expect(told).toContain('the lifecycle of feat/x stays open on G2-3')
+  expect(told).toContain('/pr-gate waive feat/x:G2-3 <reason>, from this worktree')
+  expect(told).toContain('Tell the person')
+  // Nothing more for the watcher: only the person's waiver releases it.
+  const before = w.prompts.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.prompts.length).toBe(before)
+  const reply = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  await w.clock.advance(1000)
+  expect(reply).toContain('its lifecycle is archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('A9: a ready record merged on the website is closed by the watcher within mergeWatchMinutes, and §5.12\'s check runs', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'CLOSED'
+  await w.clock.advance(3 * 60_000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  await w.clock.advance(WATCH_MS - 3 * 60_000)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.gh.reopened).toHaveLength(1)
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: reopened me/repo#21 after the merge')).toBe(true)
+})
+
+test('A9: a session started on another branch closes a merged record of a branch not checked out; one owned by a live session elsewhere is left alone', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  const rec = await recordOf(w)
+  // Branch feat/z's record, run by another session that beat just now.
+  const other = 'lifecycle:/repo:feat/z'
+  w.store.set(other, { ...rec, branch: 'feat/z' })
+  w.store.set(`${other}:owner`, { sessionId: 'session-2', beatAt: await (w.engine as { clock: { now: () => Promise<number> } }).clock.now() })
+  w.gh.state = 'MERGED'
+  w.git.branch = 'feat/y'
+  w.clearState()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: me/repo#21 open after the merge')).toBe(true)
+  expect((w.stored(other) as LifecycleRecord).phase).toBe('ready')
+  // That session dies: its record is this watcher's once its owner is stale, with no session start and no command (review minor 2).
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((w.stored(other) as LifecycleRecord).phase).toBe('archived')
+})
+
+test('wave 2b gate R2-3: a reset and a new PR while the watcher reads the old PR\'s state: the old merge never archives the new lifecycle', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  let isSwapped = false
+  w.gh.onPrView = async () => {
+    if (isSwapped) return
+    isSwapped = true
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, pr: (rec.pr ?? 0) + 1, generation: (rec.generation ?? 0) + 1 })
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(isSwapped).toBe(true)
+  const after = await recordOf(w)
+  expect(after.phase).toBe('ready')
+  expect(archivedOf(w)).toBeUndefined()
+})
+
+test('A9: a watcher read that fails is no stop: the next beat closes the record', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  // gh cannot read the PR at the first beat.
+  w.gh.hasPr = false
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('ready')
+  w.gh.hasPr = true
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('A9: a PR merged under the person\'s post waiver files, at the merge, an issue for each finding still holding; the body names the waiver and its reason', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3')])
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'post', head: rec.head, reason: 'reviewed by hand', by: 'composer', at: 1 }] })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed).toHaveLength(2)
+  const filed = w.gh.filed[1] ?? []
+  // The title is the finding's own; only the body says how the PR merged.
+  expect(filed.find(arg => arg.startsWith('title='))).toBe('title=G2-3 Major [P2] Problem G2-3 (#1, feat/x)')
+  const body = filed.find(arg => arg.startsWith('body=')) ?? ''
+  expect(body).toContain("PR #1 merged under the person's post waiver (/pr-gate waive post): reviewed by hand. No fix round ran on this finding.")
+  expect(body).not.toContain('merged before the gate finished')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-3')).toMatchObject({ followUp: '#22', followUpLabel: 'P2' })
+})
+
+test('A9: a finding the person waived is not filed at a website merge', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3'), holding('G2-4')])
+  const rec = await recordOf(w)
+  w.store.set(KEY, { ...rec, waivers: [...rec.waivers, { scope: 'finding', findingId: 'G2-3', head: rec.head, reason: 'not a bug', by: 'composer', at: 1 }] })
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed.slice(1).map(one => one.find(arg => arg.startsWith('title=')))).toEqual(['title=G2-4 Major [P2] Problem G2-4 (#1, feat/x)'])
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('A9 review I1: a waiver given while a close checks the issues leaves no stale security block: the close archives the record, with no resume', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-5', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  // The first close cannot read #21: blocked on both the check and the security finding.
+  w.gh.issueStates[21] = 'unreadable'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('could not confirm the follow-up issue of G2-1')
+  expect(held.message).toContain('G2-5 [P1]')
+  // The watcher's next close reads #21 again; the person's waiver lands while it does, and its own close finds this one running.
+  delete w.gh.issueStates[21]
+  let reply = ''
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    reply = String((await say($, 'waive G2-5 rotated the token by hand')).text)
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(reply).toContain('already closing')
+  const latest = await recordOf(w)
+  expect(latest.phase).toBe('archived')
+  expect(archivedOf(w)?.message).toBeUndefined()
+  expect(archivedOf(w)?.postStatus).toBeUndefined()
+})
+
+test('wave 2b gate R3-3: a finding saved while a website-merge close checks the issues blocks the record; the next beat files it and archives', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: [...rec.findings, holding('G3-1')] })
+  }
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G3-1 (saved while the merge was checked')
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.filed.length).toBe(before + 1)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('wave 2b gate R4-3: a deferral naming an issue, saved while a website-merge close checks the issues, blocks the record; the next beat checks it', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: [...rec.findings, holding('G3-1', { status: 'deferred', followUp: '#77' })] })
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G3-1 (saved while the merge was checked; its issue is checked on the next check)')
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(w.gh.calls.some(one => one.startsWith('issue view 77 '))).toBe(true)
+})
+
+test('a peak raised while the merge check labels a reported fix holds until the new peak is labelled', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', {
+    severity: 'P1', peakSeverity: 'P1', status: 'reported-fixed', followUp: '#77', followUpLabel: 'P2',
+  })])
+  w.gh.state = 'MERGED'
+  w.gh.onLabel = async () => {
+    w.gh.onLabel = undefined
+    const rec = await recordOf(w)
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-3' ? f : { ...f, severity: 'P0', peakSeverity: 'P0' })) })
+  }
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-3 (saved while the merge was checked; its issue is checked on the next check)')
+  expect(held.findings.find(f => f.id === 'G2-3')).toMatchObject({ peakSeverity: 'P0', followUpLabel: 'P1' })
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(f => f.id === 'G2-3')).toMatchObject({ peakSeverity: 'P0', followUpLabel: 'P0' })
+  expect(w.gh.filed).toHaveLength(before)
+  expect(w.gh.calls.some(one => one.startsWith('issue edit 77 ') && one.includes('severity:P0'))).toBe(true)
+})
+
+test('wave 2b gate R4-9: a follow-up changed while a website-merge close refiles its issue is kept, and the record blocks', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  w.gh.state = 'MERGED'
+  w.gh.issueStates[21] = 'missing'
+  w.gh.onIssueView = async () => {
+    w.gh.onIssueView = undefined
+    const rec = await recordOf(w)
+    // As applyAnswer saves another follow-up: the old issue's label goes with it.
+    w.store.set(KEY, { ...rec, findings: rec.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, followUp: '#88', followUpLabel: undefined })) })
+  }
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.findings.find(one => one.id === 'G2-1')?.followUp).toBe('#88')
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('G2-1 (saved while the merge was checked; its issue is checked on the next check)')
+})
+
+test('A9 review I2: /pr-gate waive <id> from another branch waives the one merged lifecycle blocked on that security finding; with two, it names both and waives none', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  expect(blocked.postStatus).toBe('blocked')
+  // The same block on feat/z: the person must say which.
+  const other = 'lifecycle:/repo:feat/z'
+  w.store.set(other, { ...blocked, branch: 'feat/z' })
+  w.git.branch = 'feat/y'
+  const twice = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  expect(twice).toContain('G2-3 names a finding in the lifecycles of feat/x, feat/z: nothing was waived')
+  expect(twice).toContain('/pr-gate waive feat/x:G2-3 <reason>, /pr-gate waive feat/z:G2-3 <reason>')
+  expect((await recordOf(w)).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
+  expect((w.stored(other) as LifecycleRecord).waivers.some(one => one.findingId === 'G2-3')).toBe(false)
+  // With one left, the waiver from feat/y is given on feat/x, and the close archives it.
+  w.store.delete(other)
+  const once = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  await w.clock.advance(1000)
+  expect(once).toContain('waived G2-3 for feat/x')
+  expect(once).toContain('its lifecycle is archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.waivers.some(one => one.findingId === 'G2-3')).toBe(true)
+})
+
+/** What a waive may change on each record: its waivers, findings and status (the command's own log line aside). */
+const decidedOf = (w: ReturnType<typeof world>) => (...keys: string[]): string =>
+  JSON.stringify(keys.map(key => {
+    const one = w.stored(key) as LifecycleRecord
+    return [one.phase, one.waivers, one.findings, one.postStatus, one.message]
+  }))
+
+test('A9 re-review: an id on the checked-out branch that also blocks a merged lifecycle elsewhere is refused, naming both; nothing is written', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  expect(blocked.postStatus).toBe('blocked')
+  // feat/y has its own G2-3, open in its review.
+  const mine = 'lifecycle:/repo:feat/y'
+  w.store.set(mine, { ...blocked, branch: 'feat/y', postStatus: 'stopped', message: undefined, findings: [holding('G2-3')] })
+  w.git.branch = 'feat/y'
+  const stateOf = decidedOf(w)
+  const before = stateOf(KEY, mine)
+  const reply = String((await say($, 'waive G2-3 rotated the token by hand')).text)
+  expect(reply).toContain('G2-3 names a finding in the lifecycles of feat/y, feat/x: nothing was waived')
+  expect(reply).toContain('/pr-gate waive feat/y:G2-3 <reason>, /pr-gate waive feat/x:G2-3 <reason>')
+  expect(stateOf(KEY, mine)).toBe(before)
+})
+
+test('A9 re-review: /pr-gate waive <branch>:<id> waives that branch\'s blocked lifecycle and archives it; on a branch with no such id it is refused', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged' })])
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const blocked = await recordOf(w)
+  const mine = 'lifecycle:/repo:feat/y'
+  w.store.set(mine, { ...blocked, branch: 'feat/y', postStatus: 'stopped', message: undefined, findings: [holding('G2-9')] })
+  w.git.branch = 'feat/y'
+  const stateOf = decidedOf(w)
+  const before = stateOf(KEY, mine)
+  const wrong = String((await say($, 'waive feat/y:G2-3 rotated the token by hand')).text)
+  expect(wrong).toContain('there is no finding G2-3 in the lifecycle of feat/y')
+  expect(stateOf(KEY, mine)).toBe(before)
+  const right = String((await say($, 'waive feat/x:G2-3 rotated the token by hand')).text)
+  await w.clock.advance(1000)
+  expect(right).toContain('waived G2-3 for feat/x')
+  expect(right).toContain('its lifecycle is archived')
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.waivers.some(one => one.findingId === 'G2-3')).toBe(true)
+  expect((w.stored(mine) as LifecycleRecord).waivers).toEqual(blocked.waivers)
+})
+
+test('A9 review minor 1: the watcher says a merge block once; its next beat, finding the same block, says nothing', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3')])
+  w.gh.issueAnswer = 'fail'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).postStatus).toBe('blocked')
+  const said = w.prompts.filter(one => one.includes('could not confirm the follow-up issue of G2-3')).length
+  expect(said).toBe(1)
+  const before = w.gh.filed.length
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  // The watcher tried again (one more POST), and said nothing new.
+  expect(w.gh.filed.length).toBe(before + 1)
+  expect(w.prompts.filter(one => one.includes('could not confirm the follow-up issue of G2-3')).length).toBe(1)
+})
+
+test('A9 controller point 5: a merge close that meets another filing pass of the branch counts it as a failed check, and the watcher then archives', async ($, on) => {
+  const w = world(on)
+  await toTwoDeferred($, w)
+  // While the filing pass posts its first issue, the PR merges and a new session starts: its close meets that pass.
+  let isClosed = false
+  w.gh.onIssue = async () => {
+    if (isClosed) return
+    isClosed = true
+    w.gh.state = 'MERGED'
+    w.clearState()
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  }
+  await done($, accept('r2-verify', w, { 'G2-1': true, 'G2-2': true }))
+  await w.clock.advance(1000)
+  expect(isClosed).toBe(true)
+  expect(w.prompts.some(one => one.includes('its findings still holding (another filing pass was running'))).toBe(true)
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  // Each finding filed once, by the pass that was running: the close checked them, never filed them again.
+  expect(w.gh.filed).toHaveLength(2)
+})
+
+test('A9: the watcher skips a record whose run is running; once the run ends, its next beat closes the merged PR', async ($, on) => {
+  const w = world(on)
+  // A post-PR round runs: the triage agent is out, and never answers in this test.
+  await toTriage($, w, 'Consider renaming this')
+  expect((await runOf(w)).status).toBe('running')
+  w.gh.state = 'MERGED'
+  const views = (): number => w.gh.calls.filter(one => one === 'pr view 1 --json state').length
+  const before = views()
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect(views()).toBe(before)
+  expect((await recordOf(w)).phase).not.toBe('archived')
+  await say($, 'stop')
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+})
+
+test('A9 review minor 3: a session started again runs one merge watcher, not a second one beside the first', async ($, on) => {
+  const w = world(on)
+  await toFiled($, w)
+  let reads = 0
+  w.afterRead = key => {
+    if (key === `${KEY}:owner`) reads += 1
+  }
+  await w.clock.advance(60_000)
+  const one = reads
+  expect(one).toBeGreaterThan(0)
+  for (let i = 0; i < 2; i += 1) {
+    w.clearState()
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+    await w.clock.advance(1000)
+  }
+  reads = 0
+  await w.clock.advance(60_000)
+  expect(reads).toBe(one)
+})
+
+// ------------------------------------------------------------- A9.7: security findings open Jira tickets (spec §5.13.7)
+
+/** The roster with `jiraProject` set: security findings get their Jira tickets in KAN. */
+const JIRA = '{"reviewers":["claude[bot]"],"checks":[],"jiraProject":"KAN"}'
+
+/** A security P1 deferral Codex agreed with: the review leaves it for the person. `isJira`: the base sets jiraProject. */
+const toSecurityDeferral = async ($: Parameters<TestBody>[0], w: ReturnType<typeof world>, isJira = true): Promise<void> => {
+  await toTriage($, w, 'Consider rotating this token')
+  // toTriage sets the roster: the setting goes on after it, before the filing pass reads it.
+  if (isJira) w.git.roster = JIRA
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P1', isSecurity: true, note: 'needs a key rotation', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+}
+
+const creates = (w: ReturnType<typeof world>): string[][] => w.acli.calls.filter(one => one[2] === 'create')
+
+test('A9.7: with jiraProject set, a security deferral left for the person files one Jira ticket; it still holds, and status and the report name it', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  // The ticket tracks it and never settles it: it still holds, for the person's waiver alone.
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(creates(w)).toHaveLength(1)
+  const made = creates(w)[0] ?? []
+  const flag = (name: string): string | undefined => made[made.indexOf(name) + 1]
+  expect(made.slice(0, 7)).toEqual(['jira', 'workitem', 'create', '--project', 'KAN', '--type', 'Bug'])
+  expect(flag('--summary')).toMatch(/^G2-1 Critical \[P1\] .* \(#1, me\/repo, feat\/x\)$/)
+  expect(flag('--label')).toBe('security,severity-P1')
+  expect(made.at(-1)).toBe('--json')
+  // The body went through a file in git's directory, never on the command line, and the file is gone.
+  // Named for the PR, the finding and a nonce: two records sharing git's directory never touch each other's file.
+  expect(flag('--description-file')).toMatch(/^\/repo\/\.git\/pr-gate-jira-1-G2-1-\d+-[a-z0-9]+\.txt$/)
+  expect(w.written.map(one => one.path)).toEqual([flag('--description-file')])
+  const body = w.written[0]?.text ?? ''
+  expect(body).toContain('Severity: Critical [P1], security.')
+  expect(made.some(one => one.includes('needs a key rotation'))).toBe(false)
+  expect(w.acli.tickets[0]?.description).toBe(body)
+  expect(w.files.size).toBe(0)
+  // Never a public GitHub issue.
+  expect(w.gh.filed).toEqual([])
+  expect(w.prompts.at(-1)).toContain("G2-1 → KAN-512 Critical [P1], waiting for the person's waiver")
+  expect((await say($, 'status')).text).toContain('G2-1 → KAN-512 Critical [P1], waiting for your waiver.')
+  // The next pass files no second ticket.
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+})
+
+test('A9.7: without jiraProject, no acli call is made and the security deferral waits for the person as before', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w, false)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.acli.calls).toEqual([])
+  expect(w.written).toEqual([])
+  expect(w.gh.filed).toEqual([])
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBeUndefined()
+  expect(rec.postStatus).toBe('awaiting-decision')
+})
+
+test('A9.7: acli unauthorized holds the finding with its words and tells the person once to log in; a later pass files the ticket', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'unauthorized'
+  await toSecurityDeferral($, w)
+  const held = await recordOf(w)
+  const g = held.findings.find(one => one.id === 'G2-1')
+  expect(g?.jiraTicket).toBeUndefined()
+  expect(g?.jiraError).toBe("unauthorized: use 'acli [product] auth login' to authenticate")
+  expect(held.isJiraLoginSaid).toBe(true)
+  const logins = (): string[] => w.toasts.filter(one => one.includes('acli jira auth login'))
+  expect(logins()).toHaveLength(1)
+  expect(logins()[0]).toContain('could not file the Jira ticket of security finding G2-1 (unauthorized')
+  expect(logins()[0]).toContain('. Run acli jira auth login. The gate retries on its next pass.')
+  expect(logins()[0]).not.toContain('Install acli')
+  expect(w.prompts.at(-1)).toContain("Jira tickets not filed, retried on the gate's next pass: G2-1 (unauthorized")
+  // The toast told the person: the report lists the failure with acli's words and says no more about logging in.
+  expect(w.prompts.at(-1)).toContain('Never file a GitHub issue for a security finding.')
+  expect(w.prompts.at(-1)).not.toContain('Tell the person: Run acli jira auth login')
+  expect(w.gh.filed).toEqual([])
+  // The second pass fails again, and says nothing new to the person.
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(2)
+  expect(logins()).toHaveLength(1)
+  // The second report lists the failure again, with no login instruction.
+  expect(w.prompts.at(-1)).toContain("Jira tickets not filed, retried on the gate's next pass: G2-1 (unauthorized")
+  expect(w.prompts.at(-1)).not.toContain('auth login. ')
+  expect(w.prompts.at(-1)).not.toContain('Tell the person:')
+  // Logged in: the third pass searches Jira first (an earlier answer may have been lost), finds nothing, and files the ticket.
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(3)
+  expect(w.acli.calls.filter(one => one[2] === 'search')).toHaveLength(2)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect(logins()).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: acli missing, or a description that cannot be written, holds the finding with the words; never a stop or a GitHub issue', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'missing'
+  await toSecurityDeferral($, w)
+  // The spawn rejected (the test host names no ENOENT of its own): acli could not be started, with the rejection's words; the gate goes on.
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('acli could not be started (')
+  // Ruling (b): a missing acli is told to install it, then log in, never only to log in.
+  const told = w.toasts.filter(one => one.includes('acli jira auth login'))
+  expect(told).toHaveLength(1)
+  expect(told[0]).toContain('Install acli (the Atlassian CLI), then run acli jira auth login.')
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraTicket).toBeUndefined()
+  // The body file is removed even though acli never ran.
+  expect(w.files.size).toBe(0)
+  w.acli.create = 'ok'
+  w.isWriteBroken = true
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toMatch(/^could not write the ticket's description to \/repo\/\.git\/pr-gate-jira-1-G2-1-/)
+  expect(w.files.size).toBe(0)
+  expect(creates(w)).toHaveLength(1)
+  expect(rec.postStatus).toBe('awaiting-decision')
+  expect((await runOf(w)).status).not.toBe('running')
+  expect(w.toasts.filter(one => one.includes('acli jira auth login'))).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: a lost create answer, then a retry: Jira is searched and the ticket found, so there is no second create; a failed search files nothing', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'lost'
+  await toSecurityDeferral($, w)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('context deadline exceeded')
+  expect(w.acli.tickets).toHaveLength(1)
+  w.acli.create = 'ok'
+  // A search that fails files nothing this pass.
+  w.acli.search = 'fail'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraError).toContain('could not search Jira for a ticket a lost answer filed: Error: the Jira site answered 502')
+  w.acli.search = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  const search = w.acli.calls.filter(one => one[2] === 'search').at(-1) ?? []
+  // Scoped to this PR, its repository (wave 2b gate R4-6) and the security label, newest first, 50 to a page.
+  expect(search[search.indexOf('--jql') + 1]).toBe('project = KAN AND summary ~ "\\"G2-1\\"" AND summary ~ "\\"#1\\"" AND summary ~ "\\"me/repo\\"" AND labels = security ORDER BY created DESC')
+  expect(search[search.indexOf('--limit') + 1]).toBe('50')
+  const rec = await recordOf(w)
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(rec.findings.find(one => one.id === 'G2-1')?.jiraError).toBeUndefined()
+  expect(rec.log?.some(one => one.text.startsWith('G2-1: found Jira KAN-512, filed by an answer acli lost'))).toBe(true)
+})
+
+test('PR #28 review: a lost Jira create, then a peak rise before the retry: the ticket is found by its summary at the earlier peak, no second create', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'lost'
+  await toSecurityDeferral($, w)
+  expect(w.acli.tickets).toHaveLength(1)
+  const was = w.acli.tickets[0]?.summary ?? ''
+  const held = await recordOf(w)
+  const peak = held.findings.find(one => one.id === 'G2-1')?.peakSeverity
+  const higher = peak === 'P0' ? undefined : peak === 'P1' ? 'P0' : 'P1'
+  expect(higher).toBeDefined()
+  w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: higher })) })
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect(w.acli.tickets[0]?.summary).toBe(was)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+})
+
+test('PR #28 review: a lost Jira create, then an issueSpec change on the base: the ticket is found by the summary saved before the create', async ($, on) => {
+  const w = world(on)
+  w.acli.create = 'lost'
+  await toSecurityDeferral($, w)
+  expect(w.acli.tickets).toHaveLength(1)
+  const was = w.acli.tickets[0]?.summary ?? ''
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraSummaries).toEqual([was])
+  // The base now names a spec in every title: no title the retry computes is the one Jira has.
+  w.git.roster = JSON.stringify({ ...(JSON.parse(JIRA) as object), issueSpec: 'docs/spec.md' })
+  w.acli.create = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(creates(w)).toHaveLength(1)
+  expect(w.acli.tickets).toHaveLength(1)
+  expect(w.acli.tickets[0]?.summary).toBe(was)
+  const g = (await recordOf(w)).findings.find(one => one.id === 'G2-1')
+  expect(g?.jiraTicket).toBe('KAN-512')
+  expect(g?.jiraSummaries).toBeUndefined()
+})
+
+test('A9.7: a website merge with the ticket filed archives the record and tells the person the finding and its ticket', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(w.prompts.at(-1)).toContain('Security findings still holding at the merge, tracked by their Jira tickets, which never settle them: G2-1 → KAN-512 Critical [P1].')
+  expect(w.prompts.at(-1)).toContain('Tell the person now')
+  expect(w.toasts.at(-1)).toContain('merged with security findings tracked in Jira, not settled: G2-1 → KAN-512 Critical [P1]')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira KAN-512 exists after the merge')).toBe(true)
+  expect(creates(w)).toHaveLength(1)
+  expect(w.gh.filed).toEqual([])
+})
+
+test('A9.7: a security finding still open at a website merge gets its ticket there and archives; one acli cannot file blocks as before', async ($, on) => {
+  const w = world(on)
+  await toHolding($, w, [holding('G2-3', { severity: 'P1', peakSeverity: 'P1', isSecurity: true, title: 'Token logged in plain text' })])
+  w.git.roster = JIRA
+  w.acli.create = 'unauthorized'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain('with a security finding still holding that no ticket tracks: G2-3 [P1]')
+  expect(held.findings.find(one => one.id === 'G2-3')?.jiraError).toContain('unauthorized')
+  expect(w.gh.filed).toHaveLength(1)
+  // A failed ticket is a failed check (wave 2b gate R1-8): the record stays the watcher's, and the message names the retry.
+  expect(held.message).toContain('merged, but the gate could not confirm the follow-up issue of G2-3 (could not file its Jira ticket: unauthorized')
+  expect(w.prompts.at(-1)).toContain('the gate files its Jira ticket again on each check')
+  // Logged in: the watcher's next read files the ticket and archives the record, with no resume and no waiver.
+  w.acli.create = 'ok'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  const f = archivedOf(w)?.findings.find(one => one.id === 'G2-3')
+  expect(f?.jiraTicket).toBe('KAN-512')
+  const made = creates(w).at(-1) ?? []
+  expect(made[made.indexOf('--summary') + 1]).toBe('G2-3 Critical [P1] Token logged in plain text (#1, me/repo, feat/x)')
+  expect(w.prompts.at(-1)).toContain('G2-3 → KAN-512 Critical [P1]')
+  expect(w.gh.filed).toHaveLength(1)
+})
+
+test('A9.7: after the merge a ticket Jira says does not exist is filed again; an acli read that fails blocks the record until it reads', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  // Deleted in Jira before the merge.
+  w.acli.tickets = []
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(creates(w)).toHaveLength(2)
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-513')
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira says KAN-512 does not exist; filing it again, searching Jira first')).toBe(true)
+  expect(archivedOf(w)?.log?.some(one => one.text === 'G2-1: Jira KAN-512 is gone; filed Jira KAN-513')).toBe(true)
+  // A refile always searches first: Jira says "does not exist" too of a ticket acli's account cannot see.
+  expect(w.acli.calls.filter(one => one[2] === 'search')).toHaveLength(1)
+  // Its body says how the PR merged, not that the review rounds ran out.
+  expect(w.acli.tickets.at(-1)?.description).toContain('PR #1 merged before the gate finished: no fix round ran on this finding.')
+  expect(w.prompts.at(-1)).toContain('G2-1 → KAN-513 Critical [P1]')
+})
+
+test('A9.7: after the merge an acli read that fails, or is unauthorized, blocks the record and files nothing; the next beat archives it', async ($, on) => {
+  const w = world(on)
+  await toSecurityDeferral($, w)
+  w.acli.view = 'unauthorized'
+  w.gh.state = 'MERGED'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  const held = await recordOf(w)
+  expect(held.phase).not.toBe('archived')
+  expect(held.postStatus).toBe('blocked')
+  expect(held.message).toContain("could not confirm the follow-up issue of G2-1 (could not read Jira KAN-512: unauthorized: use 'acli [product] auth login'")
+  expect(creates(w)).toHaveLength(1)
+  w.acli.view = 'fail'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).message).toContain('could not read Jira KAN-512: Error: the Jira site answered 502')
+  expect(creates(w)).toHaveLength(1)
+  w.acli.view = 'ok'
+  await w.clock.advance(WATCH_MS)
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).phase).toBe('archived')
+  expect(archivedOf(w)?.findings.find(one => one.id === 'G2-1')?.jiraTicket).toBe('KAN-512')
+  expect(creates(w)).toHaveLength(1)
+})
+

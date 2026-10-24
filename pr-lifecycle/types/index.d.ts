@@ -6,8 +6,10 @@ export type FindingStatus = 'open' | 'reported-fixed' | 'verified-fixed' | 'rebu
 export type FindingSource = 'codex-review' | 'codex-challenge' | 'github'
 
 /**
- * `severity`: the severity an answer set, with `from` the one before it (R85). `lowering`: Codex's ruling on the agent's lowering of
- * the severity before it (Adam, 2026-10-20).
+ * `answer`: an acknowledgement, stored as a rebuttal (R94). `severity`: the severity an answer set, with `from` the one before it (R85).
+ * `lowering`: Codex's ruling on the agent's lowering of the severity before it, on a record from 1.4.0 (R85, replaced by `deferral`).
+ * `deferral`: Codex's ruling on the agent's deferral (R92 M2): agreed, it cannot reasonably be fixed in this PR; refused, it can, and
+ * the finding is open again.
  */
 export type FindingEvent = {
   round: number
@@ -17,6 +19,16 @@ export type FindingEvent = {
   severity?: Severity
   from?: Severity
   lowering?: 'agreed' | 'refused'
+  deferral?: 'agreed' | 'refused'
+  /** The answer as the agent gave it, when the status alone does not say: an acknowledgement is stored as a rebuttal (R82, R94). */
+  answer?: 'acknowledged'
+  /** Codex's refusal of the agent's link (R90): the original it found a different problem. A link to it again is no answer. */
+  refusedLink?: string
+  /**
+   * The id of the link that raised the severity (A9): a record of the raise, not an answer or a ruling. The status it carries is
+   * the finding's own, copied; readers of the answers and rulings skip it (`answersOf`), and `loweringOf` reads its severity.
+   */
+  raisedBy?: string
   by: string
   at: number
 }
@@ -36,6 +48,11 @@ export type Finding = {
   isSecurity?: boolean
   /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
   severitySource?: 'tag' | 'hint'
+  /**
+   * The lowest severity a linked reviewer's tag or Codex's rating gave it (R84, R90): a guessed severity is answered down to it, never
+   * below. It stays after the link is dropped or refused, as the link's security does.
+   */
+  severityFloor?: Severity
   title: string
   file?: string
   line?: number
@@ -44,15 +61,47 @@ export type Finding = {
   headSeen: string
   status: FindingStatus
   note?: string
-  /** The GitHub issue a P3 deferral's follow-up is tracked in (R85): `#<n>`, `owner/repo#<n>` or its URL, other text around it. */
+  /**
+   * The GitHub issue that tracks it: named by the agent's answer (R85) or filed by the gate (R92). `#<n>`, `owner/repo#<n>` or its
+   * URL, other text around it.
+   */
   followUp?: string
-  /** The highest severity the finding had during the gate (R85): what its follow-up issue is labelled with. */
+  /** The highest severity the finding had during the gate (R85): what its issue is labelled with. */
   peakSeverity?: Severity
-  /** The `severity:<P>` label the gate put on the follow-up issue; a deferral settles only once it is the peak's. */
+  /** The `severity:<P>` label the gate put on that issue; the finding settles once it is the peak's (R92). */
   followUpLabel?: Severity
-  /** gh's error when the gate last failed to label the follow-up issue: the deferral holds until a pass labels it. */
+  /** gh's error when the gate last failed to label the issue the agent named: the finding holds until a pass labels it. */
   followUpLabelError?: string
-  /** A later change touched its file: the evidence behind its status needs checking again. */
+  /** gh's error when the gate last failed to file the finding's issue (R92): the finding holds until a pass files it. */
+  issueError?: string
+  /**
+   * The gate sent the finding's issue and has not saved GitHub's number for it (wave 2b gate R4-5): the next pass reads the
+   * repository's issues for it before filing another. Unlike issueError, an answer never clears it; a saved issue number does.
+   */
+  isIssueSent?: true
+  /**
+   * The Jira ticket that tracks a security finding (spec §5.13.7), such as `KAN-512`, filed through acli where the base sets
+   * `jiraProject`. It tracks the finding but never settles it: before a merge, only the person's waiver releases it.
+   */
+  jiraTicket?: string
+  /** acli's words when the gate last failed to file the finding's Jira ticket: the next pass searches Jira before filing again. */
+  jiraError?: string
+  /**
+   * The exact summaries sent to Jira by creates whose answer was not saved, each saved before its create (PR #28 review,
+   * round.ts:3434): the search after a lost answer matches them as well as today's titles, so a summary the base's issueSpec has
+   * changed since is still found and never filed twice. Cleared once a ticket is saved.
+   */
+  jiraSummaries?: string[]
+  /** The finding this one names again (R90): it holds, and settles, with its original. Never a linked finding's id. */
+  duplicateOf?: string
+  /** Who linked it: the gate's match (`isSame`), or the agent's answer, which Codex checks (R90). */
+  linkBy?: 'gate' | 'agent'
+  /** Codex agreed the agent's link names the same problem. */
+  isLinkChecked?: boolean
+  /**
+   * A later change touched its file, or a link raised it into blocking range or made it security (A9): the evidence behind its
+   * status needs checking again. Codex's check clears it.
+   */
   needsRecheck?: boolean
   /** The head `line` was last placed at (R73): a head move reads the diff from here and shifts `line` along with the code. */
   lineHead?: string
@@ -95,6 +144,9 @@ export type Effort = 'high' | 'medium' | 'low'
 /** full: the whole gate. light: a branch named by `lightBranches` (chore/), one round and no advisories. */
 export type Lane = 'full' | 'light'
 
+/** How the agent merges a PR the gate let through (R93): `gh pr merge --merge`, `--squash` or `--rebase`. */
+export type MergeMethod = 'merge' | 'squash' | 'rebase'
+
 export type LifecyclePhase = 'pre' | 'post' | 'ready' | 'archived'
 
 /** baseline rounds and the final-head check are free; discretionary ones draw on the allowance. */
@@ -117,6 +169,13 @@ export type RoundRecord = {
   /** The PR base the round reviewed against; a pre-PR round's verdict covers that base only. */
   base?: string
   isCompleted: boolean
+  /**
+   * A completed discretionary post round only (R88): whether it drew on the allowance, because a new blocker was raised in it, Codex
+   * rejected a fix, rebuttal or acknowledgement in it, or the agent reported a fix in it, of any finding at any severity, raised in it
+   * or earlier (A8; never a linked duplicate's). Absent on a pre
+   * round and on a record from before 1.5.0, which count as charged, and on a baseline round, a final-head check or an attempt.
+   */
+  isCharged?: boolean
   /** The Codex effort the round, or the attempt, ran at. Absent on a record from before 1.2.0. */
   effort?: Effort
   /** The Codex model that reviewed it, from the reviewer's `CODEX_MODEL:` line, else the model the gate named (R69). */
@@ -148,7 +207,8 @@ export type Waiver = {
   lapsedHead?: string
 }
 
-export type Grant = { n: number; reason: string; head: string; at: number }
+/** A round added to the allowance: the person's `/pr-gate allow`, or the gate's own for a late blocker (`by: 'gate'`, R92, at most two). */
+export type Grant = { n: number; reason: string; head: string; at: number; by?: 'gate' }
 
 /**
  * One line of the run log (`/pr-gate log`): what cost time or needed the person. stop: a run ended short of done (error, blocked,
@@ -186,7 +246,31 @@ export type LifecycleRecord = {
   processed: string[]
   /** Feedback id to the id of the reply posted to it. */
   replies: Record<string, string>
+  /** Every reply id the agent reported, in any step and for any answer, accepted or not (R91): never read back as feedback. */
+  ownReplies?: string[]
+  /**
+   * When the PR's head reached the PR (#24), kept across stop, resume and another session: GitHub's push time (the latest push into
+   * the head, from the repository activity log), else when the gate first saw it. `asked`: the requestReview names asked again for
+   * this head because a comment may predate it; `counted`: comments counted for it on a guess while GitHub gave no push time.
+   * `since`: a time the head had surely not reached the PR yet (the last time the gate saw the head before it as the PR's), the
+   * lower bound of that guess with `committedAt`, the head commit's committer date once read. `seenAt`: the last poll that saw
+   * this head as the PR's.
+   */
+  headArrival?: {
+    head: string
+    at: number
+    isPushTime: boolean
+    asked?: string[]
+    counted?: string[]
+    since?: number
+    committedAt?: number
+    seenAt?: number
+  }
+  /** Where the PR's head branch lives, as gh last said (#24): a fork's repository for a PR from one, and its branch name. */
+  headPlace?: { repo?: string; branch?: string; isCrossRepository?: boolean }
   waivers: Waiver[]
+  /** The person was told to run `acli jira auth login` (spec §5.13.7): once per lifecycle, however often acli fails. */
+  isJiraLoginSaid?: boolean
   phase: LifecyclePhase
   /**
    * Which lifecycle of the branch this is: a reset raises it, and a fresh start keeps the raised one, so work begun before a reset
@@ -245,8 +329,19 @@ export type Run = {
   waitMs: number
   /** Post-PR collection: when it started, when feedback last arrived, when gh was last polled. */
   collect?: { startedAt: number; lastArrivalAt: number; polledAt: number; headAt: number }
-  /** Post-PR: the feedback ids handed to the main agent this round. */
+  /** Post-PR: the feedback ids handed to the main agent in the triage turn in flight (or the last one). */
   triaged?: string[]
+  /** Post-PR: the feedback ids every triage turn of this round was handed (R88); a turn while collecting asks only what is not in it. */
+  handed?: string[]
+  /** Post-PR: the fresh feedback ids the last poll saw, so the next poll can tell what arrived since. */
+  polled?: string[]
+  /**
+   * afterTriage is between clearing a turn taken while collecting and its last write (R88, A4): when it began, so polls only note
+   * arrivals; a flag older than the step timeout is stale, and a poll clears it.
+   */
+  isSettling?: number
+  /** Post-PR: how many triage turns taken while collecting timed out this round (R88). The first goes back to collecting; a second stops the run. */
+  midTurnTimeouts?: number
   /** Post-PR: the finding ids the triage step was asked to answer (fresh, Codex's, carried). */
   asked?: string[]
   /** Post-PR: the security rebuttals Codex is checking (R36). */
@@ -278,7 +373,7 @@ export type CheckState = { name: string; bucket: string; isRequired: boolean }
 export type Blocker = {
   kind:
     | 'open' | 'verify-owed' | 'reverify-owed' | 'rebuttal-unchecked' | 'disputed' | 'deferred' | 'security-p1'
-    | 'lowering-unchecked' | 'label-owed' | 'label-failed'
+    | 'deferral-unchecked' | 'issue-owed' | 'issue-failed' | 'label-failed' | 'link-unchecked'
     | 'head-unreviewed' | 'round-owed' | 'retargeted' | 'ci-failing' | 'ci-running' | 'ci-unreadable'
   /** A finding id, or a check name. */
   id?: string

@@ -10,7 +10,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Effort, Finding, LifecycleRecord, Run, Standing } from '../types'
-import { activityOf, classify, isVersionOnly, lowerOf, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
+import { activityOf, classify, isVersionOnly, lowerOf, mergeStep, prePerson, prPrompt, readGitlinks, slugOf, stepDown } from './core'
 import { hasOtherSteps, readPrAction } from './github'
 import type { PrAction } from './github'
 import {
@@ -20,9 +20,10 @@ import {
   lastReviewedHead,
   holdText,
   isReverifyOwed,
-  isSettledDeferral,
-  loweringRefusal,
-  peakOf,
+  isFileable,
+  isSettledByIssue,
+  issueLine,
+  scopeNote,
   mergeHolds,
   reverifyOwed,
   newRecord,
@@ -30,6 +31,7 @@ import {
   rescope,
   securityHolds,
   logSummary,
+  ticketLine,
   unresolvedBlockers,
   usedRounds,
   verificationOwed,
@@ -55,26 +57,30 @@ import {
   holdingPrompts,
   ignoredNote,
   isLiveNow,
+  isMergeBlocked,
   isOwnedElsewhere,
   isStillCurrent,
   isTurnOf,
   markPr,
+  noteArrival,
   onAnswer,
   onTurnStart,
   PANE,
   patch,
   prStateOf,
   say,
+  securityBlockedIds,
   setLive,
   setSession,
   setup,
   startTicker,
+  startWatcher,
   tellAgent,
   untriagedFeedback,
 } from './round'
-import type { Config } from './round'
+import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
-import { latestArchive, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
+import { latestArchive, liveRecords, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -305,7 +311,9 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         : {
             ...newRecord({ root, branch, base, head, tier: scope.tier, tierWhy: scope.why, lane, allowance, at: now }),
             // After a reset: feedback already processed and replied to stays answered (R47).
-            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, generation: prior.generation }),
+            ...(prior === undefined ? {} : { processed: prior.processed, replies: prior.replies, ownReplies: prior.ownReplies, generation: prior.generation }),
+            // When the head reached the PR (#24) carries over only for that same head.
+            ...(prior?.headArrival?.head === head ? { headArrival: prior.headArrival } : {}),
             effort,
             ...(scope.tier === 'trivial' ? { passThrough: scope.why } : {}),
           }
@@ -760,7 +768,7 @@ const judgeMerge = async ($: Engine, action: PrAction): Promise<string | undefin
           `or type /${COMMAND} reset to review it again for ${pr.baseRefName}.`
       : isRunning
         ? `Next: the gate. /${COMMAND} is collecting the reviews now. Leave this branch alone until it sends you what needs an answer, ` +
-          'or says the PR is ready for the merge decision; other work is fine.'
+          'or says to merge the PR; other work is fine.'
         : rec.phase !== 'ready' && rec.postStatus === 'awaiting-decision'
           ? `This needs the person's decision: tell them which findings are deferred or disputed and why, then stop. They can type ` +
             `/${COMMAND} waive <findingId> <reason> for each one, or /${COMMAND} waive post <reason> to let this head merge.`
@@ -794,8 +802,71 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   if (pr === undefined) return
   const who = await identityOf($, root)
   const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }))
+  // When the head reached the PR (#24): GitHub's push time, else now.
+  if (saved !== undefined) await noteArrival($, root, branch, pr.headRefOid, await $.clock.now())
   await markOpened($)
   if (saved !== undefined) await advance($, root, branch)
+}
+
+/**
+ * The agent's merge went through (R93): once GitHub reads the PR as merged, the lifecycle closes, after the issue check (spec §5.12).
+ * A merge not yet done (`--auto`), or a `gh pr view` that fails here, is left to the next poll, session start or /pr-gate (R62).
+ */
+const onMerged = async ($: Engine, action: PrAction): Promise<void> => {
+  // A say that throws must not hide the error that brought the gate here (final review m6).
+  const tell = async (key: RecordKey, text: string): Promise<void> => {
+    try {
+      await say($, key, text)
+    } catch {
+      // The original error is rethrown below.
+    }
+  }
+  let root = action.cwd ?? ''
+  let view: Awaited<ReturnType<Engine['process']['run']>>
+  try {
+    const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
+    if (!top.isOk) return
+    root = top.out
+    // A merge in another repository (`--repo`, a PR URL) is not this checkout's PR, even with the same number and branch (wave 2b gate R1-4).
+    if (action.repo !== undefined) {
+      const origin = await git($, root, ['remote', 'get-url', 'origin'])
+      if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return
+    }
+    view = await $.process.run(
+      ['gh', 'pr', 'view', ...(action.number === undefined ? [] : [String(action.number)]), ...(action.repo === undefined ? [] : ['--repo', action.repo]), '--json', 'number,headRefName,state'],
+      { cwd: top.out, timeoutMs: 30_000 },
+    )
+  } catch (error) {
+    // A git or gh spawn threw before the gate knew the PR: the merge went through, and the agent is told the issue check did not run
+    // (final review m5). The checkout's record, if any, is the one the prompt is about.
+    const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+    const branch = await git($, root === '' ? undefined : root, ['rev-parse', '--abbrev-ref', 'HEAD']).then(got => (got.isOk ? got.out : ''), () => '')
+    await tell({ root, branch }, `pr-gate: the merge went through, but the gate failed before it could check the follow-up issues (${said}). ` +
+      'The issue check did not run, and the lifecycle is not closed: run /pr-gate.')
+    throw error
+  }
+  let pr: { number?: unknown; headRefName?: unknown; state?: unknown } | undefined
+  try {
+    pr = view.exitCode === 0 ? (JSON.parse(view.stdout) as { number?: unknown; headRefName?: unknown; state?: unknown } | null) ?? undefined : undefined
+  } catch {
+    pr = undefined
+  }
+  if (pr?.state !== 'MERGED' || typeof pr.headRefName !== 'string' || typeof pr.number !== 'number') return
+  const key = { root, branch: pr.headRefName }
+  const number = pr.number
+  try {
+    const rec = await loadRecord($, key.root, key.branch)
+    if (rec === undefined || rec.phase === 'archived' || rec.pr !== number) return
+    // closeLifecycle turns a failed issue check into a blocked record with gh's words, which /pr-gate resume runs again.
+    await closeLifecycle($, key.root, key.branch, number, 'MERGED')
+  } catch (error) {
+    // GitHub took the merge, but the gate failed closing it: the agent is told, never left with a toast alone (the gate can't go
+    // silent). The record, unarchived, is checked again by /pr-gate resume, or at the next session start.
+    const said = (error instanceof Error ? error.message : String(error)).slice(0, 200)
+    await tell(key, `pr-gate: PR #${number} merged, but the gate failed while it checked the follow-up issues and closed the lifecycle (${said}). ` +
+      'The follow-up issues are not confirmed yet. Run /pr-gate resume: the gate checks them again (a new session does too).')
+    throw error
+  }
 }
 
 // ------------------------------------------------------------ the command
@@ -818,10 +889,14 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   const granted = rec.grants.reduce((sum, one) => sum + one.n, 0)
   const baseline = rec.rounds.filter(one => one.phase === 'post' && one.isCompleted && one.kind === 'baseline').length
   const pr = rec.pr === undefined ? '' : ` (PR #${rec.pr})`
+  const note = scopeNote(rec)
+  // A security finding's Jira ticket tracks it and never settles it (spec §5.13.7): named with the waiver it still waits for.
+  const tickets = mergeHolds(rec).filter(one => one.isSecurity === true && one.jiraTicket !== undefined)
   const settled = rec.findings
-    .filter(isSettledDeferral)
-    .map(one => ` ${one.id} deferred, follow-up at ${one.followUp}, labelled severity:${peakOf(one)}.`)
-    .concat(rec.findings.flatMap(one => (loweringRefusal(one) === undefined || one.status !== 'deferred' ? [] : [` ${loweringRefusal(one) ?? ''}.`])))
+    .filter(isSettledByIssue)
+    .map(one => ` ${issueLine(one)}.`)
+    .concat(tickets.map(one => ` ${ticketLine(one)}, waiting for your waiver.`))
+    .concat(note === undefined ? [] : [` ${note}`])
     .join('')
   return (
     `${rec.branch} → ${rec.base}: ${rec.phase}${standing === undefined ? '' : ` (${standing})`}${pr}, ` +
@@ -830,15 +905,43 @@ const statusText = async ($: Engine, run: Run | null): Promise<string> => {
   )
 }
 
+const FINDING_ID = /^[RG]\d+-\d+$/
+
+/**
+ * The branch a `/pr-gate waive <id>` acts on (spec §5.13.2, §5.13.4). `<branch>:<id>` names it. An unqualified id is the checked-out
+ * branch's, or else the one merged lifecycle under this root blocked on that security finding: ids repeat across lifecycles, so one
+ * that could mean more than one is refused, naming each with its qualified command, and nothing is written.
+ */
+async function waiveTarget($: Engine, root: string, checkedOut: string, arg: string): Promise<{ branch: string } | { refusal: string }> {
+  // A branch name never holds a colon (git refuses one), so a colon in it could only reach another root's key: refused.
+  const qualified = /^([^\s:]+):([RG]\d+-\d+)$/.exec(arg)
+  if (qualified !== null) return { branch: qualified[1] ?? checkedOut }
+  if (!FINDING_ID.test(arg)) return { branch: checkedOut }
+  const own = await loadRecord($, root, checkedOut)
+  const isOwn = own !== undefined && own.phase !== 'archived' && own.findings.some(each => each.id === arg)
+  const blocked = (await liveRecords($, root)).filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
+  const all = [...(isOwn ? [checkedOut] : []), ...blocked]
+  if (all.length > 1) {
+    return {
+      refusal: `/${COMMAND}: ${arg} names a finding in the lifecycles of ${all.join(', ')}: nothing was waived. Say which: ` +
+        `${all.map(one => `/${COMMAND} waive ${one}:${arg} <reason>`).join(', ')}.`,
+    }
+  }
+  const [only] = blocked
+  return { branch: !isOwn && only !== undefined ? only : checkedOut }
+}
+
 /** Why a finding is settled, for a waiver that has nothing to release. */
 const settledAs = (rec: LifecycleRecord, one: Finding): string =>
   rec.waivers.some(each => each.scope === 'finding' && each.findingId === one.id)
     ? 'waived'
     : isAcceptedRebuttal(one)
       ? 'its rebuttal is accepted by Codex'
-      : one.status === 'verified-fixed'
-        ? 'verified fixed'
-        : one.status
+      : isSettledByIssue(one)
+        ? `tracked by its issue: ${issueLine(one)}`
+        : one.status === 'verified-fixed'
+          ? 'verified fixed'
+          : one.status
 
 /** The checkout's branch: its toplevel and name, or undefined outside a checkout or on a detached HEAD. */
 async function hereOf($: Engine): Promise<{ root: string; branch: string } | undefined> {
@@ -876,7 +979,7 @@ async function logCommand($: Engine, args: string, reply: string, origin: string
 }
 
 /**
- * `/pr-gate start|<base>`, `status`, `log`, `stop`, `resume`, `waive pre|post|<findingId> <reason>`, `allow <n> <reason>`, `reset`.
+ * `/pr-gate start|<base>`, `status`, `log`, `stop`, `resume`, `waive pre|post|[<branch>:]<findingId> <reason>`, `allow <n> <reason>`, `reset`.
  * Waivers, `allow` and `reset` are the person's alone. The replies may start with the command; prompts never do (R21).
  */
 const runCommand = async ($: Engine, args: string, origin: string): Promise<string> => {
@@ -904,8 +1007,12 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   const top = await git($, undefined, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return 'Not a git repository.'
   const root = top.out
-  const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  const checkedOut = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   const head = (await git($, root, ['rev-parse', 'HEAD'])).out
+  // `waive <id>` may act on another branch's merged lifecycle (spec §5.13.2): everything below is about the branch it names.
+  const aimed = verb === 'waive' ? await waiveTarget($, root, checkedOut, rest[0] ?? '') : { branch: checkedOut }
+  if ('refusal' in aimed) return aimed.refusal
+  const { branch } = aimed
   const stored = await loadRecord($, root, branch)
   const rec = stored?.phase === 'archived' ? undefined : stored
   const now = await $.clock.now()
@@ -948,8 +1055,8 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
     if (!isRunning && rec.phase !== 'ready') await advance($, root, branch)
     const after = (await loadRecord($, root, branch)) ?? rec
-    // Rounds never settle a deferral or a dispute (R42): only the person's waiver of each does.
-    const theirs = mergeHolds(after).filter(one => one.status === 'deferred' || isDisputed(one))
+    // Rounds never settle a deferral or a dispute (R42): only the person's waiver of each does, or its issue when the gate files it (R92).
+    const theirs = mergeHolds(after).filter(one => (one.status === 'deferred' || isDisputed(one)) && !isFileable(one))
     const settles =
       theirs.length === 0
         ? ''
@@ -957,10 +1064,12 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
           `${theirs.length === 1 ? 'releases' : 'release'} ${ids(theirs)}.`
     return `/${COMMAND}: ${n} more round${n === 1 ? '' : 's'} allowed for ${branch}: ${reason}.${settles}`
   }
-  const [scope = '', ...why] = rest
+  const [named = '', ...why] = rest
   const reason = why.join(' ').trim()
-  const isFinding = /^[RG]\d+-\d+$/.test(scope)
-  if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|<findingId> <reason>`
+  // `<branch>:<id>` named the branch above; the finding is the id.
+  const scope = named.replace(/^\S+:(?=[RG]\d+-\d+$)/, '')
+  const isFinding = FINDING_ID.test(scope)
+  if ((scope !== 'pre' && scope !== 'post' && !isFinding) || reason === '') return `Say what and why: /${COMMAND} waive pre|post|[<branch>:]<findingId> <reason>`
   if (isFinding) {
     // Decided on the read taken under the record's lock (F5): a finding settled meanwhile is not waived.
     const refusalOf = (one: LifecycleRecord | undefined): string | undefined => {
@@ -983,6 +1092,17 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     })
     if (refusal !== undefined) return refusal
     await take()
+    // A PR merged before the gate finished, blocked on this finding or on an issue it could not confirm (spec §5.12, §5.13.2): the
+    // waiver runs the close again, never a round on a merged PR, and the lifecycle is archived once nothing is left.
+    const merged = await loadRecord($, root, branch)
+    if (merged !== undefined && merged.pr !== undefined && isMergeBlocked(merged)) {
+      const closed = await closeLifecycle($, root, branch, merged.pr, 'MERGED')
+      const isArchived = (await loadRecord($, root, branch))?.phase === 'archived'
+      if (isArchived) {
+        await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`, `${closed}. Nothing more is needed from you for PR #${merged.pr}.`)
+      }
+      return `/${COMMAND} waived ${scope} for ${branch}: ${reason}. ${closed}.`
+    }
     // A round in flight is not asked about it again.
     if (isOurs) await patch($, run.id, one => (one.asked === undefined ? one : { ...one, asked: one.asked.filter(id => id !== scope) }))
     // Released from the merge test and from ready: the controller decides again, unless a round in flight will. After a push no
@@ -1002,13 +1122,18 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       ? { number: settled.pr, baseRefName: live?.baseRefName ?? settled.base, headRefOid: live?.headRefOid ?? settled.head }
       : undefined
     const standing = settled !== undefined && pr !== undefined ? await gatherStanding($, settled, pr) : undefined
+    const method = (await configFor($, root, pr?.baseRefName ?? settled?.base ?? '')).config.mergeMethod
+    // advance has just sent the ready prompt, merge step included, when this waiver is what made the lifecycle ready: say it once.
+    const hasMergeStep = before.phase !== 'ready' && settled?.phase === 'ready'
     // A reset while the standing was gathered supersedes this note (gate G7-3).
     if (settled !== undefined && pr !== undefined && !(await isStillCurrent($, settled))) return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
     await tellAgent($, { root, branch }, `waived ${scope}: ${reason}`,
       standing === undefined
         ? 'nothing more is needed from you for this finding; the pre-PR review continues.'
         : standing.mayProceed
-          ? "nothing holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          ? hasMergeStep
+            ? 'no review finding holds the merge: the gate has just sent you the merge step; follow that one.'
+            : `no review finding holds the merge: ${mergeStep(pr?.number, method, pr?.headRefOid)}.`
           : 'answer what is yours in the list above, and leave the rest to who it names.',
       standing)
     return `/${COMMAND} waived ${scope} for ${branch}: ${reason}.`
@@ -1118,6 +1243,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
   const standing = after !== undefined && pr !== undefined ? await gatherStanding($, after, pr) : undefined
+  const method = (await configFor($, root, pr?.baseRefName ?? after?.base ?? '')).config.mergeMethod
   // A reset while the standing was gathered supersedes this note (gate G7-3).
   const isSuperseded = after !== undefined && pr !== undefined && !(await isStillCurrent($, after))
   if (!isSuperseded) {
@@ -1126,7 +1252,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         ? 'the waiver is recorded, but GitHub did not return this pull request, so what else holds the merge is unknown. ' +
             'Check it with gh pr view before telling the person anything; do not merge.'
         : standing.mayProceed
-          ? "nothing else holds the merge. It is ready for the merge decision, which is the person's: tell them, and do not merge unless they ask."
+          ? `no other review finding holds the merge: ${mergeStep(pr?.number, method, at)}.`
           : 'the waiver covers the review only: wait for what is listed, then tell the person.',
       standing)
   }
@@ -1164,7 +1290,17 @@ export const register: Register = (on, options) => {
       const url = action.repo === undefined && typeof command === 'string' ? command.match(/github\.com\/([^/\s'"]+\/[^/\s'"]+)\/pull\/(\d+)/) : null
       const target = url !== null && url[1] !== undefined && Number(url[2]) === action.number ? { ...action, repo: url[1] } : action
       const refusal = config.enforceMerge ? await judgeMerge($, target) : undefined
-      return refusal !== undefined ? { deny: asHold(refusal) + tail } : next(e)
+      if (refusal !== undefined) return { deny: asHold(refusal) + tail }
+      const ran = await next(e)
+      // A merge GitHub refused leaves the lifecycle where it was (spec §6.4); one that went through closes it (spec §5.12). What fails
+      // here is said, never dropped: the merge itself has run, so its result goes back as it was. The agent's turn holds the
+      // session while its tool runs, so what the check tells it waits until the call has returned, as a command's prompts do.
+      if (ran.deny === undefined && ran.isError !== true) {
+        await holdingPrompts($, () => onMerged($, target)).catch((error: unknown) => {
+          $.ui.toast(`pr-gate: the merge went through, but the gate could not close its lifecycle (${error instanceof Error ? error.message : String(error)}). Run /pr-gate.`.slice(0, 300))
+        })
+      }
+      return ran
     }
     const found = await gatedCreate($, action)
     if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
@@ -1215,14 +1351,15 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pr-gate',
       description: "Run /pr-gate: pre-PR Codex review, then the PR's own reviews, under one budget (start, status, log, stop, resume, waive, allow, reset)",
-      argumentHint: '[base] | status | log | stop | resume | waive pre|post|<id> <reason> | allow <n> <reason> | reset',
+      argumentHint: '[base] | status | log | stop | resume | waive pre|post|[<branch>:]<id> <reason> | allow <n> <reason> | reset',
       immediate: true,
     })
     setSession(e.isInteractive)
     const run = await getRun($)
     if (run !== null && run.status === 'running') {
-      // A reload dropped the module's timer, not the run: the host kept it.
+      // A reload dropped the module's timers, not the run: the host kept it.
       startTicker($)
+      startWatcher($, run.root)
       void $.ui.open({ id: PANE, title: 'PR lifecycle' }).catch(() => undefined)
     } else {
       setLive(false)
@@ -1231,18 +1368,34 @@ export const register: Register = (on, options) => {
       try {
         const top = await git($, e.cwd, ['rev-parse', '--show-toplevel'])
         const branch = top.isOk ? (await git($, top.out, ['rev-parse', '--abbrev-ref', 'HEAD'])).out : ''
+        // Every record under the repository's root, not only the branch checked out (spec §5.13.4): a merge done while no session ran
+        // is caught by the next one, whichever branch it is on. A PR merged or closed meanwhile is closed here, after the issue check
+        // (spec §5.12) and the filing of what still holds (§5.13.1), whatever the record waits on (final review m1); it is not
+        // collected again (R62). Only a session a person is at does this, and never on a record a live session elsewhere owns (#13).
+        if (top.isOk && e.isInteractive) {
+          for (const one of await liveRecords($, top.out)) {
+            if (one.pr === undefined || (one.phase !== 'ready' && one.phase !== 'post')) continue
+            const pr = one.pr
+            try {
+              if (await isOwnedElsewhere($, top.out, one.branch)) continue
+              const state = await prStateOf($, top.out, pr)
+              if (state !== 'MERGED' && state !== 'CLOSED') continue
+              await claimRecord($, top.out, one.branch)
+              await holdingPrompts($, () => closeLifecycle($, top.out, one.branch, pr, state))
+            } catch {
+              // A failed read is the watcher's to retry; the other records are read all the same.
+            }
+          }
+          // Whatever is left with a PR is watched from now on (spec §5.13.3); the watcher stops itself when nothing is.
+          startWatcher($, top.out)
+        }
         const rec = top.isOk && branch !== '' && branch !== 'HEAD' ? await loadRecord($, top.out, branch) : undefined
         // A review that stopped on an error (gh down, a step that failed) polls again, as the spec's restart does; a stop is the person's.
         // Only a session a person is at takes a record over, and only once its owner has gone quiet (#13; Adam, decision D): a
         // headless child in the same checkout (a hook's `claude -p`) never runs the lifecycle or gets its prompts.
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
+        // One still open is left as it is, unless its review was under way or stopped on an error.
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
-          // A PR merged or closed meanwhile is not collected again: its record is archived (R62).
-          const state = rec.pr === undefined ? undefined : await prStateOf($, top.out, rec.pr)
-          if (state === 'MERGED' || state === 'CLOSED') {
-            await closeLifecycle($, top.out, branch, rec.pr, state)
-            return next(e)
-          }
           if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
           await holdingPrompts($, () => advance($, top.out, branch))
         }

@@ -115,7 +115,9 @@ export const readInlineComments = (text: string): Feedback[] =>
     kind: 'inline',
     reviewer: login(row),
     body: str(row.body) ?? '',
-    head: str(row.commit_id),
+    // The commit the comment was written on: GitHub moves commit_id forward to the newest commit while the line is unchanged, which
+    // would make an old comment read as coverage of a new head.
+    head: str(row.original_commit_id) ?? str(row.commit_id),
     file: str(row.path),
     line: num(row.line) ?? num(row.original_line),
     threadId: String(num(row.in_reply_to_id) ?? row.id),
@@ -143,6 +145,26 @@ export function readCheckRuns(text: string): Check[] {
     const runs = (page as { check_runs?: unknown } | null)?.check_runs
     return Array.isArray(runs) ? (runs as Row[]) : []
   }).map(row => ({ name: String(row.name ?? ''), status: String(row.status ?? ''), conclusion: str(row.conclusion) ?? null }))
+}
+
+/** Commit-status states that are final: a pending status has not finished. */
+const FINAL_STATES = ['success', 'failure', 'error']
+
+/**
+ * The head's combined commit status (`{ state, statuses: [{ context, state }] }` per page) read as checks (R89): some CI posts a
+ * required check as a status, not a check run. A final state is a completed check whose conclusion is that state. Throws on text
+ * that does not parse, so the caller can say so.
+ */
+export function readStatuses(text: string): Check[] {
+  return readPages(text).flatMap(page => {
+    const rows = (page as { statuses?: unknown } | null)?.statuses
+    return Array.isArray(rows) ? (rows as Row[]) : []
+  }).flatMap(row => {
+    const name = str(row.context)
+    const state = str(row.state) ?? ''
+    if (name === undefined) return []
+    return [{ name, status: FINAL_STATES.includes(state) ? 'completed' : 'pending', conclusion: FINAL_STATES.includes(state) ? state : null }]
+  })
 }
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((one): one is string => typeof one === 'string' && one !== '') : [])
@@ -195,7 +217,7 @@ export const isTrusted = (one: Feedback, roster: Roster | undefined): boolean =>
  * name or starts with `<name>-` (`copilot` posts as `copilot-pull-request-reviewer[bot]`). Only a `[bot]` login, which no person can
  * hold, matches by prefix.
  */
-const postsFor = (login: string, name: string): boolean => {
+export const postsFor = (login: string, name: string): boolean => {
   if (login === name) return true
   if (!login.endsWith('[bot]')) return false
   const stem = login.slice(0, -'[bot]'.length)
@@ -210,13 +232,26 @@ const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(ent
  */
 const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-blocking|nit(?:pick)?|optional|follow-up)[*_\])]*\s*(?:[:,(—]|-\s|\n|$)/i
 
+/**
+ * A reviewer's own severity tag (R94): a token standing alone. `[P2]`, `(P2)`, `**P2**` or `**P2:**` anywhere; `P2:` or `P2 -` at the
+ * start of a line, after a list marker; or a badge image named for it (`![P2 Badge]`, as Codex's connector posts). Any other mention,
+ * such as "[P2 thread]" or "the outstanding P2", is a hint the agent may change.
+ */
+const TAG = /\[P([0-3])\]|\(P([0-3])\)|\*\*P([0-3]):?\*\*|!\[P([0-3])[ _-]?Badge\]|^[ \t]*(?:[-*+][ \t]+|\d+\.[ \t]+)?P([0-3])(?::|[ \t]+-[ \t])/gim
+
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
   const isSecurity = SECURITY.test(body)
-  // The most severe explicit tag anywhere wins: one P1 in a list of advisories is a P1.
-  const tags = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  // The most severe tag anywhere wins: one P1 in a list of advisories is a P1.
+  const tags = [...body.matchAll(TAG)].map(one => Number(one.slice(1).find(each => each !== undefined)))
   if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
   if (ADVISORY.test(body)) return { severity: 'P3', isSecurity, isTagged: true }
+  // A severity named in passing is a guess (R94): the most severe one named, never below P2 for a security hint.
+  const named = [...body.matchAll(/\bP([0-3])\b/g)].map(one => Number(one[1]))
+  if (named.length > 0) {
+    const level = Math.min(...named)
+    return { severity: `P${isSecurity ? Math.min(level, 2) : level}` as Severity, isSecurity, isTagged: false }
+  }
   if (/\b(critical|blocker|high)\b/i.test(body)) return { severity: 'P1', isSecurity, isTagged: false }
   // A security hint never drops below P2 unless the reviewer tagged a severity itself.
   if (/\b(nit|nitpick|typo|minor)\b/i.test(body)) return { severity: isSecurity ? 'P2' : 'P3', isSecurity, isTagged: false }
@@ -261,9 +296,17 @@ export type CollectInput = {
   now: number
   quietMs: number
   capMs: number
+  /** Logins with a pending review request on the PR, this machine's own left out (R89). */
+  requested?: readonly string[]
+  /** The base's required checks (R86), or 'unknown', where every reported check stands in. Absent reads as 'unknown'. */
+  required?: readonly string[] | 'unknown'
 }
 
-/** Whether a post-PR round has collected enough: the roster's list, or settled checks and a quiet spell; always the cap. */
+/**
+ * Whether a post-PR round has collected enough (R89): every required check has a completed run on the head, every pending review
+ * request has a review of the head, and every roster reviewer covered it. Check suites are never read: an installed app can leave
+ * one queued forever. The quiet window applies only where none of the three exists. The cap applies always.
+ */
 export function collectionDone(input: CollectInput): { isDone: boolean; isComplete: boolean; missing: string[]; covered: string[] } {
   const roster = input.roster
   const hasRoster = roster !== undefined && (roster.reviewers.length > 0 || roster.checks.length > 0)
@@ -274,13 +317,43 @@ export function collectionDone(input: CollectInput): { isDone: boolean; isComple
   const isOnHead = (one: Feedback): boolean => (one.head === undefined ? one.at >= input.headAt : one.head === input.head)
   const covered = [...new Set(input.feedback.filter(one => counts(one) && isOnHead(one)).map(one => one.reviewer))]
   const finished = new Set(input.checks.filter(one => one.status === 'completed').map(one => one.name))
-  const missing = hasRoster
-    ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))]
-    : input.checks.filter(one => one.status !== 'completed').map(one => one.name)
-  const isQuiet = hasRoster || input.now - input.lastArrivalAt >= input.quietMs
+  const required = input.required === undefined || input.required === 'unknown' ? [...new Set(input.checks.map(one => one.name))] : input.required
+  const requested = input.requested ?? []
+  // A request is answered by a review of the head, or, with a roster, by the reviewer covering it as the roster counts it: a roster
+  // reviewer the gate asked again may reply in a comment, which GitHub never clears the request for (#24: never a wait on the cap).
+  // Without a roster, coverage never answers one: only a review of the head does.
+  const isAnswered = (who: string): boolean =>
+    input.feedback.some(one => one.kind === 'review' && one.head === input.head && postsFor(one.reviewer, who)) ||
+    (hasRoster && covered.some(one => postsFor(one, who)))
+  const missing = [
+    ...new Set([
+      ...(hasRoster ? [...roster.reviewers.filter(one => !covered.includes(one)), ...roster.checks.filter(one => !finished.has(one))] : []),
+      ...requested.filter(one => !isAnswered(one)),
+      ...required.filter(one => !finished.has(one)),
+    ]),
+  ]
+  const hasSignals = hasRoster || requested.length > 0 || required.length > 0
+  const isQuiet = hasSignals || input.now - input.lastArrivalAt >= input.quietMs
   if (missing.length === 0 && isQuiet) return { isDone: true, isComplete: true, missing, covered }
   if (input.now - input.startedAt >= input.capMs) return { isDone: true, isComplete: missing.length === 0, missing, covered }
   return { isDone: false, isComplete: false, missing, covered }
+}
+
+/**
+ * The logins a PR's review is requested from (R89), as `GET .../requested_reviewers` lists them; teams are not people the gate can
+ * match, so they are left out, and so is this machine's own login (Review Focus 2). Unreadable text lists none.
+ */
+export function readRequested(text: string, self: string): string[] {
+  try {
+    const users = (JSON.parse(text) as { users?: unknown } | null)?.users
+    if (!Array.isArray(users)) return []
+    return users.flatMap(one => {
+      const name = str((one as Row | null)?.login)
+      return name === undefined || name === self ? [] : [name]
+    })
+  } catch {
+    return []
+  }
 }
 
 // ----------------------------------------------------------- PR actions

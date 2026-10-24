@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import { createPr, done, isHeld, P1, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
-import { configOf, overrideConfig } from '../hooks/round'
+import { configOf, ignoredNote, overrideConfig } from '../hooks/round'
 import type { LifecycleRecord } from '../types'
 
 // R67: a repository's `.github/pr-gate.json` on the base sets its own round settings, over the plugin options. The file is read from
@@ -240,10 +240,11 @@ test('a roster only on the branch\'s HEAD is ignored: collection does not wait o
   await w.clock.advance(30_000)
   expect((await runOf(w)).activity).not.toContain('junie[bot]')
   expect(w.prompts.some(one => one.includes('crypto miner'))).toBe(false)
-  expect(w.gh.calls.some(one => one.includes('requested_reviewers'))).toBe(false)
+  expect(w.gh.requests).toEqual([])
 })
 
-test('a roster on the base is used: collection waits on its reviewer, whose comment is trusted', async ($, on) => {
+// Machine load: 3 engine steps, no real wait (spec §7.3).
+test('a roster on the base is used: collection waits on its reviewer, whose comment is trusted', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   w.git.roster = '{"reviewers":["junie[bot]"],"checks":[]}'
   w.git.rosterOn = 'dev'
@@ -405,4 +406,46 @@ test('M5: the ignored-keys note follows the scope detail and the start message a
   expect(detail).not.toContain('. .')
   expect(said).toContain('allowanceStandard')
   expect(said).not.toContain('. .')
+})
+
+test('R92: issueSpec names the spec in each issue title; a blank or non-string one is ignored', async () => {
+  expect(configOf({}).issueSpec).toBeUndefined()
+  expect(overrideConfig(configOf({}), '{"issueSpec":"docs/spec.md"}').config.issueSpec).toBe('docs/spec.md')
+  const bad = overrideConfig(configOf({}), '{"issueSpec":7}')
+  expect(bad.config.issueSpec).toBeUndefined()
+  expect(bad.ignored).toEqual(['issueSpec (not a non-empty string)'])
+})
+
+test('R93: mergeMethod picks how the agent merges; merge by default, anything else is ignored', async () => {
+  expect(configOf({}).mergeMethod).toBe('merge')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"squash"}').config.mergeMethod).toBe('squash')
+  expect(overrideConfig(configOf({}), '{"mergeMethod":"rebase"}').config.mergeMethod).toBe('rebase')
+  const bad = overrideConfig(configOf({}), '{"mergeMethod":"fast-forward"}')
+  expect(bad.config.mergeMethod).toBe('merge')
+  expect(bad.ignored).toEqual(['mergeMethod (not merge, squash or rebase)'])
+})
+
+test('R95: mergeWatchMinutes paces the merge watcher; 5 by default, 0, "x" or anything outside 1-60 is ignored with the usual warning', async () => {
+  expect(configOf({}).mergeWatchMinutes).toBe(5)
+  expect(overrideConfig(configOf({}), '{"mergeWatchMinutes":10}').config.mergeWatchMinutes).toBe(10)
+  expect(overrideConfig(configOf({}), '{"mergeWatchMinutes":60}').config.mergeWatchMinutes).toBe(60)
+  for (const value of ['0', '"x"', '61', '2.5']) {
+    const bad = overrideConfig(configOf({}), `{"mergeWatchMinutes":${value}}`)
+    expect(bad.config.mergeWatchMinutes).toBe(5)
+    expect(bad.ignored).toEqual(['mergeWatchMinutes (not a whole number of minutes from 1 to 60)'])
+    expect(ignoredNote('dev', bad.ignored)).toBe(
+      'The base\'s .github/pr-gate.json (origin/dev): ignored mergeWatchMinutes (not a whole number of minutes from 1 to 60); the plugin options apply instead.',
+    )
+  }
+})
+
+test('A9.7: jiraProject names the Jira project of security tickets; none by default, and anything but a project key is ignored', async () => {
+  expect(configOf({}).jiraProject).toBeUndefined()
+  expect(overrideConfig(configOf({}), '{"jiraProject":"KAN"}').config.jiraProject).toBe('KAN')
+  expect(overrideConfig(configOf({}), '{"jiraProject":"SEC2"}').config.jiraProject).toBe('SEC2')
+  for (const one of ['"kan"', '"K"', '"KAN-1"', '""', '7', '"KAN AND x"']) {
+    const bad = overrideConfig(configOf({}), `{"jiraProject":${one}}`)
+    expect(bad.config.jiraProject).toBeUndefined()
+    expect(bad.ignored).toEqual(['jiraProject (not a Jira project key such as KAN)'])
+  }
 })

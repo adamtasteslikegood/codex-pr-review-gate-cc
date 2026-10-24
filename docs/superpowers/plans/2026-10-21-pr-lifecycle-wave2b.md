@@ -3819,6 +3819,91 @@ Claude-Session: https://claude.ai/code/session_013psw4N6YUX1kFWBPU3DdQ1"
 Append to `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`:
 
 ```markdown
+### Task 17: Gate round 1 deferrals R1-5 and R1-6: no duplicate or lost issues
+
+**Why:** the pre-PR gate's round 1 on this branch (head 41f762e) raised R1-5 and R1-6. Its fixer deferred both because each needed a design decision. These are the rulings (controller, 2026-10-21; Adam's rule: rulings, not stalls):
+
+- **R1-5 [P2]:** "fileIssues records only issueError after a timeout and the retry posts a new issue; the first is orphaned." A POST whose answer is lost (a timeout, a non-JSON answer, a missing number) may still have created the issue. **Ruling:** before it POSTs an issue for a finding whose last attempt left an `issueError`, the filing pass lists the repository's issues with `gh api repos/<slug>/issues?state=all&per_page=100&sort=created&direction=desc` and looks for one whose title is exactly the title it would file. The REST list is read-your-writes; the search API isn't, so it is never used here. If one is found, the pass takes its number and labels it if it needs to, as the R85 reuse path does, and files nothing. If the list itself fails, the pass files nothing for that finding this time: it keeps the `issueError` with gh's words, and the next pass tries again. A list failure never leads to a POST. The same check runs in `checkIssuesAfterMerge` before a refile, for a finding whose last refile left an `issueError`.
+- **R1-6 [P2]:** "checkIssuesAfterMerge keeps replacements in a local map until closeOnce saves; a crash or later throw re-creates them on resume." **Ruling:** each refile's new issue number is written to the record as soon as GitHub answers. That means the finding's `followUp`, `followUpLabel`, `followUpLabelError` and `issueError` go to the record under its lock with `updateRecord`, after the A6 `isMovedFrom` check. That check returns `{ moved: true }` exactly as today when the record moved. `closeOnce` still applies `touched` afterwards, which is idempotent. A resume after a crash finds the new number open and logs it: it never files again.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/round.ts` (`fileOnce` around the POST at ~3223; `checkIssuesAfterMerge` around the refile POST at ~3365)
+- Modify: `pr-lifecycle/tests/world.ts`: answer `GET repos/<slug>/issues?…` from a list of the issues the fake has filed (title, number, labels, state). Add a knob, `w.gh.issueListAnswer: 'ok' | 'fail'`. Add a knob that makes a POST create the issue but answer as a failure (`w.gh.issueAnswer = 'lost'`).
+- Test: `pr-lifecycle/tests/flow.test.ts`
+
+**Tests (each fails before the fix):**
+1. A lost POST answer, then the next filing pass: exactly one issue exists in the fake, the finding settles on its number, and there is no second POST.
+2. Same as test 1, but the list fails on the retry: no POST, the `issueError` is kept, and the pass after that (with the list working) settles on the first issue.
+3. Post-merge: a refile whose answer is lost, then `/pr-gate resume`: one replacement issue in all.
+4. Post-merge: with two findings to refile, a throw after the first refile is answered, then a resume: the first finding's new number is on the record and is not filed again.
+
+Run `npm run test` from the repo root (the controller runs it if the subagent's `claude plugin test` refuses). Commit: `pr-lifecycle 1.5.0: no duplicate or lost issues after a lost answer or a crash (wave 2b gate R1-5, R1-6)`, with the trailers.
+
+---
+
+### Task 18: A merge outside the gate (spec §5.13 items 1-6, A9, R95)
+
+**Why:** read spec §5.13 first, because it is the requirement. The agent's `gh pr merge` is refused while anything holds, but a website merge is not. Today:
+- `startTicker` stops when no run exists, so a ready record is never polled.
+- The session-start check (`register.tsx`, around `prStateOf`) reads only the record of the branch checked out.
+- `closeOnce` → `checkIssuesAfterMerge` reads only findings already settled by an issue, so findings still in `mergeHolds` are archived with no issue.
+
+**Requirements (spec §5.13):**
+1. **Filing on the merge.** In `closeOnce`, on `MERGED`, before `checkIssuesAfterMerge`, file an issue for each non-security finding in `mergeHolds(rec)`. Reuse the filing pass (`fileIssues`/`fileOnce`, with its per-branch guard) with a flag meaning "merged outside the gate". The flag makes every holding non-security finding fileable whatever its status, and adds the line "PR #<n> merged before the gate finished: no fix round ran on this finding." to the issue body. A failed filing is a failed check: blocked with `MERGE_UNCONFIRMED`-style words, not archived. The ready path (nothing holds) is unchanged.
+2. **Security.** A holding security finding with no Jira ticket (see Task 19; until then, none has one) blocks the record. The record is not archived, and the gate tells the agent and the person through `say`. A new message constant names the finding and the merge. `/pr-gate waive <id>` on it re-runs the close, and the record archives once nothing is left. Find where `waive` runs and call the close when the record is blocked by this message.
+3. **The watcher.** A new config key, `mergeWatchMinutes` (default 5, integer from 1 to 60), read in `configFor` as the other keys are. A second clock timer, separate from the run ticker, runs in a session that owns records, interactive only. Every `mergeWatchMinutes` it lists this session's records that have a PR, have no running run, are not archived, and are not owned elsewhere (`isOwnedElsewhere`). For each, it reads `prStateOf`; MERGED or CLOSED runs `closeLifecycle` inside `holdingPrompts`. A read failure is skipped until the next beat. The watcher stops itself when there is no such record. It starts at session start, and again whenever a record reaches `ready` or a run ends with a PR (`finish`), if it isn't running already.
+4. **Session start, every record.** Replace the single-branch check: list every live record key under the repository's root through the store's keys (prefix `lifecycle:<root>:`, excluding `:owner` and `:archived:` keys), and do the PR-state read and close for each one as above. Keep the existing advance of the checked-out branch's `post` record.
+5. **No manual resume on the happy path.** Tests prove that items 3 and 4 close a merged record with no `/pr-gate` command.
+
+**Files:**
+- Modify: `pr-lifecycle/hooks/round.ts` (`closeOnce`, filing pass flag, `issueBody`'s caller, watcher, config)
+- Modify: `pr-lifecycle/hooks/register.tsx` (session start, `waive` path)
+- Modify: `pr-lifecycle/hooks/store.ts` (a `liveRecords($, root)` helper)
+- Modify: `pr-lifecycle/hooks/lifecycle.ts` if the issue body needs the flag
+- Test: `pr-lifecycle/tests/flow.test.ts`, `pr-lifecycle/tests/world.ts` (a PR merged "on the website": set the fake's PR state to MERGED with no `gh pr merge` call)
+
+**Tests (spec §9, A9 lines):**
+1. In post round 2, a P2 is open and a P3 deferral is agreed by Codex. The PR merges on the website and the next watcher beat runs: both are filed with the no-fix-round line, then checked, and the record is archived. There is no `/pr-gate` command.
+2. Same as test 1, but the issue POST fails: the record is blocked, not archived, and the agent is told. With the POST working again, the next beat files, checks and archives.
+3. A security finding is open at the website merge: blocked, no issue filed, and the person is told. `/pr-gate waive <id>` archives the record.
+4. A ready record with nothing holding, merged on the website: the watcher closes it within `mergeWatchMinutes` (advance the fake clock), and §5.12's check runs.
+5. A session starts with branch B checked out while branch A's record is merged: A is closed. A record owned by a live session elsewhere is left alone.
+6. A watcher read fails: no stop, and the next beat closes the record.
+7. `mergeWatchMinutes: 0` or `"x"` in pr-gate.json is ignored with the usual config warning.
+
+Commit: `pr-lifecycle 1.5.0: a merge outside the gate files what still holds and is seen without a resume (A9, R95)`, with the trailers.
+
+---
+
+### Task 19: Security findings open Jira tickets (spec §5.13 item 7, A9.7)
+
+**Why:** read spec §5.13 item 7 first, because it is the requirement. When `.github/pr-gate.json` sets `jiraProject`, a security finding that would wait for the person first gets a Jira ticket through `acli`. The ticket tracks the finding but does not settle it.
+
+**Requirements:**
+1. **Config.** `jiraProject` is read in `configFor`; valid values match `^[A-Z][A-Z0-9]+$`.
+2. **Filing.** Where the filing pass (Task 12 code) leaves a security finding waiting for the person, and in the merge-outside-the-gate path (Task 18 item 2), file a ticket with:
+   `acli jira workitem create --project <key> --type Bug --summary <issueTitle> --description-file <tmp file with issueBody> --label security,severity-<peak> --json`
+   Run it through `$.process.run` with a 30 s timeout. Read the key from the JSON answer (`key`). Store it on the finding as `jiraTicket` (a new optional field, e.g. `KAN-512`), plus `jiraError` with acli's words on failure. Write the body file in the record's root under `.git/pr-gate-jira-<id>.txt` and remove it afterwards. Never put the body on the command line.
+3. **Holds.** The ticket does not settle the finding: `mergeHolds` is unchanged. The hold list, `/pr-gate status` and the reports name the ticket: `S2-1 → KAN-512 Critical [P1], waiting for your waiver`.
+4. **Merge outside the gate.** A holding security finding with a `jiraTicket` counts as tracked. The record is archived and the person is told, naming the finding and its ticket. One without a ticket blocks the record (Task 18 item 2).
+5. **Failure.** acli missing (ENOENT), unauthorized or erroring: the finding keeps `jiraError`, and the person is told once per lifecycle to run `acli jira auth login`. Keep a record flag so the message isn't repeated. The next pass retries. Never a stop, and never a GitHub issue in the ticket's place.
+6. **After the merge.** `checkIssuesAfterMerge` reads each `jiraTicket` with `acli jira workitem view <key> --json` (30 s). An answer is logged as checked, whatever its status. A not-found answer (acli exits non-zero with "does not exist" or "not found" in its words) refiles the ticket. Any other failure is a failed check, as for a GitHub issue.
+7. **Duplicate guard (as Task 17).** Before re-creating a ticket whose last attempt left a `jiraError`, search with `acli jira workitem search --jql 'project = <key> AND summary ~ "\"<id>\""' --json` and reuse an exact summary match. If the search fails, nothing is filed this pass.
+
+**Files:** `pr-lifecycle/hooks/round.ts`, `pr-lifecycle/hooks/lifecycle.ts` (the `Finding` type and hold-list words), `pr-lifecycle/hooks/core.ts` (the status and report lines), `pr-lifecycle/tests/world.ts` (an `acli` fake: `create`, `view` and `search`, with knobs `ok | fail | unauthorized | missing`), `pr-lifecycle/tests/flow.test.ts`, `pr-lifecycle/tests/lifecycle.test.ts`.
+
+**Tests (spec §9, A9.7 line):**
+1. With `jiraProject` set, a security deferral at exhaustion files one ticket. The finding still holds, and the status names the ticket.
+2. Without `jiraProject`, no acli call is made, and behaviour is as before.
+3. acli answers unauthorized: the finding holds with `jiraError`, the person is told once to log in, a second pass doesn't repeat the message, and the third pass (acli ok) files the ticket.
+4. A website merge with the ticket filed archives the record and tells the person the ticket.
+5. After the merge, a ticket that doesn't exist is refiled, and an acli read failure blocks the record.
+6. A lost create answer, then a retry: the search finds the ticket, so there is no second create.
+
+Commit: `pr-lifecycle 1.5.0: security findings open Jira tickets where jiraProject is set (A9.7)`, with the trailers.
+
+---
+
 ## Rulings in wave 2b (1.5.0)
 
 Spec: `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`. Plan: `docs/superpowers/plans/2026-10-21-pr-lifecycle-wave2b.md`.

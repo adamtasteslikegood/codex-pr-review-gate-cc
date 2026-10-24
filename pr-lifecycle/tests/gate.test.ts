@@ -6,7 +6,8 @@ import type { LifecycleRecord } from '../types'
 
 const recordOf = (w: World): LifecycleRecord => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
 
-test('a PR to a gated base is held and starts the gate; a clean review opens it', async ($, on) => {
+// Machine load: 1 engine step, no real wait (spec §7.3).
+test('a PR to a gated base is held and starts the gate; a clean review opens it', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   const held = await $.tool.call(createPr)
   expect(held.deny ?? held.text).toContain('/pr-gate')

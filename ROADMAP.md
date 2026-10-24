@@ -128,7 +128,7 @@ routine steps.
 Serves goal 2. Removes the waits and the one-command-per-blocker routine.
 Two PRs (decision L). Specs:
 `docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2a-design.md` and
-`docs/superpowers/specs/2026-10-20-pr-lifecycle-wave2b-design.md`.
+`docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`.
 
 ### Wave 2a: the person's actions and holds (pr-lifecycle 1.4.0)
 
@@ -161,35 +161,36 @@ in live use, makes a hold on a chained command say nothing in it ran.
 
 ### Wave 2b: rounds that keep up with the agent (pr-lifecycle 1.5.0)
 
-1. **Triage while slow reviewers finish (decision F; #14 part 2; findings 5, 10).**
+**Status:** built on `wave2b/pr-lifecycle-1.5.0` (rulings R88-R94).
+
+1. **Triage while slow reviewers finish (decision F; #14 part 2; findings 5, 10) (done in 1.5.0).**
    Findings already in go to the agent during collection, and it pushes as it
    goes.
-2. **One round per push; only a clean round is free (decision G).** A new
-   blocking finding or a rejected fix or rebuttal charges the round.
+2. **One round per push; only a clean round is free (decision G) (done in 1.5.0).** A new
+   blocking finding, a rejected fix or rebuttal, or a fix the agent reports
+   (amendment A8) charges the round.
    Amends what counts in `usedRounds`.
-3. **One re-request per burst (decision H).**
+3. **One re-request per burst (decision H) (done in 1.5.0).**
 4. **Collection ends on GitHub's signals, not a timer (replaces "tune the
-   wait times").** The 3-minute quiet window only applies with no roster: it
-   waits out unknown reviewers and checks that haven't registered yet. 2b
-   reads the head's check suites, the ruleset's required checks and pending
-   review requests instead, and keeps a short quiet window only when none of
-   those exist. Which signals are reliable is probed first (the Codex
+   wait times") (done in 1.5.0).** The 3-minute quiet window only applied
+   with no roster: it waits out unknown reviewers and checks that haven't
+   registered yet. 2b reads the ruleset's required check runs and pending
+   review requests as well as the roster, and keeps the quiet window only
+   when none of those exist. Check suites are not read: some never finish
+   (R89). Which signals are reliable was probed first (spec §2; the Codex
    connector's 👀 reaction, for one, didn't show on PRs #18 and #19).
-5. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
+5. **One finding per problem (done in 1.5.0, R90).**
+6. **Issues instead of waivers; the agent merges (done in 1.5.0, R92, R93).**
+
+The lanes item moved to wave 2c.
+
+### Wave 2c: parallel fixers in lanes
+
+1. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
    groups a round's findings into lanes by the files they touch and starts one fixer per
    lane in parallel; findings that share a file share a lane, so no two fixers edit the
    same code. On PR #20's pre-PR round 1, one fixer took 7 findings in turn where two lanes
    (required checks, waivers) would have run side by side.
-
-### Not yet placed: one finding per problem (Adam, 2026-10-20)
-
-The gate should merge findings from separate rounds and reviewers that name
-the same problem. Today `triage()` only labels a duplicate for the prompt, and
-the agent's `duplicateOf` answer is read but unused, so each copy is its own
-blocker (on PR #19, review summary G2-1 was carried next to its inline G2-2).
-Needs its own design: what counts as the same finding, whether a duplicate
-takes on its original's status, and how a summary links to its inline
-findings. See the wave 2a spec's note.
 
 ## Wave 3: visibility, scoping and fewer person-only steps
 
@@ -210,11 +211,15 @@ Serves goal 2. Makes the gate legible and reachable from anywhere.
    - Subcommands resolve "the current branch" the same way.
 3. **Archive when the PR merges (finding 14).** The record is archived when the
    merge is seen, not at the next command.
-4. **The shared account (findings 16, 25).** Adam, Codex and the agent all post
-   as `adamtasteslikegood`. The gate skips comments whose ids the session itself
-   reported as `replyId`, and doesn't count others' replies as the agent's own.
+4. **The shared account (findings 16, 25) (done in 1.5.0, R91).** Adam, Codex
+   and the agent all post as `adamtasteslikegood`. The gate skips every comment
+   id the agent reported as a reply, whatever its answer (R91), and the person's
+   other comments under that login still reach triage (R64).
 5. **Announce background work (finding 23).** The pane names the Codex
    verification and final-head sub-agents while they run.
+6. **Prevent merges outside the gate.** A required `pr-gate` commit status in
+   the `main` ruleset (pending until ready), with the merge link. Since 1.5.0
+   the gate sees such a merge and files what still held (R95); this stops it.
 
 ## Wave 4 and later: findings that are never lost, and the exhausted decision
 
@@ -224,6 +229,8 @@ Serves goals 3 and 4. It starts once waves 1-3 run live without errors.
   - An unresolved finding becomes a Jira ticket where the repo has a Jira
     project, and a GitHub issue otherwise.
   - The ticket is linked back from the PR thread.
+  - Security findings already go to Jira since 1.5.0 (R95), where
+    `jiraProject` is set. The rest follow in wave 4.
 - **Redefine "exhausted"** to fit how rounds actually run once the loop is
   smooth.
 - **At exhaustion,** the gate either blocks the merge or allows it with an issue

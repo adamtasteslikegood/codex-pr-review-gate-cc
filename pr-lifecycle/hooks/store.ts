@@ -14,6 +14,21 @@ export async function loadRecord($: Engine, root: string, branch: string): Promi
 }
 
 /**
+ * Every live lifecycle record under the repository's `root` (spec §5.13.4), whichever branch is checked out: the keys
+ * `lifecycle:<root>:<branch>`, never an owner or an archive key (a branch name holds no ':'), and never an archived seed.
+ */
+export async function liveRecords($: Engine, root: string): Promise<LifecycleRecord[]> {
+  const prefix = recordKey(root, '')
+  const keys = (await $.store.keys()).filter(key => key.startsWith(prefix) && key.length > prefix.length && !key.slice(prefix.length).includes(':'))
+  const found: LifecycleRecord[] = []
+  for (const key of keys) {
+    const value = (await $.store.get(key)) as LifecycleRecord | undefined | null
+    if (value !== null && value !== undefined && value.version === 1 && value.phase !== 'archived' && recordKey(value.root, value.branch) === key) found.push(value)
+  }
+  return found
+}
+
+/**
  * Keeps a reset record whole under its own key (R47): `lifecycle:<root>:<branch>:archived:<at>`. `loadRecord` reads only the
  * branch's own key, so an archive is never read as the live record.
  */

@@ -3,10 +3,23 @@ import { expect, test } from 'claude-code/testing'
 import type { Finding } from '../types'
 import {
   allowanceFor,
+  alsoOf,
   applyAnswer,
+  applyLinks,
+  dropLink,
+  isLinked,
+  isLinkOwed,
+  linkTo,
+  withLinkedPeak,
+  acceptRebuttal,
+  isAcceptedRebuttal,
+  raisedIn,
+  raiseOf,
+  rebuttedAt,
   decideNext,
   changedLines,
   invalidate,
+  isAcknowledged,
   lastReviewedHead,
   markHeld,
   markVerified,
@@ -14,27 +27,43 @@ import {
   mayStartRound,
   isDisputed,
   isFollowUpRef,
-  isLoweringOwed,
-  isSettledDeferral,
   issueOf,
   checksOwed,
   loweringOf,
-  loweringRefusal,
   peakOf,
-  ruleLowering,
-  wouldSettle,
+  ruleDeferral,
+  isDeferralAgreed,
+  isDeferralOwed,
   mergeHolds,
+  filingPeak,
+  isPeakUnknown,
+  gateGrant,
+  isFileable,
+  isTicketable,
+  isSettledByIssue,
+  issueBody,
+  issueTitle,
+  jiraKeyOf,
+  planIssues,
+  scopeNote,
+  isChargedRound,
   mergeFindings,
   moveLine,
   newRecord,
   readDiff,
+  refuseLink,
   relocate,
   remaining,
   rejections,
   holdText,
   rescope,
   roundOf,
+  securityHolds,
   standingOf,
+  ticketLine,
+  ticketTitle,
+  titlesAtAnyPeak,
+  untrackedSecurity,
   triage,
   unresolvedBlockers,
   usedRounds,
@@ -42,7 +71,8 @@ import {
   withRound,
 } from '../hooks/lifecycle'
 import {
-  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readReview, readTriage, readVerdicts, readVerify, readyPrompt, replyIdOf, reportPrompt,
+  fixPrompt, heldPrompt, priorRounds, prPrompt, readDispositions, readLinks, readReview,
+  readTriage, readVerdicts, readVerify, mergeStep, readyPrompt, replyIdOf, reportPrompt,
   reviewPrompt, TRAILER, triagePrompt, verifyPrompt,
 } from '../hooks/core'
 
@@ -118,6 +148,9 @@ const finding = (over: Partial<Finding> = {}): Finding => ({
   history: [],
   ...over,
 })
+
+/** Codex agreed with the finding's deferral (R92 M2). */
+const agreedBy = (f: Finding): Finding => ruleDeferral(f, true, 9, 9)
 
 test('the fixer reports a fix; only a check verifies it', async () => {
   const reported = applyAnswer(finding(), { id: 'R1-1', action: 'fixed', note: 'allow-list' }, 1, 'main', 5)
@@ -350,10 +383,11 @@ test('the triage answer carries dispositions, severities, reply ids and duplicat
       { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
     ],
   })}`
+  // A row with duplicateOf is a link, whatever its action (R90): readLinks reads it, never readTriage.
   expect(readTriage(answer)).toEqual([
     { id: 'G3-1', action: 'fixed', note: 'parameterised', severity: 'P1', isSecurity: true, replyId: '991' },
-    { id: 'G3-2', action: 'rebutted', note: 'see R1-1', duplicateOf: 'R1-1', replyId: '992' },
   ])
+  expect(readLinks(answer)).toEqual([{ id: 'G3-2', duplicateOf: 'R1-1', replyId: '992' }])
 })
 
 test('prior rounds list the answered findings that still apply, with their evidence and what is owed', async () => {
@@ -487,7 +521,8 @@ test('the triage prompt calls new commits unreviewed, not someone else\'s, and l
 // ------------------------------------------------------------- task 12 fix round 2
 
 test('M1: a deferred security P1 post-PR: the agent tells the person, the waiver is the person\'s option', async () => {
-  const rec = at([pre(), post({ n: 2, rebutted: 1 })], { phase: 'post', findings: [finding({ id: 'G2-1', status: 'deferred', isSecurity: true })] })
+  // Codex agreed with the deferral (R92 M2): it is the person's.
+  const rec = at([pre(), post({ n: 2, rebutted: 1 })], { phase: 'post', findings: [agreedBy(finding({ id: 'G2-1', status: 'deferred', isSecurity: true }))] })
   const next = decideNext(rec)
   // R39: every deferral, security or not, awaits the person's decision.
   expect(next).toMatchObject({ kind: 'awaiting-decision', nextStep: 'tell the person G2-1 is deferred and why, then stop: only their waiver settles it' })
@@ -537,8 +572,9 @@ test('R39: ready and the merge predicate agree on every kind of finding, from ei
   expect(mergeHolds(at([post()], { findings: [finding({ severity: 'P3', status: 'deferred' })] })).map(one => one.id)).toEqual(['R1-1'])
 })
 
-test('R39: deferrals alone end post-PR review awaiting the person\'s decision, not exhausted or ready', async () => {
-  const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings: [finding({ id: 'G2-1', severity: 'P3', status: 'deferred', note: 'KAN-9' })] })
+test('R39: security deferrals alone end post-PR review awaiting the person\'s decision, not exhausted or ready', async () => {
+  // Security: any other deferral Codex agreed with gets its GitHub issue instead (R92).
+  const rec = at([pre(), post({ n: 2 })], { phase: 'post', findings: [agreedBy(finding({ id: 'G2-1', severity: 'P3', status: 'deferred', note: 'KAN-9', isSecurity: true }))] })
   expect(decideNext(rec)).toMatchObject({ kind: 'awaiting-decision' })
 })
 
@@ -574,7 +610,7 @@ const disputed = (): Finding => {
   return { ...one, status: 'rebutted', history: [...one.history, { round: 2, status: 'rebutted', note: 'renaming breaks the public API', by: 'main', at: 4 }] }
 }
 
-test('R40: after one rejection the agent may fix or defer; a second rebuttal is a dispute for the person, not a Codex check', async () => {
+test('R40, R92: after one rejection the agent may fix or defer; a second rebuttal is a dispute, filed as an issue, not a Codex check', async () => {
   const round = post({ n: 2, startHead: 'b', endHead: 'b' })
   const once = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [rejected()] })
   expect(decideNext(once)).toMatchObject({ kind: 'blocked', answer: ['G2-1'], nextStep: 'fix or defer G2-1, then /pr-gate resume' })
@@ -582,9 +618,15 @@ test('R40: after one rejection the agent may fix or defer; a second rebuttal is 
   expect(isDisputed(disputed())).toBe(true)
   const twice = at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [disputed()] })
   const next = decideNext(twice)
-  expect(next.kind).toBe('awaiting-decision')
+  // Not security: the filing pass files it, with both sides in the issue (R92); a security one waits for the person.
+  expect(next).toMatchObject({ kind: 'blocked', issues: ['G2-1'] })
   expect(next).not.toHaveProperty('recheck')
-  const why = (next as { why: string }).why
+  const body = issueBody(disputed(), { pr: 7, findings: [] })
+  expect(body).toContain('renaming breaks the public API')
+  expect(body).toContain('the name misleads callers')
+  const person = decideNext(at([pre({ endHead: 'b' }), round], { phase: 'post', findings: [{ ...disputed(), isSecurity: true }] }))
+  expect(person.kind).toBe('awaiting-decision')
+  const why = (person as { why: string }).why
   expect(why).toContain('renaming breaks the public API')
   expect(why).toContain('the name misleads callers')
 })
@@ -603,8 +645,9 @@ test('R43: a final-head check that ends on its own head with a rejected rebuttal
 })
 
 test('R42: the awaiting-decision report has the agent tell the person and stop, with only the waivers as options', async () => {
+  // Security ones: any other gets its GitHub issue (R92).
   const rec = at([pre({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'b' })], {
-    phase: 'post', pr: 7, findings: [disputed(), finding({ id: 'G2-2', severity: 'P3', status: 'deferred', note: 'KAN-9' })],
+    phase: 'post', pr: 7, findings: [{ ...disputed(), isSecurity: true }, agreedBy(finding({ id: 'G2-2', severity: 'P3', status: 'deferred', note: 'KAN-9', isSecurity: true }))],
   })
   const next = decideNext(rec)
   expect(next.kind).toBe('awaiting-decision')
@@ -762,52 +805,17 @@ test('R82: only an untagged-or-P3, non-security GitHub finding may be acknowledg
   expect(mayAcknowledge(finding())).toBe(false)
 })
 
-test('R85: isSettledDeferral needs deferred, P3, an issue follow-up, its label and no security flag', async () => {
-  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', followUp: '#1', followUpLabel: 'P3' })
-  expect(isSettledDeferral(base)).toBe(true)
-  // A guessed severity settles too (Adam, 2026-10-20): legacy findings without severitySource, and 'hint' ones, alike.
-  expect(isSettledDeferral({ ...base, severitySource: undefined })).toBe(true)
-  expect(isSettledDeferral({ ...base, severitySource: 'hint' })).toBe(true)
-  expect(isSettledDeferral({ ...base, source: 'codex-review', reviewer: 'codex', severitySource: undefined })).toBe(true)
-  expect(isSettledDeferral({ ...base, severity: 'P2' })).toBe(false)
-  expect(isSettledDeferral({ ...base, followUp: undefined })).toBe(false)
-  expect(isSettledDeferral({ ...base, isSecurity: true })).toBe(false)
-  expect(isSettledDeferral({ ...base, status: 'open' })).toBe(false)
-  // Not yet labelled, or labelled below the peak: it would settle, and waits on the gate's label.
-  expect(isSettledDeferral({ ...base, followUpLabel: undefined })).toBe(false)
-  expect(wouldSettle({ ...base, followUpLabel: undefined })).toBe(true)
-  expect(isSettledDeferral({ ...base, peakSeverity: 'P1' })).toBe(false)
-  expect(isSettledDeferral({ ...base, peakSeverity: 'P1', followUpLabel: 'P1' })).toBe(true)
-})
-
-test('gate R7-6: a record from before peakSeverity whose severity the agent set, from an unknown one, never settles on its own', async () => {
-  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'hint', followUp: '#1', followUpLabel: 'P3' })
-  // The P1 it was raised at is not on the record: the agent's P3 answer names no severity before it.
-  const legacy = { ...base, history: [{ round: 2, status: 'deferred' as const, severity: 'P3' as const, note: 'cosmetic', by: 'main' as const, at: 5 }] }
-  expect(wouldSettle(legacy)).toBe(false)
-  expect(isSettledDeferral(legacy)).toBe(false)
-  expect(isLoweringOwed(legacy)).toBe(false)
-  // The same answer on a record that knows the peak goes to Codex, as any lowering does.
-  expect(isLoweringOwed({ ...legacy, peakSeverity: 'P1' })).toBe(true)
-  // A legacy record whose history names no severity has nothing unknown: its severity is its peak.
-  expect(isSettledDeferral(base)).toBe(true)
-  // A later answer does not make the lost peak known (gate R8-1): it still waits for the person.
-  const again = applyAnswer(legacy, { id: 'R1-1', action: 'deferred', severity: 'P3', note: 'still cosmetic', followUp: '#1' }, 3, 'main', 6)
-  expect(again.peakSeverity).toBeUndefined()
-  expect(wouldSettle({ ...again, followUpLabel: 'P3' })).toBe(false)
-})
-
 test('R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-20)', async () => {
-  const base = finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', followUpLabel: 'P3' })
+  const base = agreedBy(finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', followUpLabel: 'P3' }))
   const ok = ['https://github.com/me/repo/issues/12', '#12', 'me/repo#12', ' #12 ', 'KAN-9 #12', 'tracked in issue #12 (KAN-9)']
   const bad = ['later', 'tracked', 'KAN-9', 'http://x/1', '#', 'https://', 'https://example.com/1', 'https://github.com/me/repo/pull/12', 'https://github.com/me/repo/pull/12#issuecomment-5', 'a#12']
   for (const one of ok) {
     expect(isFollowUpRef(one)).toBe(true)
-    expect(isSettledDeferral({ ...base, followUp: one })).toBe(true)
+    expect(isSettledByIssue({ ...base, followUp: one })).toBe(true)
   }
   for (const one of bad) {
     expect(isFollowUpRef(one)).toBe(false)
-    expect(isSettledDeferral({ ...base, followUp: one })).toBe(false)
+    expect(isSettledByIssue({ ...base, followUp: one })).toBe(false)
   }
   expect(issueOf('#12', 'me/repo')).toEqual({ repo: 'me/repo', number: 12 })
   expect(issueOf('KAN-9 #12', 'me/repo')).toEqual({ repo: 'me/repo', number: 12 })
@@ -819,64 +827,55 @@ test('R85: a follow-up settles only when it names a GitHub issue (Adam, 2026-10-
   // The deferral is kept either way: an unshaped follow-up only leaves it to the person, as before R85.
   const kept = applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: 'later' }, 2, 'main', 5)
   expect(kept.status).toBe('deferred')
-  expect(isSettledDeferral(kept)).toBe(false)
+  expect(isSettledByIssue(kept)).toBe(false)
 })
 
 test('R85: a deferral without a follow-up clears the earlier one and its label (final review T4)', async () => {
   const tagged = finding({ source: 'github', severity: 'P3', severitySource: 'tag' })
-  const first = { ...applyAnswer(tagged, { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5), followUpLabel: 'P3' as const }
-  expect(isSettledDeferral(first)).toBe(true)
+  const first = { ...agreedBy(applyAnswer(tagged, { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5)), followUpLabel: 'P3' as const }
+  expect(isSettledByIssue(first)).toBe(true)
   const again = applyAnswer({ ...first, status: 'open' }, { id: 'R1-1', action: 'deferred', note: 'still later' }, 3, 'main', 6)
   expect(again.followUp).toBeUndefined()
-  expect(isSettledDeferral(again)).toBe(false)
+  expect(isSettledByIssue(again)).toBe(false)
   // Another issue named: the label was on the old one, so the new one is labelled anew.
   const moved = applyAnswer({ ...first, status: 'open' }, { id: 'R1-1', action: 'deferred', followUp: '#13' }, 3, 'main', 6)
   expect(moved.followUpLabel).toBeUndefined()
-  expect(wouldSettle(moved)).toBe(true)
 })
 
-test('R85: a severity the agent lowered settles only once Codex agrees with the lowering (Adam, 2026-10-20)', async () => {
-  // A P1 guessed from "critical", lowered to P3 and deferred in the same answer, waits on Codex.
-  const guessed = finding({ source: 'github', severity: 'P1', severitySource: 'hint' })
-  const lowered = { ...applyAnswer(guessed, { id: 'R1-1', action: 'deferred', severity: 'P3', note: 'only a typo', followUp: '#12' }, 2, 'main', 5), followUpLabel: 'P1' as const }
-  expect(lowered.severity).toBe('P3')
-  expect(lowered.peakSeverity).toBe('P1')
-  expect(loweringOf(lowered)).toMatchObject({ from: 'P1', to: 'P3' })
-  expect(isLoweringOwed(lowered)).toBe(true)
-  expect(wouldSettle(lowered)).toBe(false)
-  expect(isSettledDeferral(lowered)).toBe(false)
-  expect(checksOwed([lowered]).map(one => one.id)).toEqual(['R1-1'])
-  // Codex agrees: its entry comes after the lowering, and the deferral settles.
-  const agreed = ruleLowering(lowered, true, 2, 6)
+test('R92: every deferral waits on Codex; agreed it waits, refused it is open again and charges the round (Adam, 2026-10-21)', async () => {
+  // A P2 deferral, a security deferral and a P3 deferred to an issue all go to Codex.
+  const p2 = applyAnswer(finding({ source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', note: 'needs a schema change' }, 2, 'main', 5)
+  expect(isDeferralOwed(p2)).toBe(true)
+  expect(isDeferralOwed({ ...p2, isSecurity: true })).toBe(true)
+  const p3 = { ...applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5), followUpLabel: 'P3' as const }
+  expect(isDeferralOwed(p3)).toBe(true)
+  expect(isSettledByIssue(p3)).toBe(false)
+  expect(checksOwed([p2, p3]).map(one => one.id)).toEqual(['R1-1', 'R1-1'])
+  // Agreed: it stays deferred and waits; Codex is not asked again.
+  const agreed = ruleDeferral(p2, true, 2, 6)
   expect(agreed.status).toBe('deferred')
-  expect(agreed.history.at(-1)).toMatchObject({ by: 'codex', status: 'deferred', lowering: 'agreed' })
-  expect(isLoweringOwed(agreed)).toBe(false)
-  expect(isSettledDeferral(agreed)).toBe(true)
+  expect(agreed.history.at(-1)).toMatchObject({ round: 2, status: 'deferred', deferral: 'agreed', by: 'codex', at: 6 })
+  expect(isDeferralOwed(agreed)).toBe(false)
+  expect(isDeferralAgreed(agreed)).toBe(true)
   expect(checksOwed([agreed])).toEqual([])
-  // Codex disagrees: the person's, with Codex's reason; Codex is not asked again.
-  const refused = ruleLowering(lowered, false, 2, 6, 'the comment reports data loss')
-  expect(refused.status).toBe('deferred')
-  expect(isLoweringOwed(refused)).toBe(false)
-  expect(isSettledDeferral(refused)).toBe(false)
-  expect(checksOwed([refused])).toEqual([])
-  expect(loweringRefusal(refused)).toBe('Codex disagrees with lowering R1-1 from P1 to P3: the comment reports data loss')
-  // Lowered in one answer and deferred in a later one, it waits on Codex too.
-  const first = applyAnswer(guessed, { id: 'R1-1', action: 'rebutted', severity: 'P3', note: 'cosmetic' }, 2, 'main', 5)
-  const later = { ...applyAnswer({ ...first, status: 'open' }, { id: 'R1-1', action: 'deferred', followUp: '#12' }, 3, 'main', 6), followUpLabel: 'P1' as const }
-  expect(isLoweringOwed(later)).toBe(true)
-  // A guessed P2 raised to P1 and brought back down to P3 was lowered.
-  const raised = applyAnswer(finding({ source: 'github', severity: 'P2', severitySource: 'hint' }), { id: 'R1-1', action: 'rebutted', severity: 'P1' }, 2, 'main', 5)
-  expect(isLoweringOwed(applyAnswer({ ...raised, status: 'open' }, { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 6))).toBe(true)
-  // A later lowering after Codex agreed needs Codex again.
-  const up = applyAnswer({ ...agreed, status: 'open' }, { id: 'R1-1', action: 'rebutted', severity: 'P2' }, 3, 'main', 7)
-  const down = { ...applyAnswer({ ...up, status: 'open' }, { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 8), followUpLabel: 'P1' as const }
-  expect(isLoweringOwed(down)).toBe(true)
-  expect(isSettledDeferral(down)).toBe(false)
-  // A guessed P3 the agent kept, and a reviewer-tagged P3, were never lowered: they settle once labelled.
-  const kept = applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5)
-  expect(loweringOf(kept)).toBeUndefined()
-  expect(isSettledDeferral({ ...kept, followUpLabel: 'P3' })).toBe(true)
-  expect(isSettledDeferral({ ...applyAnswer(finding({ source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'R1-1', action: 'deferred', followUp: '#12' }, 2, 'main', 5), followUpLabel: 'P3' })).toBe(true)
+  expect(isSettledByIssue(agreedBy(p3))).toBe(true)
+  // Refused: open again with Codex's reason, back to the agent; the refusal charges the round it is in.
+  const refused = ruleDeferral(p2, false, 2, 6, 'a one-line guard fixes it')
+  expect(refused.status).toBe('open')
+  expect(refused.history.at(-1)).toMatchObject({ round: 2, status: 'open', note: 'a one-line guard fixes it', deferral: 'refused', by: 'codex' })
+  expect(isDeferralOwed(refused)).toBe(false)
+  expect(isChargedRound([refused], 2)).toBe(true)
+  expect(isChargedRound([agreed], 2)).toBe(false)
+  // Deferred again after the refusal: Codex checks the new deferral.
+  const again = applyAnswer(refused, { id: 'R1-1', action: 'deferred', note: 'the guard breaks the public API' }, 3, 'main', 7)
+  expect(isDeferralOwed(again)).toBe(true)
+  // A deferral from a 1.4.0 record, whose lowering Codex agreed with, is checked once more: a lowering ruling is not a deferral ruling.
+  const legacy = { ...p3, history: [...p3.history, { round: 2, status: 'deferred' as const, lowering: 'agreed' as const, by: 'codex', at: 6 }] }
+  expect(isDeferralOwed(legacy)).toBe(true)
+  // The agent's lowering is still read, for the prompt.
+  const lowered = applyAnswer(finding({ source: 'github', severity: 'P1', severitySource: 'hint' }), { id: 'R1-1', action: 'deferred', severity: 'P3', note: 'only a typo', followUp: '#12' }, 2, 'main', 5)
+  expect(loweringOf(lowered)).toMatchObject({ from: 'P1', to: 'P3' })
+  expect(isDeferralOwed(lowered)).toBe(true)
 })
 
 test('R85: the peak severity is raised by an answer that raises, kept when lowered, and read from history for an older record', async () => {
@@ -892,35 +891,41 @@ test('R85: the peak severity is raised by an answer that raises, kept when lower
   expect(peakOf(finding({ severity: 'P2' }))).toBe('P2')
 })
 
-test('R85: the ready prompt names the follow-up of a settled deferral and not of a plain one', async () => {
-  const settled = finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', followUp: 'https://github.com/me/repo/issues/9', peakSeverity: 'P1', followUpLabel: 'P1' })
-  const plain = finding({ id: 'G2-2', source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag' })
+test('R92: the ready prompt lists each finding settled by its issue', async () => {
+  const settled = { ...agreedBy(finding({ id: 'G2-1', source: 'github', status: 'deferred', severity: 'P3', severitySource: 'tag', peakSeverity: 'P1' })), followUp: '#21', followUpLabel: 'P1' as const }
+  const plain = finding({ id: 'G2-2', source: 'github', status: 'verified-fixed', severity: 'P3' })
   const said = readyPrompt({ ...fresh(), pr: 7, findings: [settled, plain] })
-  expect(said).toContain('G2-1')
-  expect(said).toContain('(follow-up at https://github.com/me/repo/issues/9, labelled severity:P1)')
-  expect(said.match(/follow-up at/g)).toHaveLength(1)
+  expect(said).toContain('follow-up issues: G2-1 → #21 Critical [P1]')
+  expect(said).not.toContain('G2-2 →')
 })
 
-test('R85: a lowering owed Codex, one Codex refused, and an issue the gate could not label each hold with their own owner', async () => {
-  const lowered = applyAnswer(finding({ id: 'G2-1', source: 'github', reviewer: 'mallory', severity: 'P1', severitySource: 'hint' }), { id: 'G2-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5)
-  const owed = standingOf(postRec({ findings: [lowered] }), { head: 'a', base: 'dev' }).blockers
-  expect(owed.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'lowering-unchecked', 'codex']])
-  expect(owed[0]?.said).toBe('G2-1 [P3] comment from mallory: lowered from P1 to P3, Codex has not checked the lowering')
-  const refused = ruleLowering(lowered, false, 2, 6, 'it loses data')
+test('R92: a deferral owed Codex holds as Codex\'s; one Codex refused is open; an issue the gate could not label holds as the agent\'s', async () => {
+  const deferred = applyAnswer(finding({ id: 'G2-1', source: 'github', reviewer: 'mallory', severity: 'P1', severitySource: 'hint' }), { id: 'G2-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 2, 'main', 5)
+  const owed = standingOf(postRec({ findings: [deferred] }), { head: 'a', base: 'dev' }).blockers
+  expect(owed.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'deferral-unchecked', 'codex']])
+  expect(owed[0]?.said).toBe('G2-1 [P3] comment from mallory: deferred, Codex has not checked the deferral')
+  const refused = ruleDeferral(deferred, false, 2, 6, 'it loses data')
   const held = standingOf(postRec({ findings: [refused] }), { head: 'a', base: 'dev' }).blockers
-  expect(held.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'deferred', 'person']])
-  expect(held[0]?.said).toBe('Codex disagrees with lowering G2-1 from P1 to P3: it loses data')
-  const failed = { ...ruleLowering(lowered, true, 2, 6), followUpLabelError: 'HTTP 404: Not Found' }
+  expect(held.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'open', 'agent']])
+  const failed = { ...ruleDeferral(deferred, true, 2, 6), followUpLabelError: 'HTTP 404: Not Found' }
   const label = standingOf(postRec({ findings: [failed] }), { head: 'a', base: 'dev' }).blockers
   expect(label).toEqual([{
     kind: 'label-failed', id: 'G2-1', said: 'could not label issue #12 severity:P1 (HTTP 404: Not Found)', owner: 'agent',
-    release: 'check the issue exists and gh can edit it; the gate retries on the next pass',
+    release: 'check the issue exists and gh can edit it; the gate retries on the next pass, or the person can /pr-gate waive G2-1 <reason>',
   }])
-  const pending = standingOf(postRec({ findings: [ruleLowering(lowered, true, 2, 6)] }), { head: 'a', base: 'dev' }).blockers
-  expect(pending.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'label-owed', 'gate']])
-  // The controller sends a lowering to Codex, never to the person.
-  expect(decideNext(postRec({ findings: [lowered] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
-  expect(decideNext(postRec({ findings: [refused] })).kind).toBe('awaiting-decision')
+  const pending = standingOf(postRec({ findings: [ruleDeferral(deferred, true, 2, 6)] }), { head: 'a', base: 'dev' }).blockers
+  expect(pending.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'issue-owed', 'gate']])
+  // The controller sends a deferral to Codex, never to the person; a refusal goes back to the agent.
+  const next = decideNext(postRec({ findings: [deferred] }))
+  expect(next).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  expect(next.kind === 'blocked' ? next.why : '').toBe('Codex has not checked the deferral of G2-1')
+  expect(next.kind === 'blocked' ? next.nextStep : '').toBe('run /pr-gate resume: Codex checks the deferral on this head, using no review round')
+  const back = decideNext(postRec({ findings: [refused] }))
+  expect(back).toMatchObject({ kind: 'blocked', answer: ['G2-1'] })
+  expect(back.kind === 'blocked' ? back.why : '').toBe('Codex says G2-1 can be fixed in this PR: it loses data')
+  // Agreed: the gate files its issue (R92).
+  const p2 = ruleDeferral(applyAnswer(finding({ id: 'G2-1', source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'G2-1', action: 'deferred', note: 'later' }, 2, 'main', 5), true, 2, 6)
+  expect(decideNext(postRec({ findings: [p2] }))).toMatchObject({ kind: 'blocked', issues: ['G2-1'] })
 })
 
 const postRec = (over: object = {}) => at([post({ endHead: 'a' })], { phase: 'post', pr: 7, ...over })
@@ -929,7 +934,7 @@ test('R79: the standing lists every finding that holds the merge, each with its 
   const rec = postRec({
     findings: [
       finding({ id: 'G2-1', source: 'github', severity: 'P2', status: 'open' }),
-      finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' }),
+      agreedBy(finding({ id: 'G2-2', source: 'github', severity: 'P3', status: 'deferred' })),
       finding({ id: 'R1-1', status: 'reported-fixed' }),
       finding({ id: 'R1-2', status: 'verified-fixed', needsRecheck: true }),
     ],
@@ -938,13 +943,14 @@ test('R79: the standing lists every finding that holds the merge, each with its 
   expect(s.blockers.map(one => [one.id, one.kind, one.owner])).toEqual(
     expect.arrayContaining([
       ['G2-1', 'open', 'agent'],
-      ['G2-2', 'deferred', 'person'],
+      ['G2-2', 'issue-owed', 'gate'],
       ['R1-1', 'verify-owed', 'codex'],
       ['R1-2', 'reverify-owed', 'codex'],
     ]),
   )
   expect(s.mayProceed).toBe(false)
-  expect(s.blockers.find(one => one.id === 'G2-2')?.release).toBe('/pr-gate waive G2-2 <reason>')
+  // Agreed and not security: the gate files its issue (R92).
+  expect(s.blockers.find(one => one.id === 'G2-2')?.release).toBe('nothing: the gate files it')
 })
 
 test("gate R2-3: a reviewer's comment is named by its reviewer in a blocker, never by its own first line", async () => {
@@ -1039,3 +1045,746 @@ test('R79: an exhausted post report states its reason once, not again under the 
   expect(report.split(why)).toHaveLength(2)
   expect(report).toContain('Also holding:\n- check check running')
 })
+
+test('R94: an acknowledgement is named as one in the history, the standing and the recheck', async () => {
+  const comment = (id: string, severity: 'P2' | 'P3') => finding({ id, round: 2, source: 'github', reviewer: 'bot', severity, severitySource: 'hint' })
+  const ack = applyAnswer(comment('G2-1', 'P3'), { id: 'G2-1', action: 'acknowledged', note: 'No change requested: a status note' }, 2, 'main', 5)
+  expect(ack.status).toBe('rebutted')
+  expect(ack.history.at(-1)).toMatchObject({ status: 'rebutted', answer: 'acknowledged' })
+  expect(isAcknowledged(ack)).toBe(true)
+  const argued = applyAnswer(comment('G2-2', 'P2'), { id: 'G2-2', action: 'rebutted', note: 'see src/app.ts:3' }, 2, 'main', 5)
+  expect(isAcknowledged(argued)).toBe(false)
+  const blockers = standingOf(postRec({ findings: [ack, argued] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.find(one => one.id === 'G2-1')?.said).toBe('G2-1 [P3] comment from bot: acknowledgement not yet confirmed')
+  expect(blockers.find(one => one.id === 'G2-2')?.said).toBe('G2-2 [P2] comment from bot: rebuttal not yet accepted')
+  const next = decideNext(postRec({ findings: [ack] }))
+  expect(next).toMatchObject({ kind: 'blocked', recheck: ['G2-1'], nextStep: 'run /pr-gate resume: Codex checks the acknowledgement on this head, using no review round' })
+  expect((next as { why: string }).why).toBe('Codex has not checked the acknowledgement of G2-1 on a')
+  // Codex reopening it ends the acknowledgement; a later rebuttal is a rebuttal.
+  const reopened = markHeld(ack, 2, 'codex', 6, 'it asks for a change')
+  expect(isAcknowledged(reopened)).toBe(false)
+  expect(isAcknowledged(applyAnswer(reopened, { id: 'G2-1', action: 'rebutted', note: 'see src/app.ts:9' }, 2, 'main', 7))).toBe(false)
+})
+
+test('R88: a post round is charged for a new blocker or a Codex rejection in it; a pre round and an older record always count', async () => {
+  const blocker = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P1' })
+  const advisory = finding({ id: 'G3-2', round: 3, source: 'github', severity: 'P3' })
+  expect(isChargedRound([blocker], 3)).toBe(true)
+  expect(isChargedRound([advisory], 3)).toBe(false)
+  expect(isChargedRound([blocker], 4)).toBe(false)
+  // A fix Codex rejects is charged to the round that rejects it.
+  const rejectedFix = finding({ id: 'R2-1', round: 2, severity: 'P2', history: [
+    { round: 2, status: 'open', by: 'codex', at: 1 },
+    { round: 3, status: 'reported-fixed', by: 'main', at: 2 },
+    { round: 4, status: 'open', note: 'still reachable', by: 'codex', at: 3 },
+  ] })
+  // Round 4 is charged by the rejection alone (round 3, by the fix reported in it: A8).
+  expect(isChargedRound([rejectedFix], 4)).toBe(true)
+  expect(isChargedRound([rejectedFix], 2)).toBe(false)
+  const upheld = finding({ id: 'R2-2', round: 2, status: 'verified-fixed', history: [
+    { round: 3, status: 'reported-fixed', by: 'main', at: 1 },
+    { round: 4, status: 'verified-fixed', by: 'codex', at: 2 },
+  ] })
+  expect(isChargedRound([upheld], 4)).toBe(false)
+  // A rejected rebuttal and a rejected acknowledgement charge too.
+  expect(isChargedRound([rejected()], 2)).toBe(true)
+  const d = (n: number, over: object = {}) => roundOf({ n, phase: 'post', kind: 'discretionary', ...over })
+  expect(usedRounds({ rounds: [pre(), d(2, { isCharged: false }), d(3, { isCharged: true }), d(4)] })).toBe(3)
+  expect(usedRounds({ rounds: [pre({ isCharged: false })] })).toBe(1)
+  expect(remaining({ allowance: 2, grants: [], rounds: [d(2, { isCharged: false }), d(3, { isCharged: false })] })).toBe(2)
+})
+
+// ------------------------------------------------------------------ R90
+
+test('R90: new feedback links to any finding naming the same problem, open ones included, never to a linked one', async () => {
+  const open = finding({ id: 'G2-1', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, status: 'open' })
+  const item = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 5 }
+  expect(triage(item, [open], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // Linking to a linked finding links to its original.
+  const linked = { ...finding({ id: 'G3-1', source: 'github', title: 'cache never cleared', file: 'src/cache.ts', line: 11 }), duplicateOf: 'G2-1', linkBy: 'gate' as const }
+  expect(triage(item, [linked], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // R33: feedback after a rebuttal answers it; a changed file keeps it new.
+  const rebutted = { ...open, status: 'rebutted' as const, history: [{ round: 2, status: 'rebutted' as const, by: 'main', at: 4 }] }
+  expect(triage(item, [rebutted], new Set()).cls).toBe('new-on-reviewed')
+  expect(triage(item, [open], new Set(['src/cache.ts'])).cls).toBe('new-on-changed')
+})
+
+test('R90: a linked finding holds and settles with its original, is listed beside it, and raises its peak', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', peakSeverity: 'P2', status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1' }), original, 'gate', 2, 5)
+  expect(dup).toMatchObject({ duplicateOf: 'G2-1', linkBy: 'gate' })
+  expect(dup.history.at(-1)).toMatchObject({ note: 'linked to G2-1', by: 'gate' })
+  expect(isLinked(dup)).toBe(true)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.peakSeverity).toBe('P1')
+  expect(withLinkedPeak(dup, original).peakSeverity).toBe('P1')
+  const rec = postRec({ findings: [raised, dup] })
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(alsoOf(rec.findings, 'G2-1')).toEqual(['G2-2'])
+  // A9: the original's severity rises with its link's, so it is listed at P1.
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers[0]?.said).toBe('G2-1 (also G2-2) [P1] comment from bot: open')
+  // The original settles: so does the link.
+  expect(mergeHolds(postRec({ findings: [markVerified(raised, 2, 'codex', 6), dup] }))).toEqual([])
+  // Never a chain: linking to a linked finding links to its original.
+  expect(linkTo(finding({ id: 'G3-1' }), dup, 'gate', 3, 7).duplicateOf).toBe('G2-1')
+  expect(dropLink(dup)).not.toHaveProperty('duplicateOf', 'G2-1')
+})
+
+test('R90: the agent\'s link waits for Codex, at no round\'s cost; agreed it stands, refused the item stands alone', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', status: 'reported-fixed' })
+  const claimed = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P2' }), original, 'agent', 2, 5)
+  expect(isLinkOwed(claimed)).toBe(true)
+  expect(isLinked(claimed)).toBe(false)
+  const blockers = standingOf(postRec({ findings: [claimed] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-2', 'link-unchecked', 'codex']])
+  expect(checksOwed([claimed]).map(one => one.id)).toEqual(['G2-2'])
+  expect(decideNext(postRec({ findings: [claimed] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-2'] })
+  const agreed = { ...claimed, isLinkChecked: true }
+  expect(isLinked(agreed)).toBe(true)
+  const refused = markHeld(dropLink(claimed), 2, 'codex', 6, 'a different file')
+  expect(isChargedRound([refused], 2)).toBe(false)
+  // A linked duplicate raised as a blocker is not new: it charges nothing.
+  expect(isChargedRound([linkTo(finding({ id: 'G2-3', round: 2, severity: 'P1' }), original, 'gate', 2, 5)], 2)).toBe(false)
+})
+
+test('R90: a row with duplicateOf reads as a link, whatever its action', async () => {
+  const answer = trailerOf({ step: 'r2-triage', dispositions: [
+    { id: 'G2-2', duplicateOf: 'G2-1', replyId: 'https://github.com/me/repo/pull/1#discussion_r55' },
+    { id: 'G2-3', action: 'fixed', duplicateOf: 'G2-1' },
+    { id: 'G2-4', action: 'fixed', note: 'done' },
+  ] })
+  expect(readLinks(answer)).toEqual([{ id: 'G2-2', duplicateOf: 'G2-1', replyId: '55' }, { id: 'G2-3', duplicateOf: 'G2-1' }])
+  expect(readTriage(answer).map(one => one.id)).toEqual(['G2-4'])
+})
+
+// ------------------------------------------------------- R90, PR #25 review A1-A3
+
+test('R90 A1: a link carries security to the original, both ways, and nothing clears it', async () => {
+  const deferral = { status: 'deferred' as const, severity: 'P3' as const, peakSeverity: 'P3' as const, followUp: '#5', followUpLabel: 'P3' as const }
+  const original = agreedBy(finding({ id: 'G2-1', source: 'github', reviewer: 'bot', ...deferral }))
+  expect(isSettledByIssue(original)).toBe(true)
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.isSecurity).toBe(true)
+  // A security problem never settles by its issue: it holds for the person.
+  expect(isSettledByIssue(raised)).toBe(false)
+  // Made security, the deferral Codex agreed with goes back to Codex first (R92 M2, ruling on Task 11 concern 4).
+  expect(isDeferralAgreed(raised)).toBe(false)
+  expect(isFileable(raised)).toBe(false)
+  expect(standingOf(postRec({ findings: [raised, dup] }), { head: 'a', base: 'dev' }).blockers.map(one => [one.id, one.owner])).toEqual([['G2-1', 'codex']])
+  // Agreed again, it still never settles by its issue: it holds for the person.
+  const again = ruleDeferral(raised, true, 2, 6)
+  expect(isDeferralAgreed(again)).toBe(true)
+  expect(isSettledByIssue(again)).toBe(false)
+  const rec = postRec({ findings: [again, dup] })
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  // Security through its link: the gate never files it (R92); nor the security duplicate itself.
+  expect(isFileable(again)).toBe(false)
+  expect(isFileable(dup)).toBe(false)
+  expect(standingOf(rec, { head: 'a', base: 'dev' }).blockers.map(one => [one.id, one.owner])).toEqual([['G2-1', 'person']])
+  // Neither dropping a link nor an unknown peak clears it.
+  expect(dropLink(raised).isSecurity).toBe(true)
+  const lost = finding({ id: 'G2-3', history: [{ round: 1, status: 'open', severity: 'P3', by: 'main', at: 1 }] })
+  expect(withLinkedPeak(lost, dup).isSecurity).toBe(true)
+  // A security original stays security beside a non-security link.
+  const secure = finding({ id: 'G2-4', isSecurity: true, severity: 'P2' })
+  const kept = withLinkedPeak(secure, linkTo(finding({ id: 'G2-5', severity: 'P3' }), secure, 'gate', 2, 5))
+  expect(kept.isSecurity).toBe(true)
+  expect(isFileable(kept)).toBe(false)
+  expect(isFileable(agreedBy({ ...kept, status: 'deferred' }))).toBe(false)
+  expect(applyLinks([secure, finding({ id: 'G2-5', severity: 'P3' })], [{ id: 'G2-5', duplicateOf: 'G2-4' }], 2, 5).findings[0]?.isSecurity).toBe(true)
+})
+
+test('wave 2b gate R1-2: a link with a lost peak keeps the Critical [P1] floor, and a known P0 beats it', async () => {
+  const lost = finding({ id: 'G2-1', severity: 'P3', history: [{ round: 1, status: 'open', severity: 'P3', by: 'main', at: 1 }] })
+  const minor = finding({ id: 'G2-2', severity: 'P3', peakSeverity: 'P3' })
+  // A known P3 original linked to a lost peak: filed at P1, never P3.
+  expect(filingPeak(withLinkedPeak(minor, linkTo(lost, minor, 'gate', 2, 5)))).toBe('P1')
+  // A lost original linked to a known P0: the P0 is kept.
+  const blocker = finding({ id: 'G2-3', severity: 'P0', peakSeverity: 'P0' })
+  expect(filingPeak(withLinkedPeak(lost, linkTo(blocker, lost, 'gate', 2, 5)))).toBe('P0')
+  // A lost original whose link does not pass the floor stays lost.
+  expect(isPeakUnknown(withLinkedPeak(lost, linkTo(minor, lost, 'gate', 2, 5)))).toBe(true)
+})
+
+test('R90 A2: the agent\'s links are checked on canonical ids over the whole batch: no self-link, no cycle, no chain', async () => {
+  const a = finding({ id: 'A', status: 'open' })
+  const b = linkTo(finding({ id: 'B', status: 'open' }), a, 'gate', 2, 5)
+  const c = finding({ id: 'C', status: 'open' })
+  // B is linked to A, and the agent links A to B: that is A to itself, no answer. A still holds; B still holds through A.
+  const self = applyLinks([a, b], [{ id: 'A', duplicateOf: 'B' }], 2, 6)
+  expect(self.linked).toEqual([])
+  expect(self.findings).toEqual([a, b])
+  expect(mergeHolds(postRec({ findings: self.findings })).map(one => one.id)).toEqual(['A'])
+  // A link to itself, or naming an id not on the list, is no answer either.
+  expect(applyLinks([a, c], [{ id: 'A', duplicateOf: 'A' }, { id: 'C', duplicateOf: 'Z' }, { id: 'Z', duplicateOf: 'A' }], 2, 6).linked).toEqual([])
+  // B is linked to A, and the agent links A to C: A and B both point at C, and Codex checks both.
+  const moved = applyLinks([a, b, c], [{ id: 'A', duplicateOf: 'C' }], 2, 6)
+  expect(moved.linked).toEqual(['A'])
+  expect(moved.findings.map(one => [one.id, one.duplicateOf, one.linkBy])).toEqual([['A', 'C', 'agent'], ['B', 'C', 'agent'], ['C', undefined, undefined]])
+  expect(checksOwed(moved.findings).map(one => one.id)).toEqual(['A', 'B'])
+  // Two unlinked findings linked to each other in one answer: neither link is applied, both hold, and no check is owed on a link.
+  const pair = applyLinks([a, c], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'A' }], 2, 6)
+  expect(pair.linked).toEqual([])
+  expect(mergeHolds(postRec({ findings: pair.findings })).map(one => one.id)).toEqual(['A', 'C'])
+  expect(checksOwed(pair.findings)).toEqual([])
+  // A three-finding cycle: none applied.
+  const d = finding({ id: 'D', status: 'open' })
+  const ring = applyLinks([a, c, d], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'D' }, { id: 'D', duplicateOf: 'A' }], 2, 6)
+  expect(ring.linked).toEqual([])
+  expect(ring.findings.every(one => one.duplicateOf === undefined)).toBe(true)
+  // An acyclic A→C→D batch: A and C both point at D.
+  const line = applyLinks([a, c, d], [{ id: 'A', duplicateOf: 'C' }, { id: 'C', duplicateOf: 'D' }], 2, 6)
+  expect(line.linked).toEqual(['A', 'C'])
+  expect(line.findings.map(one => one.duplicateOf)).toEqual(['D', 'D', undefined])
+  // The gate's own link confirmed stays the gate's.
+  expect(applyLinks([a, b], [{ id: 'B', duplicateOf: 'A' }], 2, 6)).toEqual({ findings: [a, b], linked: ['B'] })
+})
+
+test('R90 A3: R33 is read on a candidate\'s original, so an open alias never reopens a settled rebuttal', async () => {
+  const a = finding({ id: 'G2-1', source: 'github', title: 'retry loop has no backoff', file: 'src/net.ts', line: 50, status: 'rebutted',
+    history: [{ round: 2, status: 'rebutted', by: 'main', at: 4 }, { round: 2, status: 'rebutted', by: 'codex', at: 6 }] })
+  const b = { ...finding({ id: 'G3-1', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, status: 'open' }), duplicateOf: 'G2-1', linkBy: 'gate' as const }
+  const objection = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 10 }
+  expect(triage(objection, [a, b], new Set()).cls).toBe('new-on-reviewed')
+  // Before the rebuttal it is the original's duplicate.
+  expect(triage({ ...objection, at: 3 }, [a, b], new Set())).toEqual({ cls: 'duplicate', matchId: 'G2-1' })
+  // A recheck on the original keeps it new as well.
+  expect(triage({ ...objection, at: 3 }, [{ ...a, needsRecheck: true }, b], new Set()).cls).toBe('new-on-reviewed')
+})
+
+test('R90: a link Codex refused is recorded, charges nothing, and linking there again is no answer (the gate cannot loop)', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
+  const alias = linkTo(finding({ id: 'G2-3', source: 'github' }), original, 'gate', 2, 5)
+  const other = finding({ id: 'G2-9', source: 'github', status: 'open' })
+  // The item had been rebutted: Codex refusing the link still rejects no answer.
+  const claimed = linkTo(finding({ id: 'G2-2', round: 2, severity: 'P2', status: 'rebutted' }), original, 'agent', 2, 5)
+  const refused = refuseLink(claimed, 2, 6, 'a different file')
+  expect(refused).toMatchObject({ status: 'open', duplicateOf: undefined, linkBy: undefined })
+  expect(refused.history.at(-1)).toMatchObject({ by: 'codex', status: 'open', refusedLink: 'G2-1', note: 'a different file' })
+  expect(isChargedRound([refused], 2)).toBe(false)
+  // The same link again, directly or through another finding linked to the same original, is no answer: it is asked again.
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-1' }], 3, 7).linked).toEqual([])
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-3' }], 3, 7).linked).toEqual([])
+  // A link to another problem is still an answer.
+  expect(applyLinks([original, alias, other, refused], [{ id: 'G2-2', duplicateOf: 'G2-9' }], 3, 7).linked).toEqual(['G2-2'])
+})
+
+// ------------------------------------------------------- R90 fix round 1 (A9)
+
+test('R90 A9: new feedback never matches through the agent\'s unchecked link; it stands alone, and holds after a refusal', async () => {
+  const t = finding({ id: 'G2-1', source: 'github', title: 'retry loop has no backoff', file: 'src/net.ts', line: 50, severity: 'P3', status: 'deferred' })
+  const x = linkTo(finding({ id: 'G2-2', source: 'github', title: 'the cache is never cleared', file: 'src/cache.ts', line: 10, severity: 'P3' }), t, 'agent', 2, 5)
+  const n = { file: 'src/cache.ts', line: 12, title: 'cache never cleared on logout', at: 6 }
+  expect(triage(n, [t, x], new Set()).cls).toBe('new-on-reviewed')
+  // linkTo never resolves through an owed link either.
+  const item = finding({ id: 'G3-1', source: 'github', severity: 'P1', round: 3 })
+  expect(linkTo(item, x, 'gate', 3, 7).duplicateOf).toBe('G2-2')
+  // Codex refuses X→T: N, standing alone, still holds as its own P1.
+  const refused = refuseLink(x, 3, 8, 'a different problem')
+  const rec = postRec({ findings: [t, refused, item] })
+  expect(mergeHolds(rec).map(one => one.id)).toContain('G3-1')
+  expect(unresolvedBlockers(rec).map(one => one.id)).toEqual(['G3-1'])
+})
+
+test('R90 A9: a link raises the original\'s severity, recorded as the gate\'s, and never lowers it', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', reviewer: 'bot', severity: 'P2', peakSeverity: 'P2', status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, dup)
+  expect(raised.severity).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2', by: 'gate' })
+  expect(loweringOf(raised)).toBeUndefined()
+  // A P1 security duplicate keeps its hold for the person, through its original.
+  const rec = postRec({ findings: [raised, dup] })
+  expect(securityHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(rec).map(one => one.id)).toEqual(['G2-1'])
+  // Never lowered: a lower link leaves it as it was.
+  expect(withLinkedPeak(raised, finding({ id: 'G2-3', severity: 'P3' })).severity).toBe('P1')
+  // The original raised in an earlier round is no new blocker of this one.
+  expect(isChargedRound([{ ...raised, round: 1 }, dup], 2)).toBe(false)
+  // A P1 linked to a P3 issue deferral: it no longer settles without the person.
+  const deferral = agreedBy(finding({ id: 'G1-1', source: 'github', severity: 'P3', peakSeverity: 'P3', status: 'deferred', followUp: '#5', followUpLabel: 'P3' }))
+  expect(isSettledByIssue(deferral)).toBe(true)
+  const held = withLinkedPeak(deferral, linkTo(finding({ id: 'G2-4', source: 'github', severity: 'P1' }), deferral, 'gate', 2, 5))
+  expect(isSettledByIssue(held)).toBe(false)
+  expect(mergeHolds(postRec({ findings: [held] })).map(one => one.id)).toEqual(['G1-1'])
+  // An agent's link raises it too, and Codex refusing the link leaves it raised.
+  const linked = applyLinks([original, finding({ id: 'G2-5', severity: 'P1' })], [{ id: 'G2-5', duplicateOf: 'G2-1' }], 2, 6).findings
+  expect(linked[0]?.severity).toBe('P1')
+  const after = [linked[0] as Finding, refuseLink(linked[1] as Finding, 2, 7, 'different')]
+  expect(after[0]?.severity).toBe('P1')
+})
+
+test('R90: an equal tagged duplicate preserves the original\'s authoritative severity', async () => {
+  for (const severity of ['P0', 'P1', 'P2', 'P3'] as const) {
+    const original = finding({ id: 'G2-1', source: 'github', severity, peakSeverity: severity, severitySource: 'hint' })
+    const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', severity, severitySource: 'tag' }), original, 'gate', 2, 5)
+    const raised = withLinkedPeak(original, duplicate)
+    expect(raised.severitySource).toBe('tag')
+    expect(raised.history).toEqual(original.history)
+    expect(applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3' }, 2, 'main', 6).severity).toBe(severity)
+    expect(mayAcknowledge(raised)).toBe(severity === 'P3')
+    // The agent's link uses the same provenance rule.
+    const agent = applyLinks([original, dropLink(duplicate)], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+    expect(agent.findings[0]?.severitySource).toBe('tag')
+  }
+})
+
+test('R90: an equal tagged security duplicate keeps its P1 hold and round charge after triage', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', round: 2, severity: 'P1', peakSeverity: 'P1', severitySource: 'hint' })
+  const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', round: 2, severity: 'P1', severitySource: 'tag', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, duplicate)
+  const answered = applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3', note: 'out of scope' }, 2, 'main', 6)
+  expect(answered.severity).toBe('P1')
+  expect(securityHolds(postRec({ findings: [answered, duplicate] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(isChargedRound([answered, duplicate], 2)).toBe(true)
+  // Raising a guessed advisory to an explicit P1 keeps its existing protection too.
+  expect(withLinkedPeak({ ...original, severity: 'P2' }, duplicate)).toMatchObject({ severity: 'P1', severitySource: 'tag', isSecurity: true })
+})
+
+test('R90: a Codex-rated duplicate preserves its chosen severity instead of the original\'s hint', async () => {
+  for (const source of ['codex-review', 'codex-challenge'] as const) {
+    for (const severity of ['P1', 'P2'] as const) {
+      const original = finding({ id: 'G2-1', source: 'github', severity, peakSeverity: severity, severitySource: 'hint' })
+      const duplicate = finding({ id: 'R2-1', source, severity: 'P1', peakSeverity: 'P1' })
+      const agent = applyLinks([original, duplicate], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+      const raised = agent.findings[0] as Finding
+      expect(raised.severity).toBe('P1')
+      expect(raised.severitySource).toBeUndefined()
+      expect(applyAnswer(raised, { id: raised.id, action: 'deferred', severity: 'P3' }, 2, 'main', 6).severity).toBe('P1')
+      // A Codex link never replaces an existing reviewer tag with a weaker provenance.
+      expect(withLinkedPeak({ ...original, severitySource: 'tag' }, duplicate).severitySource).toBe('tag')
+    }
+  }
+})
+
+test('R90: a guessed P0 linked to a lower tagged security P1 is answered down to P1, never below', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', round: 2, severity: 'P0', peakSeverity: 'P0', severitySource: 'hint' })
+  const duplicate = linkTo(finding({ id: 'G2-2', source: 'github', round: 2, severity: 'P1', severitySource: 'tag', isSecurity: true }), original, 'gate', 2, 5)
+  const raised = withLinkedPeak(original, duplicate)
+  // The guess stays the severity and stays a guess: a tag does not freeze an overestimate.
+  expect(raised).toMatchObject({ severity: 'P0', severitySource: 'hint', severityFloor: 'P1', isSecurity: true })
+  expect(applyAnswer(raised, { id: raised.id, action: 'fixed', severity: 'P1' }, 2, 'main', 6).severity).toBe('P1')
+  for (const lower of ['P2', 'P3'] as const) {
+    const answered = applyAnswer(raised, { id: raised.id, action: 'deferred', severity: lower, note: 'out of scope' }, 2, 'main', 6)
+    expect(answered.severity).toBe('P1')
+    expect(answered.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P0' })
+    expect(answered.history.at(-1)?.note).toContain(`answered ${lower}, kept at P1`)
+    expect(securityHolds(postRec({ findings: [answered, duplicate] })).map(one => one.id)).toEqual(['G2-1'])
+    expect(isChargedRound([answered, duplicate], 2)).toBe(true)
+  }
+  // The agent's link sets the same floor, and a Codex rating does too; a floor of P2 or above also refuses an acknowledgement.
+  const agent = applyLinks([original, dropLink(duplicate)], [{ id: duplicate.id, duplicateOf: original.id }], 2, 5)
+  expect(agent.findings[0]?.severityFloor).toBe('P1')
+  const codex = finding({ id: 'R2-1', source: 'codex-review', severity: 'P2', peakSeverity: 'P2' })
+  expect(withLinkedPeak(original, linkTo(codex, original, 'gate', 2, 5)).severityFloor).toBe('P2')
+  expect(mayAcknowledge({ ...original, severity: 'P2', severityFloor: 'P2' })).toBe(false)
+  expect(mayAcknowledge({ ...original, severity: 'P2', severityFloor: 'P3' })).toBe(true)
+})
+
+test('R90: Codex refusing a link is not a rejected rebuttal', async () => {
+  const original = finding({ id: 'G2-1', source: 'github', status: 'open' })
+  const rebutted = finding({ id: 'G2-2', source: 'github', severity: 'P2', status: 'rebutted', history: [{ round: 2, status: 'rebutted', note: 'not a bug', by: 'main', at: 4 }] })
+  const refused = refuseLink(linkTo(rebutted, original, 'agent', 2, 5), 2, 6, 'a different problem')
+  expect(rejections(refused)).toBe(0)
+  expect(isDisputed(refused)).toBe(false)
+  const next = decideNext(postRec({ findings: [refused] }))
+  expect(next.kind).toBe('blocked')
+  expect(JSON.stringify(next)).not.toContain('did not accept the rebuttal')
+})
+
+// ------------------------------------------------------------- A8 (task 6b)
+
+test('A8: a post round is charged when the agent reports a fix in it, for any finding at any severity; once, never for a duplicate', async () => {
+  const p3 = finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P3' })
+  // The triage answer is stamped with the round that asked, the one that raised it (afterTriage, before the push ends the round).
+  expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action: 'fixed', note: 'renamed' }, 3, 'main', 5)], 3)).toBe(true)
+  // A rebuttal, a deferral or an acknowledgement of a non-blocking finding stays free.
+  for (const action of ['rebutted', 'deferred', 'acknowledged'] as const) {
+    expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action, note: 'no' }, 3, 'main', 5)], 3)).toBe(false)
+  }
+  // A8 as ruled ("charge the push that fixes last round's findings"): a fix in round 3 of a finding raised in round 2 charges round 3,
+  // the round the fix was reported in, and not round 2, whose record is written.
+  const earlier = applyAnswer({ ...p3, id: 'G2-1', round: 2 }, { id: 'G2-1', action: 'fixed' }, 3, 'main', 5)
+  expect(isChargedRound([earlier], 3)).toBe(true)
+  expect(isChargedRound([earlier], 2)).toBe(false)
+  // An earlier finding rebutted, deferred or acknowledged in round 3 stays free.
+  expect(isChargedRound([applyAnswer({ ...p3, id: 'G2-1', round: 2 }, { id: 'G2-1', action: 'deferred', note: 'later' }, 3, 'main', 5)], 3)).toBe(false)
+  // Only the agent's fix: the gate's or Codex's event with a reported-fixed status is none.
+  expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'gate', at: 5 }] }], 3)).toBe(false)
+  expect(isChargedRound([{ ...p3, history: [{ round: 3, status: 'reported-fixed', by: 'codex', at: 5 }] }], 3)).toBe(false)
+  // The pre-PR fixer is the agent too.
+  expect(isChargedRound([applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'fixer', 5)], 3)).toBe(true)
+  // A linked duplicate fixed charges nothing; its original carries the charge when it was raised in the round.
+  const original = finding({ id: 'G1-1', round: 1, source: 'github', severity: 'P3' })
+  const dup = linkTo(finding({ id: 'G3-2', round: 3, source: 'github', severity: 'P3' }), original, 'gate', 3, 4)
+  const fixedDup = { ...dup, status: 'reported-fixed' as const, history: [...dup.history, { round: 3, status: 'reported-fixed' as const, by: 'main', at: 5 }] }
+  expect(isChargedRound([original, fixedDup], 3)).toBe(false)
+  // A round with both a new blocker and a fix is charged once: a boolean.
+  const blocker = finding({ id: 'G3-3', round: 3, source: 'github', severity: 'P1' })
+  expect(isChargedRound([blocker, applyAnswer(p3, { id: 'G3-1', action: 'fixed' }, 3, 'main', 5)], 3)).toBe(true)
+})
+
+test('A9: a link\'s severity raise moves no status reader: the rebuttal\'s time and the acknowledgement stay, rejections are read as before', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', title: 'cache never cleared', file: 'src/cache.ts', line: 10 })
+  const acked = acceptRebuttal(applyAnswer(p3, { id: 'G2-1', action: 'acknowledged', note: 'by design' }, 2, 'main', 4), 2, 5)
+  expect(isAcceptedRebuttal(acked)).toBe(true)
+  expect(isAcknowledged(acked)).toBe(true)
+  // A P1 duplicate, posted before the rebuttal and linked at 9 in round 3.
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', severity: 'P1', peakSeverity: 'P1', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), acked, 'gate', 3, 9)
+  const raised = withLinkedPeak(acked, dup)
+  // The raise is recorded, as the gate's change with the severity before it (R85).
+  expect(raised.severity).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P3', by: 'gate', raisedBy: 'G3-1' })
+  expect(loweringOf(raised)).toBeUndefined()
+  // Raised into blocking range, the accepted acknowledgement goes back to Codex at P1 (ruling on 6b concern 1), still named as one.
+  expect(isAcceptedRebuttal(raised)).toBe(false)
+  expect(isAcknowledged(raised)).toBe(true)
+  expect(rejections(raised)).toBe(0)
+  expect(isDisputed(raised)).toBe(false)
+  expect(checksOwed([raised]).map(one => one.id)).toEqual(['G2-1'])
+  const blockers = standingOf(postRec({ findings: [raised, dup] }), { head: 'a', base: 'dev' }).blockers
+  expect(blockers.map(one => [one.id, one.kind, one.owner])).toEqual([['G2-1', 'rebuttal-unchecked', 'codex']])
+  expect(blockers[0]?.said).toContain('acknowledgement not yet confirmed')
+  expect(decideNext(postRec({ findings: [raised, dup] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  // Codex accepting it again settles it at P1; refusing it reopens it. Either way, once: the same link raises nothing more.
+  const settled = acceptRebuttal(raised, 3, 10)
+  expect(isAcceptedRebuttal(settled)).toBe(true)
+  expect(mergeHolds(postRec({ findings: [settled, dup] }))).toEqual([])
+  expect(withLinkedPeak(settled, dup).needsRecheck).toBeUndefined()
+  expect(markHeld(raised, 3, 'codex', 10, 'reachable at P1').status).toBe('open')
+  // A further raise, P1 to P0, sends it back once more; so does a link that makes it security.
+  expect(isAcceptedRebuttal(withLinkedPeak(settled, { ...dup, id: 'G3-2', severity: 'P0' }))).toBe(false)
+  expect(isAcceptedRebuttal(withLinkedPeak(settled, { ...dup, id: 'G3-3', isSecurity: true }))).toBe(false)
+  // A raise that stays advisory, P3 to P2, does not reopen it.
+  const p2 = withLinkedPeak(acked, { ...dup, id: 'G3-4', severity: 'P2', peakSeverity: 'P2' })
+  expect(p2.severity).toBe('P2')
+  expect(isAcceptedRebuttal(p2)).toBe(true)
+  expect(mergeHolds(postRec({ findings: [p2] }))).toEqual([])
+  // R33: a reply posted between the rebuttal (4) and the link (9) still answers the rebuttal; the raise moves no rebuttal time.
+  const reply = { file: 'src/cache.ts', line: 11, title: 'cache never cleared on logout', at: 7 }
+  expect(triage(reply, [p2], new Set()).cls).toBe('new-on-reviewed')
+  expect(rebuttedAt(raised)).toBe(5)
+  expect(rebuttedAt(p2)).toBe(5)
+  // Nothing in the link's round: no charge, and the original was not raised in it.
+  expect(isChargedRound([raised], 3)).toBe(false)
+  // A rebuttal Codex has not ruled on stays one, and an open original raised by a link is not "raised in" the link's round.
+  const rebutted = applyAnswer(p3, { id: 'G2-1', action: 'rebutted', note: 'not reachable' }, 2, 'main', 4)
+  const owed = withLinkedPeak(rebutted, dup)
+  expect(checksOwed([owed]).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(postRec({ findings: [owed, dup] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(raisedIn(withLinkedPeak(p3, dup), 3)).toBe(false)
+  // A rejection before the raise is still read as one.
+  const once = withLinkedPeak(markHeld(rebutted, 2, 'codex', 5, 'still reachable'), dup)
+  expect(rejections(once)).toBe(1)
+  expect(isChargedRound([once], 2)).toBe(true)
+})
+
+test('6b fix 1: a re-check a link raised names the link, its severity and its report; a file change keeps its own label', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', title: 'cache never cleared' })
+  const accepted = acceptRebuttal(applyAnswer(p3, { id: 'G2-1', action: 'rebutted', note: 'cleared on restart' }, 2, 'main', 4), 2, 5)
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', reviewer: 'bot', severity: 'P1', isSecurity: true, title: 'session cache leaks tokens',
+    detail: 'tokens stay readable after logout', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), accepted, 'gate', 3, 9)
+  const raised = withLinkedPeak(accepted, dup)
+  const text = verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [raised, dup] }), 'abcdef0', [raised])
+  expect(text).toContain('G2-1 [P1] comment from bot (src/app.ts:12) (raised to P1, security, by its linked item G3-1: re-check)')
+  expect(text).not.toContain('file changed since')
+  expect(text).toContain('G3-1, linked to G2-1 as the same problem, raised it to P1, security. Its report:\n    <reviewer-comment from="bot">')
+  expect(text).toContain('tokens stay readable after logout')
+  expect(text).toContain('does the rebuttal still hold at P1, given that report?')
+  // The flag from a file change keeps its label, and so does a raise Codex already ruled on, then a file change.
+  const changed = { ...accepted, needsRecheck: true }
+  expect(verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [changed] }), 'abcdef0', [changed])).toContain('(file changed since: re-verify)')
+  const ruled = { ...acceptRebuttal(raised, 3, 10), needsRecheck: true }
+  const later = verifyPrompt(runOf({ lifecycle: 'post', round: 4, findings: [ruled, dup] }), 'abcdef0', [ruled])
+  expect(later).toContain('(file changed since: re-verify)')
+  expect(later).not.toContain('by its linked item')
+  // A security link with no severity change is named the same way.
+  const p1 = acceptRebuttal(applyAnswer({ ...p3, severity: 'P1', peakSeverity: 'P1' }, { id: 'G2-1', action: 'rebutted', note: 'n' }, 2, 'main', 4), 2, 5)
+  const secured = withLinkedPeak(p1, dup)
+  expect(secured.needsRecheck).toBe(true)
+  expect(verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [secured, dup] }), 'abcdef0', [secured])).toContain('(raised to P1, security, by its linked item G3-1: re-check)')
+  expect(loweringOf(secured)).toBeUndefined()
+})
+
+test('R92: a link that raises a deferral Codex agreed with into P1 or security makes Codex check it again, free; a refusal reopens it and charges the round', async () => {
+  const p3 = finding({ id: 'G2-1', round: 2, source: 'github', reviewer: 'bot', severity: 'P3', peakSeverity: 'P3', severitySource: 'tag', title: 'cache never cleared' })
+  const deferred = { ...applyAnswer(p3, { id: 'G2-1', action: 'deferred', note: 'needs the cache rework', followUp: '#12' }, 2, 'main', 4), followUpLabel: 'P3' as const }
+  const agreed = ruleDeferral(deferred, true, 2, 5)
+  expect(isSettledByIssue(agreed)).toBe(true)
+  const dup = linkTo(finding({ id: 'G3-1', round: 3, source: 'github', reviewer: 'bot', severity: 'P1', peakSeverity: 'P1', title: 'session cache leaks tokens',
+    detail: 'tokens stay readable after logout', history: [{ round: 3, status: 'open', by: 'bot', at: 3 }] }), agreed, 'gate', 3, 9)
+  const raised = withLinkedPeak(agreed, dup)
+  expect(raised.severity).toBe('P1')
+  expect(raised.status).toBe('deferred')
+  expect(raised.needsRecheck).toBe(true)
+  expect(raiseOf(raised)).toMatchObject({ raisedBy: 'G3-1' })
+  // Codex's agreement was given at P3: it is owed again, nothing settles or waits on the person before it.
+  expect(isDeferralAgreed(raised)).toBe(false)
+  expect(isDeferralOwed(raised)).toBe(true)
+  // Nor is it filed (R92): its issue waits for Codex's new ruling.
+  expect(isFileable(raised)).toBe(false)
+  expect(isSettledByIssue(raised)).toBe(false)
+  expect(checksOwed([raised]).map(one => one.id)).toEqual(['G2-1'])
+  expect(mergeHolds(postRec({ findings: [raised, dup] })).map(one => one.id)).toEqual(['G2-1'])
+  expect(decideNext(postRec({ findings: [raised, dup] }))).toMatchObject({ kind: 'blocked', recheck: ['G2-1'] })
+  // The link's round is not charged by the raise.
+  expect(isChargedRound([raised], 3)).toBe(false)
+  // The check names the link, the new severity and the linked item's report.
+  const text = verifyPrompt(runOf({ lifecycle: 'post', round: 3, findings: [raised, dup] }), 'abcdef0', [raised])
+  expect(text).toContain('(raised to P1 by its linked item G3-1: re-check)')
+  expect(text).toContain('G3-1, linked to G2-1 as the same problem, raised it to P1. Its report:')
+  expect(text).toContain('tokens stay readable after logout')
+  expect(text).toContain('You agreed before that G2-1 cannot reasonably be fixed in this PR: does that still hold at P1, given that report?')
+  // Agreed again: it waits once more, the flag cleared; the same link raises nothing more.
+  const again = ruleDeferral(raised, true, 3, 10)
+  expect(again.needsRecheck).toBeUndefined()
+  expect(isDeferralOwed(again)).toBe(false)
+  expect(isDeferralAgreed(again)).toBe(true)
+  expect(isFileable(again)).toBe(true)
+  expect(withLinkedPeak(again, dup).needsRecheck).toBeUndefined()
+  // Refused: open again with Codex's reason, and the round is charged as for any refused deferral.
+  const refused = ruleDeferral(raised, false, 3, 10, 'at P1 it must be fixed here')
+  expect(refused.status).toBe('open')
+  expect(refused.history.at(-1)).toMatchObject({ round: 3, status: 'open', deferral: 'refused', by: 'codex' })
+  expect(isChargedRound([refused], 3)).toBe(true)
+  // A link that makes it security does the same; a raise that stays advisory, P3 to P2, does not.
+  expect(isDeferralOwed(withLinkedPeak(agreed, { ...dup, id: 'G3-2', severity: 'P3', peakSeverity: 'P3', isSecurity: true }))).toBe(true)
+  const p2 = withLinkedPeak(agreed, { ...dup, id: 'G3-3', severity: 'P2', peakSeverity: 'P2' })
+  expect(p2.needsRecheck).toBeUndefined()
+  expect(isDeferralAgreed(p2)).toBe(true)
+  // A deferral Codex has not ruled on is owed already: the raise adds no flag.
+  expect(withLinkedPeak(deferred, dup).needsRecheck).toBeUndefined()
+  expect(isDeferralOwed(withLinkedPeak(deferred, dup))).toBe(true)
+})
+
+/** A post lifecycle with the allowance spent: four charged rounds, then a final-head check that moved the head from a to b. */
+const spent = (over: object = {}) =>
+  postRec({
+    head: 'b',
+    rounds: [
+      post({ n: 2 }),
+      ...[3, 4, 5, 6].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true })),
+      roundOf({ n: 7, phase: 'post', kind: 'final-head-check', endHead: 'b' }),
+    ],
+    ...over,
+  })
+
+test('R92: the issue title names the finding, its peak severity, the PR, the branch, a Jira key and the spec handle', async () => {
+  const f = finding({ id: 'R4-3', severity: 'P2', title: 'Workflows rules ignored when reading required checks' })
+  expect(issueTitle(f, { pr: 20, branch: 'wave2a/pr-lifecycle-1.4.0' })).toBe(
+    'R4-3 Major [P2] Workflows rules ignored when reading required checks (#20, wave2a/pr-lifecycle-1.4.0)',
+  )
+  expect(issueTitle({ ...f, severity: 'P3', peakSeverity: 'P1' }, { pr: 20, branch: 'feat/KAN-12-cache' }, 'docs/spec.md')).toBe(
+    'R4-3 Critical [P1] Workflows rules ignored when reading required checks (#20, feat/KAN-12-cache, KAN-12, docs/spec.md)',
+  )
+  expect(jiraKeyOf('feat/x')).toBeUndefined()
+  expect(jiraKeyOf('fix/ABC2-77-retry')).toBe('ABC2-77')
+  // A long branch and spec handle never take the title past GitHub's 256 characters or Jira's 255 (wave 2b gate R2-1).
+  const long = issueTitle({ ...f, title: 'x'.repeat(200) }, { pr: 20, branch: `feat/KAN-12-${'b'.repeat(200)}` }, `docs/${'s'.repeat(200)}.md`)
+  expect(long).toHaveLength(255)
+  expect(long.startsWith('R4-3 Major [P2] xxx')).toBe(true)
+  // A Jira ticket's summary names the repository too (wave 2b gate R4-4): repositories sharing a project never match each other's.
+  expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: 'me/repo' })).toBe('R4-3 Major [P2] Workflows rules ignored when reading required checks (#20, me/repo, feat/x)')
+  expect(ticketTitle(f, { pr: 20, branch: 'feat/x', slug: undefined })).toBe(issueTitle(f, { pr: 20, branch: 'feat/x' }))
+})
+
+test('PR #28 review: retry titles retain earlier peaks after a real link raise records severity in history', async () => {
+  const f = finding({ id: 'G2-1', severity: 'P2', peakSeverity: 'P2', title: 'Lost task' })
+  const raised = withLinkedPeak(f, finding({ id: 'R3-1', round: 3, severity: 'P1', peakSeverity: 'P1' }))
+  const rec = { pr: 20, branch: 'feat/x', slug: 'me/repo' }
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2' })
+  for (const title of [(one: Finding) => issueTitle(one, rec), (one: Finding) => ticketTitle(one, rec)]) {
+    const titles = titlesAtAnyPeak(raised, title)
+    expect(titles).toContain(title(f))
+    expect(titles.map(one => one.match(/\[P[0-3]\]/)?.[0])).toEqual(['[P0]', '[P1]', '[P2]', '[P3]'])
+  }
+  // Rendering historical titles must not lower the actual finding or erase its history.
+  expect(filingPeak(raised)).toBe('P1')
+  expect(raised.history.at(-1)).toMatchObject({ severity: 'P1', from: 'P2' })
+})
+
+test('R92: the issue body says who raised it and where, its severity, the problem, why it waits, and what is linked', async () => {
+  const f = agreedBy(finding({
+    id: 'G4-3', source: 'github', reviewer: 'mallory', severity: 'P2', title: 'cache never cleared', detail: 'Logging out keeps the cache.',
+    url: 'https://github.com/me/repo/pull/20#discussion_r5', file: 'src/cache.ts', line: 10, round: 4, status: 'deferred', note: 'needs a schema change', followUp: 'KAN-9',
+  }))
+  const dup = { ...finding({ id: 'G5-1', source: 'github' }), duplicateOf: 'G4-3', linkBy: 'gate' as const }
+  const body = issueBody(f, { pr: 20, findings: [f, dup] })
+  expect(body).toContain('Raised by mallory in round 4 of #20, at `src/cache.ts:10` ([thread](https://github.com/me/repo/pull/20#discussion_r5)).')
+  expect(body).toContain('Severity: Major [P2].')
+  expect(body).toContain('## Problem\n\nLogging out keeps the cache.')
+  expect(body).toContain('Deferred by the agent: needs a schema change. Codex agreed it cannot reasonably be fixed in this PR.')
+  expect(body).toContain('Follow-up named by the agent: KAN-9.')
+  expect(body).toContain('- G5-1: the same problem, raised again')
+  // A lowered severity says so; a dispute gives both sides; an open finding says the rounds ran out.
+  expect(issueBody({ ...f, severity: 'P3', peakSeverity: 'P1' }, { pr: 20, findings: [] })).toContain('Severity: Critical [P1], answered as P3.')
+  expect(issueBody(disputed(), { pr: 20, findings: [] })).toContain('is disputed: the agent says')
+  const left = finding({ id: 'R7-1', status: 'open', history: [{ round: 7, status: 'open', note: 'still reachable from /login', by: 'codex', at: 1 }] })
+  expect(issueBody(left, { pr: 20, findings: [] })).toContain("Still open when the review rounds ran out. Codex's last word: still reachable from /login.")
+})
+
+test('R92: a finding settles by its issue, labelled at its peak, unless it is security; its file changing does not unsettle it', async () => {
+  const filed = { ...agreedBy(finding({ id: 'G2-1', source: 'github', severity: 'P2', status: 'deferred' })), followUp: '#21', followUpLabel: 'P2' as const }
+  expect(isSettledByIssue(filed)).toBe(true)
+  expect(isSettledByIssue({ ...filed, followUpLabel: undefined })).toBe(false)
+  expect(isSettledByIssue({ ...filed, peakSeverity: 'P1' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, isSecurity: true })).toBe(false)
+  expect(isSettledByIssue({ ...filed, followUp: 'KAN-9' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, status: 'open' })).toBe(true)
+  expect(isSettledByIssue({ ...filed, status: 'reported-fixed' })).toBe(false)
+  expect(isSettledByIssue({ ...filed, needsRecheck: true })).toBe(true)
+  // A deferral Codex has not checked never settles, whatever its label says.
+  expect(isSettledByIssue({ ...filed, history: [] })).toBe(false)
+  const rec = postRec({ findings: [filed] })
+  expect(mergeHolds(rec)).toEqual([])
+  expect(decideNext(rec)).toEqual({ kind: 'ready' })
+})
+
+test('R92: the gate files open findings, deferrals Codex agreed with and disputes; never security, a link or an unchecked answer', async () => {
+  const open = finding({ id: 'R1-1', severity: 'P2', status: 'open' })
+  const owed = applyAnswer(finding({ id: 'R1-2', severity: 'P2' }), { id: 'R1-2', action: 'deferred', note: 'later' }, 2, 'main', 5)
+  expect(isFileable(open)).toBe(true)
+  expect(isFileable(owed)).toBe(false)
+  expect(isFileable(agreedBy(owed))).toBe(true)
+  expect(isFileable(disputed())).toBe(true)
+  expect(isFileable(rejected())).toBe(true)
+  expect(isFileable({ ...open, isSecurity: true })).toBe(false)
+  expect(isFileable({ ...open, status: 'reported-fixed' })).toBe(false)
+  expect(isFileable({ ...open, status: 'rebutted', history: [{ round: 2, status: 'rebutted', by: 'main', at: 1 }] })).toBe(false)
+  // Gate R7-6: a record that lost the peak is filed as Critical [P1], with the loss in its body (Adam, 2026-10-21).
+  const legacy = agreedBy({ ...finding({ source: 'github', status: 'deferred', severity: 'P3', severitySource: 'hint' }), history: [{ round: 2, status: 'deferred' as const, severity: 'P3' as const, note: 'cosmetic', by: 'main', at: 5 }] })
+  expect(isFileable(legacy)).toBe(true)
+  expect(filingPeak(legacy)).toBe('P1')
+  expect(filingPeak({ ...legacy, peakSeverity: 'P2' })).toBe('P2')
+  expect(issueTitle(legacy, { pr: 20, branch: 'feat/x' })).toMatch(/^R1-1 Critical \[P1\] /)
+  expect(issueBody(legacy, { pr: 20, findings: [] })).toContain("Severity: Critical [P1], assigned because the gate lost this finding's severity (answered as P3).")
+  expect(isSettledByIssue({ ...legacy, followUp: '#21', followUpLabel: 'P1' })).toBe(true)
+  // Review Focus 5: a duplicate linked to a security original holds with it and is never filed.
+  const original = finding({ id: 'G2-1', source: 'github', severity: 'P1', isSecurity: true, status: 'open' })
+  const dup = linkTo(finding({ id: 'G2-2', source: 'github', severity: 'P2' }), original, 'gate', 2, 5)
+  expect(isFileable(dup)).toBe(false)
+  expect(planIssues(spent({ findings: [original, dup] }), 9)).toEqual({ kind: 'none' })
+})
+
+test('R92: at exhaustion a blocker first raised in the round that spent the allowance, or the last one, adds a round, twice at most', async () => {
+  const late = finding({ id: 'R7-1', round: 7, severity: 'P1', status: 'open' })
+  const rec = spent({ findings: [late] })
+  expect(decideNext(rec).kind).toBe('exhausted')
+  const grant = { n: 1, reason: "late blocker R7-1: the PR's scope may be too wide", head: 'b', at: 50, by: 'gate' }
+  expect(gateGrant(rec, 50)).toEqual(grant)
+  expect(planIssues(rec, 50)).toEqual({ kind: 'grant', grant, late: ['R7-1'] })
+  // Raised in the last charged round (6) is late too; an earlier one, or a late advisory, gets its issue.
+  expect(planIssues(spent({ findings: [{ ...late, id: 'R6-1', round: 6 }] }), 50).kind).toBe('grant')
+  expect(planIssues(spent({ findings: [{ ...late, id: 'R5-1', round: 5 }] }), 50)).toMatchObject({ kind: 'file', items: [{ id: 'R5-1', peak: 'P1' }] })
+  // Filed, it settles; the head the final check left unreviewed still holds, and the next pass files nothing again.
+  const after = spent({ findings: [{ ...late, id: 'R5-1', round: 5, followUp: '#21', followUpLabel: 'P1' as const }] })
+  expect(mergeHolds(after)).toEqual([])
+  expect(decideNext(after).kind).toBe('exhausted')
+  expect(planIssues(after, 51)).toEqual({ kind: 'none' })
+  expect(planIssues(spent({ findings: [{ ...late, severity: 'P2' }] }), 50)).toMatchObject({ kind: 'file', items: [{ id: 'R7-1', peak: 'P2' }] })
+  // Two gate rounds used: the third late blocker gets its issue. A person's grant does not count against them.
+  const twice = spent({
+    rounds: [
+      post({ n: 2 }),
+      ...[3, 4, 5, 6, 7, 8].map(n => roundOf({ n, phase: 'post', kind: 'discretionary', isCharged: true })),
+      roundOf({ n: 9, phase: 'post', kind: 'final-head-check', endHead: 'b' }),
+    ],
+    grants: [
+      { n: 1, reason: 'late blocker R6-1', head: 'a', at: 1, by: 'gate' },
+      { n: 1, reason: 'late blocker R8-1', head: 'a', at: 2, by: 'gate' },
+    ],
+    findings: [{ ...late, id: 'R9-1', round: 9 }],
+  })
+  expect(decideNext(twice).kind).toBe('exhausted')
+  expect(gateGrant(twice, 50)).toBeUndefined()
+  expect(planIssues(twice, 50)).toMatchObject({ kind: 'file', items: [{ id: 'R9-1', peak: 'P1' }] })
+  expect(scopeNote(twice)).toBe(
+    "The gate added 2 rounds for blockers first raised after the allowance was spent (late blocker R6-1; late blocker R8-1): tell the person the PR's scope may be too wide.",
+  )
+  expect(scopeNote(rec)).toBeUndefined()
+  // Before the PR, or with nothing to file, there is no plan.
+  expect(planIssues({ ...rec, phase: 'pre' }, 50)).toEqual({ kind: 'none' })
+  expect(planIssues(postRec(), 50)).toEqual({ kind: 'none' })
+})
+
+test('R92: a deferral the agent tied to an issue is filed by labelling that issue; any other gets a new one', async () => {
+  const named = agreedBy(applyAnswer(finding({ id: 'G2-1', source: 'github', severity: 'P2', severitySource: 'tag' }), { id: 'G2-1', action: 'deferred', note: 'later', followUp: 'other/lib#7' }, 2, 'main', 5))
+  const unnamed = agreedBy(applyAnswer(finding({ id: 'G2-2', source: 'github', severity: 'P3', severitySource: 'tag' }), { id: 'G2-2', action: 'deferred', note: 'later' }, 2, 'main', 5))
+  const next = decideNext(postRec({ findings: [named, unnamed] }))
+  expect(next).toMatchObject({ kind: 'blocked', issues: ['G2-1', 'G2-2'] })
+  const plan = planIssues(postRec({ findings: [named, unnamed], slug: 'me/repo' }), 9)
+  expect(plan).toMatchObject({ kind: 'file', items: [{ id: 'G2-1', peak: 'P2', reuse: { repo: 'other/lib', number: 7 } }, { id: 'G2-2', peak: 'P3' }] })
+  expect(plan.kind === 'file' ? plan.items[1] : undefined).not.toHaveProperty('reuse')
+})
+
+test('R92: an exhaustion says a filing that failed for a finding, in gh\'s words, beside the fix step', async () => {
+  const moved = post({ n: 3, kind: 'final-head-check', startHead: 'c', endHead: 'd', raised: { blocking: 1, advisory: 0 } })
+  const open = finding({ id: 'R3-1', round: 3, status: 'open', issueError: 'HTTP 410: Issues are disabled for this repo' })
+  const rec = { ...at([post({ endHead: 'b' }), post({ n: 2, startHead: 'b', endHead: 'c' }), moved], { phase: 'post', allowance: 0, findings: [open] }), head: 'd' }
+  const next = decideNext(rec)
+  expect(next.kind).toBe('exhausted')
+  expect(next.kind === 'exhausted' ? next.why : '').toContain('; could not file an issue for R3-1 (HTTP 410: Issues are disabled for this repo)')
+  const label = decideNext({ ...rec, findings: [{ ...open, issueError: undefined, followUp: '#12', followUpLabelError: 'HTTP 404: Not Found' }] })
+  expect(label.kind === 'exhausted' ? label.why : '').toContain('; could not label issue #12 severity:')
+  // With no failure, the reason is as before.
+  const plain = decideNext({ ...rec, findings: [{ ...open, issueError: undefined }] })
+  expect(plain.kind).toBe('exhausted')
+  expect(plain.kind === 'exhausted' ? plain.why : '').not.toContain('could not')
+})
+
+test('R92: a new answer makes an earlier filing failure stale, so it is cleared', async () => {
+  const failed = finding({ id: 'G2-1', status: 'open', followUp: '#12', issueError: 'HTTP 410: Issues are disabled for this repo', followUpLabelError: 'HTTP 404: Not Found' })
+  const deferred = applyAnswer(failed, { id: 'G2-1', action: 'deferred', severity: 'P3', followUp: '#12' }, 3, 'main', 9)
+  expect(deferred.issueError).toBeUndefined()
+  expect(deferred.followUpLabelError).toBeUndefined()
+  expect(deferred.followUp).toBe('#12')
+  const fixed = applyAnswer(failed, { id: 'G2-1', action: 'fixed' }, 3, 'main', 9)
+  expect(fixed.issueError).toBeUndefined()
+  expect(fixed.followUpLabelError).toBeUndefined()
+})
+
+test('R93: the ready prompt tells the agent to merge with the repository\'s method and report the merge commit', async () => {
+  const rec = { ...fresh(), pr: 7 }
+  const said = readyPrompt(rec)
+  expect(said).toContain(`No review finding holds the merge: merge it now with gh pr merge 7 --merge --match-head-commit ${rec.head} and tell the person the merge commit`)
+  expect(said).toContain('wait for them (gh pr checks 7 --watch) and merge again')
+  expect(said).toContain("if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop")
+  expect(said).not.toContain("the person's")
+  expect(said).not.toContain('do not merge')
+  expect(readyPrompt(rec, 'squash')).toContain('gh pr merge 7 --squash')
+  expect(mergeStep(12, 'rebase')).toBe(
+    "merge it now with gh pr merge 12 --rebase and tell the person the merge commit; if the merge guard holds it for checks still running, wait for them (gh pr checks 12 --watch) and merge again; never write Closes, Fixes or Resolves before a follow-up issue's number in the PR, a commit or the merge, because those issues stay open, and the gate checks them after the merge; if a required check fails, or GitHub refuses the merge, tell the person the check's or GitHub's words and stop: the lifecycle stays where it is",
+  )
+})
+
+test('A9.7: a security finding left for the person owes a Jira ticket where jiraProject is set; the ticket tracks it and never settles it', async () => {
+  const deferred = agreedBy(finding({ id: 'G2-1', source: 'github', severity: 'P1', isSecurity: true, status: 'deferred', history: [{ round: 2, status: 'deferred', note: 'later', by: 'main', at: 5 }] }))
+  expect(isTicketable(deferred)).toBe(true)
+  expect(isTicketable({ ...deferred, isSecurity: false })).toBe(false)
+  expect(isTicketable(finding({ isSecurity: true, status: 'reported-fixed' }))).toBe(false)
+  const rec = postRec({ findings: [deferred] })
+  expect(decideNext(rec).kind).toBe('awaiting-decision')
+  // Without the setting no ticket is planned, and nothing else is: security never gets a GitHub issue.
+  expect(planIssues(rec, 9)).toEqual({ kind: 'none' })
+  expect(planIssues(rec, 9, undefined, undefined, true)).toMatchObject({ kind: 'file', items: [], tickets: [{ id: 'G2-1', peak: 'P1', isRetry: false }] })
+  // A failed attempt searches first; a filed ticket is owed no more.
+  expect(planIssues(postRec({ findings: [{ ...deferred, jiraError: 'unauthorized' }] }), 9, undefined, undefined, true)).toMatchObject({ tickets: [{ isRetry: true }] })
+  const filed = { ...deferred, jiraTicket: 'KAN-512' }
+  expect(planIssues(postRec({ findings: [filed] }), 9, undefined, undefined, true)).toEqual({ kind: 'none' })
+  // Still holding, still the person's: only the merge outside the gate counts it as tracked.
+  const tracked = postRec({ findings: [filed] })
+  expect(mergeHolds(tracked).map(one => one.id)).toEqual(['G2-1'])
+  expect(decideNext(tracked).kind).toBe('awaiting-decision')
+  expect(untrackedSecurity(rec).map(one => one.id)).toEqual(['G2-1'])
+  expect(untrackedSecurity(tracked)).toEqual([])
+  expect(ticketLine(filed)).toBe('G2-1 → KAN-512 Critical [P1]')
+  expect(standingOf(tracked, { head: 'a', base: 'dev' }).blockers).toEqual([
+    { kind: 'security-p1', id: 'G2-1', said: 'G2-1 → KAN-512 Critical [P1], waiting for your waiver', owner: 'person', release: '/pr-gate waive G2-1 <reason>' },
+  ])
+  expect(standingOf(postRec({ findings: [{ ...deferred, jiraError: 'unauthorized' }] }), { head: 'a', base: 'dev' }).blockers[0]?.said).toContain('(Jira ticket not filed: unauthorized)')
+  // At a merge every security finding still holding is planned, whatever its status.
+  const fixed = finding({ id: 'R1-1', isSecurity: true, status: 'reported-fixed' })
+  expect(planIssues(postRec({ findings: [fixed] }), 9, undefined, { kind: 'outside' }, true)).toMatchObject({ kind: 'file', items: [], tickets: [{ id: 'R1-1' }] })
+})
+

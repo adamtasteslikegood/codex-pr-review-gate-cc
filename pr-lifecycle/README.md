@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.4.0. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.5.0. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -47,13 +47,14 @@ nudging each one.
    happened before the PR opened, and draws nothing from the allowance. The
    mod *collects* the PR's own reviews and checks, then, if no repository
    reviewer covered the head within the wait cap, runs a *Codex fallback* on
-   the delta since the last reviewed head. The main agent then *triages* what
-   arrived: it verifies each item against the code, fixes or rebuts it, and
-   *replies* in the reviewer's thread. Round 2, also free, runs when round 1
-   changed the head, by anyone. A clean first round does not force a second.
+   the delta since the last reviewed head. The main agent *triages* what
+   arrives, while collection still runs: it verifies each item against the
+   code, fixes or rebuts it, and *replies* in the reviewer's thread. Round 2,
+   also free, runs when round 1 changed the head, by anyone. A clean first
+   round does not force a second.
 8. **Ready.** When the last round is clean, verified and the head unchanged,
-   the lifecycle is `ready`: the agent is told the PR is ready for the merge
-   decision. A new unreviewed head gets a discretionary round if allowance
+   the lifecycle is `ready`: the agent is told no review finding holds the
+   merge, and merges (R93). A new unreviewed head gets a discretionary round if allowance
    remains, otherwise a *final-head check* (Codex on the delta only) outside
    the allowance. Running out of allowance never certifies a head nobody
    reviewed.
@@ -98,6 +99,11 @@ start the next round.
 Incomplete attempts and their effort are recorded separately from completed
 rounds.
 
+After the PR opens, a round is one head (R88). Triage starts during
+collection: findings go to the agent as they arrive, and it pushes as it goes.
+A push ends the round on its old head at the end of the turn that pushed, and
+the next round starts on the new head.
+
 ## The budget
 
 One discretionary allowance per lifecycle, shared by pre-PR and post-PR
@@ -114,7 +120,11 @@ rounds, blocking, advisory and rebuttal rounds alike:
   fixes runs only while at least one round would remain afterwards. The
   advisory fix itself never waits on the reserve.
 - **Outside the allowance.** The post-PR baseline (rounds 1 and 2), the
-  final-head check, and Codex's check of a rebuttal after the PR opens.
+  final-head check, Codex's checks (rebuttal, deferral, link), and any
+  post-PR round that brings no new blocking finding, no Codex rejection and no
+  fix (R88). A round in which the agent reports a fix, for a finding raised
+  then or earlier, is charged (amendment A8). Up to two rounds the gate adds
+  for late blockers (R92) are named in the report.
 - **`/pr-gate allow <n> <reason>`** adds 1 to 5 rounds. It is the person's
   alone. It settles no deferral or dispute.
 - **Exhaustion** is its own status, never read as passing. The record and the
@@ -143,14 +153,17 @@ first processing, using the reviewer's own label where present. P0/P1 block;
 P2/P3 do not block a pass, but every finding at any severity counts against
 the merge (below).
 
-Triage drops feedback it has already processed, shows a duplicate with the
-earlier answer attached, and judges a new claim on previously reviewed code on
-its merits. Every review prompt carries a "prior rounds" section: the
+Triage drops feedback it has already processed, links a duplicate to the
+finding it repeats, and judges a new claim on previously reviewed code on
+its merits. A linked finding follows its original's status, and raises the
+original's severity when it is higher (R90). The gate links a clear repeat;
+a link the agent gives is checked by Codex at no cost. Every review prompt carries a "prior rounds" section: the
 still-applicable findings in the touched files, their dispositions and
 evidence, and what verification is owed. Inline findings are answered in their
 own thread, top-level reviews with an issue comment; the reply id (the comment
 number, also when the agent reports the URL gh prints) is recorded
-so a resumed session never replies twice. Of the comments made under this
+so a resumed session never replies twice. Every reply id the agent reports is
+kept as the gate's own, whatever the answer (R91). Of the comments made under this
 machine's gh login, only those replies are skipped (an inline reply in a
 thread, or a comment whose id is a recorded reply): the person's own other
 comments reach triage. Their reviews never count as covering a head.
@@ -166,14 +179,37 @@ comments reach triage. Their reviews never count as covering a head.
   it rejects reopens it.
 - **A rebuttal Codex has rejected cannot be argued again.** The agent fixes or
   defers it.
-- **A second rebuttal ends in `awaiting-decision`**, a dispute for the person
-  (R40).
+- **A second rebuttal is a dispute** (R40). When the review can do no more,
+  the gate files an issue for it (below).
 
-### Deferrals
+### Deferrals and issues
 
-A deferral is an honest answer: it ends triage. It does not release the merge.
-It leaves `postStatus` at `awaiting-decision` until the person runs
-`/pr-gate waive <findingId> <reason>` or `/pr-gate waive post <reason>`.
+A deferral is an answer, not a release. Codex checks every deferral at the end
+of the round, at no cost: if it says the finding can be fixed in this PR, the
+finding is open again and the round is charged (R92). If it agrees, the
+finding waits.
+
+When the review can do no more (the allowance is spent, or only deferrals and
+disputes hold the merge), the gate files a GitHub issue for each finding still
+holding it, except security ones:
+
+- title: `R4-3 Major [P2] <title> (#20, <branch>, <Jira key>, <issueSpec>)`;
+- label: `severity:<P>`, the highest severity the finding had;
+- body: who raised it and where, the problem, and why it was not fixed here.
+
+If the agent's follow-up names an issue that already tracks it, the gate
+labels that one instead. An issue counts only once GitHub shows its label; an
+issue filed without it is labelled on the next pass, not filed again. A
+finding whose severity was lost is filed as Critical [P1]. The issue settles
+the finding; a change to its file does not unsettle it. After the merge,
+before the gate archives the record, it checks each follow-up issue: it
+reopens a closed one, and files one again when gh says it no longer exists or
+the reopen fails (see The agent merges). A failure to file holds the merge with gh's words, and the next pass
+retries. Security findings wait for `/pr-gate waive <id>`.
+
+Before filing, a blocker first raised in the round that spent the allowance
+gets one more round, at most twice per lifecycle. The report then says the
+PR's scope may be too wide.
 
 ### Security P1
 
@@ -188,7 +224,8 @@ in the history as lapsed, and only a fresh waiver restores it. The same applies
 to an accepted rebuttal and to a verified fix: when a push touches their file,
 each becomes *re-verify owed* and holds the merge until Codex re-verifies it
 (R58). A re-verify Codex rejects reopens the finding. A commit that lands while
-a fix-review verify runs is not covered by it (R59).
+a fix-review verify runs is not covered by it (R59). A finding settled by its
+issue does not lapse (R92).
 
 ## The merge rule
 
@@ -199,7 +236,7 @@ A merge to a gated base is held unless the lifecycle is `ready` for the PR's
 current head, or the person waived it. There is **no merge while any finding,
 from either phase, at any severity, is open, deferred, unverified (including
 owed a re-verify), or rebutted without Codex accepting the rebuttal**, unless
-the person waived that finding. The refusal names what is missing ("post-PR
+its follow-up issue settles it (R92) or the person waived that finding. The refusal names what is missing ("post-PR
 round 1 owed", "R3-2 [P1] unresolved"). A refusal never starts work. A new push
 holds the merge again until the new head is reviewed.
 
@@ -214,11 +251,38 @@ cannot read hold the merge (fail closed), with gh's error.
 ### Who decides
 
 The gate settles review itself and gives the agent its own next step: fix this,
-answer that, run `/pr-gate resume`. It names the person only for deferrals, security P1s, disputes (a second
-rebuttal), and exhaustion. After the PR opens, exhaustion names the person
-whatever `onExhausted` is set to. Before it opens, exhaustion names them only
-under `onExhausted: stop` or when a security P1 is open. The person's tools
-there are the waivers and `allow`.
+answer that, run `/pr-gate resume`. It names the person for:
+
+- a security finding that is deferred or disputed, which the gate never files;
+- a review exhausted with a head no round reviewed and nothing to file
+  (`/pr-gate allow 1` or `waive post`);
+- a PR retargeted to another base (point it back, or `/pr-gate reset`);
+- before the PR opens, exhaustion under `onExhausted: stop` or with a
+  security P1 open.
+
+Everything else ends in a fix, Codex's check, or an issue (R92). When nothing
+holds the merge, the agent merges (R93). The person's tools are the waivers
+and `allow`.
+
+### The agent merges
+
+When no review finding holds the merge, the ready prompt says so and tells the
+agent to merge with `gh pr merge <n> --<mergeMethod>` and report the merge
+commit (R93). The guard still checks the head and CI. If it holds the merge
+for checks still running, the agent waits with `gh pr checks <n> --watch` and
+merges again. If a required check fails, or GitHub refuses, the agent reports
+the check's or GitHub's words and stops, and the lifecycle stays where it was.
+The merge step is sent once. The agent never writes `Closes`, `Fixes` or
+`Resolves` before a follow-up issue's number: those issues stay open.
+
+The gate then checks the follow-up issues, after the agent's merge or when a
+poll, a session start or `/pr-gate` sees the PR merged. An open issue is
+logged. A closed one is reopened with a comment; if the reopen fails, the
+gate files a new issue instead. A read that fails with "Could not resolve to
+an issue or pull request" means the issue is gone, and it is filed again; any
+other failed read leaves the record blocked. A refile that fails also leaves
+it blocked. The agent gets gh's words, and `/pr-gate resume` checks again. Only then is the record archived, and the agent is told which
+issues stay open.
 
 ## Settings per repository
 
@@ -248,7 +312,11 @@ overrides; the mod never falls back to HEAD.
   "codexModelHigh": "gpt-6-astra",
   "highEffort": "medium",
   "rereviewEffort": "low",
-  "runnerModel": "sonnet"
+  "runnerModel": "sonnet",
+  "mergeMethod": "merge",
+  "issueSpec": "docs/spec.md",
+  "mergeWatchMinutes": 5,
+  "jiraProject": "KAN"
 }
 ```
 
@@ -263,6 +331,13 @@ only spaces, as for the plugin options) turns the match off
 letters, digits, dots and dashes, starting with a letter or digit, where `""`
 names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
 `rereviewEffort`) are `low`, `medium` or `high` (see Models and effort).
+`mergeMethod` is `merge` (default), `squash` or `rebase`. `issueSpec` is a
+spec handle, cut to 80 characters, named in each filed issue's title.
+`mergeWatchMinutes` is how often the gate reads the PR state of a record with
+no run, a whole number of minutes from 1 to 60 (default 5; see Merged outside
+the gate). `jiraProject` is a Jira project key such as `KAN`; with it set, a
+security finding gets a Jira Bug through `acli` (see Merged outside the gate).
+All four are read from the base's file only.
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
@@ -292,12 +367,16 @@ names no model. The efforts (`reviewEffort`, `lightEffort`, `highEffort`,
   version** (or, without one, by the plugin options), not by its own. Its
   settings apply to the PRs after it merges.
 
-- **With a roster**, collection ends when every listed reviewer has posted on
-  the current head and every listed check has completed. A `trusted` reviewer
-  is never waited for: its feedback is triaged when it arrives, in this round
-  or the next, and its review of the current head, when already in, covers it.
-- **Without one**, it ends when every check run has completed and nothing new
-  arrived for `quietMinutes`. The mod never guesses a roster.
+- **On GitHub's signals** (R89), collection ends when every check the base
+  requires has a completed run or status on the head, every reviewer in the
+  PR's pending review requests has reviewed the head, and, with a roster,
+  every listed reviewer has covered it. Check suites are never read. A team's
+  request is not waited for, nor one from this machine's own login. A
+  `trusted` reviewer is never waited for: its feedback is triaged when it
+  arrives, in this round or the next, and its review of the current head, when
+  already in, covers it.
+- **With none of the three**, it ends when every check run has completed and
+  nothing new arrived for `quietMinutes`. The mod never guesses a roster.
 - **Always**, it ends at `waitCapMinutes` with whatever arrived. Missing
   evidence is recorded as incomplete; if no reviewer covered the head, the
   Codex fallback runs.
@@ -311,8 +390,9 @@ else's comment is dropped before triage and covers no head. A row that does
 not say its author association is kept.
 
 The mod polls about every 30 seconds with `gh api` while the session stays
-free. `requestReview` re-requests review from the listed reviewers on a new
-head in round 2 or later; otherwise the mod never triggers reviewers. If `gh`
+free. `requestReview` re-requests review from the listed reviewers once per
+agent turn that pushed, on the head the turn ends on (R88); otherwise the mod
+never triggers reviewers. If `gh`
 is unauthenticated or rate-limited, the attempt is recorded incomplete, the
 pane says what to fix, and `/pr-gate resume` retries. A new interactive session picks a
 post-PR collection back up where it was once the session that ran it has been
@@ -542,8 +622,8 @@ transcript or above the prompt, depending on the host.
 | `/pr-gate resume` | continue a stopped, held or incomplete round from the record |
 | `/pr-gate waive pre <reason>` | let this commit's PR open without the pre-PR review, to the base the record has now, or with no record the repository's default branch (it covers that base only); post-PR review still runs. Refused while a security P1 holds |
 | `/pr-gate waive post <reason>` | let this head merge without the review, and stop the post-PR review in flight; a security P1 needs its own waiver first |
-| `/pr-gate waive <findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test, security P1 included |
-| `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds; rounds settle no deferral or dispute |
+| `/pr-gate waive [<branch>:]<findingId> <reason>` | release one finding that holds the merge (open, reported fixed, re-verify owed, rebutted, deferred or disputed) from the merge test; the usual case is a finding the gate cannot file, a security one (R92). `<branch>:` names a merged lifecycle of another branch whose security finding blocks its archive; an id that matches more than one lifecycle is refused, and the refusal names each with its qualified command |
+| `/pr-gate allow <n> <reason>` | add 1 to 5 review rounds |
 | `/pr-gate reset` | archive the record under its own key, history kept, and start fresh |
 
 Waivers, `allow` and `reset` are the person's alone: an agent's or a plugin's
@@ -557,13 +637,36 @@ poll, the triage step, a session start, `/pr-gate` or `resume` reads it merged
 or closed, the run in flight stops and the record is archived. Collection does
 not start again for it.
 
+### Merged outside the gate
+
+A person on GitHub's website, a connector, or a merge under `waive post` can
+merge a PR at any point of its lifecycle. The gate sees it without a command.
+A watcher reads the PR state of every record with a PR and no run every
+`mergeWatchMinutes`, and a session start reads every record under the
+repository's root, not only the checked-out branch. Then the close files a
+GitHub issue for each non-security finding still holding. The body says no fix
+round ran, or names the post waiver and its reason. A finding the person
+waived by id is not filed.
+
+A security finding is never filed in a GitHub issue. With `jiraProject` set,
+it gets a Jira Bug through `acli`, labelled `security` and `severity-P<n>`.
+The ticket tracks the finding and never settles it: before a merge, only the
+person's waiver releases it. At a merge outside the gate, a finding with a
+ticket counts as tracked and the record is archived. One with no ticket blocks
+the record until the person runs `/pr-gate waive <id>`, or
+`/pr-gate waive <branch>:<id> <reason>` from another checkout. After the
+merge the ticket is viewed and filed again if it is missing. If `acli` fails,
+the finding holds, with one notice: install `acli`, or log in with
+`acli jira auth login`. A required `pr-gate` status that would stop such a
+merge is on the roadmap (wave 3).
+
 ## Options
 
 Set in `/config` or under `pluginConfigs["pr-lifecycle"].options`. A
 repository's `.github/pr-gate.json` on the base overrides `allowanceStandard`,
 `allowanceHigh`, `allowanceLight`, `onExhausted`, `highRiskPaths`, `lightBranches`,
 `waitCapMinutes`, `quietMinutes`, the four models and the four efforts (see
-Settings per repository):
+Settings per repository); `mergeMethod`, `issueSpec`, `mergeWatchMinutes` and `jiraProject` are set there only:
 
 | Option | Default | |
 | --- | --- | --- |
@@ -590,7 +693,7 @@ Settings per repository):
 | `stepTimeoutMinutes` | 30 | hard cap on one agent step |
 | `routineRoundMinutes` | 3 | soft active-time target for a round |
 | `waitCapMinutes` | 20 | longest a round waits for reviewers |
-| `quietMinutes` | 3 | quiet period that ends collection without a roster |
+| `quietMinutes` | 3 | quiet period that ends collection with no required checks, no pending review requests and no roster |
 
 ## Migrating from codex-gate 0.3.1
 

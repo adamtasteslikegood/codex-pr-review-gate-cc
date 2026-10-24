@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { dropQueued, holdingPrompts, mergeNotes, patch, say } from '../hooks/round'
+import { jiraAdvice } from '../hooks/lifecycle'
+import { dropQueued, holdingPrompts, mergeNotes, patch, say, ticketIn } from '../hooks/round'
 
 test('R81: a note merges into a prompt of the same batch and record only', async () => {
   const a = { root: '/repo', branch: 'feat/x' }
@@ -81,4 +82,36 @@ test('gate R4-5: a stop run during another command\'s hold drops that command\'s
   await holdingPrompts($, async () => say($, key, 'pr-gate: a fresh prompt'))
   await flush()
   expect(sent).toEqual(['pr-gate: a fresh prompt'])
+})
+
+test('A9.7: acli search answers as an array, or an object holding it under issues or values; any other shape is a failed search', async () => {
+  const title = 'G2-1 Critical [P1] Token logged (#1, feat/x)'
+  const items = [{ key: 'KAN-9', fields: { summary: `${title} more` } }, { key: 'KAN-12', fields: { summary: title } }]
+  expect(ticketIn(JSON.stringify(items), title)).toEqual({ key: 'KAN-12' })
+  expect(ticketIn(JSON.stringify({ issues: items, total: 2 }), title)).toEqual({ key: 'KAN-12' })
+  expect(ticketIn(JSON.stringify({ values: items }), title)).toEqual({ key: 'KAN-12' })
+  // A list with no exact summary: nothing found, and the caller files the ticket.
+  expect(ticketIn(JSON.stringify({ issues: [items[0]] }), title)).toEqual({})
+  expect(ticketIn('[]', title)).toEqual({})
+  // Anything else files nothing: the next pass searches again.
+  for (const other of ['{"issues":"KAN-12"}', '{"key":"KAN-12"}', '"KAN-12"', 'null', 'not json', '']) {
+    expect(ticketIn(other, title)).toEqual({ error: 'acli did not answer with a list of work items' })
+  }
+  // A malformed key is never taken.
+  expect(ticketIn(JSON.stringify([{ key: 'kan-12', fields: { summary: title } }]), title)).toEqual({})
+  // A set of summaries (PR #28 review): the ticket an earlier attempt filed at another peak is found by any of them.
+  expect(ticketIn(JSON.stringify(items), ['G2-1 Critical [P1] other', title])).toEqual({ key: 'KAN-12' })
+  expect(ticketIn(JSON.stringify(items), ['G2-1 Critical [P1] other'])).toEqual({})
+})
+
+test('A9.7 ruling (b): a missing acli is told to install it, unauthorized to log in, and anything else gets only acli\'s words', async () => {
+  const install = 'Install acli (the Atlassian CLI), then run acli jira auth login. '
+  expect(jiraAdvice('acli could not be started (spawn acli ENOENT)')).toBe(install)
+  expect(jiraAdvice('exec: "acli": executable file not found in $PATH')).toBe(install)
+  expect(jiraAdvice('fork/exec /usr/bin/acli: no such file or directory')).toBe(install)
+  expect(jiraAdvice('sh: acli: command not found')).toBe(install)
+  expect(jiraAdvice("unauthorized: use 'acli [product] auth login' to authenticate")).toBe('Run acli jira auth login. ')
+  expect(jiraAdvice('Error: the Jira site answered 502 Bad Gateway')).toBe('')
+  // A description that could not be written is not acli's fault, whatever the file system said.
+  expect(jiraAdvice("could not write the ticket's description to /repo/.git/x.txt: ENOENT: no such file or directory")).toBe('')
 })

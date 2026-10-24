@@ -200,7 +200,8 @@ test('#11: rereviewEffort is never above the tier\'s starting effort', { options
   expect(argsOf(w)).toBe("review --model 'gpt-6-luna' --effort medium")
 })
 
-test('#11: the post-PR Codex fallback re-review runs at rereviewEffort', async ($, on) => {
+// Machine load: 2 engine steps, no real wait (spec §7.3).
+test('#11: the post-PR Codex fallback re-review runs at rereviewEffort', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))

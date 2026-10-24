@@ -244,3 +244,14 @@ A post waiver covers its head: it ends review holds for it and sets aside, by na
 Reuse the existing review execution, session hooks, commands, and UI where practical. The main change is lifecycle ownership and accounting.
 
 No new hosting service, replacement CI pipeline, fixed reviewer roster, or separate project-management layer is needed.
+
+## Amended in pr-lifecycle 1.5.0 (wave 2b)
+
+- **One round is one head (R88).** A post-PR round reviews one head. A push ends it at the end of the turn that pushed. Only a round with a new blocking finding, a Codex rejection, or a fix the agent reports in it (amendment A8) draws on the allowance.
+- **Collection (R89).** It waits for the base's required checks, the PR's requested reviews and the roster; the quiet window only when none exists.
+- **Settling (R92).** Deferrals get Codex's check. When the review can do no more, findings still holding the merge get GitHub issues, except security; the issue settles them.
+- **The merge (R93).** When no review finding holds the merge, the agent merges with the repository's `mergeMethod`. The gate then checks that every follow-up issue is open (reopening it, or filing it again when it is missing or cannot be reopened) before it archives the record.
+- **A merge outside the gate (R95).** A PR merged on the website, through a connector or under `waive post` is seen without a command: a watcher reads every record with no run every `mergeWatchMinutes`, and a session start reads every record under the repository's root. The gate then files an issue for each non-security finding still holding, and says no fix round ran, or names the post waiver. A finding the person waived by id is not filed.
+- **Security and Jira (R95).** A security finding is never filed in a GitHub issue. With `jiraProject` set it gets a Jira Bug through `acli`, kept as `jiraTicket`. A ticket never settles the finding: before a merge only the person's waiver releases it. At a merge outside the gate, a finding with a ticket counts as tracked and the record is archived; one without blocks until the person waives it (`/pr-gate waive <id>`, or `<branch>:<id>`).
+
+See `docs/superpowers/specs/2026-10-21-pr-lifecycle-wave2b-design.md`.
