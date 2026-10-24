@@ -7122,7 +7122,7 @@ test('PR #28 review: a lost Jira create, then an issueSpec change on the base: t
   const was = w.acli.tickets[0]?.summary ?? ''
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.jiraSummaries).toEqual([was])
   // The base now names a spec in every title: no title the retry computes is the one Jira has.
-  w.git.roster = JIRA.replace('}', ',"issueSpec":"docs/spec.md"}')
+  w.git.roster = JSON.stringify({ ...(JSON.parse(JIRA) as object), issueSpec: 'docs/spec.md' })
   w.acli.create = 'ok'
   await say($, 'resume')
   await w.clock.advance(1000)
