@@ -6207,7 +6207,7 @@ test('PR #28 review: after a reset, a finding of the same id whose POST is lost 
   noUnknownId(w)
 })
 
-test('#29: a second checkout of the same PR, same generation, never takes the first checkout\'s issue for its own finding of that id', async ($, on) => {
+test('#29: a record with a different lifecycle id, same PR, generation and finding id, never takes the issue marked with the first id', async ($, on) => {
   const w = world(on)
   w.gh.issueAnswer = 'lost'
   await toTriage($, w, 'Consider renaming this')
