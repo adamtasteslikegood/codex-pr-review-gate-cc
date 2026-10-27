@@ -98,7 +98,7 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
     - the stored record still has no `lifecycleId`;
     - `w.gh.issues` has length 0.
 
-    Then `resume`. Assert one issue, and that its body contains `lc ${(await recordOf(w)).lifecycleId}` (the saved id equals the mark sent). Note in a comment how the run reports the failed save (hold or stop), as observed.
+    Then `resume`. Assert one issue. Take its mark's UUID with `/<!-- pr-gate filing: G2-1 of #1 lc ([0-9a-f-]{36}) -->/` and assert `expect(sent).toBe((await recordOf(w)).lifecycleId)`, an exact equality, not a substring. Note in a comment how the run reports the failed save (hold or stop), as observed.
   - **Mutation check (not committed):** in `withLifecycleId`, first return `{ ...rec, lifecycleId: newLifecycleId() }` without saving, then wrap the `updateRecord` in a `try`/`catch` that carries on. Each change must make the test above fail. Restore the code, and record both failures in the task's commit message.
   - `'#29: a new session and a resume keep the lifecycle id'`. Get to triage, read the id, call `w.clearState()` and `say($, 'resume')`. Assert the id is unchanged.
   - `'#29: a reset archives the old lifecycle with its id; the live record gets a new one'`. After `say($, 'reset')`, find the key matching `/^lifecycle:\/repo:feat\/x:archived:/`. Assert that its `lifecycleId` is the old one, and that the live record's id is defined and different.
