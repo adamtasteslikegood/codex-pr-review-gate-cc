@@ -71,6 +71,7 @@ import {
   markVerified,
   mergeFindings,
   mergeHolds,
+  newLifecycleId,
   newRecord,
   nextIds,
   mayAcknowledge,
@@ -117,7 +118,7 @@ import {
   titleOf,
   untrackedSecurity,
 } from './lifecycle'
-import type { Allowances, MergeKind, Next, TicketItem, TriageClass } from './lifecycle'
+import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
 import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
@@ -3534,8 +3535,25 @@ async function markSent(
   return saved === undefined || isGone ? 'gone' : isSecret ? 'secret' : 'sent'
 }
 
-async function fileOnce($: Engine, rec: LifecycleRecord, merged: MergeKind | undefined): Promise<LifecycleRecord | undefined> {
-  if ((rec.phase === 'pre' && merged === undefined) || rec.pr === undefined) return rec
+/**
+ * The record with its lifecycle id (#29), saved under the lock first for a record from before ids: every mark a pass writes or
+ * looks for names it. Undefined when the lifecycle was reset or replaced meanwhile.
+ */
+async function withLifecycleId($: Engine, rec: LifecycleRecord): Promise<WithId | undefined> {
+  if (rec.lifecycleId !== undefined) return { ...rec, lifecycleId: rec.lifecycleId }
+  let id: string | undefined
+  await updateRecord($, rec.root, rec.branch, latest => {
+    if (latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)) return latest
+    id = latest.lifecycleId ?? newLifecycleId()
+    return latest.lifecycleId === undefined ? { ...latest, lifecycleId: id } : latest
+  })
+  return id === undefined ? undefined : { ...rec, lifecycleId: id }
+}
+
+async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | undefined): Promise<LifecycleRecord | undefined> {
+  if ((given.phase === 'pre' && merged === undefined) || given.pr === undefined) return given
+  const rec = await withLifecycleId($, given)
+  if (rec === undefined) return undefined
   const now = await $.clock.now()
   const { config: c } = await configFor($, rec.root, rec.base)
   const plan = planIssues(rec, now, c.issueSpec, merged, c.jiraProject !== undefined)
@@ -3838,7 +3856,9 @@ export type MergeCheck = { moved: true } | { moved?: undefined; failed: string[]
  * change, and after the last read, the record is read afresh: one reset or replaced since ends the check with `moved` (A6).
  * Never through a PR-create command line (spec §5.9).
  */
-export async function checkIssuesAfterMerge($: Engine, rec: LifecycleRecord): Promise<MergeCheck> {
+export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): Promise<MergeCheck> {
+  const rec = await withLifecycleId($, given)
+  if (rec === undefined) return { moved: true }
   const failed: string[] = []
   const lines: LogEntry[] = []
   const touched = new Map<string, Finding>()
