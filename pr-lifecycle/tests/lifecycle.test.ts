@@ -928,7 +928,8 @@ test('R92: a deferral owed Codex holds as Codex\'s; one Codex refused is open; a
   expect(decideNext(postRec({ findings: [p2] }))).toMatchObject({ kind: 'blocked', issues: ['G2-1'] })
 })
 
-const postRec = (over: object = {}) => at([post({ endHead: 'a' })], { phase: 'post', pr: 7, ...over })
+// A fixed lifecycle id (#29): the filing pass plans only for a record that has one.
+const postRec = (over: object = {}) => ({ ...at([post({ endHead: 'a' })], { phase: 'post', pr: 7, ...over }), lifecycleId: 'lc-7' })
 
 test('R79: the standing lists every finding that holds the merge, each with its owner and release', async () => {
   const rec = postRec({

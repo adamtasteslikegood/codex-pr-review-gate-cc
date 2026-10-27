@@ -5,9 +5,12 @@ import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } f
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
 import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, newRecord, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
+import type { WithId } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
+/** No issue the gate filed carries a filing mark with an unknown lifecycle id (#29). */
+const noUnknownId = (w: ReturnType<typeof world>): void => expect(w.gh.issues.filter(one => (one.body ?? '').includes(' lc ?'))).toEqual([])
 const fixed = (id: string, note = 'done') => `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id, action: 'fixed', note }] })}`
 
 test('several reviewers in one cycle consume one round', async ($, on) => {
@@ -5673,8 +5676,9 @@ test('wave 2b final review I1: a gate round refused in the lock because a waiver
     id: 'R7-1', round: 7, source: 'codex-review', reviewer: 'codex', severity: 'P1', title: 'Unvalidated redirect in login', file: 'src/app.ts',
     line: 12, headSeen: head, status: 'open', history: [],
   }
-  const spent: LifecycleRecord = {
+  const spent: WithId = {
     ...rec,
+    lifecycleId: rec.lifecycleId ?? 'none',
     postStatus: undefined,
     message: undefined,
     allowance: 4,
@@ -6155,6 +6159,7 @@ test('PR #28 review: a lost issue POST, then a peak rise before the retry: the i
   expect(edit).toContain('--title G2-1 Critical [P1]')
   expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
   expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  noUnknownId(w)
 })
 
 test('PR #28 review: an issue a lost POST filed before the filing mark is still found by its title at the peak it was filed at', async ($, on) => {
@@ -6173,6 +6178,7 @@ test('PR #28 review: an issue a lost POST filed before the filing mark is still 
   expect(w.gh.filed).toHaveLength(1)
   expect(w.gh.labelled.some(one => one.startsWith('issue edit 21 ') && one.includes('--add-label severity:P0'))).toBe(true)
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P0' })
+  noUnknownId(w)
 })
 
 test('PR #28 review: after a reset, a finding of the same id whose POST is lost never takes the earlier lifecycle\'s issue', async ($, on) => {
@@ -6198,6 +6204,7 @@ test('PR #28 review: after a reset, a finding of the same id whose POST is lost 
   expect(w.gh.issues).toHaveLength(2)
   expect(w.gh.issues.at(-1)?.body).toContain('<!-- pr-gate filing: G2-1 of #1 lc after-reset -->')
   expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${old} `))).toBe(false)
+  noUnknownId(w)
 })
 
 test('#29: a second checkout of the same PR, same generation, never takes the first checkout\'s issue for its own finding of that id', async ($, on) => {
@@ -6223,6 +6230,7 @@ test('#29: a second checkout of the same PR, same generation, never takes the fi
   expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${first?.number} `))).toBe(false)
   expect(w.gh.issues[1]?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 lc ${b.lifecycleId} -->`)
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.followUp).toBe(`#${w.gh.issues[1]?.number}`)
+  noUnknownId(w)
 })
 
 test('#29: a reset gives the next lifecycle a new id', async ($, on) => {
@@ -6233,6 +6241,7 @@ test('#29: a reset gives the next lifecycle a new id', async ($, on) => {
   await say($, 'reset')
   expect((await recordOf(w)).lifecycleId).toBeDefined()
   expect((await recordOf(w)).lifecycleId).not.toBe(before)
+  noUnknownId(w)
 })
 
 test('#29: a record from before lifecycle ids gets one at its first filing pass, and its issue is marked with it', async ($, on) => {
@@ -6245,6 +6254,7 @@ test('#29: a record from before lifecycle ids gets one at its first filing pass,
   const id = (await recordOf(w2)).lifecycleId
   expect(id).toBeDefined()
   expect(w2.gh.issues[0]?.body).toContain(`lc ${id} -->`)
+  noUnknownId(w2)
 })
 
 test('PR #28 review: an issue with a filing mark of no generation, or of another, is never matched by title either', async ($, on) => {

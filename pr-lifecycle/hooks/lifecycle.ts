@@ -59,6 +59,9 @@ export function rescope(rec: LifecycleRecord, tier: Tier, why: string, a: Allowa
 /** A fresh lifecycle id (#29): random, so no two checkouts or lifecycles share one. */
 export const newLifecycleId = (): string => crypto.randomUUID()
 
+/** A record whose lifecycle id is known (#29): every filing mark names one, so no mark is ever written with an unknown id. */
+export type WithId = LifecycleRecord & { lifecycleId: string }
+
 export function newRecord(init: {
   root: string
   branch: string
@@ -835,11 +838,11 @@ export const FILING_MARK = '<!-- pr-gate filing:'
  * issue (#29). Earlier marks, by generation or with neither, are never matched: a POST lost just before the upgrade may file its
  * issue once more, never take another lifecycle's.
  */
-export const filingMark = (id: string, rec: Pick<LifecycleRecord, 'pr' | 'lifecycleId'>): string =>
-  `${FILING_MARK} ${id} of #${rec.pr ?? '?'} lc ${rec.lifecycleId ?? '?'} -->`
+export const filingMark = (id: string, rec: Pick<WithId, 'pr' | 'lifecycleId'>): string =>
+  `${FILING_MARK} ${id} of #${rec.pr ?? '?'} lc ${rec.lifecycleId} -->`
 
 /** A GitHub issue's body: the shared body (`issueBody`), then its filing mark. A Jira ticket's description is the body without it. */
-export const githubBody = (f: Finding, rec: Pick<LifecycleRecord, 'pr' | 'findings' | 'lifecycleId'>, merged?: MergeKind): string =>
+export const githubBody = (f: Finding, rec: Pick<WithId, 'pr' | 'findings' | 'lifecycleId'>, merged?: MergeKind): string =>
   `${issueBody(f, rec, merged)}\n\n${filingMark(f.id, rec)}`
 
 /**
@@ -1424,7 +1427,7 @@ export type IssuePlan = { kind: 'none' } | { kind: 'grant'; grant: Grant; late: 
  * (`gateGrant`); else an issue for each held finding it files (`isFileable`). `isJira`: the base sets `jiraProject`, and each security
  * finding left waiting for the person (`isTicketable`), or every one still holding at a merge, that has no ticket gets one (§5.13.7).
  */
-export function planIssues(rec: LifecycleRecord, at: number, spec?: string, merged?: MergeKind, isJira = false): IssuePlan {
+export function planIssues(rec: WithId, at: number, spec?: string, merged?: MergeKind, isJira = false): IssuePlan {
   const isMerged = merged !== undefined
   if (isMerged) {
     // The PR merged outside the gate (spec §5.13.1): no round can run, so no grant; every finding still holding is filed now.

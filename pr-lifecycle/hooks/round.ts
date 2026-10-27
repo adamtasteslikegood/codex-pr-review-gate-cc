@@ -118,7 +118,7 @@ import {
   titleOf,
   untrackedSecurity,
 } from './lifecycle'
-import type { Allowances, MergeKind, Next, TicketItem, TriageClass } from './lifecycle'
+import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
 import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
@@ -3539,8 +3539,8 @@ async function markSent(
  * The record with its lifecycle id (#29), saved under the lock first for a record from before ids: every mark a pass writes or
  * looks for names it. Undefined when the lifecycle was reset or replaced meanwhile.
  */
-async function withLifecycleId($: Engine, rec: LifecycleRecord): Promise<LifecycleRecord | undefined> {
-  if (rec.lifecycleId !== undefined) return rec
+async function withLifecycleId($: Engine, rec: LifecycleRecord): Promise<WithId | undefined> {
+  if (rec.lifecycleId !== undefined) return { ...rec, lifecycleId: rec.lifecycleId }
   let id: string | undefined
   await updateRecord($, rec.root, rec.branch, latest => {
     if (latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)) return latest
