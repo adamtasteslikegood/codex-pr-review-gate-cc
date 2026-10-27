@@ -45,7 +45,7 @@
 1. **A real second root.** The existing test swaps the id under `lifecycle:/repo:feat/x`. Two roots means two keys and one fake GitHub, with A's record left untouched. *(Task 2)*
 2. **A failed id save.** If the migration's `saveRecord` throws, the filing pass must send no POST, and a later pass must still file once with an id. *(Task 2)*
 3. **A mark with `lc ?`.** `filingMark` falls back to `?` when the id is missing. Make that a type error, and assert that no fake issue body ever contains `lc ?`. *(Task 1)*
-4. **Takeover and resume keep the id.** A new session (`w.clearState()`) followed by `resume` must not change `lifecycleId`. *(Task 2)*
+4. **Takeover and resume keep the id.** A different session must take ownership through the real session-start path, then `resume` without changing `lifecycleId`; clearing run state alone is not a new session. *(Task 2)*
 5. **Archived history keeps the id.** The `:archived:<at>` copy carries the old id, and the live seed carries a new one. *(Task 2)*
 
 ---
@@ -100,7 +100,7 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
 
     Then `resume`. Assert one issue. Take its mark's UUID with `/<!-- pr-gate filing: G2-1 of #1 lc ([0-9a-f-]{36}) -->/` and assert `expect(sent).toBe((await recordOf(w)).lifecycleId)`, an exact equality, not a substring. Note in a comment how the run reports the failed save (hold or stop), as observed.
   - **Mutation check (not committed):** in `withLifecycleId`, first return `{ ...rec, lifecycleId: newLifecycleId() }` without saving, then wrap the `updateRecord` in a `try`/`catch` that carries on. Each change must make the test above fail. Restore the code, and record both failures in the task's commit message.
-  - `'#29: a new session and a resume keep the lifecycle id'`. Get to triage, read the id, call `w.clearState()` and `say($, 'resume')`. Assert the id is unchanged.
+  - `'#29: a new session and a resume keep the lifecycle id'`. Follow the existing #13 interactive takeover test in `flow.test.ts`: get to triage, save the lifecycle id and current owner, clear run state, set a different `w.sessionId`, and emit `$.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)` to reset the cached session identity. Check that a recent owner's record is not automatically taken. Advance the fake clock through the required owner-staleness interval (the existing test uses 121_000 ms), then start a fresh interactive session with another distinct id. Assert the stored `:owner` session id changed to that session, and the persisted lifecycle id is unchanged both after takeover and after `say($, 'resume')`. `w.clearState()` alone does not change the session, and assigning `w.sessionId` alone does not reset `round.ts`'s cached `me`.
   - `'#29: a reset archives the old lifecycle with its id; the live record gets a new one'`. After `say($, 'reset')`, find the key matching `/^lifecycle:\/repo:feat\/x:archived:/`. Assert that its `lifecycleId` is the old one, and that the live record's id is defined and different.
 - [ ] **Step 3:** `npm run test`. Expected: the new tests pass on c9790da's code plus Task 1. A test that fails here is a real gap in option A: fix it in `round.ts` and say so in the commit.
 - [ ] **Step 4:** Commit: `test(pr-lifecycle): #29 two roots, a failed id save, resume and archive keep the id`.
@@ -131,7 +131,8 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
 
 ### Fixed inputs
 
-- **Seam.** `pr-lifecycle/hooks/store.ts`: `loadRecord`, `saveRecord`, `archiveRecord`, `updateRecord`, `upsertRecord` and `lockRecord`. `lockRecord`'s per-process promise chain is what a DO's single-threaded storage would replace. Option A's `lifecycleId` becomes the DO's key material, so none of A is thrown away.
+- **Seam.** Audit all of `pr-lifecycle/hooks/store.ts`: record operations (`loadRecord`, `saveRecord`, `archiveRecord`, `updateRecord`, `upsertRecord`, `lockRecord`), ownership (`ownerOf`, `setOwner`) and discovery/history (`liveRecords`, `latestArchive`). Connect the adapter to the controller's claim, heartbeat, takeover and ownership checks, not just record reads/writes. Explicitly define which backend supplies discovery and archived history.
+- **Atomic mutation boundary.** The existing `lockRecord` serializes load → arbitrary async callback → save within one client process. Separate remote load/save calls do not preserve that contract merely because a DO is single-threaded. The spike must define server-side atomic mutations or revision/CAS commits that reject or safely reconcile stale updates, including any interleaving around external awaits. Decide how client callbacks map to that boundary; do not automatically retry callbacks with external side effects. Option A's `lifecycleId` remains identity/key material within the per-PR shared state.
 - **Shared tooling, not a mandate.** One Worker serves many repositories, and one DO is keyed by canonical `owner/repo#pr`. A repository opts in through `.github/pr-gate.json`, read from the base branch like every other per-repo setting. Without it, the local store stays as it is. Nothing assumes one issue tracker or one source of truth for all of Adam's projects, and nothing forbids one.
 - **One human principal for now:** GitHub login `adamtasteslikegood`, which owns the Cloudflare account and signs in with Google using Adam's tasteslikegood.org address. Agents act as that person; there is no second human.
 - **What A doesn't cover and B must:** a crash after a POST still needs exact-mark reconciliation, because a claim alone isn't enough (spec). There is also no atomic remote create.
@@ -148,7 +149,7 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
 
 ### Spike steps
 
-- [ ] Write the adapter interface over `store.ts`'s six functions, with the local implementation behind it and no behavior change. This one piece may land early as a refactor PR with all tests green.
-- [ ] Prototype the DO under Miniflare or `wrangler dev`, locally only, with `updateRecord` semantics, a filing ledger and a lease. Exercise it against `world.ts` through the adapter.
+- [ ] Write the adapter interface after auditing the record, ownership, discovery and archive operations above, with the local implementation behind it and no behavior change. Trace `claimRecord`, `isOwnedElsewhere`, heartbeat and takeover through this boundary. This one piece may land early as a refactor PR with all tests green; it must not silently leave ownership or history on a different backend.
+- [ ] Prototype the DO under Miniflare or `wrangler dev`, locally only, with the explicit atomic mutation boundary, a filing ledger and a lease. Add a deterministic two-client read/modify/write interleaving test: both read revision R, one commits, and the stale second commit is rejected or safely reconciled without losing either accepted update. Exercise two independent controller clients against the same PR through the adapter; verify claim, heartbeat and takeover obey the selected R74/lease policy and a non-owner cannot dispatch work. Include discovery and archive retrieval checks. Lease duration/fencing policy remains Adam's decision; a standalone ledger/lease test is not a substitute for controller integration.
 - [ ] Measure the latency of a hook round trip against today's local lock, and the request count per lifecycle against the prepaid Workers plan.
 - [ ] Write the design doc with the measurements and the decisions above, for Adam's review.
