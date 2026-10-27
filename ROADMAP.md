@@ -184,6 +184,14 @@ in live use, makes a hold on a chained command say nothing in it ran.
 
 The lanes item moved to wave 2c.
 
+**Follow-up (1.5.1): a filing identity unique across checkouts (#29, option A).**
+From PR #28's review: a second checkout of the same PR could adopt the first's
+issue after a lost POST answer. Each lifecycle gets a random id, which goes in
+the filing mark. Built on `fix/29-lifecycle-id`. Spec:
+`docs/superpowers/specs/2026-10-24-lifecycle-filing-identity-design.md`. Plan:
+`docs/superpowers/plans/2026-10-27-pr-lifecycle-filing-identity.md`. Option B,
+a shared Durable Object store, is evaluated with wave 3 item 2.
+
 ### Wave 2c: parallel fixers in lanes
 
 1. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate
@@ -209,6 +217,9 @@ Serves goal 2. Makes the gate legible and reachable from anywhere.
    - Subcommands accept a `#<pr>` argument.
    - The merge guard resolves the PR being merged, not the checked-out branch.
    - Subcommands resolve "the current branch" the same way.
+   - Decided together with #27 (resume across worktrees) and #29 option B (one
+     Durable Object per `owner/repo#pr`, behind `store.ts`): all three are
+     one PR seen from many checkouts. See the #29 plan's Part B.
 3. **Archive when the PR merges (finding 14).** The record is archived when the
    merge is seen, not at the next command.
 4. **The shared account (findings 16, 25) (done in 1.5.0, R91).** Adam, Codex
