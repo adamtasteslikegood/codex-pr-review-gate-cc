@@ -46,6 +46,8 @@ export type World = {
     locals: string[]
     /** The session is outside any checkout: `rev-parse --show-toplevel` fails wherever it runs. */
     isOutside: boolean
+    /** The checkout's root, as `rev-parse --show-toplevel` answers it: a second checkout of the same PR has its own (#29). */
+    toplevel: string
     /** How many `git fetch` calls fail from now on, each with `fetchError` on stderr. */
     fetchFails: number
     fetchError: string
@@ -220,6 +222,11 @@ export type World = {
   afterRead?: (key: string, n: number) => void
   /** Awaited before each store read, with its key: a test holds a step at a read until it lets it go. */
   beforeRead?: (key: string) => void | Promise<void>
+  /**
+   * Called before each store write with its key, the new value and the value it replaces: true fails the write and stores nothing.
+   * A test makes it one-shot itself, since a failure on every write to a key would hide which write mattered (PR #30 review G1-2).
+   */
+  failSet?: (key: string, value: unknown, prior: unknown) => boolean
 }
 
 export const runOf = async (w: World): Promise<Run> => w.run as Run
@@ -272,6 +279,7 @@ export function world(on: On): World {
       shadow: '',
       locals: [],
       isOutside: false,
+      toplevel: '/repo',
       fetchFails: 0,
       fetchError: 'fatal: unable to access origin: Could not resolve host: github.com',
       fetches: [],
@@ -331,6 +339,7 @@ export function world(on: On): World {
     return { value }
   })
   on('store.set', (_$, e) => {
+    if (w.failSet?.(e.key, e.value, w.store.get(e.key)) === true) throw new Error('store write failed')
     w.store.set(e.key, e.value)
     return { value: undefined }
   })
@@ -559,7 +568,7 @@ export function world(on: On): World {
       for (const one of e.argv.slice(2)) w.files.delete(one)
       return out('')
     }
-    if (args.startsWith('rev-parse --absolute-git-dir')) return out('/repo/.git\n')
+    if (args.startsWith('rev-parse --absolute-git-dir')) return out(`${w.git.toplevel}/.git\n`)
     if (args.startsWith('fetch')) {
       w.git.fetches.push(args)
       await w.git.onFetch?.()
@@ -579,7 +588,7 @@ export function world(on: On): World {
       return out(file, file === '' ? 128 : 0)
     }
     // Outside a checkout (`cd /tmp && ...`), git finds no repository.
-    if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out('/repo\n')
+    if (args.startsWith('rev-parse --show-toplevel')) return e.init?.cwd === '/tmp' || w.git.isOutside ? out('', 128) : out(`${w.git.toplevel}\n`)
     if (args.startsWith('rev-parse --abbrev-ref')) return out(`${w.git.branch}\n`)
     if (args.startsWith('rev-parse --verify --quiet refs/heads/')) {
       const name = args.slice('rev-parse --verify --quiet refs/heads/'.length)
