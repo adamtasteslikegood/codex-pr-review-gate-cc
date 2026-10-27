@@ -82,7 +82,7 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
 - Test: `pr-lifecycle/tests/flow.test.ts` (next to the existing `#29` tests, about line 6203)
 
 **Interfaces:**
-- Produces in `world.ts`: `w.git.toplevel: string` (default `'/repo'`), which `rev-parse --show-toplevel` and `rev-parse --absolute-git-dir` (`${toplevel}/.git`) answer with. Also `w.failSet?: (key: string) => boolean`: when it returns true, the `store.set` handler throws `new Error('store write failed')` and stores nothing.
+- Produces in `world.ts`: `w.git.toplevel: string` (default `'/repo'`), which `rev-parse --show-toplevel` and `rev-parse --absolute-git-dir` (`${toplevel}/.git`) answer with. Also `w.failSet?: (key: string, value: unknown, prior: unknown) => boolean`: when it returns true, the `store.set` handler throws `new Error('store write failed')` and stores nothing. A test makes it one-shot itself. It is never a failure on every write to a key, because `markSent` (`round.ts:3688`) writes the same key before the POST and would hide a missing id save (PR #30 review, G1-2).
 
 - [ ] **Step 1: Add the two world options.** With both unset, every existing test must behave the same. Run `npm run test` to confirm.
 - [ ] **Step 2: Write the tests.**
@@ -93,7 +93,13 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
     - the stored record at A's key deep-equals its value before B ran;
     - B's issue body contains `lc ${B's id}`;
     - `noUnknownId(w)`.
-  - `'#29: a failed id save on a record from before ids sends no issue POST, and the next pass files once with an id'`. Use a legacy record (no `lifecycleId`) and set `w.failSet = k => k === KEY` before the filing pass. Assert `w.gh.issues` has length 0. Then clear `failSet` and `resume`. Assert one issue, whose body contains `lc ${(await recordOf(w)).lifecycleId}`. Note in a comment how the run reports the failed save (hold or stop), as observed.
+  - `'#29: a failed id save on a record from before ids sends no issue POST, and the next pass files once with an id'`. Use a legacy record (no `lifecycleId`). Before the filing pass, set a one-shot `failSet` that matches only the migration write: `key === KEY`, `prior` has no `lifecycleId`, `value` has one, and the hook hasn't fired yet. Set `fired = true` when it matches. All other writes go through. Assert:
+    - `fired` is true;
+    - the stored record still has no `lifecycleId`;
+    - `w.gh.issues` has length 0.
+
+    Then `resume`. Assert one issue, and that its body contains `lc ${(await recordOf(w)).lifecycleId}` (the saved id equals the mark sent). Note in a comment how the run reports the failed save (hold or stop), as observed.
+  - **Mutation check (not committed):** in `withLifecycleId`, first return `{ ...rec, lifecycleId: newLifecycleId() }` without saving, then wrap the `updateRecord` in a `try`/`catch` that carries on. Each change must make the test above fail. Restore the code, and record both failures in the task's commit message.
   - `'#29: a new session and a resume keep the lifecycle id'`. Get to triage, read the id, call `w.clearState()` and `say($, 'resume')`. Assert the id is unchanged.
   - `'#29: a reset archives the old lifecycle with its id; the live record gets a new one'`. After `say($, 'reset')`, find the key matching `/^lifecycle:\/repo:feat\/x:archived:/`. Assert that its `lifecycleId` is the old one, and that the live record's id is defined and different.
 - [ ] **Step 3:** `npm run test`. Expected: the new tests pass on c9790da's code plus Task 1. A test that fails here is a real gap in option A: fix it in `round.ts` and say so in the commit.
