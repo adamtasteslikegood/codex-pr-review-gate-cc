@@ -134,22 +134,43 @@ Work in the `/home/allisone/Projects/pr-gate-wave2b` worktree, on branch `fix/29
 - **Seam.** Audit all of `pr-lifecycle/hooks/store.ts`: record operations (`loadRecord`, `saveRecord`, `archiveRecord`, `updateRecord`, `upsertRecord`, `lockRecord`), ownership (`ownerOf`, `setOwner`) and discovery/history (`liveRecords`, `latestArchive`). Connect the adapter to the controller's claim, heartbeat, takeover and ownership checks, not just record reads/writes. Explicitly define which backend supplies discovery and archived history.
 - **Atomic mutation boundary.** The existing `lockRecord` serializes load → arbitrary async callback → save within one client process. Separate remote load/save calls do not preserve that contract merely because a DO is single-threaded. The spike must define server-side atomic mutations or revision/CAS commits that reject or safely reconcile stale updates, including any interleaving around external awaits. Decide how client callbacks map to that boundary; do not automatically retry callbacks with external side effects. Option A's `lifecycleId` remains identity/key material within the per-PR shared state.
 - **Shared tooling, not a mandate.** One Worker serves many repositories, and one DO is keyed by canonical `owner/repo#pr`. A repository opts in through `.github/pr-gate.json`, read from the base branch like every other per-repo setting. Without it, the local store stays as it is. Nothing assumes one issue tracker or one source of truth for all of Adam's projects, and nothing forbids one.
-- **One human principal for now:** GitHub login `adamtasteslikegood`, which owns the Cloudflare account and signs in with Google using Adam's tasteslikegood.org address. Agents act as that person; there is no second human.
 - **What A doesn't cover and B must:** a crash after a POST still needs exact-mark reconciliation, because a claim alone isn't enough (spec). There is also no atomic remote create.
 
-### Decisions for Adam (each with the fact that decides it)
+### Identity and access (Adam, 2026-10-27, on PR #30)
 
-1. **Auth from a hook.** (a) The Worker checks the GitHub token the hook already has through `gh` (`GET /user`, login on an allowlist). No new credential is needed, but every call carries a GitHub token. (b) Cloudflare Access with Google as the identity provider for the person, and an Access service token for hooks. This is a new secret on each machine, but the login stays separate from GitHub. Deciding fact: whether Plaza and other consumers already sit behind Access.
-2. **Offline or Worker down.** Fall back to the local store with A's ids, or hold the round. Deciding fact: how often hooks run without network (cloud sessions do, by policy).
-3. **Driver lease.** The lease length, whether it is fenced (a token checked on each write), and how it maps to R74's 2-minute takeover.
-4. **Retry identity.** The claim key `lifecycleId:findingId:attempt`, and when `attempt` advances.
-5. **Retention and migration.** How long filing results stay, and whether existing local records are pushed up or left alone.
-6. **Where the code lives.** A `pr-lifecycle-relay/` Worker in this repo, or a shared package Plaza also uses. Its relation to Plaza's DomainSessionStore: separate, per the spec.
-7. **Scope with wave 3 item 2 and #27.** Whether "records by PR" is built on the DO or locally first.
+"One user" in the design meant *who authenticates to the store today*. It never meant that other people or identities can't hold access, or privileged access, later. So:
+
+- **Allowlist of principals.** Every caller is a named principal (a person or a machine identity) with its own rights. Today the list holds Adam alone: GitHub login `adamtasteslikegood`, with Google sign-in through his tasteslikegood.org address on the Cloudflare account. Adding a principal is a configuration change, not a redesign. No code may assume a single user.
+- **Authentication: Cloudflare Access with service tokens.** People sign in through Access with Google as the identity provider. Each machine or agent gets its own Access service token, which can be revoked without touching any other. A GitHub token alone is not a credential to the store.
+- **Non-human actors get scoped identities of their own.** Codex, CI, cloud sessions and Plaza each have a service identity limited to the repositories and operations they need. They never act as Adam. Every write to the store records which principal made it.
+- **Repo-scoped grants from fixed presets.** A grant names a principal, a repository, and one of two presets: `read` (records, history, the filing ledger) or `operate` (also claim a lease, mutate the record, record filings). Grants are managed in configuration in v1. Custom roles and delegated administration are deferred.
+- **Admin is a separate capability.** Breaking another checkout's lease, deleting or rewriting filing records, and changing grants are admin-only. Admin is not a preset and doesn't come with `operate`. Only Adam's human identity holds it at first; no service principal holds it.
+- **Enforced on the server.** The Worker or DO checks the caller's grant on every call, in the same atomic step as the lease and revision checks. A client never decides its own permissions. Every change records the authenticated principal that made it.
+- **The spike tests it:**
+  - a principal with no grant is refused;
+  - `read` can't mutate;
+  - `operate` on repo X can't touch repo Y;
+  - a service principal can't run an admin operation;
+  - revoking one token leaves the others working;
+  - each write records its actor.
+
+### Decided (Adam, 2026-10-27)
+
+- **Offline or Worker down:** fall back to the local store with A's ids, and say so in the run log. Nothing coordinates across checkouts meanwhile, but a round never stalls on the network.
+- **Where the code lives:** a `pr-lifecycle-relay/` Worker in this repository, versioned with the adapter. Other projects call the deployed Worker. It stays separate from Plaza's DomainSessionStore, per the spec.
+
+### Decisions still open (each with the fact that decides it)
+
+1. **Driver lease.** The lease length, whether it is fenced (a token checked on each write), and how it maps to R74's 2-minute takeover.
+2. **Retry identity.** The claim key `lifecycleId:findingId:attempt`, and when `attempt` advances.
+3. **Retention and migration.** How long filing results stay, and whether existing local records are pushed up or left alone.
+4. **Scope with wave 3 item 2 and #27.** Whether "records by PR" is built on the DO or locally first.
+5. **Grant configuration.** Which file or binding holds the v1 grants (a Worker config versioned in this repo, or Access policy groups mirrored in it), and how a change to them is reviewed.
 
 ### Spike steps
 
 - [ ] Write the adapter interface after auditing the record, ownership, discovery and archive operations above, with the local implementation behind it and no behavior change. Trace `claimRecord`, `isOwnedElsewhere`, heartbeat and takeover through this boundary. This one piece may land early as a refactor PR with all tests green; it must not silently leave ownership or history on a different backend.
 - [ ] Prototype the DO under Miniflare or `wrangler dev`, locally only, with the explicit atomic mutation boundary, a filing ledger and a lease. Add a deterministic two-client read/modify/write interleaving test: both read revision R, one commits, and the stale second commit is rejected or safely reconciled without losing either accepted update. Exercise two independent controller clients against the same PR through the adapter; verify claim, heartbeat and takeover obey the selected R74/lease policy and a non-owner cannot dispatch work. Include discovery and archive retrieval checks. Lease duration/fencing policy remains Adam's decision; a standalone ledger/lease test is not a substitute for controller integration.
+- [ ] Add the identity checks listed under "Identity and access" to the local prototype. Use stand-ins for Access's identity headers; no Access application is created.
 - [ ] Measure the latency of a hook round trip against today's local lock, and the request count per lifecycle against the prepaid Workers plan.
 - [ ] Write the design doc with the measurements and the decisions above, for Adam's review.
