@@ -4,10 +4,13 @@ import type { TestBody } from 'claude-code/testing'
 import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
-import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
+import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, newRecord, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
+import type { WithId } from '../hooks/lifecycle'
 import type { Finding, FindingEvent, LifecycleRecord } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
+/** No issue the gate filed carries a filing mark with an unknown lifecycle id (#29). */
+const noUnknownId = (w: ReturnType<typeof world>): void => expect(w.gh.issues.filter(one => (one.body ?? '').includes(' lc ?'))).toEqual([])
 const fixed = (id: string, note = 'done') => `Fixed.\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id, action: 'fixed', note }] })}`
 
 test('several reviewers in one cycle consume one round', async ($, on) => {
@@ -5673,8 +5676,9 @@ test('wave 2b final review I1: a gate round refused in the lock because a waiver
     id: 'R7-1', round: 7, source: 'codex-review', reviewer: 'codex', severity: 'P1', title: 'Unvalidated redirect in login', file: 'src/app.ts',
     line: 12, headSeen: head, status: 'open', history: [],
   }
-  const spent: LifecycleRecord = {
+  const spent: WithId = {
     ...rec,
+    lifecycleId: rec.lifecycleId ?? 'none',
     postStatus: undefined,
     message: undefined,
     allowance: 4,
@@ -6139,7 +6143,7 @@ test('PR #28 review: a lost issue POST, then a peak rise before the retry: the i
   await done($, accept('r2-verify', w))
   expect(w.gh.issues).toHaveLength(1)
   expect(w.gh.issues[0]?.title).toContain('G2-1 Major [P2]')
-  expect(w.gh.issues[0]?.body).toContain('<!-- pr-gate filing: G2-1 of #1 gen 0 -->')
+  expect(w.gh.issues[0]?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 lc ${(await recordOf(w)).lifecycleId} -->`)
   // The peak rises before the next pass: the title the retry would send is no longer the one GitHub filed.
   const held = await recordOf(w)
   w.store.set(KEY, { ...held, findings: held.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, peakSeverity: 'P1' })) })
@@ -6155,6 +6159,7 @@ test('PR #28 review: a lost issue POST, then a peak rise before the retry: the i
   expect(edit).toContain('--title G2-1 Critical [P1]')
   expect(rec.findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P1' })
   expect(rec.findings.find(one => one.id === 'G2-1')?.isIssueSent).toBeUndefined()
+  noUnknownId(w)
 })
 
 test('PR #28 review: an issue a lost POST filed before the filing mark is still found by its title at the peak it was filed at', async ($, on) => {
@@ -6173,6 +6178,7 @@ test('PR #28 review: an issue a lost POST filed before the filing mark is still 
   expect(w.gh.filed).toHaveLength(1)
   expect(w.gh.labelled.some(one => one.startsWith('issue edit 21 ') && one.includes('--add-label severity:P0'))).toBe(true)
   expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')).toMatchObject({ followUp: '#21', followUpLabel: 'P0' })
+  noUnknownId(w)
 })
 
 test('PR #28 review: after a reset, a finding of the same id whose POST is lost never takes the earlier lifecycle\'s issue', async ($, on) => {
@@ -6185,8 +6191,9 @@ test('PR #28 review: after a reset, a finding of the same id whose POST is lost 
   const old = w.gh.issues[0]?.number
   // What a reset leaves: the next lifecycle's generation, whose ids start again, and an unrelated finding that is G2-1 again, still
   // marked sent because its own POST's answer was lost too. Its title is the same, so only the mark tells the two apart.
+  // A reset's record is a new one (archiveLifecycle's seed), with a new lifecycle id.
   const held = await recordOf(w)
-  w.store.set(KEY, { ...held, generation: (held.generation ?? 0) + 1 })
+  w.store.set(KEY, { ...held, generation: (held.generation ?? 0) + 1, lifecycleId: 'after-reset' })
   w.gh.issueAnswer = 'ok'
   await say($, 'resume')
   await w.clock.advance(1000)
@@ -6195,8 +6202,162 @@ test('PR #28 review: after a reset, a finding of the same id whose POST is lost 
   expect(g?.followUp).toBeDefined()
   expect(g?.followUp).not.toBe(`#${old}`)
   expect(w.gh.issues).toHaveLength(2)
-  expect(w.gh.issues.at(-1)?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 gen ${(held.generation ?? 0) + 1} -->`)
+  expect(w.gh.issues.at(-1)?.body).toContain('<!-- pr-gate filing: G2-1 of #1 lc after-reset -->')
   expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${old} `))).toBe(false)
+  noUnknownId(w)
+})
+
+test('#29: a record with a different lifecycle id, same PR, generation and finding id, never takes the issue marked with the first id', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // Checkout A filed #21 for its G2-1 (an old cache problem); the answer was lost, so the issue is A's alone.
+  expect(w.gh.issues).toHaveLength(1)
+  const first = w.gh.issues[0]
+  const a = await recordOf(w)
+  // Checkout B: its own record of the same repository and PR, at the same generation, with an unrelated G2-1 of the same peak whose
+  // POST was sent and lost too. Its record is a fresh one, so its lifecycle id is its own.
+  const b = newRecord({ root: a.root, branch: a.branch, base: a.base, head: a.head ?? '', tier: a.tier, tierWhy: a.tierWhy, lane: a.lane, allowance: a.allowance, at: 1_000 })
+  expect(b.lifecycleId).not.toBe(a.lifecycleId)
+  w.store.set(KEY, { ...a, lifecycleId: b.lifecycleId, findings: a.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, title: 'Rename the retry flag', body: 'Rename the retry flag.' })) })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.issues).toHaveLength(2)
+  expect(w.gh.issues[0]).toEqual(first)
+  expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${first?.number} `))).toBe(false)
+  expect(w.gh.issues[1]?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 lc ${b.lifecycleId} -->`)
+  expect((await recordOf(w)).findings.find(one => one.id === 'G2-1')?.followUp).toBe(`#${w.gh.issues[1]?.number}`)
+  noUnknownId(w)
+})
+
+test('#29: a reset gives the next lifecycle a new id', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  const before = (await recordOf(w)).lifecycleId
+  expect(before).toBeDefined()
+  await say($, 'reset')
+  expect((await recordOf(w)).lifecycleId).toBeDefined()
+  expect((await recordOf(w)).lifecycleId).not.toBe(before)
+  noUnknownId(w)
+})
+
+test('#29: a record from before lifecycle ids gets one at its first filing pass, and its issue is marked with it', async ($, on) => {
+  const w2 = world(on)
+  await toTriage($, w2, 'Consider renaming this')
+  const { lifecycleId: _, ...legacy } = await recordOf(w2)
+  w2.store.set(KEY, legacy)
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w2))
+  const id = (await recordOf(w2)).lifecycleId
+  expect(id).toBeDefined()
+  expect(w2.gh.issues[0]?.body).toContain(`lc ${id} -->`)
+  noUnknownId(w2)
+})
+
+test('#29: two checkout roots of one PR, same generation and finding id: the second neither adopts nor edits the first\'s issue', async ($, on) => {
+  const w = world(on)
+  w.gh.issueAnswer = 'lost'
+  await toTriage($, w, 'Consider renaming this')
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // Checkout A filed its G2-1 and lost the answer: the issue is A's alone.
+  expect(w.gh.issues).toHaveLength(1)
+  const first = structuredClone(w.gh.issues[0])
+  const a = await recordOf(w)
+  const aStored = structuredClone(w.stored(KEY))
+  // Checkout B, another root of the same repository and PR: its own record, at the same generation, with an unrelated G2-1 of the
+  // same peak whose POST was sent and lost too. A fresh record, so its lifecycle id is its own.
+  w.git.toplevel = '/repo-b'
+  w.clearState()
+  const b = newRecord({ root: '/repo-b', branch: a.branch, base: a.base, head: a.head, tier: a.tier, tierWhy: a.tierWhy, lane: a.lane, allowance: a.allowance, at: 1_000 })
+  const KEY_B = 'lifecycle:/repo-b:feat/x'
+  w.store.set(KEY_B, {
+    ...a, root: '/repo-b', lifecycleId: b.lifecycleId,
+    findings: a.findings.map(f => (f.id !== 'G2-1' ? f : { ...f, title: 'Rename the retry flag', body: 'Rename the retry flag.' })),
+  })
+  w.gh.issueAnswer = 'ok'
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.issues).toHaveLength(2)
+  expect(w.gh.issues[0]).toEqual(first)
+  expect(w.gh.labelled.some(one => one.startsWith(`issue edit ${first?.number} `))).toBe(false)
+  expect(w.stored(KEY)).toEqual(aStored)
+  expect(w.gh.issues[1]?.body).toContain(`<!-- pr-gate filing: G2-1 of #1 lc ${b.lifecycleId} -->`)
+  expect((w.stored(KEY_B) as LifecycleRecord).findings.find(one => one.id === 'G2-1')?.followUp).toBe(`#${w.gh.issues[1]?.number}`)
+  noUnknownId(w)
+})
+
+test('#29: a failed id save on a record from before ids sends no issue POST, and the next pass files once with an id', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  const { lifecycleId: _, ...legacy } = await recordOf(w)
+  w.store.set(KEY, legacy)
+  // Only the write that saves the new id fails, once: markSent writes the same key before the POST, so failing every write to it
+  // would hide a missing id save (PR #30 review G1-2).
+  let fired = false
+  const has = (value: unknown): boolean => (value as LifecycleRecord | undefined)?.lifecycleId !== undefined
+  w.failSet = (key, value, prior) => {
+    if (fired || key !== KEY || has(prior) || !has(value)) return false
+    fired = true
+    return true
+  }
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P2', note: 'later', replyId: '992' }]))
+  await done($, accept('r2-verify', w))
+  // The failed save stops the run as an error of the gate itself (status 'error', a toast), with no POST; resume runs the pass again.
+  expect(fired).toBe(true)
+  expect((await recordOf(w)).lifecycleId).toBeUndefined()
+  expect(w.gh.issues).toHaveLength(0)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect(w.gh.issues).toHaveLength(1)
+  const sent = w.gh.issues[0]?.body?.match(/<!-- pr-gate filing: G2-1 of #1 lc ([0-9a-f-]{36}) -->/)?.[1]
+  expect(sent).toBe((await recordOf(w)).lifecycleId)
+  noUnknownId(w)
+})
+
+test('#29: a new session and a resume keep the lifecycle id', async ($, on) => {
+  const w = world(on)
+  w.git.roster = roster
+  await toPost($, w)
+  await w.clock.advance(1000)
+  const id = (await recordOf(w)).lifecycleId
+  expect(id).toBeDefined()
+  const owner = (w.stored(OWNER) as { sessionId: string }).sessionId
+  // An owner that beat moments ago keeps the record.
+  w.clearState()
+  w.sessionId = 'second'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe(owner)
+  // Two quiet minutes later, another session takes it over, and the lifecycle stays the same one.
+  await w.clock.advance(121_000)
+  w.clearState()
+  w.sessionId = 'third'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  await w.clock.advance(1000)
+  expect((w.stored(OWNER) as { sessionId: string }).sessionId).toBe('third')
+  expect((await recordOf(w)).lifecycleId).toBe(id)
+  await say($, 'resume')
+  await w.clock.advance(1000)
+  expect((await recordOf(w)).lifecycleId).toBe(id)
+  noUnknownId(w)
+})
+
+test('#29: a reset archives the old lifecycle with its id; the live record gets a new one', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider renaming this')
+  const before = (await recordOf(w)).lifecycleId
+  expect(before).toBeDefined()
+  await say($, 'reset')
+  const archived = [...w.store.keys()].filter(key => /^lifecycle:\/repo:feat\/x:archived:/.test(key))
+  expect(archived).toHaveLength(1)
+  expect((w.stored(archived[0] ?? '') as LifecycleRecord).lifecycleId).toBe(before)
+  const after = (await recordOf(w)).lifecycleId
+  expect(after).toBeDefined()
+  expect(after).not.toBe(before)
+  noUnknownId(w)
 })
 
 test('PR #28 review: an issue with a filing mark of no generation, or of another, is never matched by title either', async ($, on) => {

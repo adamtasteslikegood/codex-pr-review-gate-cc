@@ -184,10 +184,10 @@ in live use, makes a hold on a chained command say nothing in it ran.
 
 The lanes item moved to wave 2c.
 
-**Follow-up (1.5.1): a filing identity unique across checkouts (#29, option A).**
+**Follow-up (1.5.1): a filing identity unique across checkouts (#29, option A) (done in 1.5.1, R96).**
 From PR #28's review: a second checkout of the same PR could adopt the first's
 issue after a lost POST answer. Each lifecycle gets a random id, which goes in
-the filing mark. Built on `fix/29-lifecycle-id`. Spec:
+the filing mark, and a mark is never written without one. Spec:
 `docs/superpowers/specs/2026-10-24-lifecycle-filing-identity-design.md`. Plan:
 `docs/superpowers/plans/2026-10-27-pr-lifecycle-filing-identity.md`. Option B,
 a shared Durable Object store, is evaluated with wave 3 item 2.
