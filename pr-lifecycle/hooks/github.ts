@@ -92,6 +92,13 @@ export function readJsonList(text: string): unknown[] {
 
 const rows = (text: string): Row[] => readJsonList(text).filter((one): one is Row => typeof one === 'object' && one !== null)
 
+/**
+ * Whether a comment raises anything: it has words, and its verdict is not a settling one. A comment carries no review state, so
+ * the no-action read ran on reviews only and every "no changes needed" from the Independent Claude review or Codex's status note
+ * became a finding (discussion #15 items 30 and 33, Adam's ruling of 2026-10-27).
+ */
+const isCommentFinding = (body: string, kind: Feedback['kind']): boolean => body.trim() !== '' && !isNoAction(undefined, body, kind)
+
 export const readReviews = (text: string): Feedback[] =>
   rows(text).map(row => {
     const body = str(row.body) ?? ''
@@ -123,7 +130,7 @@ export const readInlineComments = (text: string): Feedback[] =>
     threadId: String(num(row.in_reply_to_id) ?? row.id),
     url: str(row.html_url),
     at: when(row.created_at),
-    isFinding: (str(row.body) ?? '').trim() !== '',
+    isFinding: isCommentFinding(str(row.body) ?? '', 'inline'),
     association: associationOf(row),
   }))
 
@@ -135,7 +142,7 @@ export const readIssueComments = (text: string): Feedback[] =>
     body: str(row.body) ?? '',
     url: str(row.html_url),
     at: when(row.created_at),
-    isFinding: (str(row.body) ?? '').trim() !== '',
+    isFinding: isCommentFinding(str(row.body) ?? '', 'comment'),
     association: associationOf(row),
   }))
 
@@ -224,7 +231,19 @@ export const postsFor = (login: string, name: string): boolean => {
   return stem === name || stem.startsWith(`${name}-`)
 }
 
-const SECURITY = /\b(security|injection|xss|csrf|ssrf|secret|credential|auth(entication|orization)? bypass|rce|path traversal)\b/i
+const SECURITY_WORD = '(?:security|injection|xss|csrf|ssrf|secret|credential|auth(?:entication|orization)? bypass|rce|path traversal)'
+const SECURITY = new RegExp(`\\b${SECURITY_WORD}\\b`, 'i')
+
+/**
+ * The same word under a negation, on its own line: "no touches to security/proxy/validation, auth", "no blocking correctness,
+ * security, regression findings". A review that says the security-sensitive paths were *not* touched is not a security finding
+ * (discussion #15 item 33, Adam 2026-10-27), so the flag comes from the claim, never from the word.
+ */
+const SECURITY_NEGATED = new RegExp(`\\b(?:no|not|never|without|nothing)\\b[^.\\n]{0,80}?\\b${SECURITY_WORD}\\b`, 'i')
+
+/** Whether the body raises security itself: every line that mentions it under a negation raises nothing. */
+const isSecurityClaim = (body: string): boolean =>
+  SECURITY.test(body) && !body.split('\n').filter(one => SECURITY.test(one)).every(one => SECURITY_NEGATED.test(one))
 
 /**
  * A reviewer's own advisory label at the start of the body (after a heading mark or list marker), never inside a sentence. Only the
@@ -241,7 +260,7 @@ const TAG = /\[P([0-3])\]|\(P([0-3])\)|\*\*P([0-3]):?\*\*|!\[P([0-3])[ _-]?Badge
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
-  const isSecurity = SECURITY.test(body)
+  const isSecurity = isSecurityClaim(body)
   // The most severe tag anywhere wins: one P1 in a list of advisories is a P1.
   const tags = [...body.matchAll(TAG)].map(one => Number(one.slice(1).find(each => each !== undefined)))
   if (tags.length > 0) return { severity: `P${Math.min(...tags)}` as Severity, isSecurity, isTagged: true }
@@ -258,30 +277,69 @@ export function severityHint(body: string): { severity: Severity; isSecurity: bo
   return { severity: isSecurity ? 'P1' : 'P2', isSecurity, isTagged: false }
 }
 
-/** Whole sentences that settle a review (R83). */
-const SCOPE = '(?: (?:in|for) this (?:[\\w/-]+ ){0,2}(?:diff|pr|pull request|changes?|commit|patch|update|revision))?'
+/**
+ * Whole sentences that settle a review (R83, widened by Adam's ruling of 2026-10-27 on discussion #15 item 33): the forms the
+ * reviewers in use actually write, each allowed the scope it reviewed and the head it reviewed it at.
+ */
+const SCOPE = '(?: (?:in|for|on) (?:this|the) (?:[\\w/-]+ ){0,3}(?:diff|pr|pull request|changes?|commit|patch|update|revision|delta))?'
+const AT_HEAD = '(?:[ ,]*(?:remain(?:s|ing)?|left)?[ ,]*(?:at|since|against|in) [`\'"]?[0-9a-f]{7,40}[`\'"]?(?:\\.\\.[0-9a-f]{7,40})?)?'
 const SETTLES = [
-  new RegExp(`^no (?:actionable|blocking) (?:findings|issues|comments)${SCOPE}$`, 'i'),
+  new RegExp(
+    `^(?:(?:follow-up )?review: )?no (?:actionable|blocking|further|additional) (?:findings|issues|comments|problems)${SCOPE}${AT_HEAD}$`,
+    'i',
+  ),
+  new RegExp(`^(?:(?:follow-up )?review: )?no (?:blocking )?(?:findings|issues) (?:remain|are left)${SCOPE}${AT_HEAD}$`, 'i'),
+  new RegExp(`^no (?:additional |further )?(?:branch )?changes?(?: is| are)? (?:needed|required)${SCOPE}${AT_HEAD}$`, 'i'),
+  new RegExp(`^nothing to (?:fix|change|do)${SCOPE}${AT_HEAD}$`, 'i'),
+  new RegExp(`^ready to merge${SCOPE}${AT_HEAD}$`, 'i'),
+  new RegExp(`^no actionable issues (?:were )?found${SCOPE}${AT_HEAD}$`, 'i'),
   /^(?:no issues found|nothing to fix|lgtm|looks good(?: to me)?|approved|ship it)$/i,
 ]
 /** Whole sentences that may sit beside them and change nothing. */
 const POLITE = [/^(?:thanks|thank you)$/i, /^reviewed [0-9a-f]{7,40}(?: against [\w./-]+)?$/i]
 
 /**
- * Whether a review says there is nothing to act on (R83): positive evidence only (review G2-2 on PR #19). Every sentence of the body
- * must be a no-action form, judged whole, never by the absence of request words (PR #19 review): "LGTM. Preserve the pending
- * findings." goes to triage. A COMMENTED review also needs one settling sentence. Inline comments are separate rows, triaged on their own.
+ * A sentence after the verdict that asks for a change: the one negative read the leading-verdict rule needs, so that
+ * "No blocking findings. However, the cache is never cleared." still goes to triage.
  */
-export function isNoAction(state: string | undefined, body: string): boolean {
-  if (state !== 'APPROVED' && state !== 'COMMENTED') return false
-  const sentences = body
-    .split(/[.!?;]+|\n+/)
+const REQUEST = new RegExp(
+  '\\b(?:please|should|must|need(?:s)? to|consider|suggest|recommend|prefer|add a|rename|remove|replace|fix|preserve' +
+    '|however|but |instead|missing|fails?|broken|leaks?|never (?:cleared|released|ends))\\b',
+  'i',
+)
+
+/**
+ * A body's sentences. A terminator counts only where whitespace or the end follows it, so a commit range the reviewer names in its
+ * verdict ("the delta since 61c98ff..8dba6cb") stays one sentence instead of splitting mid-range.
+ */
+const sentencesOf = (text: string): string[] =>
+  text
+    .split(/[.!?;]+(?=\s|$)|\n+/)
     .map(one => one.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
     .filter(one => one !== '')
-  if (sentences.length === 0) return true
+
+/** The verdict the body opens with: its first line that says anything, heading marks dropped, read as sentences. */
+const leadOf = (body: string): string[] => {
+  const line = body.split('\n').find(one => one.trim() !== '' && !one.trim().startsWith('<!--')) ?? ''
+  return sentencesOf(line.replace(/^#+\s*/, ''))
+}
+
+/**
+ * Whether a review or comment says there is nothing to act on (R83, as Adam ruled on 2026-10-27). The verdict is read from the line
+ * the body opens with, not from every sentence: a real review shows the validation it ran, and under the old rule none of the
+ * reviewers in use could ever settle (discussion #15 items 30 and 33). What follows the verdict is scanned for a request, so
+ * "No blocking findings. However, the cache is never cleared." still goes to triage. A COMMENTED review, and a comment with no
+ * state of its own, both need one settling sentence; a polite line alone settles nothing.
+ */
+export function isNoAction(state: string | undefined, body: string, kind: Feedback['kind'] = 'review'): boolean {
+  const isReview = kind === 'review'
+  if (isReview && state !== 'APPROVED' && state !== 'COMMENTED') return false
+  const lead = leadOf(body)
+  if (lead.length === 0) return isReview
   const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
-  if (!sentences.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
-  return state === 'APPROVED' || sentences.some(settles)
+  if (!lead.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
+  if (sentencesOf(body).slice(lead.length).some(one => REQUEST.test(one))) return false
+  return (isReview && state === 'APPROVED') || lead.some(settles)
 }
 
 export type CollectInput = {

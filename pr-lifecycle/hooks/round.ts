@@ -2196,8 +2196,10 @@ async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCo
     : prior
   const handed = new Set(run.handed ?? [])
   const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !(isMidCollect && handed.has(one.id)))
-  // A review that said there is nothing to act on settles on its own (R83): logged once, and processed so it is never asked about.
-  const settled = got.feedback.filter(one => one.kind === 'review' && !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
+  // Feedback that said there is nothing to act on settles on its own (R83): logged once, and processed so it is never asked about.
+  // Comments count too since the no-action read reached them (Adam's ruling of 2026-10-27), so a settling comment leaves the same
+  // approval event in the log as a settling review, and never silently disappears from the record.
+  const settled = got.feedback.filter(one => !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
   for (const one of settled) await logEvent($, run.root, run.branch, 'approval', `${one.reviewer}: ${one.body.split('\n')[0]?.slice(0, 120) ?? ''}`)
   if (settled.length > 0) {
     await updateRecord($, run.root, run.branch, one => ({ ...one, processed: [...new Set([...one.processed, ...settled.map(each => each.id)])] }))

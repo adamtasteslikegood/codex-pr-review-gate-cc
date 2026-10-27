@@ -1,6 +1,57 @@
 # Investigation: approvals held as P1/P2 findings (discussion #15, items 30, 32, 33)
 
-2026-10-27. Read-only investigation of pr-lifecycle 1.5.0. No code changed.
+2026-10-27. Investigation of pr-lifecycle 1.5.0, then Adam's ruling and the fix.
+
+## What shipped (Adam's ruling, 2026-10-27)
+
+Adam chose the leading-verdict rule over the narrower negation-only fix. Three
+changes, in `hooks/github.ts` and one line of `hooks/round.ts`:
+
+- `isNoAction` reads the verdict from the line the body opens with, and scans
+  what follows it for a request word, replacing R83's every-sentence rule. It
+  now takes a `kind`, so comments and inline comments are read too.
+- `SETTLES` covers the forms the reviewers in use write, each allowed its scope
+  and the head it names.
+- `severityHint` asks `isSecurityClaim`: a security word is ignored on a line
+  that negates it.
+- `round.ts` logs and processes a settling **comment** as it already did a
+  settling review, so the approval leaves an audit event either way.
+- `sentencesOf` splits on a terminator only where whitespace or the end follows
+  it. It split on any `.`, so a commit range in a verdict
+  (`the delta since 61c98ff..8dba6cb`) was cut in half and could not settle.
+  Found by the new tests, not by reading.
+
+Recorded as ruling R96 in
+`docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
+
+Checks: `npm run lint` clean, `claude plugin test pr-lifecycle` 693 pass /
+0 fail, `npm run validate` passed. `npm run typecheck` cannot run in this
+worktree: `pr-lifecycle/.claude-plugin/types/` is generated when a session
+loads the mod and is absent here, so tsc stops on TS2688/TS5083.
+
+No version bump: PR #31 is taking 1.5.1, so this needs 1.5.2 in
+`plugin.json`, the component README and the root README table once #31 merges.
+
+Measured on the same real bodies after the change: 6 of the 10 named approvals
+settle outright, and **0 of 10 still carry a security flag**. The 4 that remain
+findings are plain P2 non-security, so `mayAcknowledge` passes and they no
+longer hard-block the merge. Nothing that should be a finding started settling:
+across all 46 items only 7 settle, every one a genuine approval.
+
+### Why this is safe for the merge policy
+
+Adam's constraint (2026-10-27): an approval must never mark a blocking finding
+as fixed without an issue filed; the PR should merge once every blocking finding
+is either fixed or filed, with the issue as the proof.
+
+The settling path cannot do that. `isNoAction` only decides whether the review
+or comment **itself** becomes a finding; it never touches another finding's
+status. `markVerified` is called only by `codex` and the gate's own
+`fix-reviewer` (`round.ts:2775, 2781, 4226, 4408`), never by a reviewer's
+approval. And the change helps the policy: the fake security flags were the one
+thing keeping those findings off the filing path at all, since `isFileable`
+requires `!isSecurity`. With the flags gone they file as GitHub issues instead
+of needing a person-only waiver.
 
 Symptom, in Adam's words (discussion #15, items 30 and 33): reviews whose
 conclusion is "no blocking findings" or "no changes needed" are triaged as
@@ -127,10 +178,10 @@ Adam hit:
 
 ## Fixes, split by whether they need a ruling
 
-Three are mechanical; two more look mechanical but reverse a stated rule and
-need a ruling. All five live in `hooks/github.ts`.
+All five live in `hooks/github.ts`. Items 1, 2, 3 and 0a shipped under the
+ruling above; 0b was not needed once 3 landed.
 
-**Mechanical, no new behaviour decision:**
+**Shipped:**
 
 1. Call the no-action classifier on comments and inline comments too, with the
    `state` gate relaxed for the comment kinds.
@@ -141,20 +192,22 @@ need a ruling. All five live in `hooks/github.ts`.
 3. Make `SECURITY` negation-aware: a security word inside "no …", "not …",
    "no touches to …", "no changes to …" does not set the flag.
 
-**Needs Adam's ruling:**
+**Ruled on and shipped:**
 
-0a. **Judge the body by its conclusion, not by every sentence**, so a review
-   that lists the validation it ran can still settle. This reverses
-   `tests/github.test.ts:409` ("… No actionable findings in this roadmap-only
-   diff.\n\nScope: docs only." asserted *not* no-action) and with it R83's
-   positive-evidence-only rule, whose comment cites PR #19 review G2-2. A
-   conclusion-scoped read (the last non-empty sentence, plus an explicit
-   "Conclusion:" line where one exists) keeps "LGTM but fix X" out, but the rule
-   change is Adam's.
+0a. **Judge the body by the verdict it leads with, not by every sentence**, so a
+   review that lists the validation it ran can still settle. Reverses
+   `tests/github.test.ts:409` and with it R83's positive-evidence-only rule.
+   A conclusion-scoped read was tried first and measured: it settled only 2 of
+   10 real approvals, because these bodies end in a signature line
+   ("— Independent Claude review …") or an unrelated note ("GitHub checks are
+   re-running"). The verdict leads these bodies; it does not close them.
+
+**Not needed:**
+
 0b. **Stop defaulting an untagged body to a security P1.** `github.ts:255` says
    a security hint never drops below P2 unless the reviewer tagged it, and the
-   P1 fall-through is deliberate. Fix 3 removes most of the need for this, so it
-   may not be wanted at all.
+   P1 fall-through is deliberate. With the negation fix in, 0 of 10 approvals
+   carry a security flag, so this was left alone.
 
 A. **Peak for a hint-sourced severity.** Should `applyAnswer` let the peak fall
    to the agent's answer when `severitySource === 'hint'` and no reviewer tag or

@@ -405,8 +405,9 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
   expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
   expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
-  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
-  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+  // The verdict leads the body, and what follows it is scanned for a request (Adam's ruling of 2026-10-27, discussion #15 item 33).
+  // This case was asserted false while the whole body had to be no-action forms: a scope note asks for nothing, so it settles now.
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
   expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
   expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
   expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
@@ -424,6 +425,38 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   // A severity tag or a strong word means there is something to act on.
   expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
   expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+})
+
+test('item 33: the forms the reviewers in use write settle, with the head they name and the validation they show', async () => {
+  // Every one of these was triaged as a finding by 1.5.0 on cookbook PRs 3785, 3748 and 3749.
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `8dba6cb`.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `6f53e1a`.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No further findings in the delta since 61c98ff..8dba6cb.')).toBe(true)
+  expect(isNoAction(undefined, 'No changes needed.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'No changes needed on this delta.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'Ready to merge; no actionable issues were found.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'No additional branch change is needed.', 'comment')).toBe(true)
+  // A review that shows the validation it ran still settles: the lines after the verdict ask for nothing.
+  const shown = 'No blocking findings.\n\n- strict harness plan QA: 24 tasks, 0 blockers\n- all 200 harness tests passed\n- Prettier passed'
+  expect(isNoAction('COMMENTED', shown)).toBe(true)
+  // A comment carries no state of its own, and still needs a settling verdict, not only a polite line.
+  expect(isNoAction(undefined, 'Thanks!', 'comment')).toBe(false)
+  expect(isNoAction(undefined, '', 'comment')).toBe(false)
+  // A request after the verdict still goes to triage, however the verdict reads.
+  expect(isNoAction(undefined, 'No changes needed.\n\nHowever, the cache is never cleared.', 'comment')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `8dba6cb`.\n\nPlease rename the flag.')).toBe(false)
+})
+
+test('item 33: a security word under a negation raises no security finding', async () => {
+  // The Independent Claude review's own words on cookbook PR 3785, rated a security P1 by 1.5.0.
+  expect(severityHint('Mechanical, internally consistent, no code paths in auth/proxy/validation/CI/deps - nothing to fix.').isSecurity).toBe(false)
+  expect(severityHint('No touches to security/proxy/validation, auth, Dockerfiles, CI, or dependency manifests.').isSecurity).toBe(false)
+  expect(severityHint('Conclusion: no blocking correctness, security, regression, testing, or maintainability findings.').isSecurity).toBe(false)
+  expect(severityHint('No application, authentication, proxy, dependency, deployment, or runtime code changes in this PR.').isSecurity).toBe(false)
+  // A real claim still raises it, including one that sits beside a negated line.
+  expect(severityHint('The token leaks into the logs: a credential in plain text.').isSecurity).toBe(true)
+  expect(severityHint('No changes to CI.\n\nThe session secret is logged on every request.').isSecurity).toBe(true)
+  expect(severityHint('**P1** SQL injection').isSecurity).toBe(true)
 })
 
 test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {
