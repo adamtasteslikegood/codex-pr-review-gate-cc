@@ -10,6 +10,27 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-24-lifecycle-filing-identity-design.md` (Adam's design, saved verbatim). The source is issue #29.
 
+## Implementation status (2026-10-27)
+
+Part A is implemented on [PR #31](https://github.com/adamtasteslikegood/codex-pr-review-gate-cc/pull/31)
+at [dacbb82](https://github.com/adamtasteslikegood/codex-pr-review-gate-cc/commit/dacbb82d176796b52cf31c85456fbe5931e3b61f)
+as pr-lifecycle 1.5.1; the PR was still open when this note was written.
+The task checkboxes and input-commit discussion below preserve the original plan,
+not the current implementation status. The linked design remains Adam's verbatim
+proposal; this note does not rewrite that historical text.
+
+[CI run 40594242724](https://github.com/adamtasteslikegood/codex-pr-review-gate-cc/actions/runs/40594242724)
+passed lint, the real plugin harness (codex-gate 22 tests and pr-lifecycle 698 tests),
+and validation for that implementation head. CI explicitly skipped typechecking
+because generated host types were absent; the PR reports an author's local
+typecheck pass, not an independently rerun check here.
+The [pre-merge review](https://github.com/adamtasteslikegood/codex-pr-review-gate-cc/pull/31#pullrequestreview-5675735777)
+records the implementation and remaining boundaries.
+
+Part B remains a design spike: this PR does not implement or deploy a shared store.
+The full shared-store decision document and the open decisions below remain future
+work under #29; Part A does not close those decisions or issue #27.
+
 ## Where #29 fits
 
 - **Wave 2b shipped** as PR #28 (pr-lifecycle 1.5.0, rulings R88-R95, merged 2026-10-22). #29 came out of that PR's review (thread on `lifecycle.ts:834`, P2). It is a correctness bug in 2b's "issues instead of waivers" (R92): a lost POST answer can settle a finding against another checkout's issue.
