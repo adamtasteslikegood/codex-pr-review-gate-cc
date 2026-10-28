@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import { createPr, done, isHeld, P1, P2, review, RUN, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
 import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, newRecord, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
 import type { WithId } from '../hooks/lifecycle'
-import type { Finding, FindingEvent, LifecycleRecord } from '../types'
+import type { Finding, FindingEvent, LifecycleRecord, Run } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
 /** No issue the gate filed carries a filing mark with an unknown lifecycle id (#29). */
@@ -1966,10 +1966,23 @@ test('a main step whose turn never started times out saying so', { options: { st
 /** A tool call the fixer sub-agent makes: the engine names it by its id. */
 const fixerCall = ($: Parameters<TestBody>[0], agentId = 'agent-2') => $.tool.call({ tool: 'Bash', command: 'npm test', agentId } as never)
 
-/** The fixer's answer, naming its step: the engine gave the test's sub-agents no id, so the step is how a late answer is known. */
+/**
+ * The test host gives a spawned sub-agent no id, as a hook answering without `next` leaves none: each run written is given the id
+ * core would have given its fixer sub-agent, `agent-2`, so its calls and its answer are known as its own (R99).
+ */
+const nameFixer = (on: Parameters<TestBody>[1]): void => {
+  on('state.set', RUN, (_$, e, next) => {
+    const run = e.value as Run | null
+    const named = run?.pending.map(each => (each.role === 'fix' && each.isMain !== true && each.agentId === undefined ? { ...each, agentId: 'agent-2' } : each))
+    return next(run === null || named === undefined ? e : { ...e, value: { ...run, pending: named } })
+  })
+}
+
+/** The fixer's answer, naming its step. */
 const lateFixed = (id: string) => `Fixed.\n${TRAILER}\n${JSON.stringify({ step: 'r1-fix', dispositions: [{ id, action: 'fixed', note: 'done' }] })}`
 
 test('R99: a fixer sub-agent still making tool calls is not stopped at the step limit, only at three limits', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
@@ -1989,6 +2002,7 @@ test('R99: a fixer sub-agent still making tool calls is not stopped at the step 
 })
 
 test('R99: a quiet fixer sub-agent is stopped at the step limit, and the agent is told with its next step', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
@@ -2013,6 +2027,7 @@ test('R99: a main-agent step that times out is told to the agent too', { options
 })
 
 test('R99 (#26): a fixer that finishes after the step timeout keeps its answers, and a resume has Codex check them', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }]), 'agent-1'))
@@ -2038,6 +2053,7 @@ test('R99 (#26): a fixer that finishes after the step timeout keeps its answers,
 })
 
 test('R99: a late fixer answer after a reset is dropped', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
@@ -2049,6 +2065,7 @@ test('R99: a late fixer answer after a reset is dropped', { options: { stepTimeo
 })
 
 test('R99: a late fixer answer after a resume started another run is not the new run\'s', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
   const w = world(on)
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
@@ -2059,6 +2076,25 @@ test('R99: a late fixer answer after a resume started another run is not the new
   await done($, turn(lateFixed('R1-1'), 'agent-2'))
   expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
   expect((await runOf(w)).id).toBe(run.id)
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
+})
+
+test('R99: a fixer with no id from the engine is not kept alive by another sub-agent\'s calls, and its late answer is not taken', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  expect((await runOf(w)).phase).toBe('fix')
+  for (let i = 0; i < 3; i += 1) {
+    await w.clock.advance(25_000)
+    await fixerCall($, 'agent-other')
+  }
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.late).toBeUndefined()
+  expect(w.prompts.at(-1) ?? '').not.toContain('If the fixer still finishes')
+  // An answer naming the stopped step is no proof it is this fixer's: it is not applied.
+  await done($, turn(lateFixed('R1-1'), 'agent-other'))
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
   expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
 })
 

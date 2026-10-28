@@ -798,7 +798,7 @@ export function startTicker($: Engine): void {
           await noteAttempt($, run, why)
           const ended = await finish($, run.id, 'error', why, true)
           // The stop is told to the agent, with its next step, as a hold is (R99): a toast alone left it waiting on a run that had ended.
-          if (ended !== null) await say($, ended, timeoutPrompt(ended, why, fixer !== undefined))
+          if (ended !== null) await say($, ended, timeoutPrompt(ended, why, fixer?.agentId !== undefined))
         }
       }
     })().catch(() => undefined)
@@ -819,28 +819,31 @@ export async function awaitsLate($: Engine, agentId: string | undefined): Promis
 
 /**
  * A tool call of the fixer sub-agent in flight restarts its quiet clock (R99); written at most every 10 s. Where the engine gave
- * the fixer no id, any sub-agent's call counts: the ceiling still ends the step.
+ * the fixer no id, no call is known to be its own, so none counts: another sub-agent's must not keep the step alive.
  */
 export async function noteSeen($: Engine, run: Run, agentId: string): Promise<void> {
   const fixer = fixerOf(run)
-  if (fixer === undefined || (fixer.agentId !== undefined && fixer.agentId !== agentId)) return
+  if (fixer?.agentId === undefined || fixer.agentId !== agentId) return
   const now = await $.clock.now()
   if (now - (fixer.seenAt ?? 0) < 10_000) return
   await patch($, run.id, one => ({ ...one, pending: one.pending.map(each => (each.step === fixer.step ? { ...each, seenAt: now } : each)) }))
 }
 
-/** Before a step timeout ends the run: the fixer it stops, and the lifecycle it worked on, so a late answer can be matched (R99). */
+/**
+ * Before a step timeout ends the run: the fixer it stops, and the lifecycle it worked on, so a late answer can be matched (R99).
+ * Only a fixer the engine gave an id: a step name is shared by every run's round, so it cannot tell this fixer's answer from another's.
+ */
 async function keepLate($: Engine, run: Run, fixer: Pending): Promise<void> {
+  const agentId = fixer.agentId
+  if (agentId === undefined) return
   const rec = await loadRecord($, run.root, run.branch)
-  const agent = fixer.agentId === undefined ? {} : { agentId: fixer.agentId }
   const id = rec?.lifecycleId === undefined ? {} : { lifecycleId: rec.lifecycleId }
-  const late = { step: fixer.step, round: run.round, lifecycle: run.lifecycle, generation: rec?.generation ?? 0, ...agent, ...id }
+  const late = { step: fixer.step, round: run.round, lifecycle: run.lifecycle, generation: rec?.generation ?? 0, agentId, ...id }
   await patch($, run.id, one => ({ ...one, late }))
 }
 
-/** Whether a sub-agent's answer is the stopped fixer's (R99): by the id the engine gave it, else by the step its trailer names. */
-const isLateOf = (late: NonNullable<Run['late']>, agentId: string | undefined, answer: string): boolean =>
-  agentId !== undefined && (late.agentId !== undefined ? late.agentId === agentId : readTrailer(answer)?.step === late.step)
+/** Whether a sub-agent's answer is the stopped fixer's (R99): by the id the engine gave it, and only by that. */
+const isLateOf = (late: NonNullable<Run['late']>, agentId: string | undefined): boolean => agentId !== undefined && late.agentId === agentId
 
 /** What the agent is told when a step timeout ended the run (R99): what stopped, and how the gate goes on. */
 function timeoutPrompt(run: Run, why: string, isFixer: boolean): string {
@@ -4579,7 +4582,7 @@ export async function onAnswer($: Engine, agentId: string | undefined, answer: s
   if (agentId === undefined && turnId === mainTurn) mainTurn = undefined
   const run = await getRun($)
   // A fixer the step timeout stopped finished after all (R99): its answer is kept, never dropped.
-  if (run !== null && run.status !== 'running' && run.late !== undefined && isLateOf(run.late, agentId, answer)) {
+  if (run !== null && run.status !== 'running' && run.late !== undefined && isLateOf(run.late, agentId)) {
     await takeLate($, run, answer, reason)
     return
   }

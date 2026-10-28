@@ -374,10 +374,10 @@ export type Run = {
   endedAt?: number
   message?: string
   /**
-   * Set when a step timeout stopped a fixer sub-agent (R99): its id (none where the engine gave none), its step and the lifecycle
-   * it worked on, so its answer, if it still comes, is kept on the record instead of dropped.
+   * Set when a step timeout stopped a fixer sub-agent the engine gave an id (R99): that id, its step and the lifecycle it worked
+   * on, so its answer, if it still comes, is kept on the record instead of dropped.
    */
-  late?: { agentId?: string; step: string; round: number; lifecycle: 'pre' | 'post'; generation: number; lifecycleId?: string }
+  late?: { agentId: string; step: string; round: number; lifecycle: 'pre' | 'post'; generation: number; lifecycleId?: string }
 }
 
 /** A CI check on a PR head, by gh's bucket (pass, fail, cancel, pending, skipping), and whether the base requires it (R86). */
