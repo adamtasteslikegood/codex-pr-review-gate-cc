@@ -47,6 +47,7 @@ test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', a
   w.git.head = 'd'.repeat(40)
   await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r1-fix', dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
   expect(w.spawned.at(-1)?.prompt).toContain('R1-2 [P1] Second')
+  expect(w.spawned.at(-1)?.prompt).toMatch(/R1-1 \[P1\] Unvalidated redirect[^\n]*\n\s+reported-fixed, verification owed/)
   await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], held: ['R1-2'] })))
   const rec = await recordOf(w)
   expect(rec.findings.map(one => [one.id, one.status])).toEqual([
