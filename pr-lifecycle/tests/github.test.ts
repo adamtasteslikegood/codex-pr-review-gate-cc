@@ -405,8 +405,9 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.')).toBe(true)
   expect(isNoAction('COMMENTED', '## No blocking findings 🎉')).toBe(true)
   expect(isNoAction('APPROVED', 'Thanks!')).toBe(true)
-  // The whole body must be no-action forms (PR #19 review): any other sentence goes to triage, request word or not.
-  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(false)
+  // The verdict leads the body, and what follows it is scanned for a request (Adam's ruling of 2026-10-27, discussion #15 item 33).
+  // This case was asserted false while the whole body had to be no-action forms: a scope note asks for nothing, so it settles now.
+  expect(isNoAction('COMMENTED', 'Reviewed 1d4fa73 against main. No actionable findings in this roadmap-only diff.\n\nScope: docs only.')).toBe(true)
   expect(isNoAction('COMMENTED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
   expect(isNoAction('APPROVED', 'LGTM. Preserve the pending findings before archiving.')).toBe(false)
   expect(isNoAction('COMMENTED', 'LGTM. Reset still deletes pending findings.')).toBe(false)
@@ -424,6 +425,78 @@ test('R83: only positive no-action evidence settles a review (review G2-2)', asy
   // A severity tag or a strong word means there is something to act on.
   expect(isNoAction('COMMENTED', 'No blocking findings; one P2 note inline.')).toBe(false)
   expect(isNoAction('CHANGES_REQUESTED', 'LGTM')).toBe(false)
+})
+
+test('item 33: the forms the reviewers in use write settle, with the head they name and the validation they show', async () => {
+  // Every one of these was triaged as a finding by 1.5.0 on cookbook PRs 3785, 3748 and 3749.
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `8dba6cb`.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `6f53e1a`.')).toBe(true)
+  expect(isNoAction('COMMENTED', 'No further findings in the delta since 61c98ff..8dba6cb.')).toBe(true)
+  expect(isNoAction(undefined, 'No changes needed.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'No changes needed on this delta.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'Ready to merge; no actionable issues were found.', 'comment')).toBe(true)
+  expect(isNoAction(undefined, 'No additional branch change is needed.', 'comment')).toBe(true)
+  // A review that shows the validation it ran still settles: the lines after the verdict ask for nothing.
+  const shown = 'No blocking findings.\n\n- strict harness plan QA: 24 tasks, 0 blockers\n- all 200 harness tests passed\n- Prettier passed'
+  expect(isNoAction('COMMENTED', shown)).toBe(true)
+  // A comment carries no state of its own, and still needs a settling verdict, not only a polite line.
+  expect(isNoAction(undefined, 'Thanks!', 'comment')).toBe(false)
+  expect(isNoAction(undefined, '', 'comment')).toBe(false)
+  // A request after the verdict still goes to triage, however the verdict reads.
+  expect(isNoAction(undefined, 'No changes needed.\n\nHowever, the cache is never cleared.', 'comment')).toBe(false)
+  expect(isNoAction('COMMENTED', 'No blocking findings remain at `8dba6cb`.\n\nPlease rename the flag.')).toBe(false)
+})
+
+test('PR #32 review: a severity the reviewer tagged after a settling verdict is a finding, through every reader', async () => {
+  const tagged = 'No blocking findings.\n\n[P1] The reset deletes pending findings.'
+  for (let i = 0; i < 2; i++) {
+    // Twice over: a global tag regex would keep its position between calls and miss the tag on the second.
+    expect(isNoAction('COMMENTED', tagged)).toBe(false)
+    expect(isNoAction('APPROVED', tagged)).toBe(false)
+    expect(isNoAction(undefined, tagged, 'comment')).toBe(false)
+    expect(isNoAction(undefined, tagged, 'inline')).toBe(false)
+  }
+  expect(isNoAction('COMMENTED', 'No blocking findings.\n\n- P2: the flag is never read')).toBe(false)
+  expect(isNoAction('COMMENTED', 'Ready to merge.\n\n**P3** typo in the README')).toBe(false)
+  const at = '1970-01-01T00:01:00Z'
+  const [review] = readReviews(JSON.stringify([{ id: 1, user: { login: 'a' }, body: tagged, state: 'COMMENTED', commit_id: 'h', submitted_at: at }]))
+  const [comment] = readIssueComments(JSON.stringify([{ id: 2, user: { login: 'a' }, body: tagged, created_at: at }]))
+  const [inline] = readInlineComments(JSON.stringify([{ id: 3, user: { login: 'a' }, body: tagged, path: 'x.ts', line: 1, created_at: at }]))
+  expect([review?.isFinding, comment?.isFinding, inline?.isFinding]).toEqual([true, true, true])
+  // A genuine multi-line approval with no tag still settles in all three.
+  const plain = 'No blocking findings.\n\n- all 700 tests passed\n- lint clean'
+  const [r2] = readReviews(JSON.stringify([{ id: 4, user: { login: 'a' }, body: plain, state: 'COMMENTED', commit_id: 'h', submitted_at: at }]))
+  const [c2] = readIssueComments(JSON.stringify([{ id: 5, user: { login: 'a' }, body: plain, created_at: at }]))
+  const [i2] = readInlineComments(JSON.stringify([{ id: 6, user: { login: 'a' }, body: plain, path: 'x.ts', line: 1, created_at: at }]))
+  expect([r2?.isFinding, c2?.isFinding, i2?.isFinding]).toEqual([false, false, false])
+})
+
+test('item 33: a security word under a negation raises no security finding', async () => {
+  // The Independent Claude review's own words on cookbook PR 3785, rated a security P1 by 1.5.0.
+  expect(severityHint('Mechanical, internally consistent, no code paths in auth/proxy/validation/CI/deps - nothing to fix.').isSecurity).toBe(false)
+  expect(severityHint('No touches to security/proxy/validation, auth, Dockerfiles, CI, or dependency manifests.').isSecurity).toBe(false)
+  expect(severityHint('Conclusion: no blocking correctness, security, regression, testing, or maintainability findings.').isSecurity).toBe(false)
+  expect(severityHint('No application, authentication, proxy, dependency, deployment, or runtime code changes in this PR.').isSecurity).toBe(false)
+  // A real claim still raises it, including one that sits beside a negated line.
+  expect(severityHint('The token leaks into the logs: a credential in plain text.').isSecurity).toBe(true)
+  expect(severityHint('No changes to CI.\n\nThe session secret is logged on every request.').isSecurity).toBe(true)
+  expect(severityHint('**P1** SQL injection').isSecurity).toBe(true)
+  // A negated mitigation is the hole itself, and a denial covers only its own sentence (PR #32 review).
+  expect(severityHint('[P1] No escaping is performed, allowing SQL injection.').isSecurity).toBe(true)
+  expect(severityHint('Without a CSRF token the form is open to forged posts.').isSecurity).toBe(true)
+  expect(severityHint('No security issues in the UI. The API leaks a secret.')).toEqual({ severity: 'P1', isSecurity: true, isTagged: false })
+  expect(severityHint('No security issues found, but the reset path leaks a credential.').isSecurity).toBe(true)
+  // The negation has to govern the list the security word is in, not merely share a sentence with "changes" (PR #32 review).
+  expect(severityHint('[P1] No validation of credential changes is performed.')).toEqual({ severity: 'P1', isSecurity: true, isTagged: true })
+  expect(severityHint('No security check guards credential changes.').isSecurity).toBe(true)
+  expect(severityHint('No style issues, the secret is logged.').isSecurity).toBe(true)
+  expect(severityHint('No changes to CI, the secret is logged in plain text.').isSecurity).toBe(true)
+  expect(severityHint('There are no security issues in the UI.').isSecurity).toBe(false)
+  // A long sentence of list-like words reads in linear time.
+  const long = `No ${Array.from({ length: 400 }, (_, i) => `w${i}`).join(' ')} secret.`
+  const began = Date.now()
+  expect(severityHint(long).isSecurity).toBe(true)
+  expect(Date.now() - began).toBeLessThan(500)
 })
 
 test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {
