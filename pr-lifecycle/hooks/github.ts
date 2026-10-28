@@ -234,31 +234,36 @@ export const postsFor = (login: string, name: string): boolean => {
 const SECURITY_WORD = '(?:security|injection|xss|csrf|ssrf|secret|credential|auth(?:entication|orization)? bypass|rce|path traversal)'
 const SECURITY = new RegExp(`\\b${SECURITY_WORD}\\b`, 'i')
 
-/**
- * The same word under a negation, on its own line: "no touches to security/proxy/validation, auth", "no blocking correctness,
- * security, regression findings". A review that says the security-sensitive paths were *not* touched is not a security finding
- * (discussion #15 item 33, Adam 2026-10-27), so the flag comes from the claim, never from the word.
- */
-const SECURITY_NEGATED = new RegExp(`\\b(?:no|not|never|without|nothing)\\b[^.\\n]{0,80}?\\b${SECURITY_WORD}\\b`, 'i')
+/** One item of a list a denial names: one or two words ("security", "blocking correctness", "dependency manifests"). */
+const ITEM = '[\\w-]+(?: [\\w-]+)?'
+const LIST = `(?:${ITEM}(?:\\s*[,/]\\s*(?:(?:or|and|nor)\\s+)?|\\s+(?:or|and|nor)\\s+))*${ITEM}`
 
 /**
- * What a negation has to deny for the sentence to deny security: findings, or touches and changes to the security-sensitive paths.
- * "No escaping is performed, allowing SQL injection" negates the mitigation, not the issue, so it denies nothing (PR #32 review).
+ * The two forms a review uses to say security is *not* at stake (discussion #15 item 33, Adam 2026-10-27): no findings of a listed kind
+ * ("no blocking correctness, security, regression findings", "no security issues in the UI"), and no touches to a list of paths that
+ * ends the sentence ("No touches to security/proxy/validation, auth, Dockerfiles, CI, or dependency manifests"). The negation must
+ * govern the list itself, so "No validation of credential changes is performed" or "No security check guards credential changes"
+ * negate a mitigation and deny nothing (PR #32 review).
  */
-const DENIED = /\b(?:findings?|issues?|problems?|concerns?|risks?|vulnerabilit(?:y|ies)|touch(?:es)?|changes?|changed|code paths?)\b/i
+const DENIALS = new RegExp(
+  `\\b(?:no|zero|without any|not any)\\s+${LIST}\\s+(?:findings?|issues?|problems?|concerns?|risks?|vulnerabilit(?:y|ies))\\b` +
+    `|\\bno (?:touch(?:es)?|changes?|code paths?) (?:to|in|on|under) ${LIST}(?: in this (?:pr|diff|change))?$`,
+  'gi',
+)
 
 /** A consequence the sentence draws: one that says the hole is there, whatever it negates on the way. */
 const HARM =
   /\b(?:allow(?:s|ing)?|enabl(?:es|ing)|lets?|leads? to|leak(?:s|ing|ed)?|expos(?:es|ing|ed)|permit(?:s|ting)?|bypass(?:es|ed)?|vulnerable|exploit\w*)\b/i
 
 /**
- * Whether the body raises security itself. Each sentence is its own claim (PR #32 review), so "No security issues in the UI. The API
- * leaks a secret." raises it; a sentence raises nothing only when it denies security findings or touches and draws no harm from it.
+ * Whether the body raises security itself, so the flag comes from the claim, never from the word. Each sentence is its own claim
+ * (PR #32 review): it raises nothing only when every security word in it sits inside a denial and it draws no harm, so "No security
+ * issues in the UI. The API leaks a secret." raises it, and so does "No style issues, the secret is logged".
  */
 const isSecurityClaim = (body: string): boolean =>
   sentencesOf(body)
     .filter(one => SECURITY.test(one))
-    .some(one => !(SECURITY_NEGATED.test(one) && DENIED.test(one) && !HARM.test(one)))
+    .some(one => HARM.test(one) || SECURITY.test(one.replace(DENIALS, ' ')))
 
 /**
  * A reviewer's own advisory label at the start of the body (after a heading mark or list marker), never inside a sentence. Only the

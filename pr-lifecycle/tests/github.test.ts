@@ -486,6 +486,17 @@ test('item 33: a security word under a negation raises no security finding', asy
   expect(severityHint('Without a CSRF token the form is open to forged posts.').isSecurity).toBe(true)
   expect(severityHint('No security issues in the UI. The API leaks a secret.')).toEqual({ severity: 'P1', isSecurity: true, isTagged: false })
   expect(severityHint('No security issues found, but the reset path leaks a credential.').isSecurity).toBe(true)
+  // The negation has to govern the list the security word is in, not merely share a sentence with "changes" (PR #32 review).
+  expect(severityHint('[P1] No validation of credential changes is performed.')).toEqual({ severity: 'P1', isSecurity: true, isTagged: true })
+  expect(severityHint('No security check guards credential changes.').isSecurity).toBe(true)
+  expect(severityHint('No style issues, the secret is logged.').isSecurity).toBe(true)
+  expect(severityHint('No changes to CI, the secret is logged in plain text.').isSecurity).toBe(true)
+  expect(severityHint('There are no security issues in the UI.').isSecurity).toBe(false)
+  // A long sentence of list-like words reads in linear time.
+  const long = `No ${Array.from({ length: 400 }, (_, i) => `w${i}`).join(' ')} secret.`
+  const began = Date.now()
+  expect(severityHint(long).isSecurity).toBe(true)
+  expect(Date.now() - began).toBeLessThan(500)
 })
 
 test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {
