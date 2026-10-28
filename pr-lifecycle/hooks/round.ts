@@ -870,7 +870,11 @@ async function takeLate($: Engine, run: Run, answer: string, reason: string): Pr
     isOurs = true
     return { ...one, late: undefined }
   })
-  if (late === undefined || !isOurs) return
+  if (late === undefined) return
+  if (!isOurs) {
+    await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after the run moved on; nothing kept`)
+    return
+  }
   if (reason !== 'answer') {
     await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout ended on ${reason}; nothing kept`)
     return
