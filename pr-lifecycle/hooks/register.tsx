@@ -39,6 +39,7 @@ import {
 import {
   advance,
   archiveLifecycle,
+  awaitsLate,
   badOptionsNote,
   claimRecord,
   closeLifecycle,
@@ -63,6 +64,7 @@ import {
   isTurnOf,
   markPr,
   noteArrival,
+  noteSeen,
   onAnswer,
   onTurnStart,
   PANE,
@@ -1289,6 +1291,7 @@ export const register: Register = (on, options) => {
           return
         }
         // The main agent's call belongs to its step's own turn (R51); a sub-agent's to its id.
+        if (e.agentId !== undefined) await noteSeen($, run, e.agentId)
         const who = run.pending.find(one => isTurnOf(one, e.agentId))
         if (who === undefined) return
         const activity = activityOf(who.role, String(e.tool), e as unknown as Record<string, unknown>)
@@ -1347,7 +1350,7 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (isLiveNow()) {
+    if (isLiveNow() || (await awaitsLate($, e.agentId))) {
       try {
         await onAnswer($, e.agentId, e.answer, e.reason, e.turnId)
       } catch (error) {

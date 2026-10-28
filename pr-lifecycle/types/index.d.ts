@@ -124,6 +124,8 @@ export type Pending = {
   isMain?: true
   /** Main agent only: the main-loop turn that began with this step's prompt (its step marker in the turn's text, R51). */
   turnId?: string
+  /** A fixer sub-agent only: when its last tool call was seen, which restarts its step's quiet clock (R99). */
+  seenAt?: number
   answer?: string
 }
 
@@ -371,6 +373,11 @@ export type Run = {
   phaseStartedAt: number
   endedAt?: number
   message?: string
+  /**
+   * Set when a step timeout stopped a fixer sub-agent (R99): its id (none where the engine gave none), its step and the lifecycle
+   * it worked on, so its answer, if it still comes, is kept on the record instead of dropped.
+   */
+  late?: { agentId?: string; step: string; round: number; lifecycle: 'pre' | 'post'; generation: number; lifecycleId?: string }
 }
 
 /** A CI check on a PR head, by gh's bucket (pass, fail, cancel, pending, skipping), and whether the base requires it (R86). */
