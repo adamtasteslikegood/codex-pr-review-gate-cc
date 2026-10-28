@@ -1,12 +1,12 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
-import { createPr, done, isHeld, P1, P2, review, runOf, TRAILER, turn, world } from './world'
+import { createPr, done, isHeld, P1, P2, review, RUN, runOf, TRAILER, turn, world } from './world'
 import type { World } from './world'
 import { requiredChecksOf, untriagedFeedback } from '../hooks/round'
 import { applyAnswer, decideNext, invalidate, isAcceptedRebuttal, mergeHolds, newRecord, planIssues, roundOf, unresolvedBlockers } from '../hooks/lifecycle'
 import type { WithId } from '../hooks/lifecycle'
-import type { Finding, FindingEvent, LifecycleRecord } from '../types'
+import type { Finding, FindingEvent, LifecycleRecord, Run } from '../types'
 
 const recordOf = async (w: ReturnType<typeof world>): Promise<LifecycleRecord> => w.stored('lifecycle:/repo:feat/x') as LifecycleRecord
 /** No issue the gate filed carries a filing mark with an unknown lifecycle id (#29). */
@@ -45,8 +45,9 @@ test('a fix Codex confirms is verified; a rebuttal Codex holds is open again', a
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }])))
   w.git.head = 'd'.repeat(40)
-  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
+  await done($, turn(`ok\n${TRAILER}\n${JSON.stringify({ step: 'r1-fix', dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`))
   expect(w.spawned.at(-1)?.prompt).toContain('R1-2 [P1] Second')
+  expect(w.spawned.at(-1)?.prompt).toMatch(/R1-1 \[P1\] Unvalidated redirect[^\n]*\n\s+reported-fixed, verification owed/)
   await done($, turn(review('r2-review', 'PASS', [], { verified: ['R1-1'], held: ['R1-2'] })))
   const rec = await recordOf(w)
   expect(rec.findings.map(one => [one.id, one.status])).toEqual([
@@ -1958,6 +1959,179 @@ test('a main step whose turn never started times out saying so', { options: { st
   const run = await runOf(w)
   expect(run.status).toBe('error')
   expect(run.message).toContain('turn was never seen')
+})
+
+// ------------------------------------------------------------- #26: a step timeout and the fixer sub-agent (R99)
+
+/** A tool call the fixer sub-agent makes: the engine names it by its id. */
+const fixerCall = ($: Parameters<TestBody>[0], agentId = 'agent-2') => $.tool.call({ tool: 'Bash', command: 'npm test', agentId } as never)
+
+/**
+ * The test host gives a spawned sub-agent no id, as a hook answering without `next` leaves none: each run written is given the id
+ * core would have given its fixer sub-agent, `agent-2`, so its calls and its answer are known as its own (R99).
+ */
+const nameFixer = (on: Parameters<TestBody>[1]): void => {
+  on('state.set', RUN, (_$, e, next) => {
+    const run = e.value as Run | null
+    const named = run?.pending.map(each => (each.role === 'fix' && each.isMain !== true && each.agentId === undefined ? { ...each, agentId: 'agent-2' } : each))
+    return next(run === null || named === undefined ? e : { ...e, value: { ...run, pending: named } })
+  })
+}
+
+/** The fixer's answer, naming its step. */
+const lateFixed = (id: string) => `Fixed.\n${TRAILER}\n${JSON.stringify({ step: 'r1-fix', dispositions: [{ id, action: 'fixed', note: 'done' }] })}`
+
+test('R99: a fixer sub-agent still making tool calls is not stopped at the step limit, only at three limits', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  for (let i = 0; i < 5; i += 1) {
+    await w.clock.advance(30_000)
+    await fixerCall($)
+  }
+  // 150 s in, past the 60 s limit, but never 60 s quiet.
+  expect((await runOf(w)).status).toBe('running')
+  for (let i = 0; i < 2; i += 1) {
+    await w.clock.advance(30_000)
+    await fixerCall($)
+  }
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('3 times the step limit')
+})
+
+test('R99: a quiet fixer sub-agent is stopped at the step limit, and the agent is told with its next step', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.message).toContain('made no tool call for')
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain('round 1 of feat/x stopped with an error')
+  expect(told).toContain('If the fixer still finishes, its answers are kept')
+  expect(told).toContain('Your next step: run the pull request create again from feat/x')
+})
+
+test('R99: a main-agent step that times out is told to the agent too', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  await w.clock.advance(62_000)
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain('stopped with an error: The fix step ran past')
+  expect(told).not.toContain('If the fixer still finishes')
+})
+
+test('R99 (#26): a fixer that finishes after the step timeout keeps its answers, and a resume has Codex check them', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1, { ...P1, title: 'Second', line: 40 }]), 'agent-1'))
+  await w.clock.advance(62_000)
+  expect((await runOf(w)).status).toBe('error')
+  w.git.head = 'd'.repeat(40)
+  const answer = `ok\n${TRAILER}\n${JSON.stringify({ step: 'r1-fix', dispositions: [{ id: 'R1-1', action: 'fixed' }, { id: 'R1-2', action: 'rebutted', note: 'guarded at :38' }] })}`
+  await done($, turn(answer, 'agent-2'))
+  const rec = await recordOf(w)
+  expect(rec.findings.map(one => [one.id, one.status])).toEqual([
+    ['R1-1', 'reported-fixed'],
+    ['R1-2', 'rebutted'],
+  ])
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain("round 1's fixer finished after the step timeout stopped the run")
+  expect(told).toContain('1 fixed · 1 rebutted')
+  expect(told).toContain("The branch's head is ddddddd")
+  expect((await runOf(w)).late).toBeUndefined()
+  // The create resumes the gate: the round runs again, and Codex is asked about the kept answers instead of the fix being redone.
+  expect(isHeld(await $.tool.call(createPr))).toBe(true)
+  expect((await runOf(w)).phase).toBe('review')
+  expect(w.spawned.at(-1)?.prompt).toContain('R1-2 [P1] Second')
+})
+
+test('R99: a late fixer answer after a reset is dropped', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await w.clock.advance(62_000)
+  await say($, 'reset')
+  await done($, turn(lateFixed('R1-1'), 'agent-2'))
+  expect((await recordOf(w)).findings.some(one => one.status === 'reported-fixed')).toBe(false)
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
+})
+
+test('R99: a late fixer answer after a resume started another run is not the new run\'s', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await w.clock.advance(62_000)
+  await say($, 'resume')
+  const run = await runOf(w)
+  expect(run.status).toBe('running')
+  await done($, turn(lateFixed('R1-1'), 'agent-2'))
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  expect((await runOf(w)).id).toBe(run.id)
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
+})
+
+test('R99: a fixer with no id from the engine is not kept alive by another sub-agent\'s calls, and its late answer is not taken', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  expect((await runOf(w)).phase).toBe('fix')
+  for (let i = 0; i < 3; i += 1) {
+    await w.clock.advance(25_000)
+    await fixerCall($, 'agent-other')
+  }
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  expect(run.late).toBeUndefined()
+  expect(w.prompts.at(-1) ?? '').not.toContain('If the fixer still finishes')
+  // An answer naming the stopped step is no proof it is this fixer's: it is not applied.
+  await done($, turn(lateFixed('R1-1'), 'agent-other'))
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
+})
+
+test('R99 (gate G3-2): a review that times out at low effort, the last step down, is told to the agent too', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await w.clock.advance(62_000)
+  expect([(await runOf(w)).status, (await runOf(w)).effort]).toEqual(['running', 'low'])
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain('round 1 of feat/x stopped with an error')
+  expect(told).toContain('Codex timed out at low effort, the lowest the gate uses.')
+  expect(told).toContain('Your next step: run the pull request create again from feat/x')
+})
+
+test('R99 (gate G3-3): a resume between taking a late fixer answer and writing it keeps the answer off the record', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await w.clock.advance(62_000)
+  expect((await runOf(w)).late?.agentId).toBe('agent-2')
+  // A resume starts the round again while the late answer awaits its ownership check, after it took the stopped run's `late`.
+  let resumed = ''
+  w.beforeRead = async key => {
+    if (key !== OWNER || resumed !== '' || w.run?.status === 'running' || w.run?.late !== undefined) return
+    resumed = 'resuming'
+    resumed = String((await say($, 'resume')).text)
+  }
+  await done($, turn(lateFixed('R1-1'), 'agent-2'))
+  w.beforeRead = undefined
+  expect(resumed).not.toBe('')
+  expect((await runOf(w)).status).toBe('running')
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
 })
 
 // ------------------------------------------------------------- task 13 fix round 3 (R55)

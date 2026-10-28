@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.5.3. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.5.4. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -597,7 +597,13 @@ Time is tracked in two kinds. `activeMs` is agent work, compared with
 `routineRoundMinutes` (3): overrunning is shown and recorded, not failed.
 `waitMs` is waiting on external reviewers and is never counted as effort.
 `stepTimeoutMinutes` (30) is the hard, fail-closed cap on any single agent
-step.
+step. A fixer sub-agent is timed from its last tool call, so one still at work
+is not cut off; it is stopped only at three limits in all. Every timeout that
+ends the run tells the agent what stopped and its next step: run the create
+again before the PR, or have the person type `/pr-gate resume` after it. If a
+stopped fixer still answers, its answers are kept on the record (unless the
+lifecycle was reset or restarted since) and the next round has Codex check
+them (R99).
 
 ## The pane
 
@@ -692,7 +698,7 @@ Settings per repository); `mergeMethod`, `issueSpec`, `mergeWatchMinutes` and `j
 | `codexModelHigh` | `gpt-6-astra` | Codex model, high blast-radius changes; empty names none |
 | `runnerModel` | `sonnet` | Claude model of the sub-agents that run Codex; empty inherits the session's |
 | `fixAgentModel` | `opus` | Claude model of the fix sub-agent and the fix reviewer; empty inherits the session's |
-| `stepTimeoutMinutes` | 30 | hard cap on one agent step |
+| `stepTimeoutMinutes` | 30 | hard cap on one agent step; a fixer sub-agent's is from its last tool call, up to 3 limits |
 | `routineRoundMinutes` | 3 | soft active-time target for a round |
 | `waitCapMinutes` | 20 | longest a round waits for reviewers |
 | `quietMinutes` | 3 | quiet period that ends collection with no required checks, no pending review requests and no roster |

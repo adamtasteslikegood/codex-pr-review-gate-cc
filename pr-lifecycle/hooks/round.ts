@@ -758,7 +758,12 @@ export function startTicker($: Engine): void {
         // afterTriage settling a turn taken while collecting (A4): the poll clears a stale flag, so the step timeout does not apply.
         if (run.isSettling !== undefined && run.pending.length === 0) return
       }
-      if (now - run.phaseStartedAt > config.stepTimeoutMs) {
+      // A fixer sub-agent's step times out when it goes quiet, not while it works (R99): its clock restarts at each tool call it makes,
+      // and FIXER_CEILING step limits from the start end it however busy it is.
+      const fixer = fixerOf(run)
+      const quietSince = fixer === undefined ? run.phaseStartedAt : Math.max(run.phaseStartedAt, fixer.seenAt ?? 0)
+      const isOverCeiling = fixer !== undefined && now - run.phaseStartedAt > FIXER_CEILING * config.stepTimeoutMs
+      if (now - quietSince > config.stepTimeoutMs || isOverCeiling) {
         // The first turn taken while collecting that times out in a round goes back to collecting and is asked again (R88): the gate
         // runs on without the person. Only a second one stops the run.
         // Only a turn still unanswered: an answered one whose afterTriage failed before settling it falls through to the stop below,
@@ -772,7 +777,11 @@ export function startTicker($: Engine): void {
         // A main-agent step whose prompt's turn never started could not have been answered: say so, not only that it ran long.
         const isUnseen = run.pending.some(one => one.isMain === true && one.answer === undefined && one.turnId === undefined)
         const why =
-          `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.` +
+          (fixer === undefined
+            ? `The ${run.phase} step ran past ${elapsed(config.stepTimeoutMs)}.`
+            : isOverCeiling
+              ? `The fix step ran past ${elapsed(FIXER_CEILING * config.stepTimeoutMs)}, ${FIXER_CEILING} times the step limit, while its fixer was still working.`
+              : `The fixer sub-agent made no tool call for ${elapsed(config.stepTimeoutMs)}.`) +
           (isUnseen ? ' Its prompt\'s turn was never seen: the main agent never started on it, so no answer could count.' : '') +
           // A turn taken while collecting (R88) ends here too, never a triage with nothing in flight: the feedback it was handed stays unprocessed.
           (run.phase === 'triage' && run.collect !== undefined
@@ -784,12 +793,132 @@ export function startTicker($: Engine): void {
         } else if (run.phase === 'verify' && run.lifecycle === 'post') {
           await holdPost($, run, `the Codex check of a rebuttal did not finish: ${why}`)
         } else {
+          // A fixer stopped here may still finish: who it is outlives the run, so its late answer is kept, never dropped (R99).
+          if (fixer !== undefined) await keepLate($, run, fixer)
           await noteAttempt($, run, why)
-          await finish($, run.id, 'error', why, true)
+          const ended = await finish($, run.id, 'error', why, true)
+          // The stop is told to the agent, with its next step, as a hold is (R99): a toast alone left it waiting on a run that had ended.
+          if (ended !== null) await say($, ended, timeoutPrompt(ended, why, fixer?.agentId !== undefined))
         }
       }
     })().catch(() => undefined)
   })
+}
+
+/** A fixer step is cut off at most this many step limits after it began, however busy its fixer stays (R99). */
+export const FIXER_CEILING = 3
+
+/** The fixer sub-agent the run waits on, if its fix step is in flight. */
+const fixerOf = (run: Run): Pending | undefined =>
+  run.phase === 'fix' ? run.pending.find(one => one.role === 'fix' && one.isMain !== true && one.answer === undefined) : undefined
+
+/** Whether a sub-agent's ended turn may be the late answer of a fixer a step timeout stopped (R99): the run says so, not memory. */
+export async function awaitsLate($: Engine, agentId: string | undefined): Promise<boolean> {
+  return agentId !== undefined && (await getRun($))?.late !== undefined
+}
+
+/**
+ * A tool call of the fixer sub-agent in flight restarts its quiet clock (R99); written at most every 10 s. Where the engine gave
+ * the fixer no id, no call is known to be its own, so none counts: another sub-agent's must not keep the step alive.
+ */
+export async function noteSeen($: Engine, run: Run, agentId: string): Promise<void> {
+  const fixer = fixerOf(run)
+  if (fixer?.agentId === undefined || fixer.agentId !== agentId) return
+  const now = await $.clock.now()
+  if (now - (fixer.seenAt ?? 0) < 10_000) return
+  await patch($, run.id, one => ({ ...one, pending: one.pending.map(each => (each.step === fixer.step ? { ...each, seenAt: now } : each)) }))
+}
+
+/**
+ * Before a step timeout ends the run: the fixer it stops, and the lifecycle it worked on, so a late answer can be matched (R99).
+ * Only a fixer the engine gave an id: a step name is shared by every run's round, so it cannot tell this fixer's answer from another's.
+ */
+async function keepLate($: Engine, run: Run, fixer: Pending): Promise<void> {
+  const agentId = fixer.agentId
+  if (agentId === undefined) return
+  const rec = await loadRecord($, run.root, run.branch)
+  const id = rec?.lifecycleId === undefined ? {} : { lifecycleId: rec.lifecycleId }
+  const late = { step: fixer.step, round: run.round, lifecycle: run.lifecycle, generation: rec?.generation ?? 0, agentId, ...id }
+  await patch($, run.id, one => ({ ...one, late }))
+}
+
+/** Whether a sub-agent's answer is the stopped fixer's (R99): by the id the engine gave it, and only by that. */
+const isLateOf = (late: NonNullable<Run['late']>, agentId: string | undefined): boolean => agentId !== undefined && late.agentId === agentId
+
+/** What the agent is told when a step timeout ended the run (R99): what stopped, and how the gate goes on. */
+function timeoutPrompt(run: Run, why: string, isFixer: boolean): string {
+  const late = isFixer ? ' If the fixer still finishes, its answers are kept on the record, and you are told.' : ''
+  const next =
+    run.lifecycle === 'pre'
+      ? `run the pull request create again from ${run.branch}: it resumes the gate on the branch's head. The person can type /pr-gate resume instead.`
+      : `tell the person, who types /pr-gate resume to go on. Merging stays held.`
+  return [`pr-gate: round ${run.round} of ${run.branch} stopped with an error: ${why}${late}`, '', `Your next step: ${next}`].join('\n')
+}
+
+/**
+ * The fixer a step timeout stopped finished after all (R99, #26): its answers are applied to the record, as `afterFix` would have,
+ * so the round's rerun has Codex check them instead of the work being done again. Only while nothing ran since: a resume, a reset
+ * or another session in between drops it.
+ */
+async function takeLate($: Engine, run: Run, answer: string, reason: string): Promise<void> {
+  const late = run.late
+  // The stopped run, and only while it is still stopped: a resume since has started the round again.
+  const isStopped = (one: Run | null | undefined): boolean => one !== null && one !== undefined && one.id === run.id && one.status !== 'running'
+  let isOurs = false
+  await update($, runAtom, one => {
+    if (!isStopped(one) || one?.late === undefined) return one ?? null
+    isOurs = true
+    return { ...one, late: undefined }
+  })
+  if (late === undefined) return
+  if (!isOurs) {
+    await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after the run moved on; nothing kept`)
+    return
+  }
+  if (reason !== 'answer') {
+    await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout ended on ${reason}; nothing kept`)
+    return
+  }
+  if (!(await isStillMine($, run))) return
+  const now = await $.clock.now()
+  const said = readDispositions(answer)
+  let isTaken = false
+  let isResumed = false
+  const saved = await updateRecord($, run.root, run.branch, async rec => {
+    // The lifecycle the fixer worked on, and no other: a reset or a fresh start since makes the answer another lifecycle's.
+    if (rec.phase === 'archived' || (rec.generation ?? 0) !== late.generation || rec.lifecycleId !== late.lifecycleId) return rec
+    // Read under the record's lock: a resume during the awaits above runs the round again, which owns the record now.
+    if (!isStopped(await getRun($))) {
+      isResumed = true
+      return rec
+    }
+    isTaken = true
+    return {
+      ...rec,
+      ...(replyIdsOf(answer).length > 0 ? withOwnReplies(rec, answer) : {}),
+      findings: rec.findings.map(finding => {
+        const one = said.find(each => each.id === finding.id)
+        return one === undefined ? finding : applyAnswer(finding, one, late.round, 'fixer', now)
+      }),
+    }
+  })
+  if (isResumed) await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after a resume; nothing kept`)
+  if (saved === undefined || !isTaken) return
+  const head = await git($, run.root, ['rev-parse', 'HEAD'])
+  const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
+  const count = (action: string): number => said.filter(one => one.action === action).length
+  const what =
+    said.length === 0
+      ? 'it reported no answers'
+      : `its answers are kept on the record: ${count('fixed')} fixed · ${count('rebutted')} rebutted${count('deferred') > 0 ? ` · ${count('deferred')} deferred` : ''}`
+  const at = head.isOk ? ` The branch's head is ${head.out.slice(0, 7)}.` : ''
+  await logEvent($, run.root, run.branch, 'head', `${run.lifecycle}-PR round ${late.round}: the fixer finished after the step timeout; ${what}`)
+  const commit = dirty.isOk && dirty.out !== '' ? 'it left uncommitted changes: commit them, since reviews read committed code only, then ' : ''
+  const next =
+    late.lifecycle === 'pre'
+      ? `${commit}run the pull request create again from ${run.branch}: the gate resumes and Codex checks these answers on the new head. The person can type /pr-gate resume instead.`
+      : `${commit}tell the person, who types /pr-gate resume to go on.`
+  await say($, saved, [`pr-gate: round ${late.round}'s fixer finished after the step timeout stopped the run; ${what}.${at}`, '', `Your next step: ${next}`].join('\n'))
 }
 
 /**
@@ -2821,7 +2950,8 @@ async function retryLower($: Engine, run: Run, why: string): Promise<void> {
   if (lower === undefined) {
     // The effort that timed out is the carry, not a higher start a re-review ran under: the next run starts no higher than it.
     await patch($, run.id, one => ({ ...one, carriedEffort: lowerOf(one.carriedEffort ?? one.effort, run.effort) }))
-    await finish($, run.id, 'error', `${why} Codex timed out at low effort, the lowest the gate uses.`, true)
+    const ended = await finish($, run.id, 'error', `${why} Codex timed out at low effort, the lowest the gate uses.`, true)
+    if (ended !== null) await say($, ended, timeoutPrompt(ended, ended.message ?? why, false))
     return
   }
   const now = await $.clock.now()
@@ -4470,6 +4600,11 @@ export async function onTurnStart($: Engine, agentId: string | undefined, turnId
 export async function onAnswer($: Engine, agentId: string | undefined, answer: string, reason: string, turnId?: string): Promise<void> {
   if (agentId === undefined && turnId === mainTurn) mainTurn = undefined
   const run = await getRun($)
+  // A fixer the step timeout stopped finished after all (R99): its answer is kept, never dropped.
+  if (run !== null && run.status !== 'running' && run.late !== undefined && isLateOf(run.late, agentId)) {
+    await takeLate($, run, answer, reason)
+    return
+  }
   if (run === null || run.status !== 'running') {
     isLive = false
     return
