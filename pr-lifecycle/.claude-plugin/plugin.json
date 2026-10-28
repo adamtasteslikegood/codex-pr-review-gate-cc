@@ -1,6 +1,6 @@
 {
   "name": "pr-lifecycle",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "/pr-gate across the PR lifecycle: pre-PR Codex rounds, then the repository's own post-PR reviews, under one review budget and one record, with a live progress pane.",
   "author": {
     "name": "adam schoen"

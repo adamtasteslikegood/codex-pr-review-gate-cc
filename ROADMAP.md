@@ -196,7 +196,8 @@ a shared Durable Object store, is evaluated with wave 3 item 2.
 
 **What closes wave 2 (Adam, 2026-10-28).**
 - **#34 (P0), fix now:** the PR-create guard passes a create whose `--head`
-  names a branch other than the checked-out one (discussion #15 item 35).
+  names a branch other than the checked-out one (discussion #15 item 35)
+  (done in 1.5.3, R98).
 - **#26 (P1):** the fix step times out while its fixer still works.
 - **The slow-test re-check:** the three-run check under load
   (`docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md`).

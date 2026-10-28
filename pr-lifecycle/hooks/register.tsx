@@ -465,11 +465,15 @@ const outsideText = (action: PrAction): string =>
 
 type Gated = { root: string; branch: string; base: string }
 
+/** A create whose head is a branch other than the one checked out here (R98). */
+type Elsewhere = { head: string; branch: string }
+
 /**
  * The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61);
- * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); else undefined.
+ * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); `head` when it names a head
+ * that is not checked out here, so the gate cannot review it (R98); else undefined.
  */
-const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outside' | { noBase: string } | undefined> => {
+const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outside' | { noBase: string } | Elsewhere | undefined> => {
   if (action.base !== undefined && !config.bases.includes(action.base)) return undefined
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return isOutsideHeld(action) ? 'outside' : undefined
@@ -479,10 +483,12 @@ const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outsid
     if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return undefined
   }
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
-  // A PR from a branch that is not checked out here (a release PR, dev into main) is not this gate's to review.
-  if (action.head !== undefined && action.head.replace(/^[^:]+:/, '') !== branch) return undefined
+  const head = action.head?.replace(/^[^:]+:/, '')
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
-  if (config.bases.includes(branch)) return undefined
+  if (config.bases.includes(head ?? branch)) return undefined
+  // Any other head that is not checked out here is held, never let through: a branch pushed under another name opened PR #32
+  // with no review (R98, #34). The gate reviews only the branch it can see, so the create is run from that branch.
+  if (head !== undefined && head !== branch) return { head, branch }
   if (action.base !== undefined) return { root, branch, base: action.base }
   // Only gh pr create may leave the base out: REST, GraphQL and the MCP tools require one, so there a missing base is one this mod
   // could not read, and the create is held against the first gated base, as before R1-5.
@@ -498,6 +504,14 @@ const noBaseText = (action: PrAction, err: string): string =>
     `pr-gate: ${action.via} is held: it names no base, and gh could not read the repository's default branch (${err}), ` +
       'so the guard cannot tell which base the pull request would open against.',
     'Your next step: run it again with the base named (--base <branch>, or the base field of the tool). Do not create the pull request another way.',
+  ].join('\n') + unknownNote(action)
+
+const elsewhereText = (action: PrAction, found: Elsewhere): string =>
+  [
+    `pr-gate: ${action.via} is held: it opens a pull request from ${found.head}, but this checkout has ${found.branch} checked out, ` +
+      'so the gate cannot review what that pull request would carry.',
+    `Your next step: check out a local branch named ${found.head} that holds these commits (git branch -m ${found.head}, or ` +
+      `git switch ${found.head}), then run the create again from it so its gate reviews it. Do not open the pull request another way.`,
   ].join('\n') + unknownNote(action)
 
 /** Why an unknown tool is held: said after the refusal, so the agent knows it was not misread as something else. */
@@ -1305,6 +1319,7 @@ export const register: Register = (on, options) => {
     const found = await gatedCreate($, action)
     if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
     if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
+    if (found !== undefined && 'head' in found) return config.enforce ? { deny: asHold(elsewhereText(action, found)) + tail } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
     if (refusal !== undefined) return { deny: asHold(refusal) + tail }
