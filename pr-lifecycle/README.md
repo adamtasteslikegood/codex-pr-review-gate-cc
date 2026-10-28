@@ -62,8 +62,10 @@ nudging each one.
    below.
 
 A promotion between gated bases (`dev` into `main`) is not gated, and
-neither is a PR for another repository (`--repo`) or from a branch that is
-not checked out. A PR the gate never saw opened is adopted into post-PR review
+neither is a PR for another repository (`--repo`). A create whose head is a
+branch other than the one checked out (`--head`, or the `head` field) is held:
+the agent is told to check out a local branch of that name and run it from
+there, so that branch's gate reviews it (R98). A PR the gate never saw opened is adopted into post-PR review
 when `/pr-gate` runs on its branch; a merge attempt is held and tells the
 agent to run it.
 
@@ -425,9 +427,9 @@ merge it cannot resolve is held. Outside a git checkout, a create or merge that
 names a PR number or a repository, or comes from a GitHub MCP tool, is held
 too: the agent is told to run it from the repository's checkout.
 
-**Not held:** a PR from a branch not checked out here, a PR for another
-repository (`--repo`), a promotion between gated bases, and anything for a base
-outside `bases`. With `enforce` off nothing is held on create; with
+**Not held:** a PR for another repository (`--repo`), a promotion between
+gated bases, and anything for a base outside `bases`. A PR from a branch not
+checked out here is held (R98). With `enforce` off nothing is held on create; with
 `enforceMerge` off nothing is held on merge.
 
 ### Residual risk

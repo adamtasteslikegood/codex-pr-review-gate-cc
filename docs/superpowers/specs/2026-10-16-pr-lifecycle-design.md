@@ -285,8 +285,9 @@ Guards:
   person waived post. Any open, deferred, unverified or unaccepted finding
   keeps the merge held, whatever its severity. The refusal names what is missing (for example "round 2
   owed on a1b2c3d", "R3-2 [P1] unresolved"). A refusal never starts work.
-- Not intercepted: PRs from a branch not checked out here, other repos
-  (`--repo`), promotions between gated bases.
+- Not intercepted: other repos (`--repo`), promotions between gated bases
+  (the head checked out or named is itself a gated base). A create whose head
+  names a branch other than the one checked out is held, not passed (R98).
 - Every route that opens or merges a PR goes through one pure classifier,
   `readPrAction(tool, input)` in `github.ts`, returning `create` or `merge`
   (merge includes merge-queue enqueue and auto-merge) or nothing:

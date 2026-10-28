@@ -362,6 +362,39 @@ test('a promotion between gated bases is not gated', async ($, on) => {
   expect(w.spawned).toHaveLength(0)
 })
 
+test('a promotion named by --head from a feature checkout is still not gated', async ($, on) => {
+  const w = world(on)
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head dev' }))).toBe(false)
+  expect(w.spawned).toHaveLength(0)
+})
+
+test('R98 (#34): a create whose head is not the branch checked out here is held, and says to run it from that branch', async ($, on) => {
+  const w = world(on)
+  // PR #32: a worktree branch pushed under another name (git push origin HEAD:refs/heads/fix/x), then opened by that name.
+  w.git.branch = 'worktree-bridge-cse_1'
+  const commands = [
+    'gh pr create --base dev --head fix/x --title t',
+    'gh pr create -B dev -H me:fix/x --title t',
+    'gh api repos/me/repo/pulls -f base=dev -f head=fix/x -f title=t',
+  ]
+  const mcp = { tool: 'mcp__plugin_github_github__create_pull_request' as const, owner: 'me', repo: 'repo', base: 'dev', head: 'fix/x', title: 't' }
+  const results = []
+  for (const command of commands) results.push(await $.tool.call({ tool: 'Bash', command }))
+  results.push(await $.tool.call(mcp))
+  for (const ran of results) {
+    expect(isHeld(ran)).toBe(true)
+    expect(ran.deny).toContain('fix/x')
+    expect(ran.deny).toContain('worktree-bridge-cse_1')
+    expect(ran.deny).toContain('Do not open the pull request another way')
+  }
+  // Held, not reviewed: no round starts for a branch the gate cannot see.
+  expect(w.spawned).toHaveLength(0)
+  // The same head, checked out here, goes to the gate as before.
+  w.git.branch = 'fix/x'
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: commands[0]! }))).toBe(true)
+  expect(w.spawned.length).toBeGreaterThan(0)
+})
+
 test('a docs-only commit after the pass rides on it; a code commit does not', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
