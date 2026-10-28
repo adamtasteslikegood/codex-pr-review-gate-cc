@@ -10,7 +10,7 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 [README.md](README.md) for the component table and [VISION.md](VISION.md) for
 the project's goals and their order.
 
-## Current state (2026-10-27, after wave 2b and 1.5.1)
+## Current state (2026-10-28, after wave 2b and 1.5.2)
 
 - `codex-gate/` **0.3.1** is **not loaded** and **frozen**: don't change it
   unless Adam asks for a fix. Known, unfixed issues:
@@ -19,7 +19,7 @@ the project's goals and their order.
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.5.1** is the plugin in daily use, loaded through
+- `pr-lifecycle/` **1.5.2** is the plugin in daily use, loaded through
   `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. It gates the PRs of
   this repo too, so a change to it is gated by the version loaded, and you
   should expect holds on your own branch. It extends `/pr-gate` across pre-PR
@@ -37,7 +37,8 @@ the project's goals and their order.
   - Every ruling made while building it, R1–R66, Adam's rulings on
     codex-gate's deferred items R1-5 to R1-10, R67–R70 after 1.0.0,
     R71–R78 after the first live run, R79–R87 in wave 2a, R88–R95 in
-    wave 2b, and R96 after 1.5.0 (#29, the lifecycle id in the filing mark):
+    wave 2b, R96 after 1.5.0 (#29, the lifecycle id in the filing mark)
+    and R97 in 1.5.2 (approvals settle on their verdict):
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it. The goals are in
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
@@ -102,7 +103,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 698)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 701)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four
