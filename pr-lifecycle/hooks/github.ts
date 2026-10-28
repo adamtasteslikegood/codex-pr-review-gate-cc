@@ -241,9 +241,24 @@ const SECURITY = new RegExp(`\\b${SECURITY_WORD}\\b`, 'i')
  */
 const SECURITY_NEGATED = new RegExp(`\\b(?:no|not|never|without|nothing)\\b[^.\\n]{0,80}?\\b${SECURITY_WORD}\\b`, 'i')
 
-/** Whether the body raises security itself: every line that mentions it under a negation raises nothing. */
+/**
+ * What a negation has to deny for the sentence to deny security: findings, or touches and changes to the security-sensitive paths.
+ * "No escaping is performed, allowing SQL injection" negates the mitigation, not the issue, so it denies nothing (PR #32 review).
+ */
+const DENIED = /\b(?:findings?|issues?|problems?|concerns?|risks?|vulnerabilit(?:y|ies)|touch(?:es)?|changes?|changed|code paths?)\b/i
+
+/** A consequence the sentence draws: one that says the hole is there, whatever it negates on the way. */
+const HARM =
+  /\b(?:allow(?:s|ing)?|enabl(?:es|ing)|lets?|leads? to|leak(?:s|ing|ed)?|expos(?:es|ing|ed)|permit(?:s|ting)?|bypass(?:es|ed)?|vulnerable|exploit\w*)\b/i
+
+/**
+ * Whether the body raises security itself. Each sentence is its own claim (PR #32 review), so "No security issues in the UI. The API
+ * leaks a secret." raises it; a sentence raises nothing only when it denies security findings or touches and draws no harm from it.
+ */
 const isSecurityClaim = (body: string): boolean =>
-  SECURITY.test(body) && !body.split('\n').filter(one => SECURITY.test(one)).every(one => SECURITY_NEGATED.test(one))
+  sentencesOf(body)
+    .filter(one => SECURITY.test(one))
+    .some(one => !(SECURITY_NEGATED.test(one) && DENIED.test(one) && !HARM.test(one)))
 
 /**
  * A reviewer's own advisory label at the start of the body (after a heading mark or list marker), never inside a sentence. Only the
@@ -257,6 +272,9 @@ const ADVISORY = /^\s*(?:#+\s*|[-*+]\s+|\d+\.\s+)?[*_[(]*\s*(?:advisory|non-bloc
  * such as "[P2 thread]" or "the outstanding P2", is a hint the agent may change.
  */
 const TAG = /\[P([0-3])\]|\(P([0-3])\)|\*\*P([0-3]):?\*\*|!\[P([0-3])[ _-]?Badge\]|^[ \t]*(?:[-*+][ \t]+|\d+\.[ \t]+)?P([0-3])(?::|[ \t]+-[ \t])/gim
+
+/** The same tag for a yes-or-no test: without the global flag, so `test` keeps no position between calls. */
+const TAGGED = new RegExp(TAG.source, 'im')
 
 /** The reviewer's own severity, when it gave one; the main agent can still change a guessed one (R84). */
 export function severityHint(body: string): { severity: Severity; isSecurity: boolean; isTagged: boolean } {
@@ -339,6 +357,8 @@ export function isNoAction(state: string | undefined, body: string, kind: Feedba
   const settles = (one: string): boolean => SETTLES.some(re => re.test(one))
   if (!lead.every(one => settles(one) || POLITE.some(re => re.test(one)))) return false
   if (sentencesOf(body).slice(lead.length).some(one => REQUEST.test(one))) return false
+  // A severity the reviewer tagged is a finding, whatever the verdict above it says (PR #32 review).
+  if (TAGGED.test(body)) return false
   return (isReview && state === 'APPROVED') || lead.some(settles)
 }
 

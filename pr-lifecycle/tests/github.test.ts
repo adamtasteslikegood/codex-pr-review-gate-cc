@@ -447,6 +447,30 @@ test('item 33: the forms the reviewers in use write settle, with the head they n
   expect(isNoAction('COMMENTED', 'No blocking findings remain at `8dba6cb`.\n\nPlease rename the flag.')).toBe(false)
 })
 
+test('PR #32 review: a severity the reviewer tagged after a settling verdict is a finding, through every reader', async () => {
+  const tagged = 'No blocking findings.\n\n[P1] The reset deletes pending findings.'
+  for (let i = 0; i < 2; i++) {
+    // Twice over: a global tag regex would keep its position between calls and miss the tag on the second.
+    expect(isNoAction('COMMENTED', tagged)).toBe(false)
+    expect(isNoAction('APPROVED', tagged)).toBe(false)
+    expect(isNoAction(undefined, tagged, 'comment')).toBe(false)
+    expect(isNoAction(undefined, tagged, 'inline')).toBe(false)
+  }
+  expect(isNoAction('COMMENTED', 'No blocking findings.\n\n- P2: the flag is never read')).toBe(false)
+  expect(isNoAction('COMMENTED', 'Ready to merge.\n\n**P3** typo in the README')).toBe(false)
+  const at = '1970-01-01T00:01:00Z'
+  const [review] = readReviews(JSON.stringify([{ id: 1, user: { login: 'a' }, body: tagged, state: 'COMMENTED', commit_id: 'h', submitted_at: at }]))
+  const [comment] = readIssueComments(JSON.stringify([{ id: 2, user: { login: 'a' }, body: tagged, created_at: at }]))
+  const [inline] = readInlineComments(JSON.stringify([{ id: 3, user: { login: 'a' }, body: tagged, path: 'x.ts', line: 1, created_at: at }]))
+  expect([review?.isFinding, comment?.isFinding, inline?.isFinding]).toEqual([true, true, true])
+  // A genuine multi-line approval with no tag still settles in all three.
+  const plain = 'No blocking findings.\n\n- all 700 tests passed\n- lint clean'
+  const [r2] = readReviews(JSON.stringify([{ id: 4, user: { login: 'a' }, body: plain, state: 'COMMENTED', commit_id: 'h', submitted_at: at }]))
+  const [c2] = readIssueComments(JSON.stringify([{ id: 5, user: { login: 'a' }, body: plain, created_at: at }]))
+  const [i2] = readInlineComments(JSON.stringify([{ id: 6, user: { login: 'a' }, body: plain, path: 'x.ts', line: 1, created_at: at }]))
+  expect([r2?.isFinding, c2?.isFinding, i2?.isFinding]).toEqual([false, false, false])
+})
+
 test('item 33: a security word under a negation raises no security finding', async () => {
   // The Independent Claude review's own words on cookbook PR 3785, rated a security P1 by 1.5.0.
   expect(severityHint('Mechanical, internally consistent, no code paths in auth/proxy/validation/CI/deps - nothing to fix.').isSecurity).toBe(false)
@@ -457,6 +481,11 @@ test('item 33: a security word under a negation raises no security finding', asy
   expect(severityHint('The token leaks into the logs: a credential in plain text.').isSecurity).toBe(true)
   expect(severityHint('No changes to CI.\n\nThe session secret is logged on every request.').isSecurity).toBe(true)
   expect(severityHint('**P1** SQL injection').isSecurity).toBe(true)
+  // A negated mitigation is the hole itself, and a denial covers only its own sentence (PR #32 review).
+  expect(severityHint('[P1] No escaping is performed, allowing SQL injection.').isSecurity).toBe(true)
+  expect(severityHint('Without a CSRF token the form is open to forged posts.').isSecurity).toBe(true)
+  expect(severityHint('No security issues in the UI. The API leaks a secret.')).toEqual({ severity: 'P1', isSecurity: true, isTagged: false })
+  expect(severityHint('No security issues found, but the reset path leaks a credential.').isSecurity).toBe(true)
 })
 
 test('R83: readReviews marks a positive no-action review as no finding, and keeps every other body', async () => {

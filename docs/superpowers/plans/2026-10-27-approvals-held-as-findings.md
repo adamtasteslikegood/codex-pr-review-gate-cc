@@ -21,7 +21,7 @@ changes, in `hooks/github.ts` and one line of `hooks/round.ts`:
   (`the delta since 61c98ff..8dba6cb`) was cut in half and could not settle.
   Found by the new tests, not by reading.
 
-Recorded as ruling R96 in
+Recorded as ruling R97 in
 `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
 
 Checks: `npm run lint` clean, `claude plugin test pr-lifecycle` 693 pass /
