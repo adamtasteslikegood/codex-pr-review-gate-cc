@@ -1,6 +1,6 @@
 {
   "name": "pr-lifecycle",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "/pr-gate across the PR lifecycle: pre-PR Codex rounds, then the repository's own post-PR reviews, under one review budget and one record, with a live progress pane.",
   "author": {
     "name": "adam schoen"
@@ -164,7 +164,7 @@
     "stepTimeoutMinutes": {
       "type": "number",
       "title": "Step timeout (minutes)",
-      "description": "How long one agent step may run before the gate stops with an error.",
+      "description": "How long one agent step may run before the gate stops with an error and tells the agent its next step. A fixer sub-agent is timed from its last tool call, up to three times this in all, and its late answer is kept.",
       "default": 30
     },
     "routineRoundMinutes": {

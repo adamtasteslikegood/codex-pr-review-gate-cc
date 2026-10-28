@@ -262,7 +262,10 @@ Time:
   Overrunning is shown and recorded, not failed.
 - `waitMs`: waiting on external reviewers; never counted as effort.
 - `stepTimeoutMinutes` (30): fail-closed hard cap on any single agent step,
-  as in 0.3.1.
+  as in 0.3.1. A fixer sub-agent is timed from its last tool call instead,
+  up to three limits in all; every timeout that ends the run tells the
+  agent its next step; and a stopped fixer's late answer is kept on the
+  record (R99).
 
 `requestReview`: on a new head in round 2 or later, the controller
 re-requests review from the listed reviewers. Otherwise it never triggers
