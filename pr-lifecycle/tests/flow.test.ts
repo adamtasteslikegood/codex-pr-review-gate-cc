@@ -2098,6 +2098,42 @@ test('R99: a fixer with no id from the engine is not kept alive by another sub-a
   expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
 })
 
+test('R99 (gate G3-2): a review that times out at low effort, the last step down, is told to the agent too', { options: { stepTimeoutMinutes: 1 } }, async ($, on) => {
+  const w = world(on)
+  await $.tool.call(createPr)
+  await w.clock.advance(62_000)
+  expect([(await runOf(w)).status, (await runOf(w)).effort]).toEqual(['running', 'low'])
+  await w.clock.advance(62_000)
+  const run = await runOf(w)
+  expect(run.status).toBe('error')
+  const told = w.prompts.at(-1) ?? ''
+  expect(told).toContain('round 1 of feat/x stopped with an error')
+  expect(told).toContain('Codex timed out at low effort, the lowest the gate uses.')
+  expect(told).toContain('Your next step: run the pull request create again from feat/x')
+})
+
+test('R99 (gate G3-3): a resume between taking a late fixer answer and writing it keeps the answer off the record', { options: { stepTimeoutMinutes: 1, fixer: 'subagent' } }, async ($, on) => {
+  nameFixer(on)
+  const w = world(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1]), 'agent-1'))
+  await w.clock.advance(62_000)
+  expect((await runOf(w)).late?.agentId).toBe('agent-2')
+  // A resume starts the round again while the late answer awaits its ownership check, after it took the stopped run's `late`.
+  let resumed = ''
+  w.beforeRead = async key => {
+    if (key !== OWNER || resumed !== '' || w.run?.status === 'running' || w.run?.late !== undefined) return
+    resumed = 'resuming'
+    resumed = String((await say($, 'resume')).text)
+  }
+  await done($, turn(lateFixed('R1-1'), 'agent-2'))
+  w.beforeRead = undefined
+  expect(resumed).not.toBe('')
+  expect((await runOf(w)).status).toBe('running')
+  expect((await recordOf(w)).findings.find(one => one.id === 'R1-1')?.status).toBe('open')
+  expect(w.prompts.some(one => one.includes('finished after the step timeout'))).toBe(false)
+})
+
 // ------------------------------------------------------------- task 13 fix round 3 (R55)
 
 test('R55: a lapsed waiver stays lapsed through a clean round, until the person waives again', { options: { allowanceStandard: 4 } }, async ($, on) => {

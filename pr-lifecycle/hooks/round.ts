@@ -862,8 +862,15 @@ function timeoutPrompt(run: Run, why: string, isFixer: boolean): string {
  */
 async function takeLate($: Engine, run: Run, answer: string, reason: string): Promise<void> {
   const late = run.late
-  await update($, runAtom, one => (one !== null && one !== undefined && one.id === run.id ? { ...one, late: undefined } : (one ?? null)))
-  if (late === undefined) return
+  // The stopped run, and only while it is still stopped: a resume since has started the round again.
+  const isStopped = (one: Run | null | undefined): boolean => one !== null && one !== undefined && one.id === run.id && one.status !== 'running'
+  let isOurs = false
+  await update($, runAtom, one => {
+    if (!isStopped(one) || one?.late === undefined) return one ?? null
+    isOurs = true
+    return { ...one, late: undefined }
+  })
+  if (late === undefined || !isOurs) return
   if (reason !== 'answer') {
     await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout ended on ${reason}; nothing kept`)
     return
@@ -872,9 +879,15 @@ async function takeLate($: Engine, run: Run, answer: string, reason: string): Pr
   const now = await $.clock.now()
   const said = readDispositions(answer)
   let isTaken = false
-  const saved = await updateRecord($, run.root, run.branch, rec => {
+  let isResumed = false
+  const saved = await updateRecord($, run.root, run.branch, async rec => {
     // The lifecycle the fixer worked on, and no other: a reset or a fresh start since makes the answer another lifecycle's.
     if (rec.phase === 'archived' || (rec.generation ?? 0) !== late.generation || rec.lifecycleId !== late.lifecycleId) return rec
+    // Read under the record's lock: a resume during the awaits above runs the round again, which owns the record now.
+    if (!isStopped(await getRun($))) {
+      isResumed = true
+      return rec
+    }
     isTaken = true
     return {
       ...rec,
@@ -885,6 +898,7 @@ async function takeLate($: Engine, run: Run, answer: string, reason: string): Pr
       }),
     }
   })
+  if (isResumed) await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after a resume; nothing kept`)
   if (saved === undefined || !isTaken) return
   const head = await git($, run.root, ['rev-parse', 'HEAD'])
   const dirty = await git($, run.root, ['status', '--porcelain', '--untracked-files=no'])
@@ -2932,7 +2946,8 @@ async function retryLower($: Engine, run: Run, why: string): Promise<void> {
   if (lower === undefined) {
     // The effort that timed out is the carry, not a higher start a re-review ran under: the next run starts no higher than it.
     await patch($, run.id, one => ({ ...one, carriedEffort: lowerOf(one.carriedEffort ?? one.effort, run.effort) }))
-    await finish($, run.id, 'error', `${why} Codex timed out at low effort, the lowest the gate uses.`, true)
+    const ended = await finish($, run.id, 'error', `${why} Codex timed out at low effort, the lowest the gate uses.`, true)
+    if (ended !== null) await say($, ended, timeoutPrompt(ended, ended.message ?? why, false))
     return
   }
   const now = await $.clock.now()
