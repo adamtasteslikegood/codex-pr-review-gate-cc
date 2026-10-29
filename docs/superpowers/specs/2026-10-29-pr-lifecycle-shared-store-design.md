@@ -81,7 +81,7 @@ A "pure change" is marked at the call site (`updateRecord(..., { isPure: true })
 | --- | --- |
 | `claimRecord` (start, resume, a person's command) | `claim` with `holder` set to the session id |
 | `beat` (every 30 s today, `BEAT_MS`; 60 s recommended under decision 1) | `beat` |
-| `isOwnedElsewhere` / `isStillMine` | Answered from the `until` and `holder` that the last `claim`, `beat` or `read` returned. A network read happens only after that lease has lapsed, or when this session isn't the holder. |
+| `isOwnedElsewhere` / `isStillMine` | Between actions, answered from the `until` and `holder` that the last `claim`, `beat` or `read` returned. A network read happens only after that lease has lapsed, or when this session isn't the holder. **At an action boundary** (see the contract below), always a `beat`. |
 | `OWNER_STALE_MS` (120 s, R74) | `LEASE_MS` (120 s) |
 | standing down at the end of a run | `release` |
 
@@ -94,6 +94,24 @@ The lease is **fenced**: every new holder gets a higher `token`. It is also **bo
 - **(c) Any `operate` principal may take a live lease.** This matches today's local behaviour, but any granted checkout could then cut off any other.
 
 **Recommendation: (b).** It keeps what a person at their own prompt can do today and adds no new power across machines. It is one new op, with a test that a different principal gets 423.
+
+**The ownership cache and an immediate takeover.** A `take` or an admin `breakLease` can end a lease before the `until` its holder has cached. So the cache can never by itself authorize work with outside effects:
+
+- **An action boundary** is the moment before the driver starts:
+  - an agent turn;
+  - a git push;
+  - a gh write: a reply, a review request, a label, a merge;
+  - a filing POST.
+
+  At each one, the driver sends `beat`, and it goes ahead only on a 200. That 200 is the server acknowledging that it still holds the lease at that moment.
+- **Any 409 or 423 empties the cache at once.** That covers a `beat`, a `commit` or a `release` refused. The session then stands down as `standDown` does today.
+- **The overlap is bounded, not zero.** An action that was already acknowledged and in flight when a `take` landed runs to its end: at most one step, capped by `stepTimeoutMinutes`. Its record commit is then refused by the revision and lease checks. Its outside effects were already sent. They are safe because each is idempotent or self-correcting:
+  - a push lands on the PR branch, which the new driver fetches before acting (`round.ts`'s catch-up);
+  - a filing goes through the ledger (section 7), so it is never posted twice;
+  - a reply or review request may appear twice, which is visible and harmless.
+
+  No new action starts after the old driver's next boundary, so section 14 promises no new dispatch after a takeover, not exclusive dispatch of steps already in flight.
+- **The cost** is one `beat` per action boundary, a handful per round, added to section 12's count.
 
 ## 5. The run log under a lease (new decision Q)
 
@@ -148,14 +166,14 @@ While in fallback, the local record carries `relayRev`, the last revision it rea
 | Case | Result |
 | --- | --- |
 | The relay's `rev` still equals `relayRev` | The local record is committed at that `rev`. Its changes win, since nobody else wrote. |
-| The relay moved on | The relay's record wins. The local changes are kept as an archive taken at the recovery time, and the run log says so. The person or the conductor reads both, and nothing is merged blindly. |
+| The relay moved on | The relay's record wins, and is never overwritten, not even for a moment. The losing local record is kept twice: <ul><li>locally first, under `lifecycle:<root>:<branch>:archived:<at>` as today;</li><li>then in the relay through a new `snapshot` op.</li></ul>`snapshot` appends `{ at, record, actor, reason: 'fallback' }` to the PR's archives. It needs `operate`, not the lease, and doesn't change `record` or `rev`. The run log says so. The person or the conductor reads both, and nothing is merged blindly. |
 
 Fallback coordinates nothing across checkouts (the decided rule), so it can't stop duplicates. Two checkouts in fallback at once can each pass the exact-mark search before either issue exists, and each file the same finding. On recovery, the step 1 search in section 7 finds every issue carrying the mark. It adopts the lowest-numbered one into the ledger and lists the others in the run log, for the person to close. It never closes them itself. A single checkout in fallback files no duplicate, because its own retries find their mark.
 
 **Migration (decision 3), recommended:** leave existing local records alone, and leave existing issues and marks alone too. A post-PR record crosses over on its next change in a repo that has opted in:
 
 - if the object is empty (`rev: 0`), the local record is pushed up;
-- if it isn't, the relay's record is adopted, and the local one is archived.
+- if it isn't, the relay's record is adopted, and the local one is kept by `snapshot` (`reason: 'migration'`), as in the table above.
 
 Pre-PR records never move.
 
@@ -174,7 +192,9 @@ Pre-PR records never move.
 **Discovery.** `liveRecords(root)` lists every live record under a checkout root. A per-PR object can't answer that, so:
 
 - A second object class, `RepoIndex`, holds one object per `owner/repo`, with an entry `{ pr, branch, phase, rev, updatedAt }` for each live post-PR record.
-- After each `commit`, the PR's object calls its repo's index (object to object, inside the Worker). An archive or a closed PR removes its entry. A failed index update doesn't fail the commit; the next commit retries it.
+- **Each commit queues an index update.** It writes an outbox entry `{ pr, rev, entry | removed }` in the same storage step as the commit, and sets an alarm. Archiving the record or closing the PR writes a removal: a tombstone carrying its `rev`.
+- **The PR's object sends the outbox to its repo's index** (object to object, inside the Worker), and clears it once the index acknowledges. If the update fails, the alarm retries it with backoff until it succeeds. No client and no further commit is needed, so a lifecycle whose controller exits right after its first commit is still discovered.
+- **The index applies updates by revision.** An update whose `rev` is not above the one it holds for that PR, tombstones included, is ignored, so a delayed retry can't bring back an old entry or a removed one. Tombstones are kept for the PR object's retention period (section 8).
 - `liveRecords(root)` maps the root to its slug, then returns the index's entries, each read from its PR's object, plus the local pre-PR records.
 - A new `list` op reads the index. It needs `read` on the repo.
 
@@ -240,7 +260,8 @@ The design keeps the network off the paths where latency would matter:
 
 - `take` (if decision P is (b));
 - `commit`'s `archive` in place of `archiveAt`;
-- `log` and `list`;
+- `log`, `list` and `snapshot`;
+- the index outbox and its alarm;
 - the `RepoIndex` class;
 - the retention alarm;
 - the redaction test (if decision R is (b)).
@@ -258,6 +279,7 @@ The design keeps the network off the paths where latency would matter:
 
 - **Two controller clients** (two checkout roots, two session ids, one Miniflare relay, one fake GitHub) run one PR:
   - only the holder dispatches work;
+  - a `take` right after the old driver's beat, then an old-driver dispatch before its next beat: the action boundary's `beat` gets 423, the old driver stands down, and nothing is dispatched;
   - the other stands down;
   - a takeover after a lapse fences out the old holder's commit;
   - neither files a finding twice.
@@ -265,7 +287,8 @@ The design keeps the network off the paths where latency would matter:
 - **Fallback:** the relay goes down mid-round, the round continues locally, and recovery follows the rule in section 8 in both cases. Two checkouts that both file in fallback: on recovery, the lowest-numbered issue is adopted and the other is reported, not closed.
 - **Crash after a POST:** the issue POST succeeds, the session dies before `fileDone`, and a new session starts in the same checkout. The exact-mark hit sends no second POST, `fileDone` with the kept filing secret leaves the ledger `done`, and the same restart from another checkout leaves it `claimed`, with no second POST either.
 - **Archive:** `commit` with `archive` keeps the record `tx.archive` was given, `phase: 'archived'`, matching the local store.
-- **Discovery:** `liveRecords` through the index matches the per-PR objects.
+- **Discovery:** `liveRecords` through the index matches the per-PR objects. A first registration that fails, followed by no client commit at all: after the transport recovers, the alarm's retry makes discovery converge. A delayed old update or tombstone never brings back a removed entry or an older one.
+- **Recovery and migration with different findings:** the local record and the relay's carry visibly different findings. After recovery, and after a migration to an object that isn't empty, the relay's record and `rev` are unchanged, and the local findings survive both in the local archive and in the relay's `snapshot`.
 - **Per decision:**
   - P(b): a different principal's `take` gets 423;
   - Q: a non-holder's `log` succeeds and its commit gets 423;
