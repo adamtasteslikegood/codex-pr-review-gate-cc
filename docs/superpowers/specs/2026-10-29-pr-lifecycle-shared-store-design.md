@@ -57,7 +57,7 @@ The rule in the seam doesn't change: a change of a live record goes through `tra
 1. **The in-process lock stays.** `transact` still takes the lock for its branch, which keeps one process's transactions in order, exactly as today.
 2. **Load.** `tx.load()` sends `read` and keeps the returned `rev`.
 3. **Work runs locally.** Any git or gh calls inside it run on the checkout. `startGate` is one that does. No network lock is held while they run.
-4. **Commit.** `tx.save(rec)`, with any `tx.archive(old, at)` alongside, becomes one `commit` carrying `{ rev, record, archive? }`, sent when `work` returns. `archive` is `{ at, record }`: the record `tx.archive` was given, with `phase: 'archived'`, as the local `writeArchive` stores it. The prototype's `archiveAt`, which copies whatever record is stored, changes to this, so the relay keeps exactly what the local store would. A save with no archive sends no `archive`. If `work` saves twice, only the last save is sent.
+4. **Commit.** `tx.save(rec)`, with any `tx.archive(old, at)` alongside, becomes one `commit` carrying `{ rev, record, archive? }`, sent when `work` returns. `archive` is `{ at, record }`: the record `tx.archive` was given, with `phase: 'archived'`, as the local `writeArchive` stores it. The prototype's `commit` takes this payload (it replaced `archiveAt`, which copied whatever record was stored), so the relay keeps exactly what the local store would. A save with no archive sends no `archive`. If `work` saves twice, only the last save is sent.
 5. **Who else can commit.** The lease keeps other checkouts out: a commit under someone else's live lease gets 423. A 409 (stale revision) can then happen only in three ways:
    - the lease lapsed and was taken over mid-transaction;
    - an admin broke the lease;
@@ -259,7 +259,6 @@ The design keeps the network off the paths where latency would matter:
 **New in the relay:**
 
 - `take` (if decision P is (b));
-- `commit`'s `archive` in place of `archiveAt`;
 - `log`, `list` and `snapshot`;
 - the index outbox and its alarm;
 - the `RepoIndex` class;
@@ -278,7 +277,7 @@ The design keeps the network off the paths where latency would matter:
 ## 14. Proof before it is used
 
 - **Two controller clients** (two checkout roots, two session ids, one Miniflare relay, one fake GitHub) run one PR:
-  - only the holder dispatches work;
+  - no new dispatch after a takeover: once the old driver's boundary `beat` is refused, it starts nothing, while the new holder dispatches. An action already acknowledged before the `take` may finish (section 4's bounded overlap): its commit is refused, its push is caught up by the new driver's fetch, its filing goes through the ledger with no second POST, and a reply it sent may appear twice;
   - a `take` right after the old driver's beat, then an old-driver dispatch before its next beat: the action boundary's `beat` gets 423, the old driver stands down, and nothing is dispatched;
   - the other stands down;
   - a takeover after a lapse fences out the old holder's commit;
