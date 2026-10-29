@@ -46,6 +46,9 @@ the project's goals and their order.
   - Read the spec and the rulings before changing it. The goals are in
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
   - `/pr-gate log` sums up how a lifecycle went (R78).
+- `pr-lifecycle-relay/` is the local prototype of #29 Part B's shared store: a Worker
+  and one Durable Object per PR, tested under Miniflare. Nothing is deployed, and
+  pr-lifecycle doesn't call it yet.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
   creation, so two would gate the same PR twice. Switching
   `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.
@@ -109,7 +112,9 @@ npm run lint       # eslint, pr-lifecycle only
 npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 713)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
-npm run check      # all four
+npm run test:relay       # the #29 Part B relay prototype under Miniflare (17)
+npm run typecheck:relay  # tsc -p pr-lifecycle-relay
+npm run check      # all of the above
 ```
 
 - `typecheck` needs `pr-lifecycle/.claude-plugin/types/`, which the harness
