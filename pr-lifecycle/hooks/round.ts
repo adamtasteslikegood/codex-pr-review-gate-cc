@@ -119,7 +119,7 @@ import {
   untrackedSecurity,
 } from './lifecycle'
 import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
-import { archiveRecord, isHeldByOther, liveRecords, LOG_CAP, loadRecord, lockRecord, logEvent, ownerOf, recordKey, saveRecord, setOwner, updateRecord } from './store'
+import { isHeldByOther, liveRecords, LOG_CAP, loadRecord, logEvent, ownerOf, recordKey, setOwner, transact, updateRecord } from './store'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -1032,17 +1032,17 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
  * or, with `generation`, when the live record is another lifecycle's (A6).
  */
 export async function archiveLifecycle($: Engine, root: string, branch: string, now: number, generation?: number): Promise<boolean> {
-  return lockRecord(root, branch, async () => {
-    const last = await loadRecord($, root, branch)
+  return transact($, root, branch, async tx => {
+    const last = await tx.load()
     if (last === undefined || last.phase === 'archived') return false
     // A caller that read the record earlier archives only that lifecycle, never one a reset and a fresh start put in its place (A6).
     if (generation !== undefined && (last.generation ?? 0) !== generation) return false
-    await archiveRecord($, last, now)
+    await tx.archive(last, now)
     const { base, head, tier, tierWhy, lane, allowance } = last
     const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
     // When the head reached the PR (#24) is kept only for the head the seed names: a fresh start on another head looks it up afresh.
     const arrival = last.headArrival?.head === head ? { headArrival: last.headArrival } : {}
-    await saveRecord($, { ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, ...arrival, phase: 'archived', generation: (last.generation ?? 0) + 1 })
+    await tx.save({ ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, ...arrival, phase: 'archived', generation: (last.generation ?? 0) + 1 })
     return true
   })
 }
