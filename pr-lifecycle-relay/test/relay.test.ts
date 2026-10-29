@@ -162,72 +162,99 @@ test('a commit that archives keeps the record it replaces, newest last', async (
 
 // ----------------------------------------------------------------- lease
 
-type Held = { token: number; secret: string; holder: string; principal: string }
+type Held = { token: number; holder: string; principal: string }
 const wait = (ms: number) => new Promise(done => setTimeout(done, ms))
+/** A checkout's own capability: made on its side, never returned by the relay. */
+const secretOf = (): string => crypto.randomUUID() + crypto.randomUUID()
 
 test('a live lease holds out another holder; after it lapses the other takes over, and the old holder can neither write nor beat', async () => {
   const path = '/v1/owner/repo/13'
   const adam = await sign(person(ADAM))
   const codex = await sign(service(CODEX))
-  const mine = (await call(adam, { op: 'claim', holder: 'session-a' }, path)).json.lease as Held
-  assert.equal((await call(codex, { op: 'claim', holder: 'session-b' }, path)).status, 423)
-  assert.equal((await call(codex, { op: 'commit', rev: 0, record: { x: 1 } }, path)).status, 423)
-  assert.equal((await call(adam, { op: 'commit', rev: 0, record: { x: 1 }, secret: mine.secret }, path)).status, 200)
+  const [a, b] = [secretOf(), secretOf()]
+  const mine = (await call(adam, { op: 'claim', holder: 'session-a', secret: a }, path)).json.lease as Held
+  assert.equal((await call(codex, { op: 'claim', holder: 'session-b', secret: b }, path)).status, 423)
+  assert.equal((await call(codex, { op: 'commit', rev: 0, record: { x: 1 }, secret: b }, path)).status, 423)
+  assert.equal((await call(adam, { op: 'commit', rev: 0, record: { x: 1 }, secret: a }, path)).status, 200)
   await wait(LEASE_MS + 100)
-  const theirs = await call(codex, { op: 'claim', holder: 'session-b' }, path)
+  const theirs = await call(codex, { op: 'claim', holder: 'session-b', secret: b }, path)
   assert.equal(theirs.status, 200)
   assert.ok((theirs.json.lease as Held).token > mine.token)
-  assert.equal((await call(adam, { op: 'commit', rev: 1, record: { x: 2 }, secret: mine.secret }, path)).status, 423)
-  assert.equal((await call(adam, { op: 'beat', secret: mine.secret }, path)).status, 409)
+  assert.equal((await call(adam, { op: 'commit', rev: 1, record: { x: 2 }, secret: a }, path)).status, 423)
+  assert.equal((await call(adam, { op: 'beat', secret: a }, path)).status, 409)
+})
+
+test('a claim needs a secret, and no response ever carries it or its verifier', async () => {
+  const path = '/v1/owner/repo/21'
+  const adam = await sign(person(ADAM))
+  assert.equal((await call(adam, { op: 'claim', holder: 'session-a' }, path)).status, 400)
+  assert.equal((await call(adam, { op: 'claim', holder: 'session-a', secret: 'short' }, path)).status, 400)
+  const secret = secretOf()
+  const answers = [
+    await call(adam, { op: 'claim', holder: 'session-a', secret }, path),
+    await call(adam, { op: 'beat', secret }, path),
+    await call(adam, { op: 'read' }, path),
+    await call(adam, { op: 'fileClaim', key: 'k', secret }, path),
+    await call(adam, { op: 'fileClaim', key: 'k', secret }, path),
+    await call(adam, { op: 'fileDone', key: 'k', secret, result: 1 }, path),
+    await call(adam, { op: 'filing', key: 'k' }, path),
+  ]
+  for (const one of answers) {
+    assert.equal(one.status, 200)
+    const text = JSON.stringify(one.json)
+    assert.ok(!text.includes(secret) && !text.includes('verifier'), text)
+  }
 })
 
 test('a beat keeps the lease alive past its first term and is recorded; a failed beat records nothing', async () => {
   const path = '/v1/owner/repo/14'
   const adam = await sign(person(ADAM))
   const reader = await sign(person(READER))
-  const mine = (await call(adam, { op: 'claim', holder: 'session-a' }, path)).json.lease as Held
+  const secret = secretOf()
+  await call(adam, { op: 'claim', holder: 'session-a', secret }, path)
   await wait(LEASE_MS / 2)
-  assert.equal((await call(adam, { op: 'beat', secret: mine.secret }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'beat', secret }, path)).status, 200)
   const beat = (await call(reader, { op: 'read' }, path)).json.lastWrite as { actor: string; op: string; at: number }
   assert.deepEqual([beat.actor, beat.op], [ADAM, 'beat'])
-  assert.equal((await call(adam, { op: 'beat', secret: 'wrong' }, path)).status, 409)
+  assert.equal((await call(adam, { op: 'beat', secret: secretOf() }, path)).status, 409)
   assert.deepEqual((await call(reader, { op: 'read' }, path)).json.lastWrite, beat)
   await wait(LEASE_MS / 2 + 50)
-  assert.equal((await call(await sign(service(CODEX)), { op: 'claim', holder: 'session-b' }, path)).status, 423)
+  assert.equal((await call(await sign(service(CODEX)), { op: 'claim', holder: 'session-b', secret: secretOf() }, path)).status, 423)
 })
 
 test('a lapsed lease cannot be revived or released by its old holder', async () => {
   const path = '/v1/owner/repo/16'
   const adam = await sign(person(ADAM))
-  const mine = (await call(adam, { op: 'claim', holder: 'session-a' }, path)).json.lease as Held
+  const secret = secretOf()
+  await call(adam, { op: 'claim', holder: 'session-a', secret }, path)
   await wait(LEASE_MS + 100)
-  assert.equal((await call(adam, { op: 'beat', secret: mine.secret }, path)).status, 409)
-  assert.equal((await call(adam, { op: 'release', secret: mine.secret }, path)).status, 409)
-  assert.equal((await call(await sign(service(CODEX)), { op: 'claim', holder: 'session-b' }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'beat', secret }, path)).status, 409)
+  assert.equal((await call(adam, { op: 'release', secret }, path)).status, 409)
+  assert.equal((await call(await sign(service(CODEX)), { op: 'claim', holder: 'session-b', secret: secretOf() }, path)).status, 200)
 })
 
 test('what a read shows of a lease grants nothing: another principal or checkout copying it cannot commit, beat, renew or release', async () => {
   const path = '/v1/owner/repo/17'
   const adam = await sign(person(ADAM))
   const codex = await sign(service(CODEX))
-  const mine = (await call(adam, { op: 'claim', holder: 'checkout-a' }, path)).json.lease as Held
+  const secret = secretOf()
+  const mine = (await call(adam, { op: 'claim', holder: 'checkout-a', secret }, path)).json.lease as Held
   const seen = (await call(codex, { op: 'read' }, path)).json.lease as Record<string, unknown>
-  assert.equal(seen.secret, undefined)
   assert.equal(seen.token, mine.token)
   for (const who of [codex, adam]) {
-    const copied = { token: seen.token, holder: seen.holder }
+    const copied = { token: seen.token, holder: seen.holder, secret: secretOf() }
     assert.equal((await call(who, { op: 'commit', rev: 0, record: { x: 1 }, ...copied }, path)).status, 423)
     assert.equal((await call(who, { op: 'beat', ...copied }, path)).status, 409)
     assert.equal((await call(who, { op: 'release', ...copied }, path)).status, 409)
+    assert.equal((await call(who, { op: 'claim', ...copied }, path)).status, 423)
   }
-  // The same principal, as another checkout, renews nothing by naming the holder; another principal with the secret is still refused.
-  assert.equal((await call(adam, { op: 'claim', holder: 'checkout-a' }, path)).status, 423)
-  assert.equal((await call(codex, { op: 'claim', holder: 'checkout-a', secret: mine.secret }, path)).status, 423)
-  assert.equal((await call(codex, { op: 'release', secret: mine.secret }, path)).status, 409)
-  const renewed = await call(adam, { op: 'claim', holder: 'checkout-a', secret: mine.secret }, path)
+  // Another principal holding the very secret is still not the holder.
+  assert.equal((await call(codex, { op: 'claim', holder: 'checkout-a', secret }, path)).status, 423)
+  assert.equal((await call(codex, { op: 'release', secret }, path)).status, 409)
+  const renewed = await call(adam, { op: 'claim', holder: 'checkout-a', secret }, path)
   assert.equal(renewed.status, 200)
   assert.equal((renewed.json.lease as Held).token, mine.token)
-  assert.equal((await call(adam, { op: 'release', secret: mine.secret }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'release', secret }, path)).status, 200)
 })
 
 // ---------------------------------------------------------------- filing
@@ -236,16 +263,30 @@ test('a filing claim is idempotent: the second claim of a key finds the first, a
   const path = '/v1/owner/repo/15'
   const adam = await sign(person(ADAM))
   const key = 'lc-1:R1-1:1'
-  const first = await call(adam, { op: 'fileClaim', key }, path)
-  assert.equal(first.json.isFresh, true)
-  const again = await call(await sign(service(CODEX)), { op: 'fileClaim', key }, path)
-  assert.equal(again.json.isFresh, false)
-  assert.equal((again.json.filing as Record<string, unknown>).secret, undefined)
-  const secret = (first.json.filing as { secret: string }).secret
+  const secret = secretOf()
+  assert.equal((await call(adam, { op: 'fileClaim', key, secret }, path)).json.isFresh, true)
+  const again = await call(await sign(service(CODEX)), { op: 'fileClaim', key, secret: secretOf() }, path)
+  assert.deepEqual([again.json.isFresh, again.json.isMine], [false, false])
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 42 } }, path)).status, 200)
   const read = await call(await sign(person(READER)), { op: 'filing', key }, path)
   assert.deepEqual((read.json.filing as { state: string; result: unknown }).result, { issue: 42 })
   assert.equal((await call(await sign(service(CODEX)), { op: 'fileDelete', key }, path)).status, 403)
+})
+
+test('a lost fileClaim answer is no dead end: the retry with the same secret finds its own claim and completes it once; another checkout cannot', async () => {
+  const path = '/v1/owner/repo/22'
+  const adam = await sign(person(ADAM))
+  const key = 'lc-2:G6-2:1'
+  const secret = secretOf()
+  await call(adam, { op: 'fileClaim', key, secret }, path) // saved, but say its answer never arrived
+  const retry = await call(adam, { op: 'fileClaim', key, secret }, path)
+  assert.deepEqual([retry.json.isFresh, retry.json.isMine], [false, true])
+  // The same principal as another checkout (another secret) is not the claimant.
+  const other = await call(adam, { op: 'fileClaim', key, secret: secretOf() }, path)
+  assert.deepEqual([other.json.isFresh, other.json.isMine], [false, false])
+  assert.equal((await call(adam, { op: 'fileDone', key, secret: secretOf(), result: { issue: 7 } }, path)).status, 403)
+  assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 7 } }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 8 } }, path)).status, 409)
 })
 
 test('only the claimant finishes a filing, and a done filing never changes: the same answer is a retry, another is refused', async () => {
@@ -253,8 +294,9 @@ test('only the claimant finishes a filing, and a done filing never changes: the 
   const adam = await sign(person(ADAM))
   const codex = await sign(service(CODEX))
   const key = 'lc-1:G1-1:1'
-  const secret = ((await call(adam, { op: 'fileClaim', key }, path)).json.filing as { secret: string }).secret
-  assert.equal((await call(codex, { op: 'fileDone', key, result: { issue: 99 } }, path)).status, 403)
+  const secret = secretOf()
+  await call(adam, { op: 'fileClaim', key, secret }, path)
+  assert.equal((await call(codex, { op: 'fileDone', key, secret: secretOf(), result: { issue: 99 } }, path)).status, 403)
   assert.equal((await call(codex, { op: 'fileDone', key, secret, result: { issue: 99 } }, path)).status, 403)
   assert.equal((await call(adam, { op: 'fileDone', key, result: { issue: 99 } }, path)).status, 403)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 42 } }, path)).status, 200)
@@ -267,9 +309,10 @@ test('only the claimant finishes a filing, and a done filing never changes: the 
 test('a filing key named like an inherited property is claimed like any other', async () => {
   const path = '/v1/owner/repo/19'
   const adam = await sign(person(ADAM))
+  const secret = secretOf()
   for (const key of ['__proto__', 'constructor', 'toString']) {
-    assert.equal((await call(adam, { op: 'fileClaim', key }, path)).json.isFresh, true, key)
-    assert.equal((await call(adam, { op: 'fileClaim', key }, path)).json.isFresh, false, key)
+    assert.equal((await call(adam, { op: 'fileClaim', key, secret }, path)).json.isFresh, true, key)
+    assert.equal((await call(adam, { op: 'fileClaim', key, secret }, path)).json.isFresh, false, key)
   }
   assert.equal((await call(adam, { op: 'filing', key: 'hasOwnProperty' }, path)).json.filing, null)
 })

@@ -112,7 +112,7 @@ npm run lint       # eslint, pr-lifecycle only
 npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 713)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
-npm run test:relay       # the #29 Part B relay prototype under Miniflare (15)
+npm run test:relay       # the #29 Part B relay prototype under Miniflare (17)
 npm run typecheck:relay  # tsc -p pr-lifecycle-relay
 npm run check      # all of the above
 ```
