@@ -57,7 +57,7 @@ The rule in the seam doesn't change: a change of a live record goes through `tra
 1. **The in-process lock stays.** `transact` still takes the lock for its branch, which keeps one process's transactions in order, exactly as today.
 2. **Load.** `tx.load()` sends `read` and keeps the returned `rev`.
 3. **Work runs locally.** Any git or gh calls inside it run on the checkout. `startGate` is one that does. No network lock is held while they run.
-4. **Commit.** `tx.save(rec)`, with any `tx.archive(old, at)` alongside, becomes one `commit` carrying `{ rev, record, archiveAt? }`, sent when `work` returns. A save with no archive sends no `archiveAt`. If `work` saves twice, only the last save is sent.
+4. **Commit.** `tx.save(rec)`, with any `tx.archive(old, at)` alongside, becomes one `commit` carrying `{ rev, record, archive? }`, sent when `work` returns. `archive` is `{ at, record }`: the record `tx.archive` was given, with `phase: 'archived'`, as the local `writeArchive` stores it. The prototype's `archiveAt`, which copies whatever record is stored, changes to this, so the relay keeps exactly what the local store would. A save with no archive sends no `archive`. If `work` saves twice, only the last save is sent.
 5. **Who else can commit.** The lease keeps other checkouts out: a commit under someone else's live lease gets 423. A 409 (stale revision) can then happen only in three ways:
    - the lease lapsed and was taken over mid-transaction;
    - an admin broke the lease;
@@ -80,7 +80,7 @@ A "pure change" is marked at the call site (`updateRecord(..., { isPure: true })
 | pr-lifecycle | Relay |
 | --- | --- |
 | `claimRecord` (start, resume, a person's command) | `claim` with `holder` set to the session id |
-| `beat` every 30 s (`BEAT_MS`) | `beat` |
+| `beat` (every 30 s today, `BEAT_MS`; 60 s recommended under decision 1) | `beat` |
 | `isOwnedElsewhere` / `isStillMine` | Answered from the `until` and `holder` that the last `claim`, `beat` or `read` returned. A network read happens only after that lease has lapsed, or when this session isn't the holder. |
 | `OWNER_STALE_MS` (120 s, R74) | `LEASE_MS` (120 s) |
 | standing down at the end of a run | `release` |
@@ -111,15 +111,22 @@ Log lines then never conflict with record commits. The alternative, keeping the 
 ## 6. The checkout's secret (the answer to G6-1 on PR #48)
 
 - The secret is made once per session: two `crypto.randomUUID()` values joined, 72 characters, above `MIN_SECRET` (32).
-- It is saved in the plugin store under `relay-secret:<sessionId>` **before** the first `claim` or `fileClaim` that sends it. If that save fails, the call isn't sent, and the session uses the local store as in section 8.
-- A restarted session has a new session id, so it gets a new secret, and it is correctly treated as a new holder. A lost response is retried with the saved secret, so a claim's or filing's own author can always finish it.
+- There are two secrets, because a lease and a filing outlive different things:
+  - the **lease secret** belongs to the session. It is saved in the plugin store under `relay-secret:<sessionId>`. A restarted session has a new session id, so it gets a new secret, and it is correctly treated as a new holder;
+  - the **filing secret** belongs to the checkout and the lifecycle. It is saved under `relay-filing-secret:<root>:<lifecycleId>`, so a session restarted in the same checkout finishes a filing its predecessor claimed (section 7). Another checkout never has it, so it can't finish someone else's claim.
+- Each is saved **before** the first call that sends it. If that save fails, the call isn't sent, and the session uses the local store as in section 8.
+- A lost response is retried with the saved secret, so a claim's or filing's own author can always finish it.
 - Only the hash leaves the checkout's memory and is stored: the object keeps the SHA-256 and never returns it.
 
 ## 7. The filing ledger (open decision 2)
 
 In a repo that opts in, filing one finding goes:
 
-1. **Exact-mark search first**, as today (R96). An issue already carrying `<!-- pr-gate filing: <id> of #<pr> lc <uuid> -->` is adopted, and `fileDone` records it. A crash after a POST is recovered this way, because a claim alone can't tell whether the POST went out.
+1. **Exact-mark search first**, as today (R96). An issue already carrying `<!-- pr-gate filing: <id> of #<pr> lc <uuid> -->` is adopted. A crash after a POST is recovered this way, because a claim alone can't tell whether the POST went out. The ledger then records the adoption, without impersonating anyone:
+   - **unclaimed** (filed during fallback, section 8): `fileClaim` first, then `fileDone` with the issue;
+   - **claimed by this checkout** (the claimant crashed after its POST, and this session restarted in the same checkout): `fileDone` with the filing secret it kept (section 6). The relay answers as for the claimant, because it is the claimant's capability;
+   - **claimed by another checkout**: as in step 2's third case, no POST and no `fileDone`. The issue is used locally, and only the claimant or an admin moves the ledger;
+   - **done**: adopt its result.
 2. **`fileClaim`** with the key `lifecycleId:findingId:attempt`:
    - `isFresh: true`, or `isMine: true` (a retry after a lost answer): file the issue, then send `fileDone` with `{ number, url }`.
    - `isFresh: false, isMine: false`, still `claimed`: another checkout is filing. Don't POST. Read `filing` again on the next tick. A claim older than the step timeout (`stepTimeoutMinutes`, 30) with no `fileDone` shows in `/pr-gate log` as stuck, for an admin's `fileDelete`. It is never taken over automatically, because its POST may already have gone out.
@@ -143,7 +150,7 @@ While in fallback, the local record carries `relayRev`, the last revision it rea
 | The relay's `rev` still equals `relayRev` | The local record is committed at that `rev`. Its changes win, since nobody else wrote. |
 | The relay moved on | The relay's record wins. The local changes are kept as an archive taken at the recovery time, and the run log says so. The person or the conductor reads both, and nothing is merged blindly. |
 
-Filings made during fallback carry their exact marks, so the step 1 search in section 7 adopts them, and no duplicate is filed.
+Fallback coordinates nothing across checkouts (the decided rule), so it can't stop duplicates. Two checkouts in fallback at once can each pass the exact-mark search before either issue exists, and each file the same finding. On recovery, the step 1 search in section 7 finds every issue carrying the mark. It adopts the lowest-numbered one into the ledger and lists the others in the run log, for the person to close. It never closes them itself. A single checkout in fallback files no duplicate, because its own retries find their mark.
 
 **Migration (decision 3), recommended:** leave existing local records alone, and leave existing issues and marks alone too. A post-PR record crosses over on its next change in a repo that has opted in:
 
@@ -162,7 +169,7 @@ Pre-PR records never move.
 
 ## 9. Discovery and archives
 
-**Archives.** `latestArchive` becomes `archives`, which returns the newest. `tx.archive` together with `tx.save` is one `commit` with `archiveAt` (section 3).
+**Archives.** `latestArchive` becomes `archives`, which returns the newest. `tx.archive` together with `tx.save` is one `commit` with `archive` (section 3).
 
 **Discovery.** `liveRecords(root)` lists every live record under a checkout root. A per-PR object can't answer that, so:
 
@@ -232,6 +239,7 @@ The design keeps the network off the paths where latency would matter:
 **New in the relay:**
 
 - `take` (if decision P is (b));
+- `commit`'s `archive` in place of `archiveAt`;
 - `log` and `list`;
 - the `RepoIndex` class;
 - the retention alarm;
@@ -254,7 +262,9 @@ The design keeps the network off the paths where latency would matter:
   - a takeover after a lapse fences out the old holder's commit;
   - neither files a finding twice.
 - **A stale `startGate` commit** (409) isn't retried, and the next tick recovers.
-- **Fallback:** the relay goes down mid-round, the round continues locally, and recovery follows the rule in section 8 in both cases.
+- **Fallback:** the relay goes down mid-round, the round continues locally, and recovery follows the rule in section 8 in both cases. Two checkouts that both file in fallback: on recovery, the lowest-numbered issue is adopted and the other is reported, not closed.
+- **Crash after a POST:** the issue POST succeeds, the session dies before `fileDone`, and a new session starts in the same checkout. The exact-mark hit sends no second POST, `fileDone` with the kept filing secret leaves the ledger `done`, and the same restart from another checkout leaves it `claimed`, with no second POST either.
+- **Archive:** `commit` with `archive` keeps the record `tx.archive` was given, `phase: 'archived'`, matching the local store.
 - **Discovery:** `liveRecords` through the index matches the per-PR objects.
 - **Per decision:**
   - P(b): a different principal's `take` gets 423;
