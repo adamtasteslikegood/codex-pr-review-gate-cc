@@ -5,10 +5,15 @@
 import { isAdmin, presetOf, type Principal } from './auth.ts'
 import type { DurableObjectState, Env } from './types.ts'
 
-/** Who holds the lifecycle now (R74's owner, fenced): a write must carry the live lease's token. */
-export type Lease = { holder: string; token: number; until: number }
+/**
+ * Who holds the lifecycle now (R74's owner, fenced). `token` is the public fence: each new holder gets a higher one. `secret` is the
+ * holder's capability, returned only to the claim that made the lease and never by a read: a write under a live lease must come from the
+ * same principal and carry it, so reading the lease grants nothing.
+ */
+export type Lease = { holder: string; principal: string; token: number; until: number; secret: string }
 
-export type Filing = { state: 'claimed' | 'done'; actor: string; at: number; result?: unknown }
+/** A filing claim belongs to the principal and checkout that made it: only they may complete it, and a completed one never changes. */
+export type Filing = { state: 'claimed' | 'done'; actor: string; at: number; secret: string; result?: unknown }
 
 type Write = { actor: string; op: string; at: number; rev: number }
 
@@ -31,6 +36,13 @@ const WRITE_CAP = 100
 const LEASE_MS = 120_000
 
 const empty = (): State => ({ rev: 0, record: null, lease: null, fence: 0, archives: [], filings: {}, writes: [] })
+
+/** What anyone with `read` may see of a lease or a filing: everything but the capability. */
+const shown = <T extends { secret: string }>(one: T | null | undefined): Omit<T, 'secret'> | null => {
+  if (one === null || one === undefined) return null
+  const { secret: _, ...rest } = one
+  return rest
+}
 
 const reply = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
@@ -74,6 +86,9 @@ export class LifecycleObject {
     const s = (await this.state.storage.get<State>('state')) ?? empty()
     const leaseMs = Number(this.env.LEASE_MS ?? LEASE_MS)
     const isLive = (lease: Lease | null): lease is Lease => lease !== null && lease.until > now
+    const isMine = (lease: Lease): boolean => lease.principal === who.id && typeof body.secret === 'string' && lease.secret === body.secret
+    // A plain object inherits `__proto__` and `constructor`: a filing is only ever an own property.
+    const filingOf = (key: string): Filing | undefined => (Object.hasOwn(s.filings, key) ? s.filings[key] : undefined)
     const save = async (next: State, what: string): Promise<void> => {
       next.writes = [...next.writes, { actor: who.id, op: what, at: now, rev: next.rev }].slice(-WRITE_CAP)
       await this.state.storage.put({ state: next })
@@ -81,15 +96,15 @@ export class LifecycleObject {
 
     switch (op) {
       case 'read':
-        return reply(200, { rev: s.rev, record: s.record, lease: s.lease, lastWrite: s.writes.at(-1) ?? null })
+        return reply(200, { rev: s.rev, record: s.record, lease: shown(s.lease), lastWrite: s.writes.at(-1) ?? null })
       case 'archives':
         return reply(200, { archives: s.archives })
       case 'filing':
-        return reply(200, { filing: s.filings[String(body.key)] ?? null })
+        return reply(200, { filing: shown(filingOf(String(body.key))) })
       case 'commit': {
         // A commit names the revision it read: a stale one is refused with what is there now, never merged blindly.
         if (body.rev !== s.rev) return reply(409, { error: 'stale revision', rev: s.rev, record: s.record })
-        if (isLive(s.lease) && s.lease.token !== body.token) return reply(423, { error: 'the lease is held', lease: s.lease })
+        if (isLive(s.lease) && !isMine(s.lease)) return reply(423, { error: 'the lease is held', lease: shown(s.lease) })
         const archives =
           typeof body.archiveAt === 'number' && s.record !== null ? [...s.archives, { at: body.archiveAt, record: s.record }].slice(-ARCHIVE_CAP) : s.archives
         const next = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
@@ -99,22 +114,24 @@ export class LifecycleObject {
       case 'claim': {
         const holder = String(body.holder ?? '')
         if (holder === '') return reply(400, { error: 'claim needs a holder' })
-        if (isLive(s.lease) && s.lease.holder !== holder) return reply(423, { error: 'the lease is held', lease: s.lease })
-        const isRenewal = isLive(s.lease) && s.lease.holder === holder
+        // A live lease is renewed only by its own holder, principal and capability; anyone else waits for it to lapse.
+        if (isLive(s.lease) && (s.lease.holder !== holder || !isMine(s.lease))) return reply(423, { error: 'the lease is held', lease: shown(s.lease) })
+        const isRenewal = isLive(s.lease)
         const token = isRenewal ? s.lease!.token : s.fence + 1
-        const lease = { holder, token, until: now + leaseMs }
+        const lease: Lease = { holder, principal: who.id, token, until: now + leaseMs, secret: isRenewal ? s.lease!.secret : crypto.randomUUID() }
         const next = { ...s, lease, fence: Math.max(s.fence, token) }
         await save(next, isRenewal ? 'claim (renewed)' : s.lease === null ? 'claim' : `claim (took over from ${s.lease.holder})`)
         return reply(200, { lease })
       }
       case 'beat': {
-        if (s.lease === null || s.lease.token !== body.token) return reply(409, { error: 'the lease is lost', lease: s.lease })
+        // A lapsed lease is lost even to its holder: reviving it would block a takeover that is already allowed.
+        if (!isLive(s.lease) || !isMine(s.lease)) return reply(409, { error: 'the lease is lost', lease: shown(s.lease) })
         const lease = { ...s.lease, until: now + leaseMs }
-        await this.state.storage.put({ state: { ...s, lease } })
+        await save({ ...s, lease }, 'beat')
         return reply(200, { lease })
       }
       case 'release': {
-        if (s.lease === null || s.lease.token !== body.token) return reply(409, { error: 'the lease is lost', lease: s.lease })
+        if (!isLive(s.lease) || !isMine(s.lease)) return reply(409, { error: 'the lease is lost', lease: shown(s.lease) })
         await save({ ...s, lease: null }, 'release')
         return reply(200, {})
       }
@@ -125,19 +142,25 @@ export class LifecycleObject {
         // The claim key is `lifecycleId:findingId:attempt` (open decision 2): a second claim of it finds the first, never a new issue.
         const key = String(body.key ?? '')
         if (key === '') return reply(400, { error: 'fileClaim needs a key' })
-        const known = s.filings[key]
-        if (known !== undefined) return reply(200, { isFresh: false, filing: known })
-        const filing: Filing = { state: 'claimed', actor: who.id, at: now }
+        const known = filingOf(key)
+        if (known !== undefined) return reply(200, { isFresh: false, filing: shown(known) })
+        const filing: Filing = { state: 'claimed', actor: who.id, at: now, secret: crypto.randomUUID() }
         await save({ ...s, filings: { ...s.filings, [key]: filing } }, `fileClaim ${key}`)
         return reply(200, { isFresh: true, filing })
       }
       case 'fileDone': {
         const key = String(body.key ?? '')
-        const known = s.filings[key]
+        const known = filingOf(key)
         if (known === undefined) return reply(409, { error: 'no claim to finish' })
+        if (known.actor !== who.id || known.secret !== body.secret) return reply(403, { error: 'only the claimant may finish a filing', filing: shown(known) })
+        // Done is terminal: the same answer again is a retry, a different one is refused. A rewrite is fileDelete, by an admin.
+        if (known.state === 'done') {
+          const isSame = JSON.stringify(known.result) === JSON.stringify(body.result)
+          return reply(isSame ? 200 : 409, isSame ? { filing: shown(known) } : { error: 'the filing is done', filing: shown(known) })
+        }
         const filing: Filing = { ...known, state: 'done', result: body.result, at: now }
         await save({ ...s, filings: { ...s.filings, [key]: filing } }, `fileDone ${key}`)
-        return reply(200, { filing })
+        return reply(200, { filing: shown(filing) })
       }
       case 'fileDelete': {
         const key = String(body.key ?? '')

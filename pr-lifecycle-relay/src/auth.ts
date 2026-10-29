@@ -66,9 +66,9 @@ export async function verifyAccess(request: Request, env: Env, now: number): Pro
   const seconds = now / 1000
   if (typeof claims.exp !== 'number' || claims.exp <= seconds) return undefined
   if (typeof claims.nbf === 'number' && claims.nbf > seconds) return undefined
-  // A person signs in with an email; a service token carries its client id as common_name.
-  if (typeof claims.email === 'string' && claims.email !== '') return { id: claims.email, isService: false }
-  if (typeof claims.common_name === 'string' && claims.common_name !== '') return { id: claims.common_name, isService: true }
+  // A person signs in with an email; a service token carries its client id as common_name. Ids are compared in lower case.
+  if (typeof claims.email === 'string' && claims.email !== '') return { id: claims.email.toLowerCase(), isService: false }
+  if (typeof claims.common_name === 'string' && claims.common_name !== '') return { id: claims.common_name.toLowerCase(), isService: true }
   return undefined
 }
 
@@ -87,10 +87,10 @@ export const isAdmin = (env: Env, who: Principal): boolean =>
   !who.isService &&
   (env.ADMINS ?? '')
     .split(',')
-    .map(one => one.trim())
+    .map(one => one.trim().toLowerCase())
     .includes(who.id)
 
 export const presetOf = (env: Env, who: Principal, repo: string): Preset | undefined => {
-  const mine = grantsOf(env).filter(one => one.principal === who.id && String(one.repo).toLowerCase() === repo)
+  const mine = grantsOf(env).filter(one => String(one.principal).toLowerCase() === who.id && String(one.repo).toLowerCase() === repo)
   return mine.some(one => one.preset === 'operate') ? 'operate' : mine.length > 0 ? 'read' : undefined
 }

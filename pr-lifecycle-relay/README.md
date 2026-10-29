@@ -15,12 +15,12 @@ no Cloudflare resource or Access application exists for it. pr-lifecycle does no
 | Op | Needs | What it does |
 | --- | --- | --- |
 | `read`, `archives`, `filing` | `read` | The record, its revision and lease, the last write; the archives; one filing. |
-| `commit` | `operate` | Writes the record if `rev` is current (else 409 with the current record) and no other holder's lease is live (else 423). `archiveAt` keeps the record it replaces. |
-| `claim`, `beat`, `release` | `operate` | The lease. A new holder gets a higher fenced token, so a stale holder's writes are refused. |
-| `fileClaim`, `fileDone` | `operate` | The filing ledger. A second claim of a key finds the first. |
+| `commit` | `operate` | Writes the record if `rev` is current (else 409 with the current record) and no lease is live that the caller doesn't hold (else 423). `archiveAt` keeps the record it replaces. |
+| `claim`, `beat`, `release` | `operate` | The lease. A new holder gets a higher public fence `token` and a `secret` capability that only its claim returns. A live lease is renewed, beaten, released or written under only by the same principal with the secret; a lapsed one is lost even to its holder. |
+| `fileClaim`, `fileDone` | `operate` | The filing ledger. A second claim of a key finds the first. Only the claimant, with the claim's secret, finishes it; a done filing never changes. |
 | `breakLease`, `fileDelete` | admin | Held by people listed in `ADMINS`, never by a service principal. |
 
-Every write records its principal.
+Every write, a heartbeat included, records its principal. Principals, grants and admins are compared in lower case.
 
 ## Provisional
 
