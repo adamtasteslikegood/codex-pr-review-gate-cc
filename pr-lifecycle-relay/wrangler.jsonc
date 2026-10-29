@@ -1,0 +1,9 @@
+// Reference only: the relay is not deployed (#29 Part B). Values in angle brackets are placeholders.
+{
+  "name": "pr-lifecycle-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": { "bindings": [{ "name": "LIFECYCLE", "class_name": "LifecycleObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] }],
+  "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>" }
+}

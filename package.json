@@ -4,15 +4,18 @@
   "description": "Claude Code mods for pre-PR and post-PR review",
   "license": "MIT",
   "scripts": {
-    "lint": "eslint pr-lifecycle",
+    "lint": "eslint pr-lifecycle pr-lifecycle-relay",
     "typecheck": "tsc -p pr-lifecycle --noEmit",
     "test": "claude plugin test codex-gate && claude plugin test pr-lifecycle",
     "validate": "claude plugin validate codex-gate && claude plugin validate pr-lifecycle",
-    "check": "npm run lint && npm run test && npm run validate && npm run typecheck"
+    "check": "npm run lint && npm run test && npm run test:relay && npm run validate && npm run typecheck:relay && npm run typecheck",
+    "test:relay": "node --test pr-lifecycle-relay/test/*.test.ts",
+    "typecheck:relay": "tsc -p pr-lifecycle-relay"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "5.10.0",
     "eslint": "10.13.0",
+    "miniflare": "4.20260730.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.72.0"
   }

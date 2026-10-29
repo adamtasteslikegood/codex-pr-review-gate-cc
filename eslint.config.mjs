@@ -6,7 +6,7 @@ import tseslint from 'typescript-eslint'
 export default [
   { ignores: ['codex-gate/**', '**/.claude-plugin/types/**', 'node_modules/**'] },
   {
-    files: ['pr-lifecycle/**/*.{ts,tsx}'],
+    files: ['pr-lifecycle/**/*.{ts,tsx}', 'pr-lifecycle-relay/**/*.ts'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: { ecmaFeatures: { jsx: true } },

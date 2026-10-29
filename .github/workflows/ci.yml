@@ -25,6 +25,9 @@ jobs:
         run: npm run lint
       - name: Test
         run: npm run test
+      # The shared-store relay (#29 Part B): its tests run the Worker under Miniflare, locally; nothing is deployed.
+      - name: Relay
+        run: npm run test:relay && npm run typecheck:relay
       - name: Validate
         run: npm run validate
       # pr-lifecycle's tsconfig extends .claude-plugin/types/, which the harness lays only when a
