@@ -43,6 +43,16 @@ For wave 2. Recorded as rulings R79 or later when implemented.
 | K | **`waive post` covers rostered checks GitHub doesn't require**, pending, failing or cancelled, and names each one it sets aside. Required checks still have to pass. |
 | L | **Wave 2 ships as two PRs:** 2a (1.4.0, the small fixes) first, then 2b (1.5.0, the round changes). |
 
+## Decisions made (Adam, 2026-10-28)
+
+After 1.5.4. Recorded as rulings when implemented.
+
+| | Decision |
+| --- | --- |
+| M | **The gate is off by default for now.** `enforce` and `enforceMerge` are off in Adam's settings, and the Codex models and efforts are set per repo, so the gate no longer holds other sessions' work. |
+| N | **Separate the powers.** Rounds and sub-agents see only their own slice, so they keep finding reasons to hold. Three parts take over from growing regular expressions: **(1) a shared store**, one Durable Object per PR that every party reads and writes (#29 Part B), the record of what was found and what holds; **(2) a validator**, an agent that judges the gate's PASS or HOLD and whether every finding is tracked, reading the PR, its comments, the store and the issues, never the code (#33), that is, it judges the judgements; **(3) a conductor**, which runs the train and keeps each PR moving. The regex filters stay as the validator's inputs, not the last word. |
+| O | **Order:** the store seam first (a refactor with no behavior change), then the Durable Object prototype, then the validator, then the conductor. |
+
 ## Wave 1: no errors, no babysitting the basics (pr-lifecycle 1.3.0)
 
 **Status:** built on `wave1/pr-lifecycle-1.3.0` (rulings R71-R78). Not built: a

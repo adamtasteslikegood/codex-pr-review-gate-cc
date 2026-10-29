@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { newRecord } from '../hooks/lifecycle'
-import { loadRecord, saveRecord, updateRecord } from '../hooks/store'
+import { latestArchive, loadRecord, saveRecord, transact, updateRecord } from '../hooks/store'
 import type { LifecycleRecord } from '../types'
 
 /** A store whose every read and write yields first, as the host's does, so two read-modify-writes can interleave. */
@@ -20,6 +20,7 @@ const engine = () => {
         await tick()
         kept.set(key, value)
       },
+      keys: async () => [...kept.keys()],
     },
     clock: { now: async () => 1 },
   } as never
@@ -57,4 +58,20 @@ test('R1-6: a change that throws releases the lock', async () => {
   await expect(failing).rejects.toThrow('boom')
   await updateRecord($, '/repo', 'feat/x', grant('after'))
   expect((await loadRecord($, '/repo', 'feat/x'))?.grants.map(one => one.reason)).toEqual(['after'])
+})
+
+test('#29 seam: a transaction that archives and reseeds is one change; an update queued meanwhile lands on the seed', async () => {
+  const $ = engine()
+  await saveRecord($, seed())
+  const reset = transact($, '/repo', 'feat/x', async tx => {
+    const last = await tx.load()
+    if (last === undefined) return
+    await tx.archive(last, 5)
+    await tx.save({ ...seed(), generation: 1 })
+  })
+  await Promise.all([reset, updateRecord($, '/repo', 'feat/x', grant('later'))])
+  const live = await loadRecord($, '/repo', 'feat/x')
+  expect(live?.generation).toBe(1)
+  expect(live?.grants.map(one => one.reason)).toEqual(['later'])
+  expect((await latestArchive($, '/repo', 'feat/x'))?.phase).toBe('archived')
 })

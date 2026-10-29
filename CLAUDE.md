@@ -20,9 +20,10 @@ the project's goals and their order.
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
 - `pr-lifecycle/` **1.5.4** is the plugin in daily use, loaded through
-  `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. It gates the PRs of
-  this repo too, so a change to it is gated by the version loaded, and you
-  should expect holds on your own branch. It extends `/pr-gate` across pre-PR
+  `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. Since 2026-10-28
+  its `enforce` and `enforceMerge` settings are off and the Codex models and
+  efforts are set per repo (ROADMAP decision M), so it holds no PR create or
+  merge, this repo's included; run `/pr-gate` by hand for a review. It extends `/pr-gate` across pre-PR
   and post-PR review and implements
   [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md). The Claude model of each sub-agent
   and the Codex model and effort per tier are settings (#10, #11; R68–R70).
@@ -105,7 +106,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 712)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 713)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run check      # all four

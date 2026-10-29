@@ -82,7 +82,7 @@ import {
 } from './round'
 import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
-import { latestArchive, liveRecords, loadRecord, lockRecord, logEvent, saveRecord, updateRecord, upsertRecord } from './store'
+import { latestArchive, liveRecords, loadRecord, logEvent, transact, updateRecord, upsertRecord } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -279,8 +279,8 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
   // run inside it; the controller runs after.
-  const { prior, rec, adopted, rebase } = await lockRecord(root, branch, async () => {
-    const prior = await loadRecord($, root, branch)
+  const { prior, rec, adopted, rebase } = await transact($, root, branch, async tx => {
+    const prior = await tx.load()
     // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
     // Otherwise it starts no higher than the effort a review last completed at on this branch.
     const afterTimeout = prior?.hasTimedOut === true && prior.effort !== undefined ? (stepDown(prior.effort) ?? 'low') : startEffort
@@ -336,10 +336,10 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
         pr: open.number,
         passThrough: undefined,
       }
-      await saveRecord($, adoptedRec)
+      await tx.save(adoptedRec)
       return { prior, rec: adoptedRec, adopted: open, rebase: undefined }
     }
-    await saveRecord($, rec)
+    await tx.save(rec)
     return { prior, rec, adopted: undefined, rebase: undefined }
   })
   // One rescope only: a PR whose base moved again meanwhile is not chased; the next /pr-gate scopes against where it settled.

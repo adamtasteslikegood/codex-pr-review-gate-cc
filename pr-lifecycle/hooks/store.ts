@@ -1,4 +1,9 @@
 // The lifecycle record, kept in the plugin's store so a restart resumes it.
+//
+// The functions this module exports are the seam (#29 Part B): every read and write of a record, its owner and its archives goes
+// through them, and a change of a live record goes through `transact`. Today's backend is the plugin's own store, with a lock per
+// branch held in this process; a shared store per PR plugs in behind the same functions. (They stay function declarations: the
+// engine follows $ only into those.)
 
 import type { EngineInterface } from 'claude-code'
 
@@ -6,7 +11,33 @@ import type { LifecycleRecord, LogEntry } from '../types'
 
 type Engine = EngineInterface
 
+/** The steps a `transact` may take on one branch's record, all inside its atomic boundary. */
+export interface RecordTx {
+  load(): Promise<LifecycleRecord | undefined>
+  save(rec: LifecycleRecord): Promise<void>
+  /** Keeps `rec` whole as an archive taken at `at` (R47); the branch's own key is left to `save`. */
+  archive(rec: LifecycleRecord, at: number): Promise<void>
+}
+
 export const recordKey = (root: string, branch: string): string => `lifecycle:${root}:${branch}`
+
+/** The lock per branch (R1-6): a promise chain per root and branch, held in this process. */
+const locks = new Map<string, Promise<void>>()
+
+async function lockRecord<T>(root: string, branch: string, work: () => Promise<T>): Promise<T> {
+  const key = recordKey(root, branch)
+  const held = (locks.get(key) ?? Promise.resolve()).then(work)
+  const tail = held.then(
+    () => undefined,
+    () => undefined,
+  )
+  locks.set(key, tail)
+  try {
+    return await held
+  } finally {
+    if (locks.get(key) === tail) locks.delete(key)
+  }
+}
 
 export async function loadRecord($: Engine, root: string, branch: string): Promise<LifecycleRecord | undefined> {
   const value = (await $.store.get(recordKey(root, branch))) as LifecycleRecord | undefined | null
@@ -28,59 +59,57 @@ export async function liveRecords($: Engine, root: string): Promise<LifecycleRec
   return found
 }
 
+async function writeRecord($: Engine, rec: LifecycleRecord): Promise<void> {
+  await $.store.set(recordKey(rec.root, rec.branch), { ...rec, updatedAt: Math.max(rec.updatedAt, await $.clock.now()) })
+}
+
 /**
  * Keeps a reset record whole under its own key (R47): `lifecycle:<root>:<branch>:archived:<at>`. `loadRecord` reads only the
  * branch's own key, so an archive is never read as the live record.
  */
-export async function archiveRecord($: Engine, rec: LifecycleRecord, at: number): Promise<void> {
+async function writeArchive($: Engine, rec: LifecycleRecord, at: number): Promise<void> {
   await $.store.set(`${recordKey(rec.root, rec.branch)}:archived:${at}`, { ...rec, phase: 'archived' })
 }
 
+/** Writes the record in a transaction of its own: a seed or a test. A change that reads the record first goes through `transact`. */
 export async function saveRecord($: Engine, rec: LifecycleRecord): Promise<void> {
-  await $.store.set(recordKey(rec.root, rec.branch), { ...rec, updatedAt: Math.max(rec.updatedAt, await $.clock.now()) })
+  await transact($, rec.root, rec.branch, tx => tx.save(rec))
 }
-
-// Each branch's record is changed one read-modify-write at a time (R1-6): a promise chain per root and branch, held in this process.
-const locks = new Map<string, Promise<void>>()
 
 /**
- * Runs `work` once every earlier holder of the branch's record is done, and releases the record whether `work` returns or throws.
- * Not re-entrant: `work` must not lock the same record again (no `updateRecord`, `advance` or `finish` inside it).
+ * Runs `work` as one atomic change of the branch's record (R1-6): no other transaction on it interleaves, and the record is released
+ * whether `work` returns or throws. Not re-entrant: `work` must not open another transaction on the same record (no `updateRecord`,
+ * `advance` or `finish` inside it).
  */
-export async function lockRecord<T>(root: string, branch: string, work: () => Promise<T>): Promise<T> {
-  const key = recordKey(root, branch)
-  const held = (locks.get(key) ?? Promise.resolve()).then(work)
-  const tail = held.then(
-    () => undefined,
-    () => undefined,
+export async function transact<T>($: Engine, root: string, branch: string, work: (tx: RecordTx) => Promise<T>): Promise<T> {
+  return lockRecord(root, branch, () =>
+    work({
+      load: () => loadRecord($, root, branch),
+      save: rec => writeRecord($, rec),
+      archive: (rec, at) => writeArchive($, rec, at),
+    }),
   )
-  locks.set(key, tail)
-  try {
-    return await held
-  } finally {
-    if (locks.get(key) === tail) locks.delete(key)
-  }
 }
 
-/** Reads, changes and writes the record under its lock; undefined when there is none. A change that returns the record it was given writes nothing. */
+/** Reads, changes and writes the record atomically; undefined when there is none. A change that returns the record it was given writes nothing. */
 export async function updateRecord(
   $: Engine,
   root: string,
   branch: string,
   change: (rec: LifecycleRecord) => LifecycleRecord | Promise<LifecycleRecord>,
 ): Promise<LifecycleRecord | undefined> {
-  return lockRecord(root, branch, async () => {
-    const rec = await loadRecord($, root, branch)
+  return transact($, root, branch, async tx => {
+    const rec = await tx.load()
     if (rec === undefined) return undefined
     const next = await change(rec)
-    if (next !== rec) await saveRecord($, next)
+    if (next !== rec) await tx.save(next)
     return next
   })
 }
 
 /**
  * As `updateRecord`, for a change that may start the record: `change` sees undefined when there is none, and returns what to write,
- * or undefined to write nothing (a check on the locked read refused it).
+ * or undefined to write nothing (a check on the read inside the transaction refused it).
  */
 export async function upsertRecord(
   $: Engine,
@@ -88,9 +117,9 @@ export async function upsertRecord(
   branch: string,
   change: (rec: LifecycleRecord | undefined) => LifecycleRecord | undefined | Promise<LifecycleRecord | undefined>,
 ): Promise<LifecycleRecord | undefined> {
-  return lockRecord(root, branch, async () => {
-    const next = await change(await loadRecord($, root, branch))
-    if (next !== undefined) await saveRecord($, next)
+  return transact($, root, branch, async tx => {
+    const next = await change(await tx.load())
+    if (next !== undefined) await tx.save(next)
     return next
   })
 }
