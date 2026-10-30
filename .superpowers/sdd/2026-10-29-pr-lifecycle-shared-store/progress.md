@@ -62,3 +62,13 @@ Task 3: minor (deferred): snapshot record of any size lands in `state` (commit's
 Task 3: minor (deferred): fileAdopt 423 tested only with no lease, not another principal's live lease
 Task 3: minor (deferred): snapshot test uses CODEX as actor, brief said ADAM (stronger test)
 Task 3: minor (deferred): `s` is read before `await verifierOf` (crypto.subtle, not storage) — two concurrent same-principal takes might both get fence+1; pre-existing pattern in claim; final review to triage
+Task 4: review — Important: (1) retention tests use fixed sleeps (archived PR rev===0 single check; branch rev===2 ~100 ms margin) — flake under load
+Task 4: Ruling: the TEST_FAULTS fault refuses only index `update` (503); `list` keeps answering — the fault exists to fail registration (#53), a failing list adds nothing — cost if wrong: one test-only branch
+Task 4: Ruling: /v1/admin/index also accepts `update` (test-only, admin + TEST_FAULTS gated) — lets tests drive (born, rev) ordering directly — cost if wrong: none in prod (404)
+Task 4: Ruling: the index group runs in its own Miniflare instance with a long RETENTION_MS; branch.test.ts too — at 400 ms objects retired mid-test — cost if wrong: none
+Task 4: minor (deferred): `log` bypasses save — a line on an empty/deleted object leaves an orphan `log` key; branch retention ignores log-only activity — final review to triage (refuse log at rev 0 vs write state alongside; T7 relayLog is the caller)
+Task 4: fix round 1/5 dispatched (Important 1 + minors: deleteAll before deleteAlarm, send timeout 5 s, retry via arm, #53 timing assertion, line wrap, TEST_FAULTS-unset 404 test)
+Task 4: fix round 1/5 (7 addressed, 0 open; commit ba6c681)
+Task 4: minor (deferred): index send's 5 s AbortSignal timeout is not exercised under Miniflare
+Task 4: minor (deferred): archived-PR test asserts rev===2 right after the outbox drains; flaky only if that wait exceeds ~400 ms
+Task 4: complete (commits 91f3eb9..ba6c681, review clean)
