@@ -194,10 +194,6 @@ in live use, makes a hold on a chained command say nothing in it ran.
 
 The lanes item moved to wave 2c.
 
-**Follow-up (1.6.0): the shared store, #29 Part B (built, not deployed; R100-R108).** The relay (`pr-lifecycle-relay/`) and the plugin's relay
-backend are built and tested under Miniflare. A repo opts in with `sharedStore` in the base's `.github/pr-gate.json`. Left: the development
-deploy and the latency measurement (R108), which wait for Adam's confirmation; then the validator (#33) and the conductor (decision O).
-
 **Follow-up (1.5.1): a filing identity unique across checkouts (#29, option A) (done in 1.5.1, R96).**
 From PR #28's review: a second checkout of the same PR could adopt the first's
 issue after a lost POST answer. Each lifecycle gets a random id, which goes in
@@ -220,6 +216,10 @@ a shared Durable Object store, is evaluated with wave 3 item 2.
 
 The P2 issues #21-#24 stay in the issue queue, highest severity first. #27
 goes with wave 3 item 2. Lanes (2c) move to wave 3.
+
+**Follow-up (1.6.0): the shared store, #29 Part B (built, not deployed; R100-R108).** The relay (`pr-lifecycle-relay/`) and the plugin's relay
+backend are built and tested under Miniflare. A repo opts in with `sharedStore` in the base's `.github/pr-gate.json`. Left: the development
+deploy and the latency measurement (R108), which wait for Adam's confirmation; then the validator (#33) and the conductor (decision O).
 
 ### Wave 2c: parallel fixers in lanes (moved to wave 3)
 

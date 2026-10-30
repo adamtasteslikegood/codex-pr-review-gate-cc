@@ -39,14 +39,16 @@ object keeps only its SHA-256 and never returns it.
 | `archives`, `filing` | `read` | The kept archives; one filing. |
 | `commit` | `operate` | Writes the record if `rev` is current (else 409 with the current record) and no lease is live that the caller doesn't hold (else 423). `archive: { at, record }` keeps the record the caller archived. `isFresh` starts a new lifecycle over a tombstone. A branch key whose record now carries `pr` moves to the PR key inside the commit (R103). A tombstone answers 410. |
 | `claim` | `operate` | Takes the lease if none is live. A new holder gets a higher public fence `token`. A live lease held by another is 423. |
-| `take` | `operate` | Takes a live lease from another session of the same principal (R105). Another principal gets 423. |
+| `take` | `operate` | Takes a live lease from another session of the same principal at once, with a new `token` (R105); a lapsed or empty lease is simply taken. Another principal's live lease answers 423. |
 | `beat`, `release` | `operate` | Renew or drop your own lease. A lease you no longer hold answers 409. A lapsed lease is lost even to its holder. |
-| `moveTo`, `moveDone` | `operate` | Branch keys only (404 on a PR key). `moveTo` freezes the branch key with a tombstone that keeps the record and answers 410; `moveDone` drops the copy once the PR key has it. |
+| `moveTo`, `moveDone` | `operate` | Branch keys only (404 on a PR key). `moveTo` answers 200 and freezes the branch key with a tombstone that keeps the record; every record and lease op after it answers 410 (apart from a fresh start). `moveDone` drops the copy once the PR key has it. |
 | `log` | `operate` | Appends `{ seq, at, kind, text, principal, holder }`, with no lease needed. `text` is cut to 300 characters. The log holds 1000 lines (`RELAY_LOG_CAP`), and `logDropped` counts the lines pushed out (R106). |
-| `snapshot` | `operate` | Appends a record to the archives, with a `reason` of `fallback`, `migration` or `move`. It does not change `rev`. |
-| `fileClaim`, `fileDone` | `operate` | The filing ledger, keyed `lifecycleId:findingId:attempt` (R101). A second claim of a key finds the first. Only the claimant finishes it, and a retry with the same secret answers `isMine: true`. A done filing never changes. |
+| `snapshot` | `operate` | Appends a record to the archives, with a `reason` of `fallback`, `migration` or `move`. It does not change `rev`. The archives keep at most 1 MiB, dropping the oldest. |
+| `fileClaim`, `fileDone` | `operate` | The filing ledger, keyed `lifecycleId:findingId:attempt` (R101). A second claim of a key finds the first. Only the claimant finishes it (anyone else gets 409), and a retry with the same secret answers `isMine: true`. A done filing never changes. |
 | `fileAdopt` | `operate` + the live lease | Finishes a claim older than `FILING_STALE_MS` with the issue the exact-mark search found, recorded as `adoptedBy`. 423 without the lease, 409 on a younger claim or one with no claim. |
 | `breakLease`, `fileDelete` | admin | Held by people listed in `ADMINS`, never by a service principal. |
+
+A `commit` or `snapshot` body over 128 KiB answers 413 and changes nothing.
 
 Every write, a heartbeat included, records its principal.
 

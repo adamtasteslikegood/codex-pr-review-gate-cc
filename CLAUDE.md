@@ -53,8 +53,8 @@ the project's goals and their order.
   `sharedStore` (`{ url, aud }`) in `.github/pr-gate.json` on the base branch, with a credential in `PR_GATE_RELAY_CLIENT_ID` and
   `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token), and only when the origin of
   `sharedStore.url` equals the origin of the machine's pin, `PR_GATE_RELAY_URL`; the credential goes nowhere else. With no credential, no
-  pin or a pin of another origin, or with no answer (network, 5xx, timeout), the lifecycle runs locally. A refused credential (401, 403)
-  stands the session down instead. No base opts in yet.
+  pin or a pin of another origin, or with no answer (network, 5xx, timeout), the lifecycle runs locally. A refused credential (401, 403,
+  or Access's redirect or login page) stands the session down instead. No base opts in yet.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
   creation, so two would gate the same PR twice. Switching
   `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.
@@ -115,10 +115,10 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 813)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 825)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
-npm run test:relay       # the #29 Part B relay under Miniflare (86)
+npm run test:relay       # the #29 Part B relay under Miniflare (89)
 npm run typecheck:relay  # tsc -p pr-lifecycle-relay
 npm run check      # all of the above
 ```
@@ -126,7 +126,7 @@ npm run check      # all of the above
 - `typecheck` needs `pr-lifecycle/.claude-plugin/types/`, which the harness
   writes when a session loads that mod. With the types present, it runs in
   about 2 s with 0 errors.
-- 53 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
+- 61 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
   5 s under machine load (spec §7.3). The three-run load re-check is still
   owed: the machine ran low on memory. See
   `docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md`.

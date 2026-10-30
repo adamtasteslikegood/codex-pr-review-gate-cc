@@ -14,5 +14,5 @@
     { "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] },
     { "tag": "v2", "new_sqlite_classes": ["GrantStore", "RepoIndex"] }
   ],
-  "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>" }
+  "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>", "ADMINS": "<comma-separated admin people>" }
 }

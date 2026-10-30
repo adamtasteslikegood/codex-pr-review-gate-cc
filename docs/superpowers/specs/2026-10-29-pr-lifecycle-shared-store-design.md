@@ -122,7 +122,7 @@ The lease is **fenced**: every new holder gets a higher `token`. It is also **bo
   - a filing POST.
 
   At each one, the driver sends `beat`, and it goes ahead only on a 200. That 200 is the server acknowledging that it still holds the lease at that moment.
-- **Any 409 or 423 empties the cache at once.** That covers a `beat`, a `commit` or a `release` refused. The session then stands down as `standDown` does today.
+- **Any 409 or 423 of a lease op empties the cache at once.** That covers a `beat` or a `release` refused, and a `commit` refused by another holder's lease (423). The session then stands down as `standDown` does today. A plain revision 409 of a `commit` keeps the run (final review M1).
 - **The overlap is bounded, not zero.** An action that was already acknowledged and in flight when a `take` landed runs to its end: at most one step, capped by `stepTimeoutMinutes`. Its record commit is then refused by the revision and lease checks. Its outside effects were already sent. They are safe because each is idempotent or self-correcting:
   - a push lands on the PR branch, which the new driver fetches before acting (`round.ts`'s catch-up);
   - a filing goes through the ledger (section 7), so it is never posted twice;

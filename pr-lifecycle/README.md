@@ -426,12 +426,13 @@ ledger. It is opt-in per repo and **off unless the base's `.github/pr-gate.json`
   Without one, calls answer 403 and the checkout stands down.
 - **Records.** Pre-PR records are kept under the branch and move to the PR when it exists (R103). Every relay commit is mirrored in the
   local store, which is where fallback starts.
-- **Lease.** One driver per PR holds a 120 s lease, beaten every 60 s. An interactive session of the same person can take a live
-  lease over (R105); a headless one, or another principal, waits for a lapse. A session that loses the lease starts nothing and stands down. A plain
+- **Lease.** One driver per PR holds a 120 s lease, beaten every 60 s. An interactive session of the same principal can take a live
+  lease over (R105); a headless one, or another principal, waits for a lapse. A service token is one principal, so every machine that
+  shares it can take over from the others. A session that loses the lease starts nothing and stands down. A plain
   stale-revision conflict keeps the run, and the next tick recovers from the relay's record.
-- **Fallback.** A call that fails (network error, 5xx, no answer within 5 s) puts the lifecycle back on the local record for that step,
-  and the round goes on. On recovery the relay's record wins, and the local one is kept as a snapshot. A refused credential (401, 403)
-  stands the session down instead of continuing locally.
+- **Fallback.** A call that fails (network error, 5xx, no answer within 5 s, or a body that isn't JSON) puts the lifecycle back on the
+  local record for that step, and the round goes on. On recovery the relay's record wins, and the local one is kept as a snapshot. A
+  refused credential (401, 403), a redirect (3xx) or an HTML page (Access's login) stands the session down instead of continuing locally.
 - **Security findings.** The relay holds a security finding as a reference only (R107): no title, detail, file or URL is sent. The
   checkout that found it keeps the text, and another checkout shows a placeholder.
 - **`/pr-gate log`** shows the relay's run log, with who wrote each line, and a `stuck filings (known findings only)` section for claims
