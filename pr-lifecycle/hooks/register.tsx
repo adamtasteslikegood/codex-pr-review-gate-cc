@@ -546,7 +546,8 @@ const elsewhereText = (action: PrAction, found: Elsewhere): string =>
 const unreadText = (action: PrAction): string =>
   [
     `pr-gate: ${action.via} is held: the guard cannot read the head branch it opens a pull request from (no literal headRefName, ` +
-      'a variable whose value comes from a file or the shell, or a head in another repository), so the gate cannot review what it would carry.',
+      'one it reads two ways, a variable whose value comes from a file or the shell, a head in another repository, or more than one create ' +
+      'in the call), so the gate cannot review what it would carry.',
     'Your next step: check out the head branch here and open the pull request with gh pr create from it, so its gate reviews it. ' +
       'Do not open the pull request another way.',
   ].join('\n') + unknownNote(action)

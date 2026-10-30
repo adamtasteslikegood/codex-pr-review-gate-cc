@@ -450,6 +450,30 @@ test('#39: a GraphQL create is gated by the head it names, and held when the gua
   expect(w.spawned.length).toBeGreaterThan(0)
 })
 
+test('PR #58: from dev, a decoy title or a second aliased create does not pass a feature head as the promotion', async ($, on) => {
+  const w = world(on)
+  w.git.branch = 'dev'
+  const one = (name: string, head: string) => `${name}: createPullRequest(input: {repositoryId: "R", baseRefName: "main", headRefName: "${head}"}) { clientMutationId }`
+  const calls = [
+    `gh api graphql -f query='mutation { createPullRequest(input: {repositoryId: "R", title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }'`,
+    `gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: "R", title: "h: dev", baseRefName: "main", headRefName: $h}) { clientMutationId } }' -f h=feature`,
+    `gh api graphql -f query='mutation { ${one('a', 'dev')} ${one('b', 'feature')} }'`,
+    `gh api graphql -f query='mutation { ${one('a', 'feature')} ${one('b', 'dev')} }'`,
+  ]
+  for (const command of calls) {
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(isHeld(ran)).toBe(true)
+    expect(ran.deny).toContain('cannot read')
+  }
+  // A tool this mod does not know, so not in the harness's typed list.
+  const mcp = await $.tool.call({
+    tool: 'mcp__github__graphql',
+    query: 'mutation { createPullRequest(input: {repositoryId: "R", title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }',
+  } as never)
+  expect(isHeld(mcp)).toBe(true)
+  expect(w.spawned).toHaveLength(0)
+})
+
 test('a docs-only commit after the pass rides on it; a code commit does not', async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)

@@ -209,6 +209,27 @@ test('#39: a GraphQL create carries its headRefName and baseRefName, and a head 
   expect(readPrAction('mcp__github__graphql', { query })).toMatchObject({ action: 'create', isHeadUnread: true })
 })
 
+test('PR #58: field-shaped text in a title, or a second aliased create, never decides the head', async () => {
+  const gql = (input: string, rest = '') => bash(`gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: "R", ${input}}) { clientMutationId } }'${rest}`)
+  // A title that reads like the field comes before the real head: the guard can't tell which is the field, so the head is unread.
+  expect(gql('title: "headRefName: dev", baseRefName: "main", headRefName: "feature"')).toMatchObject({ isHeadUnread: true })
+  expect(gql('title: "x", body: "headRefName: dev", baseRefName: "main", headRefName: "feature"')).toMatchObject({ isHeadUnread: true })
+  // The same for a variable: a title `h: dev` shadows -f h=feature.
+  expect(gql('title: "h: dev", baseRefName: "main", headRefName: $h', ' -f h=feature')).toMatchObject({ isHeadUnread: true })
+  // A base read two ways is no base: the create is held against the first gated base, never let through as another base's.
+  expect(gql('title: "baseRefName: release", baseRefName: "main", headRefName: "feature"')?.base).toBeUndefined()
+  // Text that agrees with the field, or names no field, changes nothing.
+  expect(gql('title: "fix the guard", baseRefName: "main", headRefName: "feature"')).toMatchObject({ base: 'main', head: 'feature' })
+  expect(gql('title: "fix the guard", baseRefName: "main", headRefName: "feature"')?.isHeadUnread).toBeUndefined()
+  // The MCP route reads the same.
+  const query = 'mutation { createPullRequest(input: {title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }'
+  expect(readPrAction('mcp__github__graphql', { query })).toMatchObject({ action: 'create', isHeadUnread: true })
+  // Two aliased creates in one mutation, in either order: the whole call is unread, whatever the first one's head.
+  const one = (name: string, head: string) => `${name}: createPullRequest(input: {repositoryId: "R", baseRefName: "main", headRefName: "${head}"}) { clientMutationId }`
+  expect(bash(`gh api graphql -f query='mutation { ${one('a', 'dev')} ${one('b', 'feature')} }'`)).toMatchObject({ isHeadUnread: true })
+  expect(bash(`gh api graphql -f query='mutation { ${one('a', 'feature')} ${one('b', 'dev')} }'`)).toMatchObject({ isHeadUnread: true })
+})
+
 test('both GitHub MCP connectors', async () => {
   expect(readPrAction('mcp__plugin_github_github__create_pull_request', { owner: 'me', repo: 'repo', base: 'dev', head: 'feat/x' })).toMatchObject({
     action: 'create',
