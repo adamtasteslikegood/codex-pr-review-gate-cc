@@ -56,3 +56,9 @@ Task 3 carry: add `take` to NEEDS so the tombstone's 410 is reached; add the def
 Task 4 carry: moveTo queues the index removal (lifecycle.ts moveTo case)
 Task 2: fix round 1/5 (4 addressed, 0 open; commits 6181e2c..a006b8f)
 Task 2: complete (commits 1328059..a006b8f, review clean)
+Task 3: complete (commits e69284a..cb3663e, review clean)
+Task 3: minor (deferred): log `kind`/`holder` uncut — Ruling: carried into Task 4 (which edits lifecycle.ts): cut both to 200 chars — an oversized log value would break `log` for good — cost if wrong: long holder names truncated
+Task 3: minor (deferred): snapshot record of any size lands in `state` (commit's archive has the same exposure) — final review to triage a size cap
+Task 3: minor (deferred): fileAdopt 423 tested only with no lease, not another principal's live lease
+Task 3: minor (deferred): snapshot test uses CODEX as actor, brief said ADAM (stronger test)
+Task 3: minor (deferred): `s` is read before `await verifierOf` (crypto.subtle, not storage) — two concurrent same-principal takes might both get fence+1; pre-existing pattern in claim; final review to triage
