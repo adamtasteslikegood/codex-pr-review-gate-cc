@@ -131,3 +131,12 @@ Task 10: fix round 1/5 dispatched
 Task 10: fix round 1/5 (2 Important + ruling + minors addressed, 0 open; commit 3a72327)
 Task 10: minor (deferred): the unreachable line also shows when sharedOf resolves local (no credential/slug); the log's stuck-section catch is broad; the slug memo lives for the process
 Task 10: complete (commits d09a411..3a72327, review clean)
+Task 11: dispatched (base d2351b5)
+Task 11: implementer DONE (commit 6522e81; check passes; ratio 2.187)
+Task 11: review — Important: the ±10% ratio band leaves 0.6% headroom (ratio = 2 + 2c/W by construction); minors: test 5 title says "next tick" but calls a second start; A's second filing pass is non-probative; B's stand-down is engine-level
+Task 11: Ruling: assert the exact formula all == 2·W + 2·commits and keep 1.8–2.2 only as this script's sanity bound — the formula is the real claim — cost if wrong: none
+Task 12 carry: §12 records the true figure (DO ≈ 2 + 2·commits/W per Worker request, plus a `list`+`read` per 60 s tick that §12 omits); §14 rewords "beat gets 423" to 409; CLAUDE.md slow-test count and test counts; follow-up issue: can the tick's read be skipped while the lease is cached
+Task 11: fix round 1/5 dispatched
+Task 11: fix round 1/5 (4 addressed, 0 open; commit e529466) — test-only 27-line diff, re-reviewed inline by the controller
+Task 11: minor (deferred): the plain-409 keep-the-run path is not driven through the ticker in a two-controller test
+Task 11: complete (commits d2351b5..e529466, review clean)
