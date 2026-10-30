@@ -30,6 +30,8 @@ import {
   remaining,
   rescope,
   securityHolds,
+  clockOf,
+  logHead,
   logSummary,
   ticketLine,
   unresolvedBlockers,
@@ -85,7 +87,8 @@ import {
 } from './round'
 import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
-import { latestArchive, liveRecords, loadRecord, logEvent, transact, updateRecord, upsertRecord } from './store'
+import { latestArchive, liveRecords, loadRecord, logEvent, relayLog, RelayRefused, stuckFilings, transact, updateRecord, upsertRecord } from './store'
+import type { RelayLine, RelayLog } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -987,7 +990,51 @@ async function logText($: Engine): Promise<string> {
   const live = await loadRecord($, here.root, here.branch)
   const rec = live !== undefined && live.phase !== 'archived' ? live : await latestArchive($, here.root, here.branch)
   if (rec === undefined) return `/${COMMAND} log: there is no lifecycle for ${here.branch}.`
+  // A record on the relay (#29 Part B): its run log is the relay's, across a move, with who wrote each line and the stuck filings.
+  if (rec === live && live.relayRev !== undefined) return `/${COMMAND} log: ${await relayLogText($, here, live)}`
   return `/${COMMAND} log: ${logSummary(rec, rec !== live)}`
+}
+
+/** One relay line: its time, kind, the principal and the short id of the session that wrote it, and its text. */
+const relayLine = (one: RelayLine): string =>
+  `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.principal === undefined ? '' : `[${one.principal} ${(one.holder ?? '').slice(0, 8)}] `}${one.text}`
+
+/** The relay's log of a lifecycle, as `/pr-gate log` shows it (spec §5): the summary, the events by section, and any stuck filing. */
+async function relayLogText($: Engine, here: { root: string; branch: string }, live: LifecycleRecord): Promise<string> {
+  let log: Awaited<ReturnType<typeof relayLog>>
+  try {
+    log = await relayLog($, here.root, here.branch)
+  } catch (error) {
+    if (!(error instanceof RelayRefused)) throw error
+    return `${logSummary(live, false)}\nThe relay refused this checkout (${error.message}): this is the local log.`
+  }
+  const all = [...(log.movedFrom?.lines ?? []), ...log.lines]
+  const lines = logHead(live, false, all)
+  const section = (one: RelayLog): string[] => [
+    ...(one.dropped > 0 ? [`${one.dropped} earlier lines dropped`] : []),
+    ...one.lines.slice(-15).map(relayLine),
+  ]
+  if (all.length === 0 && log.unreachable === undefined) lines.push('No events logged: the record is from before 1.3.0.')
+  else if (log.movedFrom === undefined) lines.push('Last events:', ...section(log))
+  else lines.push('Last events:', `branch ${here.branch}`, ...section(log.movedFrom), `PR #${log.pr ?? live.pr ?? '?'}`, ...section(log))
+  if (log.unreachable !== undefined) lines.push(`The relay was unreachable (${log.unreachable}): this is the local log.`)
+  else {
+    try {
+      const { config } = await configFor($, here.root, live.base)
+      const stuck = await stuckFilings($, here.root, here.branch, config.stepTimeoutMs)
+      if (stuck.length > 0) {
+        lines.push(
+          'stuck filings',
+          ...stuck.map(one => `  ${one.key} claimed by ${one.actor}, ${Math.round(one.ageMs / 60_000)} minutes ago`),
+          "the driver adopts it once its issue is found; otherwise an admin's fileDelete frees it",
+        )
+      }
+    } catch (error) {
+      if (error instanceof RelayRefused) lines.push(`The relay refused this checkout (${error.message}).`)
+      else throw error
+    }
+  }
+  return lines.join('\n')
 }
 
 /** The person's commands that change a lifecycle, for its run log. */

@@ -123,6 +123,7 @@ import {
   beatLease,
   dropLease,
   forgetLeases,
+  claimAgeMs,
   isHeldByOther,
   ledgerCall,
   liveRecords,
@@ -4303,7 +4304,7 @@ async function ledgerOf(
     await ledgerCall($, rec.root, rec.branch, { op: 'fileDone', key, result: ledgerResult(at.repo, found.number), secret }, { isOwed: true })
     return { kind: 'found', issue: found, others, isOwed: false, how: 'its mark found, and the filing ledger told' }
   }
-  const age = (await $.clock.now()) - (typeof filing.at === 'number' ? filing.at : 0)
+  const age = claimAgeMs(filing, await $.clock.now())
   const isStale = age >= at.stepTimeoutMs
   if (found === undefined) {
     // Never claimed afresh: its POST may already be on its way. The driver adopts it once a marked issue shows, or an admin deletes it.
