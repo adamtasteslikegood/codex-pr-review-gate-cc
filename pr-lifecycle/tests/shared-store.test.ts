@@ -578,6 +578,25 @@ test('a redacted finding is restored from the local mirror on load, and one foun
   expect(theirs?.history).toEqual([])
 })
 
+test('restore takes only text from the mirror: a link, a link check or a recheck another checkout cleared stays cleared (PR #54 R2-1)', async () => {
+  const original = finding('R1-1', 'SECRET-TITLE long enough to be a needle', { isSecurity: true, status: 'verified-fixed', needsRecheck: true })
+  const linked = finding('G2-1', 'a second report of SECRET-TITLE long enough to be a needle', {
+    source: 'github', reviewer: 'alice', detail: 'LINKED-DETAIL', duplicateOf: 'R1-1', linkBy: 'agent', isLinkChecked: true,
+  })
+  const mirror = seed({ lifecycleId: 'L1', findings: [original, linked] })
+  // Another checkout's later record: the link was dropped and answered on its own, and the recheck was paid.
+  const sent = redact(mirror)
+  const [first, second] = sent.findings
+  const { needsRecheck: _recheck, ...paid } = first!
+  const { duplicateOf: _link, linkBy: _by, isLinkChecked: _checked, ...unlinked } = second!
+  const theirs = { ...sent, findings: [paid, { ...unlinked, status: 'rebutted' }] } as LifecycleRecord
+  const back = restore(theirs, mirror)
+  expect(back.findings[0]?.needsRecheck).toBeUndefined()
+  expect(back.findings[0]?.title).toBe(original.title)
+  expect(back.findings[1]).toMatchObject({ status: 'rebutted', title: linked.title, detail: 'LINKED-DETAIL' })
+  expect([back.findings[1]?.duplicateOf, back.findings[1]?.linkBy, back.findings[1]?.isLinkChecked]).toEqual([undefined, undefined, undefined])
+})
+
 test('restore needs the same lifecycle', async () => {
   const mirror = seed({ lifecycleId: 'L1', findings: [{ ...SECRET, id: 'G1-1' }] })
   const placeholder = { id: 'G1-1', round: 1, source: 'github', reviewer: 'bob', severity: 'P1', isSecurity: true, headSeen: 'c'.repeat(40), status: 'rebutted', title: PLACEHOLDER, ref: 'local' } as unknown as Finding

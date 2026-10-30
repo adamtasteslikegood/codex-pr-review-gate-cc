@@ -402,8 +402,10 @@ export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefi
       const mine = own.get(one.id)
       if (one.ref !== 'local') return mine === undefined ? one : refill(one, mine) as Finding
       if (mine === undefined) return { ...one, history: one.history ?? [] }
+      // Only the text comes from the mirror: a control field the relay no longer has was cleared there, and stays cleared (PR #54 R2-1).
       const { ref: _, title: _title, ...shared } = refill(one, mine) as Finding
-      return { ...mine, ...shared, ...(one.history !== undefined ? { history: historyOf(one.history, mine.history) } : {}) }
+      const text = Object.fromEntries(TEXT_FIELDS.flatMap(name => mine[name] === undefined ? [] : [[name, mine[name]]]))
+      return { ...shared, ...text, history: historyOf(one.history ?? [], mine.history) } as Finding
     }),
   }
 }
