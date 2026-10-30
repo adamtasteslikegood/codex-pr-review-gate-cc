@@ -194,3 +194,21 @@ CLAUDE.md now gives pr-lifecycle 825 (was 813) and relay 89 (was 86), from the f
 4. **A refusal line in `payOwed` can be lost (an old limit, unchanged).** The line goes to the refused entry's own path, so when a grant is revoked it never lands. The drop still happens, and only its line is lost.
 5. **The validate warning is old.** The pr-lifecycle README has no marketplace install line, and this work left that as it was.
 6. **Task 9 uses a toast, not the run log, for the reset exit.** I applied the G7-8 rule, so a reset or replaced lifecycle's claim is announced in a toast. `markSent` also answers `gone` when the lifecycle was archived, which is the same lifecycle, so the toast fires on archive too. Only the generation-bump trigger is tested. If Adam wants that line in the new lifecycle's run log, it is a one-line change in `left`.
+
+## Round 2 (scoped re-review N1–N6)
+
+Commits: `62f25df` (N1, N2, N5, relay.ts comment), `911915a` (N4, N6, CLAUDE.md counts). N3 left alone (parked).
+
+- **N1.** store.ts `tooLargeOf` maps a 413 answer to a down answer tagged `HTTP 413`, and `settle` and the move's commit go through it. `noteDown` writes one `relay too large` line per lifecycle (not `relay down`), and the lifecycle runs locally with no stand-down. `keepLocal` treats a snapshot 413 as not owed: the local archive is the only copy, `publishMove` goes on to `moveDone`, and nothing retries. `BODY_MAX` is 512 KiB in the relay and the fake (`fake.bodyMax` lets a test lower it); the contract pads are 500 KiB and 513 KiB; the relay README says so. Tests: shared-store (a commit over the bound: the local record moves, one line, the gate never throws, and a save that fits reaches the relay again) and shared-move (a snapshot over the bound: one snapshot, one `moveDone`, a local archive only, no later resend).
+- **N2.** relay.ts `answerOf` refuses `text/html` only below 400. An HTML 404 is down; HTML 401 and 403 stay refused. The test is in relay.test.ts (M4).
+- **N4.** `ledgerOf` advances only when the done issue is not the finding's saved issue (`at.saved !== n`). Test in filing-ledger: an owed finding on #21, the ledger's attempt 1 done with #21, #21 closed. It settles on #21, with no attempt 2 and `fileAttempt` unchanged; before the fix, attempt 2 was claimed and finished with #21.
+- **N5.** The M2 test is retitled ("copies deduped"). Two `move` copies land by design: the retried move sends its own snapshot before `moveDone`, and the snapshot owed from the failed try is paid after it. The test now also asserts at least one copy, that every copy is the old lifecycle, and that a snapshot comes before `moveDone`.
+- **N6.** `markSent` returns `'archived'` (same generation, phase archived) or `'replaced'` (a generation change or no record) instead of `'gone'`. On archived, the left claim is logged in the lifecycle's own run log (`the lifecycle was archived`). On replaced, it toasts as before. The Jira caller returns on anything but `'sent'`. The filing-ledger test failed with the old toast path.
+- **Comment.** relay.ts `relayCall` now says the host may follow redirects whatever `redirect: 'manual'` says, and the `text/html` rule is the backstop.
+
+Checks: lint clean; test:relay 89; typecheck:relay and typecheck 0 errors; validate passes (the README marketplace-line notice as before); `npm run test` codex-gate 22 and pr-lifecycle 829, 0 fail. CLAUDE.md counts: pr-lifecycle 829, slow tests 63 (the N4 and N6 tests carry `{ timeoutMs: 15_000 }`).
+
+Concerns:
+- A 413 on the move's own commit (step 2) is handled like down: the move stops there and is tried again on each load until the record fits. It never throws, but a record that stays over 512 KiB never finishes its move to the relay.
+- N5 keeps the duplicate archive copy rather than removing it. Removing it would mean dropping an owed snapshot once a later one for the same lifecycle lands.
+- N3 is still open, parked as a follow-up.
