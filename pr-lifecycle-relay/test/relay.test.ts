@@ -158,6 +158,8 @@ test('a commit that archives keeps the record it was given, not the one stored, 
   const kept = { generation: 0, phase: 'archived', findings: ['local'] }
   assert.equal((await call(adam, { op: 'commit', rev: 1, record: { generation: 1 }, archive: { at: 5, record: kept } }, path)).status, 200)
   assert.equal((await call(adam, { op: 'commit', rev: 2, record: { generation: 2 }, archive: { at: 'soon', record: kept } }, path)).status, 400)
+  assert.equal((await call(adam, { op: 'commit', rev: 2, record: { generation: 2 }, archive: null }, path)).status, 400)
+  assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 2)
   const archives = (await call(await sign(person(READER)), { op: 'archives' }, path)).json.archives as { at: number; record: unknown }[]
   assert.deepEqual(archives, [{ at: 5, record: kept }])
 })

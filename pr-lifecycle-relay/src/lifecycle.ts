@@ -118,8 +118,8 @@ export class LifecycleObject {
         if (body.rev !== s.rev) return reply(409, { error: 'stale revision', rev: s.rev, record: s.record })
         if (isLive(s.lease) && !isMine(s.lease)) return reply(423, { error: 'the lease is held', lease: shown(s.lease) })
         // An archive keeps the record the caller archived (the local store's `tx.archive(rec, at)`), not whatever is stored now.
-        const archive = body.archive as { at?: unknown; record?: unknown } | undefined
-        if (archive !== undefined && (typeof archive.at !== 'number' || archive.record === undefined)) return reply(400, { error: 'archive needs { at, record }' })
+        const archive = body.archive as { at?: unknown; record?: unknown } | null | undefined
+        if (archive !== undefined && (archive === null || typeof archive.at !== 'number' || archive.record === undefined)) return reply(400, { error: 'archive needs { at, record }' })
         const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
         const next = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
         await save(next, archive !== undefined ? 'commit+archive' : 'commit')

@@ -134,7 +134,7 @@ Log lines then never conflict with record commits. The alternative, keeping the 
   - the **filing secret** belongs to the checkout and the lifecycle. It is saved under `relay-filing-secret:<root>:<lifecycleId>`, so a session restarted in the same checkout finishes a filing its predecessor claimed (section 7). Another checkout never has it, so it can't finish someone else's claim.
 - Each is saved **before** the first call that sends it. If that save fails, the call isn't sent, and the session uses the local store as in section 8.
 - A lost response is retried with the saved secret, so a claim's or filing's own author can always finish it.
-- Only the hash leaves the checkout's memory and is stored: the object keeps the SHA-256 and never returns it.
+- The checkout sends the secret itself, over TLS, and the object hashes it on arrival (`verifierOf`): it stores only the SHA-256 and never returns it. A checkout never sends a hash in its place.
 
 ## 7. The filing ledger (open decision 2)
 
