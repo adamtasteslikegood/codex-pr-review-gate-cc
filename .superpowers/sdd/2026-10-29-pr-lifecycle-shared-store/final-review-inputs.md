@@ -1,0 +1,66 @@
+# Final review inputs
+
+## Rulings (ledger)
+8:- Ruling: local backend keeps BEAT_MS 30 s; the relay lease beats every 60 s — R100's 60 s is the relay's beat; changing local shifts ~12 tests — cost if wrong: one constant.
+9:- Ruling: relay credentials are env vars only (PR_GATE_RELAY_CLIENT_ID/_SECRET or PR_GATE_RELAY_TOKEN) — userConfig has no sensitive field — cost if wrong: a config surface added later.
+10:- Ruling: the branch→PR move happens inside the store on a commit whose record carries `pr` — no call-site changes — cost if wrong: move logic relocated.
+11:- Ruling: every relay commit mirrors the full record locally with relayRev — fallback and R(b) restore need it — cost if wrong: local disk churn.
+12:- Ruling: R(b) redaction shape and same-lifecycle restore as in the plan — PR #51 review — cost if wrong: security text shown placeholder-only more often.
+13:- Ruling: `list` is POST /v1/<owner>/<repo> {op:'list'}; /v1/admin/... matched first — cost if wrong: one route.
+14:- Ruling: TEST_FAULTS='1' enables POST /v1/admin/index {op:'fault'}; unset → 404 — cost if wrong: a test-only route in prod code, gated off.
+36:- Ruling: T1's Step 4 expects every existing relay test to pass (18 now, not 17) — main moved on — cost if wrong: none.
+37:- Ruling: T3 does not rebuild fileAdopt; the existing op and its relay.test.ts test stay. T3 adds only the fileAdopt cases the plan lists that are not already covered (young claim 409, missing claim 409, same-result 200, other-result 409, no-lease 423) to log.test.ts, and the harness carries FILING_STALE_MS '300' — fileAdopt landed in PR #51 — cost if wrong: duplicated assertions.
+38:- Ruling: T7's "/pr-gate log says how many earlier lines are gone" is tested at the relayLog level (dropped count); T10 owns the command's output — avoids two tasks editing register.tsx's log subcommand — cost if wrong: one test moved.
+39:- Ruling: open issues #50 (G2-6), #52 (G2-4), #53 (G2-5) need no plan change: #53 is T4 (outbox, alarm retry, zero-further-commit test); #52 is T3's snapshot op plus T6's recovery/migration tests with distinct findings; #50 is T8 (lease cache emptied on 409/423/410, boundary beat, take-after-beat test). The PR body names them to close — cost if wrong: an issue left open after merge.
+44:Task 1: minor (deferred): /v1/admin/* shadows a repo admin/grants or admin/index — Ruling: Task 4 (which adds /v1/<owner>/<repo> list) treats owner `admin` as reserved — cost if wrong: a real GitHub owner named admin can't use the relay
+50:Task 2: Ruling: the relay refuses isFresh with 409 { error, movedTo, lifecycleId } while the tombstone still carries `record` (moveDone not yet run); the client finishes steps 2–3 first (Task 7 already does so on load) — spec §1 says a frozen record is never lost — cost if wrong: a fresh start waits one recovery step
+51:Task 2: Ruling: tighten isBranchName to also refuse a bare `@`, a component starting with `.`, and a component ending `.lock` (reviewer minor 2; matches the comment's git claim) — cost if wrong: a few legal-to-us names refused
+60:Task 3: minor (deferred): log `kind`/`holder` uncut — Ruling: carried into Task 4 (which edits lifecycle.ts): cut both to 200 chars — an oversized log value would break `log` for good — cost if wrong: long holder names truncated
+66:Task 4: Ruling: the TEST_FAULTS fault refuses only index `update` (503); `list` keeps answering — the fault exists to fail registration (#53), a failing list adds nothing — cost if wrong: one test-only branch
+67:Task 4: Ruling: /v1/admin/index also accepts `update` (test-only, admin + TEST_FAULTS gated) — lets tests drive (born, rev) ordering directly — cost if wrong: none in prod (404)
+68:Task 4: Ruling: the index group runs in its own Miniflare instance with a long RETENTION_MS; branch.test.ts too — at 400 ms objects retired mid-test — cost if wrong: none
+76:Task 5: Ruling: RelayAnswer gains `{ refused: string }` for 401 and 403; the caller stands down (does not act, does not fall back), logs once; `down` stays for network error, 5xx, timeout and a non-JSON body — the spec is the binding authority and the plan's Review Focus 2 was looser than it — cost if wrong: an expired person token stands the session down instead of continuing locally (re-auth fixes it)
+77:Task 5: Ruling: Task 6 consumes `refused` as stand-down; Tasks 6–9 dispatches carry it. Non-JSON (e.g. an Access login page on an expired token) stays `down` — check what Access actually answers at the Task 13 deploy — cost if wrong: one more branch in relayCall
+78:Task 5: Ruling: the relay answers 400 (not 500) for a body that isn't JSON (lifecycle, repo-index, grants) — a bad request is not an outage — cost if wrong: none
+79:Task 5: Ruling: Roster stays in hooks/github.ts; baseFileOf moves to relay.ts (no import cycle for Task 6); validate's env-name listing is checked in Task 6 when register.tsx reaches relayOf — cost if wrong: none
+84:Task 6: Ruling: redact walks every string outside `findings` for each security finding's needles (word-bounded id, title, detail, note, file, url, jira summaries) and replaces the whole string with a placeholder; the test drives a real MERGE_SECURITY block and walks the whole JSON of every commit and snapshot body — R107; over-redacting is the safe direction — cost if wrong: some non-security messages shown as placeholders on other checkouts
+85:Task 6: Ruling: no base may set sharedStore until Task 8 lands (StaleRecord uncaught, lease secret not sent); the branch is not merged between tasks — cost if wrong: none while no base opts in
+90:Task 6: Ruling: an exact finding id string (waiver.findingId) and top-level identity fields (root, branch, base, slug, lifecycleId) are never scrubbed — an id carries no text and is already shared on the finding — cost if wrong: none
+91:Task 6: Ruling: a finding whose duplicateOf chain reaches a security finding is redacted as security (withLinkedPeak marks only the original) — R107 — cost if wrong: a non-security duplicate shown as a placeholder elsewhere
+92:Task 6: Ruling: the scrub touches free text only — enum/identity keys skipped, non-id needle floor 8 chars — a 4-char note like 'check' turned log kinds into placeholders — cost if wrong: a security title under 8 chars without its id could leak (low value text)
+99:Task 7: Ruling: on a 410, fresh-start only when the record's lifecycleId differs from the mirror's (a real new lifecycle: reset/adoption); a record whose id matches the mirror but not the tombstone stands down (RelayMoved + noteOnce) — spec §1 — cost if wrong: a legit new lifecycle needs one more load
+100:Task 7: Ruling: a failed release of the PR claim joins the owed queue (as moveDone) — cheap now, else 423s for up to 120 s — cost if wrong: none
+111:Task 8: Ruling: a lost lease's beat answers 409 (relay contract), not the 423 spec §14 names — both stand down; the docs task rewords §14 — cost if wrong: none, behaviour identical
+112:Task 8: Ruling: a plain rev 409 at a non-pure site keeps the run (the next tick recovers, §14); only 423, RelayMoved and refused stand down — cost if wrong: one more tick before a stand-down
+121:Task 9: Ruling: fix the queue jam (drop a refused owed entry), the adopt threshold, the local-only secret, and a log line for an abandoned claim, with tests — the jam is permanent and cheap to fix — cost if wrong: one short fix round
+129:Task 10: Ruling: stuck filings list known findings only (no relay list op this wave), labelled "(known findings only)", and the probe stops at the first down with the unreachable note — §7.2 asks only that a stuck claim show in the log — cost if wrong: a dead second checkout's claim stays unlisted until an admin looks
+137:Task 11: Ruling: assert the exact formula all == 2·W + 2·commits and keep 1.8–2.2 only as this script's sanity bound — the formula is the real claim — cost if wrong: none
+
+## Deferred minors (ledger) — triage each
+43:Task 1: minor (deferred): header-replacement test doesn't isolate x-relay-principal (forge ADAM + breakLease → 403 would)
+44:Task 1: minor (deferred): /v1/admin/* shadows a repo admin/grants or admin/index — Ruling: Task 4 (which adds /v1/<owner>/<repo> list) treats owner `admin` as reserved — cost if wrong: a real GitHub owner named admin can't use the relay
+45:Task 1: minor (deferred): grant-path history tests use relative revs, not literal 1,2,3
+46:Task 1: minor (deferred): a thrown GrantStore fetch is an unmapped 500, a non-2xx presetOf a 502 (fails closed)
+47:Task 1: minor (deferred): re-granting the same preset writes rev + history
+48:Task 1: minor (deferred): relay README still describes the GRANTS env var (Task 12 updates docs)
+52:Task 2: minor (deferred): moveDone changes record without bumping rev (idempotent, harmless)
+53:Task 2: minor (deferred): a PR object once committed with record:null answers `from` with 409 record:null — client takes the snapshot path (note for Task 7)
+54:Task 2: minor (deferred): 410 Response built eagerly on every tombstone request; test title typo "tombstone own"
+60:Task 3: minor (deferred): log `kind`/`holder` uncut — Ruling: carried into Task 4 (which edits lifecycle.ts): cut both to 200 chars — an oversized log value would break `log` for good — cost if wrong: long holder names truncated
+61:Task 3: minor (deferred): snapshot record of any size lands in `state` (commit's archive has the same exposure) — final review to triage a size cap
+62:Task 3: minor (deferred): fileAdopt 423 tested only with no lease, not another principal's live lease
+63:Task 3: minor (deferred): snapshot test uses CODEX as actor, brief said ADAM (stronger test)
+64:Task 3: minor (deferred): `s` is read before `await verifierOf` (crypto.subtle, not storage) — two concurrent same-principal takes might both get fence+1; pre-existing pattern in claim; final review to triage
+69:Task 4: minor (deferred): `log` bypasses save — a line on an empty/deleted object leaves an orphan `log` key; branch retention ignores log-only activity — final review to triage (refuse log at rev 0 vs write state alongside; T7 relayLog is the caller)
+72:Task 4: minor (deferred): index send's 5 s AbortSignal timeout is not exercised under Miniflare
+73:Task 4: minor (deferred): archived-PR test asserts rev===2 right after the outbox drains; flaky only if that wait exceeds ~400 ms
+93:Task 6: minor (deferred): free text that paraphrases a security title without its id, file or full title is not caught — heuristic by design; final review to note
+96:Task 6: minor (deferred): the kind:'check' test doesn't discriminate FIXED_KEYS (needle under the 8-char floor anyway); a short security `file` (a.ts) in free text is not scrubbed — accepted per the 8-char ruling
+103:Task 7: minor (deferred): fresh-start moveDone assumes step 2 landed without checking the PR object's lifecycleId; crash test doesn't hold back the index or run a PR-key client; noteStop shares the 'relay down' noteOnce prefix; a non-200/non-down moveTo has no log line; a stale @b mirror's log lines go to the tombstoned object
+106:Task 7: minor (deferred): noteOnce dedupes 'relay move refused' per lifecycle; a fresh start whose calls are dropped falls back local and, on next load, stands down with a 'under another lifecycle' text that is slightly misleading — no data lost, Task 8 recovery settles it
+113:Task 8: minor (deferred): beat() on down makes three failing calls per tick (≤15 s); Kept.token unused; CLAUDE.md slow-test count (Task 12 docs)
+116:Task 8: minor (deferred): a fileOnce/checkOnce with no running run and no kept lease only reads at its boundary (no lease held during the write) — no concrete caller found; checkOnce's Jira boundary and watchBeat's finally-release have no dedicated test
+124:Task 9: minor (deferred): markSent exits (~4048 gone/secret) leave a post claim with no log line; the now-security abandoned-claim path has no assertion; a credential revocation drops every owed entry incl. a moveDone (payOwed runs only after a call that landed, so low risk); a deleted/transferred issue counts as closed and advances the attempt (matches the merge check)
+132:Task 10: minor (deferred): the unreachable line also shows when sharedOf resolves local (no credential/slug); the log's stuck-section catch is broad; the slug memo lives for the process
+141:Task 11: minor (deferred): the plain-409 keep-the-run path is not driven through the ticker in a two-controller test
+145:Task 12: review — Approved (no Critical/Important); minors carried to the final fix dispatch: gate.test.ts:64 flaky 5 s test needs timeoutMs; ROADMAP 1.6.0 note placement; wrangler.jsonc lacks an ADMINS placeholder; relay README take row ("a live lease") and moveTo row (moveTo answers 200; later ops 410); pr-lifecycle README "same principal" and non-JSON body as down; CLAUDE.md relay bullet "no answer (network, 5xx, timeout)" runs locally; spec line 124 "of a lease op"
