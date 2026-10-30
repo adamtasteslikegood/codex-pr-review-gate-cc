@@ -14,6 +14,7 @@ const ADAM = 'adam@example.org'
 const CODEX = 'codex-service.access'
 const READER = 'reader@example.org'
 const LEASE_MS = 600
+const FILING_STALE_MS = 300
 
 const enc = (bytes: Uint8Array | string): string =>
   Buffer.from(typeof bytes === 'string' ? new TextEncoder().encode(bytes) : bytes)
@@ -75,6 +76,7 @@ before(async () => {
       ACCESS_AUD: AUD,
       ADMINS: ` ${ADAM.toUpperCase()} , ${CODEX}`,
       LEASE_MS: String(LEASE_MS),
+      FILING_STALE_MS: String(FILING_STALE_MS),
       GRANTS: JSON.stringify([
         { principal: ADAM, repo: 'owner/repo', preset: 'operate' },
         { principal: CODEX, repo: 'owner/repo', preset: 'operate' },
@@ -308,6 +310,33 @@ test('only the claimant finishes a filing, and a done filing never changes: the 
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 99 } }, path)).status, 409)
   const filing = (await call(await sign(person(READER)), { op: 'filing', key }, path)).json.filing as { actor: string; result: unknown }
   assert.deepEqual([filing.actor, filing.result], [ADAM, { issue: 42 }])
+})
+
+test('a stale claim whose secret is lost is adopted by the lease holder, with the claimant kept and the adopter recorded', async () => {
+  const path = '/v1/owner/repo/23'
+  const adam = await sign(person(ADAM))
+  const codex = await sign(service(CODEX))
+  const key = 'lc-3:G1-2:1'
+  const lease = secretOf()
+  const issue = { number: 5, url: 'https://github.com/owner/repo/issues/5' }
+  await call(codex, { op: 'fileClaim', key, secret: secretOf() }, path) // its POST went out, then its checkout and secret were lost
+  assert.equal((await call(adam, { op: 'claim', holder: 's2', secret: lease }, path)).status, 200)
+  // Too young: its POST may still be on its way.
+  assert.equal((await call(adam, { op: 'fileAdopt', key, secret: lease, result: issue }, path)).status, 409)
+  await wait(FILING_STALE_MS + 50)
+  // Only the lease holder adopts: another principal, or the holder's principal with another secret, is refused.
+  assert.equal((await call(codex, { op: 'fileAdopt', key, secret: secretOf(), result: issue }, path)).status, 423)
+  assert.equal((await call(adam, { op: 'fileAdopt', key, secret: secretOf(), result: issue }, path)).status, 423)
+  assert.equal((await call(adam, { op: 'fileAdopt', key: 'lc-3:none:1', secret: lease, result: issue }, path)).status, 409)
+  const adopted = await call(adam, { op: 'fileAdopt', key, secret: lease, result: issue }, path)
+  assert.equal(adopted.status, 200)
+  assert.deepEqual(adopted.json.filing, { ...(adopted.json.filing as object), state: 'done', actor: CODEX, adoptedBy: ADAM, result: issue })
+  assert.equal(JSON.stringify(adopted.json).includes('verifier'), false)
+  // Done is terminal: the same result again is a retry, another is refused, and fileDone can't rewrite it either.
+  assert.equal((await call(adam, { op: 'fileAdopt', key, secret: lease, result: issue }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'fileAdopt', key, secret: lease, result: { number: 6 } }, path)).status, 409)
+  const read = await call(adam, { op: 'read' }, path)
+  assert.deepEqual(read.json.lastWrite, { ...(read.json.lastWrite as object), actor: ADAM, op: `fileAdopt ${key}` })
 })
 
 test('a filing key named like an inherited property is claimed like any other', async () => {
