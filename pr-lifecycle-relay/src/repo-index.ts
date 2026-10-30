@@ -57,7 +57,9 @@ export class RepoIndex {
         const { key, born, rev } = body
         const entry = body.entry as IndexEntry | undefined
         const isRemoved = body.removed === true
-        if (typeof key !== 'string' || !/^[#@]/.test(key) || typeof born !== 'number' || typeof rev !== 'number') return reply(400, { error: 'update needs { key, born, rev }' })
+        if (typeof key !== 'string' || !/^[#@]/.test(key) || typeof born !== 'number' || typeof rev !== 'number') {
+          return reply(400, { error: 'update needs { key, born, rev }' })
+        }
         if (isRemoved === (entry !== undefined) || (entry !== undefined && (typeof entry !== 'object' || entry === null))) {
           return reply(400, { error: 'update carries an entry or removed: true' })
         }

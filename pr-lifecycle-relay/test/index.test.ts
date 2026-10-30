@@ -30,14 +30,22 @@ async function list(repo: string, token = adam): Promise<Entry[] | undefined> {
   return res.status === 200 ? (res.json.entries as Entry[]) : undefined
 }
 
-/** Polls `list` every 25 ms for up to 3 s until `isDone` holds, and answers the last entries seen. */
-async function until(repo: string, isDone: (entries: Entry[]) => boolean): Promise<Entry[]> {
+/** Polls `list` every 25 ms for up to 3 s until `isDone` holds; answers those entries and when the poll that saw them was sent. */
+async function settled(repo: string, isDone: (entries: Entry[]) => boolean): Promise<{ entries: Entry[]; at: number }> {
   let last: Entry[] = []
   for (const end = Date.now() + 3000; Date.now() < end; await pause(25)) {
+    const at = Date.now()
     last = (await list(repo)) ?? last
-    if (isDone(last)) return last
+    if (isDone(last)) return { entries: last, at }
   }
   assert.fail(`the index never settled: ${JSON.stringify(last)}`)
+}
+const until = async (repo: string, isDone: (entries: Entry[]) => boolean): Promise<Entry[]> => (await settled(repo, isDone)).entries
+
+/** Polls `read` every 25 ms for up to 3 s until the object is empty (deleted), and asserts it is. */
+async function deleted(path: string): Promise<void> {
+  for (const end = Date.now() + 3000; Date.now() < end && (await call(adam, { op: 'read' }, path)).json.rev !== 0;) await pause(25)
+  assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 0)
 }
 
 const keysOf = (entries: Entry[]): string[] => entries.map(one => one.key).sort()
@@ -88,13 +96,14 @@ describe('the index', () => {
   test('a failed first registration converges with no further commit (#53)', async () => {
     const repo = 'idx/two'
     await grantRepo(repo)
-    assert.equal((await fault(repo, 300)).status, 200)
+    // Taken before the fault is set, so the fault's own end is no earlier than this.
     const faultEnds = Date.now() + 300
+    assert.equal((await fault(repo, 300)).status, 200)
     await commit(prPath(7, repo), live('L1'))
     // While the index refuses updates, nothing is listed; once it answers again, the alarm's retry lands it without another commit.
     assert.deepEqual(await list(repo), [])
-    const entries = await until(repo, all => all.length === 1)
-    assert.ok(Date.now() >= faultEnds - 25)
+    const { entries, at } = await settled(repo, all => all.length === 1)
+    assert.ok(at >= faultEnds, `listed ${faultEnds - at} ms before the fault ended`)
     assert.deepEqual([entries[0]!.key, entries[0]!.rev, entries[0]!.lifecycleId], ['#7', 1, 'L1'])
   })
 
@@ -170,8 +179,7 @@ describe('retention', () => {
     await until(repo, all => all.length === 0)
     // Retention runs from the archive commit, not from the object's first write.
     assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 2)
-    await pause(RETENTION_MS + 300)
-    assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 0)
+    await deleted(path)
     assert.deepEqual((await call(adam, { op: 'archives' }, path)).json.archives, [])
   })
 
@@ -190,13 +198,12 @@ describe('retention', () => {
     await grantRepo(repo)
     const path = branchPath('feat/y', repo)
     await commit(path, live('LY', { phase: 'pre' }))
-    await pause(RETENTION_MS / 2)
-    // A later write moves the deadline.
+    await pause(RETENTION_MS * 0.75)
+    // A later write moves the deadline: checked past the first deadline, with most of the second one still to run.
     await commit(path, live('LY', { phase: 'pre', n: 2 }))
-    await pause(RETENTION_MS / 2 + 100)
+    await pause(RETENTION_MS * 0.375)
     assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 2)
-    for (const end = Date.now() + 3000; Date.now() < end && (await call(adam, { op: 'read' }, path)).json.rev !== 0;) await pause(25)
-    assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 0)
+    await deleted(path)
     await until(repo, all => all.length === 0)
   })
 
@@ -207,8 +214,7 @@ describe('retention', () => {
     const before = Date.now()
     for (let n = 1; n <= 8; n++) await commit(path, live('L1', { phase: 'pre', n }))
     await until(repo, all => all[0]?.rev === 8)
-    for (const end = Date.now() + 3000; Date.now() < end && (await call(adam, { op: 'read' }, path)).json.rev !== 0;) await pause(25)
-    assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 0)
+    await deleted(path)
     assert.equal(await commit(path, live('L2', { phase: 'pre' })), 1)
     const entries = await until(repo, all => all[0]?.lifecycleId === 'L2')
     assert.deepEqual(entries.map(one => [one.key, one.rev, one.lifecycleId]), [['@x', 1, 'L2']])
@@ -216,5 +222,15 @@ describe('retention', () => {
     const old = { key: '@x', branch: 'x', phase: 'pre', rev: 8, updatedAt: 1, lifecycleId: 'L1' }
     assert.equal((await update(repo, { key: '@x', born: before, rev: 8, entry: old })).status, 200)
     assert.deepEqual((await list(repo))!.map(one => [one.key, one.rev, one.lifecycleId]), [['@x', 1, 'L2']])
+  })
+})
+
+describe('without TEST_FAULTS', () => {
+  before(startWith({ TEST_FAULTS: '' }))
+  after(stop)
+
+  test('/v1/admin/index answers 404', async () => {
+    assert.equal((await call(adam, { op: 'fault', repo: 'owner/repo', until: Date.now() + 1000 }, '/v1/admin/index')).status, 404)
+    assert.equal((await call(adam, { op: 'update', repo: 'owner/repo', key: '#1', born: 1, rev: 1, removed: true }, '/v1/admin/index')).status, 404)
   })
 })

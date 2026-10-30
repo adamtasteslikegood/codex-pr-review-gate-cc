@@ -78,6 +78,8 @@ export const RETENTION_MS = 7_776_000_000
 /** The first retry of an index update; each failure doubles it, up to 5 minutes. */
 const INDEX_RETRY_MS = 1000
 const INDEX_RETRY_CAP_MS = 300_000
+/** The relay's per-call timeout (spec §8), applied to the object's own call to its index. */
+const INDEX_SEND_TIMEOUT_MS = 5000
 
 const empty = (): State => ({ rev: 0, record: null, lease: null, fence: 0, archives: [], filings: {}, writes: [] })
 
@@ -393,10 +395,12 @@ export class LifecycleObject {
   private async send(repo: string, update: IndexUpdate): Promise<boolean> {
     try {
       const index = this.env.REPO_INDEX.get(this.env.REPO_INDEX.idFromName(repo))
+      // Time-boxed: a hung index must not hold the object, which retention blocks during this send. A timeout is a failed send, retried.
       const res = await index.fetch(new Request('https://internal/', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ op: 'update', ...update }),
+        signal: AbortSignal.timeout(INDEX_SEND_TIMEOUT_MS),
       }))
       await res.text()
       return res.ok
@@ -411,7 +415,7 @@ export class LifecycleObject {
     const last = (await storage.get<number>('retry')) ?? 0
     const delay = Math.min(last > 0 ? last * 2 : Number(this.env.INDEX_RETRY_MS ?? INDEX_RETRY_MS), INDEX_RETRY_CAP_MS)
     await storage.put({ retry: delay })
-    await storage.setAlarm(Date.now() + delay)
+    await this.arm(Date.now() + delay)
   }
 
   /** Delivers the outbox, then deletes the object once its retention has run out. No client and no further commit is needed (#53). */
@@ -446,7 +450,8 @@ export class LifecycleObject {
     // The removal sits one rev above the last update, so it wins over it at the index; the delete waits for the index's answer.
     await storage.put({ state: { ...s, isRemoving: true } })
     if (!(await this.send(s.repo, { key: s.key, born: s.born, rev: s.rev + 1, removed: true }))) return this.retry()
-    await storage.deleteAlarm()
+    // State first: an eviction between the two leaves an alarm that finds no state and stops, never a state with no alarm.
     await storage.deleteAll()
+    await storage.deleteAlarm()
   }
 }
