@@ -39,3 +39,10 @@ Branch: docs/wave2b, restarted from main 7d717cd (PR #51 merged). Adam approved 
 - Ruling: open issues #50 (G2-6), #52 (G2-4), #53 (G2-5) need no plan change: #53 is T4 (outbox, alarm retry, zero-further-commit test); #52 is T3's snapshot op plus T6's recovery/migration tests with distinct findings; #50 is T8 (lease cache emptied on 409/423/410, boundary beat, take-after-beat test). The PR body names them to close — cost if wrong: an issue left open after merge.
 
 ## Tasks
+Task 1: complete (commits eadd80e..ae16a18, review clean)
+Task 1: minor (deferred): header-replacement test doesn't isolate x-relay-principal (forge ADAM + breakLease → 403 would)
+Task 1: minor (deferred): /v1/admin/* shadows a repo admin/grants or admin/index — Ruling: Task 4 (which adds /v1/<owner>/<repo> list) treats owner `admin` as reserved — cost if wrong: a real GitHub owner named admin can't use the relay
+Task 1: minor (deferred): grant-path history tests use relative revs, not literal 1,2,3
+Task 1: minor (deferred): a thrown GrantStore fetch is an unmapped 500, a non-2xx presetOf a 502 (fails closed)
+Task 1: minor (deferred): re-granting the same preset writes rev + history
+Task 1: minor (deferred): relay README still describes the GRANTS env var (Task 12 updates docs)
