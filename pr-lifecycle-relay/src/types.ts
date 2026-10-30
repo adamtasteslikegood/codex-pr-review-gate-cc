@@ -11,6 +11,8 @@ export type Env = {
   ADMINS?: string
   /** How long a lease lasts without a beat, in ms; R74's 2 minutes when unset. */
   LEASE_MS?: string
+  /** How old a filing claim must be before the lease holder may adopt it, in ms; 30 minutes when unset. */
+  FILING_STALE_MS?: string
   LIFECYCLE: DurableObjectNamespace
 }
 

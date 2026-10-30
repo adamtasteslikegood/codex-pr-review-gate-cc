@@ -13,8 +13,11 @@ import type { DurableObjectState, Env } from './types.ts'
  */
 export type Lease = { holder: string; principal: string; token: number; until: number; verifier: string }
 
-/** A filing claim belongs to the principal and checkout (its secret) that made it: only they complete it, and a completed one never changes. */
-export type Filing = { state: 'claimed' | 'done'; actor: string; at: number; verifier: string; result?: unknown }
+/**
+ * A filing claim belongs to the principal and checkout (its secret) that made it: only they complete it, and a completed one never changes.
+ * The one exception is `fileAdopt`: once a claim is stale, the lease holder finishes it with the issue it found, recorded as `adoptedBy`.
+ */
+export type Filing = { state: 'claimed' | 'done'; actor: string; at: number; verifier: string; result?: unknown; adoptedBy?: string }
 
 type Write = { actor: string; op: string; at: number; rev: number }
 
@@ -35,6 +38,8 @@ export const ARCHIVE_CAP = 20
 const WRITE_CAP = 100
 /** R74: a session quiet for 2 minutes may be taken over. */
 const LEASE_MS = 120_000
+/** A filing claim older than the step timeout (30 minutes) may be adopted by the lease holder (PR #51 review, G1-2). */
+const FILING_STALE_MS = 1_800_000
 
 const empty = (): State => ({ rev: 0, record: null, lease: null, fence: 0, archives: [], filings: {}, writes: [] })
 
@@ -68,6 +73,7 @@ const NEEDS: Record<string, Need> = {
   release: 'operate',
   fileClaim: 'operate',
   fileDone: 'operate',
+  fileAdopt: 'operate',
   breakLease: 'admin',
   fileDelete: 'admin',
 }
@@ -177,6 +183,23 @@ export class LifecycleObject {
         }
         const filing: Filing = { ...known, state: 'done', result: body.result, at: now }
         await save({ ...s, filings: { ...s.filings, [key]: filing } }, `fileDone ${key}`)
+        return reply(200, { filing: shown(filing) })
+      }
+      case 'fileAdopt': {
+        // A claimant whose secret is lost can never finish its claim. Once the claim is stale, the driver (the live lease's holder)
+        // finishes it with the issue the exact-mark search found. The claimant stays the actor; the adopter is recorded beside it.
+        const key = String(body.key ?? '')
+        const known = filingOf(key)
+        if (!isLive(s.lease) || !isMine(s.lease)) return reply(423, { error: 'only the lease holder adopts a filing', lease: shown(s.lease) })
+        if (known === undefined) return reply(409, { error: 'no claim to adopt' })
+        if (body.result === undefined) return reply(400, { error: 'fileAdopt needs a result' })
+        if (known.state === 'done') {
+          const isSame = JSON.stringify(known.result) === JSON.stringify(body.result)
+          return reply(isSame ? 200 : 409, isSame ? { filing: shown(known) } : { error: 'the filing is done', filing: shown(known) })
+        }
+        if (now - known.at < Number(this.env.FILING_STALE_MS ?? FILING_STALE_MS)) return reply(409, { error: 'the claim is not stale yet', filing: shown(known) })
+        const filing: Filing = { ...known, state: 'done', result: body.result, at: now, adoptedBy: who.id }
+        await save({ ...s, filings: { ...s.filings, [key]: filing } }, `fileAdopt ${key}`)
         return reply(200, { filing: shown(filing) })
       }
       case 'fileDelete': {
