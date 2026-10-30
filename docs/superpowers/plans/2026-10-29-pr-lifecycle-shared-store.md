@@ -63,6 +63,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 | `moveTo` (branch only) | operate + own lease | `{ pr, secret }` | `{ rev }` | 409, 410, 404 on a PR key |
 | `moveDone` (branch only) | operate | `{ lifecycleId }` | `{}` (again: `{}`) | 409 when not moved or the id differs, 404 on a PR key |
 | `log` | operate | `{ at, kind, text, holder }` | `{ logDropped }` | — |
+| `fileAdopt` | operate + own live lease | `{ key, result: { number, url }, secret }` (the lease secret) | `{ filing }` with `adoptedBy` | 423 without the lease, 409 when the claim is younger than `FILING_STALE_MS` or done with another result, 409 when there is no claim |
 | `snapshot` | operate | `{ at, record, reason: 'fallback' \| 'migration' \| 'move' }` | `{}` | — |
 | `archives` / `filing` / `fileClaim` / `fileDone` / `fileDelete` / `breakLease` | as prototyped | as prototyped | as prototyped | as prototyped |
 
@@ -151,7 +152,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Create: `pr-lifecycle-relay/test/log.test.ts`
 
 **Interfaces:**
-- Produces: the ops `take`, `log` and `snapshot` with the wire shapes above, and `export const RELAY_LOG_CAP = 1000`.
+- Produces: the ops `take`, `log`, `snapshot` and `fileAdopt` with the wire shapes above, `export const RELAY_LOG_CAP = 1000`, and `FILING_STALE_MS` 1 800 000 (env `FILING_STALE_MS` overrides it; the harness sets `'300'`). `Filing` gains `adoptedBy?: string`.
 - Produces: the log is stored under its own storage key `log` as `{ lines: LogLine[], dropped: number, seq: number }`. `read` returns `log` (lines with `seq` above `logSince` when it is given), `logDropped` and `logSeq`.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -165,11 +166,13 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `logSince returns only lines after the cursor`: lines with seq 1, 2 and 3 and `logSince: 2` return only seq 3.
   - `a frozen clock loses no line`: with every line at the same `at`, append A, read (cursor = `logSeq`), append B, read from the cursor: B comes back once and A doesn't come back. After 1001 lines, `logSeq` is 1001 and `logDropped` is 1.
   - `each line records the principal and the holder`.
+  - `fileAdopt finishes a stale claim under the lease, without impersonating`: CODEX claims a filing with secret A; after `FILING_STALE_MS`, Adam (holding the lease, another secret) adopts with `{ number: 5, url }` and gets 200; `filing` gives `state: 'done'`, `actor: CODEX`, `adoptedBy: ADAM`; the write history names `fileAdopt` by ADAM.
+  - `fileAdopt is refused without the live lease (423), on a claim younger than FILING_STALE_MS (409), on a missing claim (409), and with another result on a done filing (409)`; with the same result it gives 200.
   - `snapshot appends to archives without touching record or rev`: the archive's last entry is `{ reason: 'fallback', actor: ADAM }`, and `ARCHIVE_CAP` still applies.
 - [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/log.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement** the three ops. The log is written with a single `storage.put({ log })` and never inside `state`.
 - [ ] **Step 4: Run** `npm run test:relay`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(relay): take within one principal, a lease-free log capped at 1000, and snapshot (R105, R106)`.
+- [ ] **Step 5: Commit** with `feat(relay): take within one principal, a lease-free log capped at 1000, snapshot, and fileAdopt (R101, R105, R106)`.
 
 ### Task 4: RepoIndex, the outbox and its alarm, `list`, retention (relay)
 
@@ -366,7 +369,8 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - [ ] **Step 1: Write the failing tests** (spec §14, "Crash after a POST"):
   - `a crash after the POST: a new session in the same checkout sends no second POST and leaves the ledger done`.
   - `the same restart from another checkout leaves it claimed, with no second POST`.
-  - `with the plugin store lost too, the claim stays claimed until an admin fileDelete; the next pass adopts the marked issue and ends done`.
+  - `with the plugin store lost too, the lease holder adopts the marked issue with fileAdopt once the claim is stale: no second POST, no admin, the ledger ends done with adoptedBy`.
+  - `a stale claim with no marked issue is not adopted and waits for an admin's fileDelete`.
   - `another checkout's live claim: no POST; read filing again on the next tick`.
   - `a claim older than stepTimeoutMinutes shows as stuck`.
   - `two checkouts that both filed in fallback: on recovery the lowest-numbered issue is adopted and the other is reported, not closed`.
@@ -388,7 +392,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `N earlier lines dropped` when `dropped > 0`;
   - for a moved lifecycle, a `branch <name>` section, then a `PR #<n>` section;
   - each line's principal and short session id;
-  - a `stuck filings` section listing claims older than `stepTimeoutMinutes` with no `fileDone`, each with its key and claimant, and the hint `an admin's fileDelete frees it`.
+  - a `stuck filings` section listing claims older than `stepTimeoutMinutes` with no `fileDone`, each with its key and claimant, and the hint `the driver adopts it once its issue is found; otherwise an admin's fileDelete frees it`.
 
 - [ ] **Step 1: Write the failing tests** for each of those output parts, plus `a repo not on the relay prints as before`.
 - [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
