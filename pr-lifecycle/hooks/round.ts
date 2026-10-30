@@ -119,7 +119,25 @@ import {
   untrackedSecurity,
 } from './lifecycle'
 import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
-import { isHeldByOther, liveRecords, LOG_CAP, loadRecord, logEvent, ownerOf, recordKey, setOwner, transact, updateRecord } from './store'
+import {
+  beatLease,
+  forgetLeases,
+  isHeldByOther,
+  liveRecords,
+  LOG_CAP,
+  loadRecord,
+  logEvent,
+  ownerOf,
+  recordKey,
+  RelayMoved,
+  RelayRefused,
+  releaseLease,
+  setOwner,
+  StaleRecord,
+  transact,
+  updateRecord,
+} from './store'
+import type { LeaseHeld } from './store'
 // `.github/pr-gate.json` as the base has it (R67): in relay.ts, which reads `sharedStore` from it and must not import this file.
 import { baseFileOf } from './relay'
 
@@ -390,6 +408,8 @@ export function setup(c: Config): void {
   // A reload drops the module's timers: the merge watcher starts afresh when something needs it.
   stopWatcher()
   watchRoots.clear()
+  // And its kept relay leases: the next boundary claims afresh (Task 8).
+  forgetLeases()
 }
 
 // This session (#13): its id, read once, and whether a person is at its prompt (session.start says; a reload keeps the default).
@@ -398,6 +418,18 @@ let isInteractive = true
 // When this session last beat for its run's record; 0 makes the next tick claim it.
 let beatAt = 0
 const BEAT_MS = 30_000
+/** How often the ticker beats a relay lease (Task 8, spec §4): well inside its 120 s, and each action boundary beats it too. */
+export const RELAY_BEAT_MS = 60_000
+// The ticker's period: RELAY_BEAT_MS while the run's record is on the relay, else BEAT_MS.
+let beatEvery = BEAT_MS
+// Who holds the lease a claim was refused for, and until when (R105): a person is told, never left with a bare "another session".
+let heldNote: string | undefined
+
+/** Why the last `claimRecord` was refused on the relay, for the person: who holds the lifecycle until when. Undefined otherwise. */
+export const heldNoteOf = (): string | undefined => heldNote
+
+const heldText = (lease: LeaseHeld): string =>
+  `session ${lease.holder.slice(0, 8)}${lease.principal === undefined ? '' : ` of ${lease.principal}`} holds this lifecycle until ${new Date(lease.until).toISOString()}`
 
 export function setSession(interactive: boolean): void {
   isInteractive = interactive
@@ -411,14 +443,26 @@ export async function sessionIdOf($: Engine): Promise<string> {
 
 /**
  * Makes this session the record's owner (#13): a start, a resume or a person's command takes the record. A headless session
- * (`-p`, the SDK) never takes one another session holds; false then.
+ * (`-p`, the SDK) never takes one another session holds; false then. On the relay (Task 8, R105) an interactive session takes the
+ * lease, which only the same principal may while it is live, and a headless one claims it; a 423 is false, and `heldNoteOf` says who
+ * holds it until when. A relay that refuses this checkout is false too: it stands down, never falls back.
  */
 export async function claimRecord($: Engine, root: string, branch: string): Promise<boolean> {
+  heldNote = undefined
   const now = await $.clock.now()
   const id = await sessionIdOf($)
   const before = await ownerOf($, root, branch)
   if (!isInteractive && isHeldByOther(before, id, now)) return false
-  await setOwner($, root, branch, { sessionId: id, beatAt: now })
+  const lease = await setOwner($, root, branch, { sessionId: id, beatAt: now }, { isTake: isInteractive })
+  if ('held' in lease || 'lost' in lease || 'refused' in lease || 'free' in lease) {
+    const held = 'held' in lease ? lease.held : 'lost' in lease ? lease.held : undefined
+    if (held !== undefined) {
+      heldNote = heldText(held)
+      $.ui.status(`pr-gate: ${heldNote}`)
+    }
+    return false
+  }
+  beatEvery = 'mine' in lease ? RELAY_BEAT_MS : BEAT_MS
   beatAt = now
   if (before !== undefined && before.sessionId !== id) {
     await logEvent($, root, branch, 'session', `session ${id.slice(0, 8)} took the record over from ${before.sessionId.slice(0, 8)}`)
@@ -432,11 +476,21 @@ export async function isOwnedElsewhere($: Engine, root: string, branch: string):
 }
 
 /**
- * The ticker's beat, on its first tick and then every 30 s: false when another session holds the record. A ticker never takes a
- * record another session holds, not even a restarted one: only a person's command, or an owner gone quiet, moves it (#13).
+ * The ticker's beat, on its first tick and then every 30 s (every RELAY_BEAT_MS on the relay): false when another session holds the
+ * record. A ticker never takes a record another session holds, not even a restarted one: only a person's command, or an owner gone
+ * quiet, moves it (#13). On the relay it beats the lease, or claims it with none kept; a relay down, or a record not on it, beats the
+ * local owner as before.
  */
 async function beat($: Engine, run: Run, now: number): Promise<boolean> {
-  if (beatAt !== 0 && now - beatAt < BEAT_MS) return true
+  if (beatAt !== 0 && now - beatAt < beatEvery) return true
+  const lease = await beatLease($, run.root, run.branch)
+  if ('mine' in lease) {
+    beatEvery = RELAY_BEAT_MS
+    beatAt = now
+    return true
+  }
+  if (!('local' in lease) && !('down' in lease)) return false
+  beatEvery = BEAT_MS
   if (await isOwnedElsewhere($, run.root, run.branch)) return false
   return claimRecord($, run.root, run.branch)
 }
@@ -448,16 +502,53 @@ export async function isStillMine($: Engine, run: Pick<Run, 'root' | 'branch'>):
   return false
 }
 
-/** Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. */
-async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<void> {
+/**
+ * An action boundary (Task 8, spec §4): called before each agent turn, sub-agent spawn and gh write. On the relay it beats the
+ * lease (or claims one this session doesn't keep) and is true only on a 200; a 409, 423 or 410 has emptied the kept lease, and this
+ * session stands down. A relay down, or a record not on it, answers `isStillMine`. A step already in flight may finish.
+ */
+export async function boundary($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<boolean> {
+  const lease = await beatLease($, run.root, run.branch)
+  if ('local' in lease || 'down' in lease) return isStillMine($, run)
+  if ('mine' in lease) {
+    // A boundary's beat is the ticker's too: its next falls RELAY_BEAT_MS after this one.
+    beatEvery = RELAY_BEAT_MS
+    beatAt = await $.clock.now()
+    return true
+  }
+  await standDown($, run, 'held' in lease ? lease.held : 'lost' in lease ? lease.held : undefined)
+  return false
+}
+
+/**
+ * A change the shared store would not take at a non-pure site (Task 8): a stale commit, a lease another session holds, a record
+ * moved under another lifecycle, or a refusal. This session stands down with a log line; never a crash. False for any other error.
+ */
+export async function isStoodDownBy($: Engine, key: Pick<Run, 'root' | 'branch'>, error: unknown): Promise<boolean> {
+  if (!(error instanceof StaleRecord || error instanceof RelayMoved || error instanceof RelayRefused)) return false
+  const held = error instanceof StaleRecord ? error.lease : undefined
+  // A start refused here says why, as a refused claim does.
+  heldNote = held === undefined ? error.message : heldText(held)
+  await standDown($, key, held, error.message)
+  return true
+}
+
+/**
+ * Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. Its
+ * line goes through `logEvent`, the relay's lease-free `log` for a record there (spec §5), never a commit.
+ */
+async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>, held?: LeaseHeld, why?: string): Promise<void> {
   const live = await getRun($)
   if (live === null || (live.root === run.root && live.branch === run.branch)) {
     stopTicker()
     isLive = false
     await update($, runAtom, () => null)
   }
-  $.ui.status('pr-gate: another session runs this lifecycle')
-  await logEvent($, run.root, run.branch, 'session', `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`)
+  $.ui.status(held === undefined ? 'pr-gate: another session runs this lifecycle' : `pr-gate: ${heldText(held)}`)
+  const text = `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`
+  const said = held !== undefined ? `${text} (${heldText(held)})` : why !== undefined ? `${text} (${why})` : text
+  // A relay that refuses the line too stands nothing further down: the session already did.
+  await logEvent($, run.root, run.branch, 'session', said).catch(() => undefined)
 }
 
 export const isLiveNow = (): boolean => isLive
@@ -493,7 +584,7 @@ const sameRecord = (a: RecordKey, b: RecordKey): boolean => a.root === b.root &&
 
 /** Submits a prompt unless another session took its record meanwhile; this one then stands down instead (#13). */
 async function deliver($: Engine, key: RecordKey, text: string): Promise<void> {
-  if (!(await isStillMine($, key))) return
+  if (!(await boundary($, key))) return
   await $.prompt.submit({ text }).catch(() => undefined)
 }
 
@@ -711,10 +802,17 @@ export async function onNewHead($: Engine, run: Run, from: string, to: string, n
     return moved.waivers
   }
   // Read and written under the record's lock (R1-6): a waiver the person gives meanwhile is not overwritten.
-  const saved = await updateRecord($, run.root, run.branch, async one => {
-    const waivers = await move(one)
-    return { ...one, findings: flag(one.findings), waivers }
-  })
+  let saved: LifecycleRecord | undefined
+  try {
+    saved = await updateRecord($, run.root, run.branch, async one => {
+      const waivers = await move(one)
+      return { ...one, findings: flag(one.findings), waivers }
+    })
+  } catch (error) {
+    // The shared store would not take it (Task 8): this session stands down, and its run's copy is gone with it.
+    if (await isStoodDownBy($, run, error)) return
+    throw error
+  }
   if (saved === undefined) await move({ findings: [], waivers: [] })
   await patch($, run.id, one => ({ ...one, findings: flag(one.findings) }))
 }
@@ -886,24 +984,31 @@ async function takeLate($: Engine, run: Run, answer: string, reason: string): Pr
   const said = readDispositions(answer)
   let isTaken = false
   let isResumed = false
-  const saved = await updateRecord($, run.root, run.branch, async rec => {
-    // The lifecycle the fixer worked on, and no other: a reset or a fresh start since makes the answer another lifecycle's.
-    if (rec.phase === 'archived' || (rec.generation ?? 0) !== late.generation || rec.lifecycleId !== late.lifecycleId) return rec
-    // Read under the record's lock: a resume during the awaits above runs the round again, which owns the record now.
-    if (!isStopped(await getRun($))) {
-      isResumed = true
-      return rec
-    }
-    isTaken = true
-    return {
-      ...rec,
-      ...(replyIdsOf(answer).length > 0 ? withOwnReplies(rec, answer) : {}),
-      findings: rec.findings.map(finding => {
-        const one = said.find(each => each.id === finding.id)
-        return one === undefined ? finding : applyAnswer(finding, one, late.round, 'fixer', now)
-      }),
-    }
-  })
+  let saved: LifecycleRecord | undefined
+  try {
+    saved = await updateRecord($, run.root, run.branch, async rec => {
+      // The lifecycle the fixer worked on, and no other: a reset or a fresh start since makes the answer another lifecycle's.
+      if (rec.phase === 'archived' || (rec.generation ?? 0) !== late.generation || rec.lifecycleId !== late.lifecycleId) return rec
+      // Read under the record's lock: a resume during the awaits above runs the round again, which owns the record now.
+      if (!isStopped(await getRun($))) {
+        isResumed = true
+        return rec
+      }
+      isTaken = true
+      return {
+        ...rec,
+        ...(replyIdsOf(answer).length > 0 ? withOwnReplies(rec, answer) : {}),
+        findings: rec.findings.map(finding => {
+          const one = said.find(each => each.id === finding.id)
+          return one === undefined ? finding : applyAnswer(finding, one, late.round, 'fixer', now)
+        }),
+      }
+    })
+  } catch (error) {
+    // The shared store would not take it (Task 8): this session stands down, and keeps nothing of the late answer.
+    if (await isStoodDownBy($, run, error)) return
+    throw error
+  }
   if (isResumed) await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after a resume; nothing kept`)
   if (saved === undefined || !isTaken) return
   const head = await git($, run.root, ['rev-parse', 'HEAD'])
@@ -1021,6 +1126,8 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
       ...(ended.lifecycle === 'post' && (status === 'error' || status === 'stopped') ? { postStatus: status } : {}),
     }
   }, { isPure: true })
+  // The lease this run claimed or took goes back at its end (Task 8); a release that doesn't land is owed.
+  await releaseLease($, ended.root, ended.branch)
   $.ui.status(undefined)
   $.ui.toast(`pr-gate ${status}: ${message}`.slice(0, 300))
   // A post-PR run that ends leaves a record with a PR and no run: the merge watcher reads its state from now on (spec §5.13.3).
@@ -1034,19 +1141,25 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
  * or, with `generation`, when the live record is another lifecycle's (A6).
  */
 export async function archiveLifecycle($: Engine, root: string, branch: string, now: number, generation?: number): Promise<boolean> {
-  return transact($, root, branch, async tx => {
-    const last = await tx.load()
-    if (last === undefined || last.phase === 'archived') return false
-    // A caller that read the record earlier archives only that lifecycle, never one a reset and a fresh start put in its place (A6).
-    if (generation !== undefined && (last.generation ?? 0) !== generation) return false
-    await tx.archive(last, now)
-    const { base, head, tier, tierWhy, lane, allowance } = last
-    const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
-    // When the head reached the PR (#24) is kept only for the head the seed names: a fresh start on another head looks it up afresh.
-    const arrival = last.headArrival?.head === head ? { headArrival: last.headArrival } : {}
-    await tx.save({ ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, ...arrival, phase: 'archived', generation: (last.generation ?? 0) + 1 })
-    return true
-  })
+  try {
+    return await transact($, root, branch, async tx => {
+      const last = await tx.load()
+      if (last === undefined || last.phase === 'archived') return false
+      // A caller that read the record earlier archives only that lifecycle, never one a reset and a fresh start put in its place (A6).
+      if (generation !== undefined && (last.generation ?? 0) !== generation) return false
+      await tx.archive(last, now)
+      const { base, head, tier, tierWhy, lane, allowance } = last
+      const seed = newRecord({ root, branch, base, head, tier, tierWhy, lane, allowance, at: now })
+      // When the head reached the PR (#24) is kept only for the head the seed names: a fresh start on another head looks it up afresh.
+      const arrival = last.headArrival?.head === head ? { headArrival: last.headArrival } : {}
+      await tx.save({ ...seed, processed: last.processed, replies: last.replies, ownReplies: last.ownReplies, ...arrival, phase: 'archived', generation: (last.generation ?? 0) + 1 })
+      return true
+    })
+  } catch (error) {
+    // The shared store would not take it (Task 8): this session stands down, and archived nothing.
+    if (await isStoodDownBy($, { root, branch }, error)) return false
+    throw error
+  }
 }
 
 export type PrState = 'OPEN' | 'MERGED' | 'CLOSED'
@@ -1394,7 +1507,11 @@ async function watchBeat($: Engine): Promise<void> {
             isWaiting = true
             continue
           }
-          await claimRecord($, rec.root, rec.branch)
+          // A claim the relay refuses (another session holds the lease, Task 8) closes nothing: that session does.
+          if (!(await claimRecord($, rec.root, rec.branch))) {
+            isWaiting = true
+            continue
+          }
           await holdingPrompts($, () => closeLifecycle($, rec.root, rec.branch, rec.pr, state, true))
         } catch {
           // One record's failure is not the others': it is read again at its next beat.
@@ -1411,6 +1528,8 @@ async function watchBeat($: Engine): Promise<void> {
 // ----------------------------------------------------------- the steps
 
 async function spawn($: Engine, run: Run, role: Role, prompt: string): Promise<{ isStarted: boolean; agentId?: string }> {
+  // An action boundary (Task 8): a session that lost the lease starts no sub-agent; it has stood down.
+  if (!(await boundary($, run))) return { isStarted: false }
   // The base's own setting, if it has one (R67, R68); no model inherits the session's.
   const model = agentModelFor(role, run.lifecycle, (await configFor($, run.root, run.base)).config)
   const started = await $.agent.spawn({
@@ -1493,11 +1612,8 @@ async function beginFix($: Engine, id: string, notes: string | undefined, kind: 
     await patch($, id, run => ({ ...run, pending: [{ role: 'fix', step: stepOf(run, 'fix'), agentId }], activity: 'waiting on the fixer…' }))
     return
   }
-  // Another session runs this record (#13): this one sends its agent nothing.
-  if (await isOwnedElsewhere($, opened.root, opened.branch)) {
-    await standDown($, opened)
-    return
-  }
+  // Another session runs this record (#13): this one sends its agent nothing. An action boundary (Task 8): an agent turn.
+  if (!(await boundary($, opened))) return
   // The prompt waits for the session to go idle. The step is armed by the main-loop turn that starts with this prompt
   // (`onTurnStart`, R51), so a turn already running when the findings came in is never read as the fix.
   void $.prompt
@@ -1557,6 +1673,8 @@ async function beginCollect($: Engine, id: string): Promise<void> {
 
 /** Asks a requestReview reviewer to review the PR again: the POST to `requested_reviewers` (1.4.0). A failed or hung request is logged, never a stop. */
 async function askAgain($: Engine, rec: LifecycleRecord, who: string): Promise<void> {
+  // An action boundary (Task 8): a gh write.
+  if (!(await boundary($, rec))) return
   const args = ['gh', 'api', '-X', 'POST', `repos/${rec.slug ?? ''}/pulls/${rec.pr ?? ''}/requested_reviewers`, '-f', `reviewers[]=${who}`]
   let why: string | undefined
   try {
@@ -2528,11 +2646,9 @@ async function startLateTriage($: Engine, rec: LifecycleRecord): Promise<void> {
  */
 async function askTriage($: Engine, id: string, text: string): Promise<void> {
   // Another session runs this record (#13): this one sends its agent nothing.
+  // An action boundary (Task 8): an agent turn.
   const run = await getRun($)
-  if (run !== null && run.id === id && (await isOwnedElsewhere($, run.root, run.branch))) {
-    await standDown($, run)
-    return
-  }
+  if (run !== null && run.id === id && !(await boundary($, run))) return
   void $.prompt
     .submit({ text })
     .then(async entered => {
@@ -3199,14 +3315,20 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     // An answer on the same head (R37): the ledger and the head move on, no round is recorded.
     // The carry, never the check's capped effort: advance may start a round at once, before finish could restore it.
     let isGone = false
-    await updateRecord($, run.root, run.branch, async rec => {
-      // Read again under the record's lock: a stop or waiver given while this step awaited writes nothing (gate R3-3).
-      if (!(await isRunning($, run.id))) {
-        isGone = true
-        return rec
-      }
-      return { ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.carriedEffort ?? run.effort }
-    })
+    try {
+      await updateRecord($, run.root, run.branch, async rec => {
+        // Read again under the record's lock: a stop or waiver given while this step awaited writes nothing (gate R3-3).
+        if (!(await isRunning($, run.id))) {
+          isGone = true
+          return rec
+        }
+        return { ...rec, head: endHead, findings: mergeFindings(rec.findings, findings), effort: run.carriedEffort ?? run.effort }
+      })
+    } catch (error) {
+      // The shared store would not take it (Task 8): this session stands down, and records nothing of the round.
+      if (await isStoodDownBy($, run, error)) return
+      throw error
+    }
     // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
     if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
     return
@@ -3244,35 +3366,41 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
   }
   // The head move is read from the record under its lock (R1-6), so a waiver given meanwhile is lapsed or kept, never lost.
   let isGone = false
-  await updateRecord($, run.root, run.branch, async rec => {
-    // Read again under the record's lock: a stop or waiver given while this step awaited the clock or git records no round (gate R3-3).
-    if (!(await isRunning($, run.id))) {
-      isGone = true
-      return rec
-    }
-    const moved = isMoved
-      ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
-      : undefined
-    // Each finding keeps its line as placed at the end head (R73); only the re-check flag spares a fix verified at that head.
-    const placed = new Map(moved?.findings.map(one => [one.id, one]) ?? [])
-    const place = (one: Finding): Finding => {
-      const at = placed.get(one.id)
-      if (at === undefined) return one
-      return {
-        ...one,
-        ...(at.needsRecheck === true && !isVerifiedAtEnd(at) ? { needsRecheck: true } : {}),
-        ...(at.line === undefined ? {} : { line: at.line }),
-        ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+  try {
+    await updateRecord($, run.root, run.branch, async rec => {
+      // Read again under the record's lock: a stop or waiver given while this step awaited the clock or git records no round (gate R3-3).
+      if (!(await isRunning($, run.id))) {
+        isGone = true
+        return rec
       }
-    }
-    return {
-      ...withRound(rec, round),
-      head: endHead,
-      findings: mergeFindings(rec.findings, run.findings).map(place),
-      ...(moved === undefined ? {} : { waivers: moved.waivers }),
-      effort: run.carriedEffort ?? run.effort,
-    }
-  })
+      const moved = isMoved
+        ? await headMoved($, run.root, { ...rec, findings: mergeFindings(rec.findings, run.findings) }, run.roundStartHead, endHead, now)
+        : undefined
+      // Each finding keeps its line as placed at the end head (R73); only the re-check flag spares a fix verified at that head.
+      const placed = new Map(moved?.findings.map(one => [one.id, one]) ?? [])
+      const place = (one: Finding): Finding => {
+        const at = placed.get(one.id)
+        if (at === undefined) return one
+        return {
+          ...one,
+          ...(at.needsRecheck === true && !isVerifiedAtEnd(at) ? { needsRecheck: true } : {}),
+          ...(at.line === undefined ? {} : { line: at.line }),
+          ...(at.lineHead === undefined ? {} : { lineHead: at.lineHead }),
+        }
+      }
+      return {
+        ...withRound(rec, round),
+        head: endHead,
+        findings: mergeFindings(rec.findings, run.findings).map(place),
+        ...(moved === undefined ? {} : { waivers: moved.waivers }),
+        effort: run.carriedEffort ?? run.effort,
+      }
+    })
+  } catch (error) {
+    // The shared store would not take it (Task 8): this session stands down, and records nothing of the round.
+    if (await isStoodDownBy($, run, error)) return
+    throw error
+  }
   // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
   if (isCompleted && !isGone && (await isRunning($, run.id))) await advance($, run.root, run.branch)
 }
@@ -3626,8 +3754,20 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: Merge
   filing.add(key)
   try {
     return await fileOnce($, rec, merged)
+  } catch (error) {
+    // A boundary this session lost (Task 8): it stood down, and decides nothing for the pass.
+    if (error instanceof StoodDown) return undefined
+    throw error
   } finally {
     filing.delete(key)
+  }
+}
+
+/** Thrown by a gh write whose action boundary this session lost (Task 8): it has stood down, and the pass that wrote ends. */
+class StoodDown extends Error {
+  constructor() {
+    super('this session stood down: another session holds the lifecycle')
+    this.name = 'StoodDown'
   }
 }
 
@@ -3749,6 +3889,11 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
     }
   }
+  // An action boundary before each gh write (Task 8): a session that lost the lease has stood down, and the pass ends there.
+  const ghWrite = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    if (!(await boundary($, rec))) throw new StoodDown()
+    return gh(args)
+  }
   const failure = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
   // Each result is saved as soon as its gh call ends, with its log line (gate R9-1), so an issue GitHub has is never filed twice. Only
   // a reset or a fresh lifecycle stops that save: a stop or a waiver does not undo an issue already filed. Written only where the
@@ -3787,7 +3932,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     }
     // Made only when missing: an existing label's colour and description are the repository's (gate R7-7). Its failure is not
     // read: the labels GitHub returns, or the edit, are the check.
-    await gh(['label', 'create', label, '--repo', repo, '--color', LABEL_COLOURS[item.peak]])
+    await ghWrite(['label', 'create', label, '--repo', repo, '--color', LABEL_COLOURS[item.peak]])
     const after = await loadRecord($, rec.root, rec.branch)
     if (after === undefined || isMoved(after)) return undefined
     if (isWaived(after)) return after
@@ -3810,7 +3955,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     let got: Filed
     let text: string
     if (item.reuse !== undefined) {
-      const edit = await gh(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
+      const edit = await ghWrite(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
       const labelError = edit.exitCode === 0 ? undefined : failure(edit)
       got = { ...base, ...(labelError === undefined ? {} : { labelError }) }
       text = labelError === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
@@ -3819,7 +3964,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       text = `${item.id}: could not read the issues of ${repo} before filing again`
     } else if (found !== undefined) {
       // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
-      const edit = await relabelFound(gh, repo, found, label, item.title)
+      const edit = await relabelFound(ghWrite, repo, found, label, item.title)
       const labelError = edit === undefined || edit.exitCode === 0 ? undefined : failure(edit)
       got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }) }
       text = `${item.id}: found ${repo}#${found.number}, filed by an answer gh lost${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
@@ -3829,7 +3974,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       const sent = await markSent($, rec, item.id, 'issueError', ISSUE_SENT)
       if (sent === 'gone') return undefined
       if (sent === 'secret') continue
-      const post = await gh(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
+      const post = await ghWrite(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
       if (filed === undefined) {
         const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : failure(post)
@@ -4001,6 +4146,16 @@ export type MergeCheck = { moved: true } | { moved?: undefined; failed: string[]
  * Never through a PR-create command line (spec §5.9).
  */
 export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): Promise<MergeCheck> {
+  try {
+    return await checkOnce($, given)
+  } catch (error) {
+    // A boundary this session lost (Task 8): it stood down, and the caller writes, says and archives nothing, as for a move.
+    if (error instanceof StoodDown) return { moved: true }
+    throw error
+  }
+}
+
+async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck> {
   const rec = await withLifecycleId($, given)
   if (rec === undefined) return { moved: true }
   const failed: string[] = []
@@ -4028,6 +4183,11 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
     } catch (e) {
       return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
     }
+  }
+  // An action boundary before each gh write (Task 8): a session that lost the lease has stood down, and the pass ends there.
+  const ghWrite = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    if (!(await boundary($, rec))) throw new StoodDown()
+    return gh(args)
   }
   const words = (got: { exitCode: number; stderr: string }): string => (got.stderr.trim() || `gh exited ${got.exitCode}`).slice(0, 200)
   const log = async (text: string): Promise<void> => {
@@ -4104,7 +4264,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
     let isOpen = state === 'OPEN'
     if (state === 'CLOSED') {
       const comment = `Reopened by pr-gate: PR #${rec.pr ?? '?'} merged without fixing ${f.id}. It stays open as the follow-up.`
-      const reopen = await gh(['issue', 'reopen', String(ref.number), '--repo', ref.repo, '--comment', comment])
+      const reopen = await ghWrite(['issue', 'reopen', String(ref.number), '--repo', ref.repo, '--comment', comment])
       if (reopen.exitCode === 0) {
         await log(`${f.id}: reopened ${where} after the merge`)
         isOpen = true
@@ -4137,9 +4297,9 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
     }
     if (isOpen) {
       // Filed again by an earlier check without its label (A7): labelled now, as the filing pass labels an issue it reuses.
-      await gh(['label', 'create', label, '--repo', ref.repo, '--color', LABEL_COLOURS[peak]])
+      await ghWrite(['label', 'create', label, '--repo', ref.repo, '--color', LABEL_COLOURS[peak]])
       if (await isMoved()) return { moved: true }
-      const edit = await gh(['issue', 'edit', String(ref.number), '--repo', ref.repo, '--add-label', label])
+      const edit = await ghWrite(['issue', 'edit', String(ref.number), '--repo', ref.repo, '--add-label', label])
       if (edit.exitCode === 0) {
         touched.set(f.id, { ...f, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined })
         await log(`${f.id}: labelled ${where} ${label} after the merge`)
@@ -4156,7 +4316,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
       await log(`${f.id}: could not confirm ${where} after the merge`)
       continue
     }
-    await gh(['label', 'create', label, '--repo', rec.slug, '--color', LABEL_COLOURS[peak]])
+    await ghWrite(['label', 'create', label, '--repo', rec.slug, '--color', LABEL_COLOURS[peak]])
     if (await isMoved()) return { moved: true }
     const was = state === 'CLOSED' ? 'could not be reopened' : 'is gone'
     const title = issueTitle(f, rec, c.issueSpec)
@@ -4176,7 +4336,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
     }
     if (found !== undefined) {
       // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
-      const edit = await relabelFound(gh, rec.slug, found, label, title)
+      const edit = await relabelFound(ghWrite, rec.slug, found, label, title)
       if (edit === undefined || edit.exitCode === 0) {
         const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
         if (await keep(settled)) return { moved: true }
@@ -4199,7 +4359,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
       await log(`${f.id}: ${where} ${was}; not filed again: it is now marked security`)
       continue
     }
-    const post = await gh(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
+    const post = await ghWrite(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close
     // saves never files the issue again, and a lost answer leaves its issueError, so the next check reads the list first.

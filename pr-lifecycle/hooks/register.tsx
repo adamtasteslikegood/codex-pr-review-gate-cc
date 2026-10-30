@@ -54,6 +54,7 @@ import {
   git,
   hasSecurityBlocker,
   headMoved,
+  heldNoteOf,
   heldReason,
   holdingPrompts,
   ignoredNote,
@@ -61,6 +62,7 @@ import {
   isMergeBlocked,
   isOwnedElsewhere,
   isStillCurrent,
+  isStoodDownBy,
   isTurnOf,
   markPr,
   noteArrival,
@@ -229,7 +231,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   if (branch === '' || branch === 'HEAD') return 'Not started: HEAD is detached, so there is no branch to open a PR from.'
   // A start or a resume takes the record for this session (#13); a headless one never takes it from another.
-  if (!(await claimRecord($, root, branch))) return 'Not started: another session runs this lifecycle.'
+  if (!(await claimRecord($, root, branch))) return `Not started: ${heldNoteOf() ?? 'another session runs this lifecycle'}.`
   const known = await loadRecord($, root, branch)
   // A PR merged or closed since: nothing more to review on it, and its record is archived (R62).
   const isOpened = known !== undefined && (known.phase === 'post' || known.phase === 'ready') && known.pr !== undefined
@@ -279,7 +281,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
   // run inside it; the controller runs after.
-  const { prior, rec, adopted, rebase } = await transact($, root, branch, async tx => {
+  const made = await transact($, root, branch, async tx => {
     const prior = await tx.load()
     // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
     // Otherwise it starts no higher than the effort a review last completed at on this branch.
@@ -341,7 +343,14 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     }
     await tx.save(rec)
     return { prior, rec, adopted: undefined, rebase: undefined }
+  }).catch(async (error: unknown) => {
+    // The shared store would not take the start (Task 8): a stale commit, another session's lease, a moved record or a refusal.
+    // This session stands down with a log line, and starts nothing.
+    if (await isStoodDownBy($, { root, branch }, error)) return undefined
+    throw error
   })
+  if (made === undefined) return `Not started: ${heldNoteOf() ?? 'another session runs this lifecycle'}.`
+  const { prior, rec, adopted, rebase } = made
   // One rescope only: a PR whose base moved again meanwhile is not chased; the next /pr-gate scopes against where it settled.
   if (rebase !== undefined && want.isRescoped === true) {
     return `The open PR from ${branch} moved to ${rebase} while the gate was scoping it: nothing was saved; run /pr-gate again.`
@@ -1355,6 +1364,8 @@ export const register: Register = (on, options) => {
         await onAnswer($, e.agentId, e.answer, e.reason, e.turnId)
       } catch (error) {
         const run = await getRun($)
+        // The shared store would not take a change (Task 8): this session stands down with a log line, and its run is not failed.
+        if (run !== null && (await isStoodDownBy($, run, error))) return done
         if (run !== null && run.status === 'running') {
           await finish($, run.id, 'error', `The gate itself failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300))
         }

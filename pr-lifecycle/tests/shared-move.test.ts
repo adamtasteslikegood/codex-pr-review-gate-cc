@@ -3,7 +3,9 @@ import type { MockClock } from 'claude-code/testing'
 import type { HttpInit, HttpResponse } from 'claude-code'
 
 import { newRecord } from '../hooks/lifecycle'
+import { boundary } from '../hooks/round'
 import {
+  forgetLeases,
   forgetOptIns,
   HELD_PLACEHOLDER,
   latestArchive,
@@ -12,6 +14,7 @@ import {
   recordKey,
   relayLog,
   RelayMoved,
+  releaseLease,
   saveRecord,
   StaleRecord,
   updateRecord,
@@ -78,6 +81,7 @@ type Setup = { w: World; fake: FakeRelay; $: never; onSend: { fn?: (body: Record
 /** A repo that opts in on its base, Adam's token in the environment, and his grant (and Codex's) on me/repo. */
 function setup(on: Parameters<typeof world>[0]): Setup {
   forgetOptIns()
+  forgetLeases()
   const w = world(on)
   w.git.roster = SHARED
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, grants: { [SLUG]: { [ADAM]: 'operate', [CODEX]: 'operate' } } })
@@ -244,7 +248,14 @@ test('a crash after each move step is finished by the next load, and only the PR
     expect(error).toBeInstanceOf(StaleRecord)
     expect(fake.objects.get(branchId)?.rev).toBe(revBefore)
     expect((other.store.get(key) as LifecycleRecord).relayKey).toBe(`#${pr}`)
-    // Task 8: the boundary assertion goes here: only the holder of the PR object's lease passes a boundary and dispatches.
+    // Only the holder of the PR object's lease passes a boundary and dispatches (Task 8): while the dead process's claim there is
+    // live, session 2 stands down; with none, its boundary claims the lease and it may go on.
+    const lease = fake.objects.get(prId)?.lease
+    const isFree = lease === null || lease === undefined || lease.until <= (w.clock as unknown as MockClock).now() || lease.holder === 'session-2'
+    // Session 2 has no run of its own here: a stand-down drops none, and its status line goes nowhere.
+    const state = { get: async () => ({ value: null }), set: async () => ({ isSet: true }) }
+    const session2 = { ...(other.$ as object), state, ui: { status: () => undefined } }
+    expect(await boundary(session2 as never, { root: '/repo', branch })).toBe(isFree)
     expect(reasons(recordAt(fake, prId))).toEqual([])
 
     // A lease the dead process left on the PR's object lapses; then the next load of the first checkout lands on the PR's object.
@@ -382,6 +393,8 @@ test('a mirror of the branch\'s object is never taken for the PR object\'s revis
   // The PR object's rev 2 then holds the first checkout's grant: the same number, of another object.
   await updateRecord($, '/repo', 'feat/x', grant('first'), { isPure: true })
   expect(fake.objects.get(PR_OBJECT)?.rev).toBe(2)
+  // The first checkout's run ends: the lease its move kept goes back (Task 8), and session 2 may write.
+  await releaseLease($, '/repo', 'feat/x')
   await updateRecord(other.$, '/repo', 'feat/x', grant('second'), { isPure: true })
   expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['first', 'second'])
   expect((other.store.get(KEY) as LifecycleRecord).relayKey).toBe(`#${PR}`)
@@ -529,20 +542,27 @@ test('a fresh start from the PR key over an unfinished move meets the relay\'s 4
   expect(recordAt(fake, PR_OBJECT).lifecycleId).toBe(old)
 })
 
-test('a lost release of the PR claim is owed, and sent after the next call that lands', async (_t, on) => {
+test('the claim the move takes is kept as the mover\'s lease; a lost release of it at the run\'s end is owed, and sent after the next call that lands', async (_t, on) => {
   const { w, fake, $, onSend } = setup(on)
   await saveRecord($, seed())
+  await updateRecord($, '/repo', 'feat/x', opened(PR), { isPure: true })
+  // Task 8: the move's claim on the PR object is this session's lease, never released and claimed again, and never locks it out.
+  expect(opsOf(fake, 'release')).toHaveLength(0)
+  expect(fake.objects.get(PR_OBJECT)?.lease?.holder).toBe(w.sessionId)
+  await updateRecord($, '/repo', 'feat/x', grant('kept'), { isPure: true })
+  expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['kept'])
+  // The run ends with the relay down: its release is owed.
   onSend.fn = body => {
     fake.down = body.op === 'release'
   }
-  await updateRecord($, '/repo', 'feat/x', opened(PR), { isPure: true })
+  await releaseLease($, '/repo', 'feat/x')
   onSend.fn = undefined
   fake.down = false
   expect(fake.objects.get(PR_OBJECT)?.lease).not.toBeNull()
   expect((w.store.get(`${KEY}:relay-owed`) as { body: { op: string } }[]).map(one => one.body.op)).toEqual(['release'])
   // No wait for the lease to lapse: the load's read lands, the release goes after it, and the commit is taken.
   await updateRecord($, '/repo', 'feat/x', grant('next'), { isPure: true })
-  expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['next'])
+  expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['kept', 'next'])
   expect(w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
 })
 

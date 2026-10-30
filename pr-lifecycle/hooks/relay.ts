@@ -54,6 +54,9 @@ export async function sharedStoreOf($: Engine, root: string, base: string): Prom
 
 export type SharedStore = { url: string; aud: string }
 
+/** Why a base that opts in stays local: the environment has no credential for the relay. */
+export const NO_CREDENTIAL = 'no relay credential'
+
 /** As `relayOf`, for a `sharedStore` already read: the credential comes from the environment each time. */
 export async function relayAt($: Engine, shared: SharedStore | undefined): Promise<Relay | { local: string }> {
   if (shared === undefined) return { local: 'no sharedStore in .github/pr-gate.json' }
@@ -66,7 +69,7 @@ export async function relayAt($: Engine, shared: SharedStore | undefined): Promi
       : token !== undefined && token !== ''
         ? { 'cf-access-token': token }
         : undefined
-  if (headers === undefined) return { local: 'no relay credential' }
+  if (headers === undefined) return { local: NO_CREDENTIAL }
   return { url: shared.url.replace(/\/+$/, ''), aud: shared.aud, headers }
 }
 

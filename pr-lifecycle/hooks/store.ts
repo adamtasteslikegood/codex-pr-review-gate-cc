@@ -9,7 +9,7 @@ import type { EngineInterface } from 'claude-code'
 
 import { slugOf } from './core'
 import { newLifecycleId } from './lifecycle'
-import { keyPath, leaseSecret, relayAt, relayCall, sharedStoreOf } from './relay'
+import { keyPath, leaseSecret, NO_CREDENTIAL, relayAt, relayCall, sharedStoreOf } from './relay'
 import type { Relay, RelayAnswer, SharedStore } from './relay'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
 
@@ -198,15 +198,20 @@ export async function upsertRecord(
 
 // ------------------------------------------------------------ the relay
 
-/** A commit the relay refused because another writer, or a lease, got there first: `rev` and `record` are what the relay holds now. */
+/**
+ * A commit the relay refused because another writer, or a lease, got there first: `rev` and `record` are what the relay holds now. A
+ * 423's `lease` says who holds the object until when (Task 8), so the session that stands down can say so; its `record` is then unknown.
+ */
 export class StaleRecord extends Error {
   rev: number
   record: unknown
-  constructor(rev: number, record: unknown, why: string) {
+  lease: LeaseHeld | undefined
+  constructor(rev: number, record: unknown, why: string, lease?: LeaseHeld) {
     super(`the shared lifecycle record moved on (rev ${rev}): ${why}; this change was not written`)
     this.name = 'StaleRecord'
     this.rev = rev
     this.record = record
+    this.lease = lease
   }
 }
 
@@ -469,6 +474,15 @@ async function standDown($: Engine, root: string, branch: string, why: string): 
   throw new RelayRefused(why)
 }
 
+/**
+ * A base that opts in, and an environment with no relay credential (Task 8): the lifecycle stays local, and its run log says why once,
+ * so a person who expected the shared store sees it isn't used. Any other reason to stay local (no opt-in) says nothing.
+ */
+async function noteNoCredential($: Engine, root: string, branch: string, why: string): Promise<void> {
+  if (why !== NO_CREDENTIAL) return
+  await noteOnce($, root, branch, NO_CREDENTIAL, `${NO_CREDENTIAL}: the base opts in to the shared store, but neither PR_GATE_RELAY_CLIENT_ID and _SECRET nor PR_GATE_RELAY_TOKEN is set; this lifecycle stays in the local store`)
+}
+
 /** The relay didn't answer (spec §8): the lifecycle goes on in the local store, and the run log says why once. */
 async function noteDown($: Engine, root: string, branch: string, why: string): Promise<void> {
   await noteOnce($, root, branch, 'relay down', `relay down (${why}): this lifecycle goes on in the local store, and is sent to the relay when it answers`)
@@ -503,7 +517,10 @@ async function runTx<T>($: Engine, root: string, branch: string, work: (tx: Reco
   const found = mirror === undefined ? undefined : await sharedOf($, root, mirror)
   if (mirror !== undefined && found !== undefined && 'local' in found) {
     // Today's local store, read afresh: the decision read the base's file, and a record may have changed meanwhile.
-    if (mirror.relayRev === undefined) return work(localTx($, root, branch))
+    if (mirror.relayRev === undefined) {
+      await noteNoCredential($, root, branch, found.local)
+      return work(localTx($, root, branch))
+    }
     // A record that has been on the relay, and the opt-in can't be read now: a fallback, never plain local, so a relay that moved on
     // meanwhile archives these writes instead of overwriting them.
     await noteDown($, root, branch, found.local)
@@ -562,9 +579,18 @@ async function readAt($: Engine, root: string, branch: string, at: Shared): Prom
  * placed there first (a 409, or a claim it holds). Another lifecycle there keeps this one by a snapshot on the branch's object. A
  * `moveDone` that doesn't land is owed; a claim or commit that doesn't is the caller's to note, and the next load finishes the move.
  */
-async function publishMove($: Engine, root: string, branch: string, from: Shared, to: Shared, rec: LifecycleRecord): Promise<Given | { down: string }> {
+async function publishMove(
+  $: Engine,
+  root: string,
+  branch: string,
+  from: Shared,
+  to: Shared,
+  rec: LifecycleRecord,
+  isKept = false,
+): Promise<Given | { down: string }> {
   const secret = await leaseSecret($)
-  const claimed = await relayCall($, to.relay, to.path, { op: 'claim', holder: await $.session.id(), secret })
+  const holder = await $.session.id()
+  const claimed = await relayCall($, to.relay, to.path, { op: 'claim', holder, secret })
   if ('refused' in claimed) return standDown($, root, branch, claimed.refused)
   if ('down' in claimed) return claimed
   let placed: Given
@@ -575,11 +601,17 @@ async function publishMove($: Engine, root: string, branch: string, from: Shared
     if (answer.status === 200) placed = { rev: Number(answer.json.rev), record: rec }
     else if (answer.status === 409 && typeof answer.json.rev === 'number') placed = { rev: answer.json.rev, record: answer.json.record }
     else throw new Error(`the shared lifecycle store answered a move's commit with HTTP ${answer.status}`)
-    // Task 8: the lease boundary goes here: only the holder of the PR object's lease passes a boundary and dispatches.
-    const release = { op: 'release', secret }
-    const released = await relayCall($, to.relay, to.path, release)
-    // A release that doesn't land is owed: else this checkout's own lease holds its next commit off the PR's object until it lapses.
-    if ('down' in released) await owe($, root, branch, { path: to.path, body: release })
+    // The mover's own move (`isKept`) keeps the claim as the driver's lease, so only it passes the next boundary on the PR's object
+    // (Task 8): never released and claimed again, which another checkout could take in between. Any other claim here is released.
+    const lease = leaseOf(claimed.json.lease)
+    if (isKept && lease !== undefined && (placed.record as LifecycleRecord | null)?.lifecycleId === rec.lifecycleId) {
+      await keepLease($, holder, root, branch, to.path, lease)
+    } else {
+      const release = { op: 'release', secret }
+      const released = await relayCall($, to.relay, to.path, release)
+      // A release that doesn't land is owed: else this checkout's own lease holds its next commit off the PR's object until it lapses.
+      if ('down' in released) await owe($, root, branch, { path: to.path, body: release })
+    }
   } else if (claimed.status === 423) {
     // Another checkout holds the PR's object: one that moved this lifecycle first, or is moving it now.
     const read = await readAt($, root, branch, to)
@@ -649,9 +681,11 @@ async function relayTx<T>(
   let saved: LifecycleRecord | undefined
   let archived: { rec: LifecycleRecord; at: number } | undefined
 
+  let localWhy: string | undefined
   const decide = async (rec: LifecycleRecord): Promise<void> => {
     if (mode !== 'undecided') return
     const found = await sharedOf($, root, rec)
+    localWhy = 'local' in found ? found.local : undefined
     shared = 'local' in found ? undefined : found
     mode = shared === undefined ? 'local' : 'relay'
   }
@@ -743,6 +777,7 @@ async function relayTx<T>(
     },
   }
   const value = await work(tx)
+  if (localWhy !== undefined) await noteNoCredential($, root, branch, localWhy)
   if (mode !== 'relay' || shared === undefined) return { value }
   const next = saved ?? owed
   if (next === undefined) {
@@ -756,11 +791,14 @@ async function relayTx<T>(
   const keepArchive = async (): Promise<void> => {
     if (archived !== undefined) await writeArchive($, archived.rec, archived.at)
   }
+  // Every commit carries this session's lease secret (Task 8): under its own live lease the relay takes it, under another's it is 423.
+  const secret = await leaseSecret($)
   const bodyAt = (at: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
     op: 'commit',
     rev: at,
     record: redact(full),
     ...(archived === undefined ? {} : { archive: { at: archived.at, record: redact({ ...archived.rec, phase: 'archived' }) } }),
+    ...(secret === undefined ? {} : { secret }),
     ...extra,
   })
 
@@ -804,7 +842,7 @@ async function relayTx<T>(
       }
       return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs, shared: at } }
     }
-    if (answer.status === 423) return { retry: { error: new StaleRecord(rev, answer.json.lease, 'another checkout holds the lease') } }
+    if (answer.status === 423) return { retry: { error: new StaleRecord(rev, undefined, 'another checkout holds the lease', leaseOf(answer.json.lease)) } }
     // A fresh start the relay holds off: the old lifecycle's move isn't finished, and its frozen record stays in the tombstone.
     if (answer.status === 409) return { retry: { error: new StaleRecord(rev, answer.json, 'the old lifecycle has not finished its move to its PR') } }
     throw new Error(`the shared lifecycle store answered a commit with HTTP ${answer.status}`)
@@ -870,11 +908,10 @@ async function relayTx<T>(
   // The move (R103, spec §1): the record has its PR. It is committed on the branch's object under a claim of it, then step 1 freezes
   // that object with the record in its tombstone, and `publishMove` takes steps 2 and 3. A step that doesn't land stops the move where
   // it is: the next load finds the record with its PR on the branch's object, or the tombstone, and finishes it.
-  const secret = await leaseSecret($)
   const claimed = await relayCall($, at.relay, at.path, { op: 'claim', holder: await $.session.id(), secret })
   if ('refused' in claimed || 'down' in claimed) return (await settle(at, claimed)) ?? { value }
   if (claimed.status === 410) return moved(at, claimed.json)
-  if (claimed.status === 423) return { retry: { error: new StaleRecord(rev, claimed.json.lease, 'another checkout holds the lease') } }
+  if (claimed.status === 423) return { retry: { error: new StaleRecord(rev, undefined, 'another checkout holds the lease', leaseOf(claimed.json.lease)) } }
   if (claimed.status !== 200) throw new Error(`the shared lifecycle store answered a claim with HTTP ${claimed.status}`)
   const answer = await relayCall($, at.relay, at.path, bodyAt(rev, { secret }))
   if (!('refused' in answer) && !('down' in answer) && answer.status !== 200 && answer.status !== 410) {
@@ -892,7 +929,8 @@ async function relayTx<T>(
   }
   if ('down' in froze || froze.status !== 200) return { value }
   const to = atKey(at, `#${full.pr}`)
-  const placed = await publishMove($, root, branch, at, to, full)
+  // This session froze the branch's object, so it drives the PR's: the claim the move takes there is kept as its lease (Task 8).
+  const placed = await publishMove($, root, branch, at, to, full, true)
   if ('down' in placed) {
     await noteStop(placed.down)
     return { value }
@@ -912,18 +950,200 @@ export const OWNER_STALE_MS = 120_000
 
 const ownerKey = (root: string, branch: string): string => `${recordKey(root, branch)}:owner`
 
+/** The owner a relay that refused this checkout stands for (spec §10): never this session, so it holds the record off. */
+export const REFUSED_OWNER = 'relay-refused'
+
+/**
+ * The record's owner. On the relay (Task 8, R100) it is the object's lease, answered from this session's own kept lease while it
+ * holds, else read: `beatAt` is the lease's `until` less OWNER_STALE_MS, so `isHeldByOther` reads it as it reads a local owner. A
+ * relay that refuses is an owner that isn't this session; a relay that is down, or a record not on it, answers the local owner.
+ */
 export async function ownerOf($: Engine, root: string, branch: string): Promise<Owner | undefined> {
+  const lease = await readLease($, root, branch)
+  if ('mine' in lease) return ownerAt(lease.mine)
+  if ('held' in lease && lease.held !== undefined) return ownerAt(lease.held)
+  if ('free' in lease) return undefined
+  if ('refused' in lease) return { sessionId: REFUSED_OWNER, beatAt: await $.clock.now() }
   const value = (await $.store.get(ownerKey(root, branch))) as Owner | undefined | null
   return value !== null && value !== undefined && typeof value.sessionId === 'string' ? value : undefined
 }
 
-export async function setOwner($: Engine, root: string, branch: string, owner: Owner): Promise<void> {
-  await $.store.set(ownerKey(root, branch), owner)
+/**
+ * Makes `owner` the record's owner. On the relay (Task 8) that is its lease: `isTake` takes it (a person's session, R105: the same
+ * principal moves it between its own sessions at once), else it is claimed (a headless session never takes a live one). The answer
+ * says whether this session holds it; only a lease held, or a relay down or not in use, writes the local owner too.
+ */
+export async function setOwner($: Engine, root: string, branch: string, owner: Owner, opts: { isTake?: boolean } = {}): Promise<LeaseAnswer> {
+  const lease = await claimLease($, root, branch, opts.isTake === true)
+  if ('mine' in lease || 'local' in lease || 'down' in lease) await $.store.set(ownerKey(root, branch), owner)
+  return lease
 }
 
 /** Another session beat for the record within `OWNER_STALE_MS` of `now`: it runs the lifecycle, not `me`. */
 export const isHeldByOther = (owner: Owner | undefined, me: string, now: number): boolean =>
   owner !== undefined && owner.sessionId !== me && now - owner.beatAt < OWNER_STALE_MS
+
+// ----------------------------------------------------------------- lease
+
+/** A relay lease as a session sees it (spec §4): which session holds the object, by which principal, until when. */
+export type LeaseHeld = { holder: string; principal?: string; token: number; until: number }
+
+/**
+ * What a lease call answered: this session holds it (`mine`), another holds it (`held`), nobody does (`free`), it is lost (a 409 or
+ * 410: another session took it, or the object moved), `refused` (stand down, never fall back), `down` (the local owner instead), or
+ * `local` (the record isn't on the relay: today's local owner).
+ */
+export type LeaseAnswer =
+  | { mine: LeaseHeld }
+  | { held: LeaseHeld }
+  | { free: true }
+  | { lost: string; held?: LeaseHeld }
+  | { refused: string }
+  | { down: string }
+  | { local: true }
+
+/** The lease the relay showed (its verifier never leaves it), or undefined for none. */
+export const leaseOf = (value: unknown): LeaseHeld | undefined => {
+  const one = value as Partial<LeaseHeld> | null | undefined
+  if (one === null || typeof one !== 'object' || typeof one.holder !== 'string' || typeof one.until !== 'number') return undefined
+  return { holder: one.holder, ...(typeof one.principal === 'string' ? { principal: one.principal } : {}), token: Number(one.token ?? 0), until: one.until }
+}
+
+const ownerAt = (lease: LeaseHeld): Owner => ({ sessionId: lease.holder, beatAt: lease.until - OWNER_STALE_MS })
+
+/** A lease this process holds on the relay: the object's path, the holder, its fencing token, and until when it holds. */
+type Kept = { key: string; holder: string; token: number; until: number }
+
+/**
+ * The lease cache (spec §4), per session and record: a session answers "is it mine" from it, with no read, while `until` is ahead.
+ * Keyed by holder too, so two sessions in one process (a test's two checkouts) never read each other's.
+ */
+const leases = new Map<string, Kept>()
+
+const keptKey = (holder: string, root: string, branch: string): string => `${holder}\0${recordKey(root, branch)}`
+
+/** Forgets every kept lease: a reload, or a test, starts with none. */
+export const forgetLeases = (): void => leases.clear()
+
+/**
+ * Keeps a lease this session was given. It holds no longer than OWNER_STALE_MS from this clock's now, so a relay clock ahead of this
+ * one never makes the cache outlive the lease. Not a function expression: the engine follows $ only into declarations.
+ */
+async function keepLease($: Engine, holder: string, root: string, branch: string, key: string, lease: LeaseHeld): Promise<void> {
+  const until = Math.min(lease.until, (await $.clock.now()) + OWNER_STALE_MS)
+  leases.set(keptKey(holder, root, branch), { key, holder, token: lease.token, until })
+}
+
+/** The relay object a record's lease is on: undefined for a record not on the relay, or why the relay can't be used now. */
+async function leaseAt($: Engine, root: string, branch: string): Promise<Shared | { local: string } | undefined> {
+  const mirror = await loadRecord($, root, branch)
+  if (mirror?.relayRev === undefined) return undefined
+  return sharedOf($, root, mirror)
+}
+
+/**
+ * Claims the record's lease (`isTake`: takes it). A relay with no `take`, or that answers it with anything but a lease, a 423 or a
+ * 410, is claimed instead. A 410 of this lifecycle's own move is followed once, to the PR's object.
+ */
+export async function claimLease($: Engine, root: string, branch: string, isTake: boolean): Promise<LeaseAnswer> {
+  const at = await leaseAt($, root, branch)
+  if (at === undefined) return { local: true }
+  if ('local' in at) return { down: at.local }
+  return claimAt($, root, branch, at, isTake, true)
+}
+
+async function claimAt($: Engine, root: string, branch: string, at: Shared, isTake: boolean, mayFollow: boolean): Promise<LeaseAnswer> {
+  const holder = await $.session.id()
+  // Saved before the first call that sends it (spec §6): a secret that can't be saved is never sent.
+  const secret = await leaseSecret($)
+  if (secret === undefined) return { down: 'the lease secret could not be saved' }
+  let answer = await relayCall($, at.relay, at.path, { op: isTake ? 'take' : 'claim', holder, secret })
+  if (isTake && 'status' in answer && answer.status !== 200 && answer.status !== 410 && answer.status !== 423) {
+    answer = await relayCall($, at.relay, at.path, { op: 'claim', holder, secret })
+  }
+  if ('refused' in answer || 'down' in answer) return answer
+  const lease = leaseOf(answer.json.lease)
+  if (answer.status === 200 && lease !== undefined) {
+    await keepLease($, holder, root, branch, at.path, lease)
+    return { mine: lease }
+  }
+  leases.delete(keptKey(holder, root, branch))
+  if (answer.status === 423) return lease === undefined ? { lost: 'the lease is held' } : { held: lease }
+  if (answer.status === 410 && mayFollow && typeof answer.json.movedTo === 'number') {
+    const mirror = await loadRecord($, root, branch)
+    if (mirror?.lifecycleId !== undefined && mirror.lifecycleId === answer.json.lifecycleId) {
+      return claimAt($, root, branch, atKey(at, `#${answer.json.movedTo}`), isTake, false)
+    }
+  }
+  return { lost: answer.status === 410 ? 'the record moved' : `HTTP ${answer.status}` }
+}
+
+/**
+ * The beat at an action boundary (spec §4): a `beat` of the lease this session keeps, or, with none kept for this object, a `claim`
+ * (never a take). `mine` only on a 200; a 409, 423 or 410 empties this session's kept lease and answers `lost`.
+ */
+export async function beatLease($: Engine, root: string, branch: string): Promise<LeaseAnswer> {
+  const at = await leaseAt($, root, branch)
+  if (at === undefined) return { local: true }
+  if ('local' in at) return { down: at.local }
+  const holder = await $.session.id()
+  const kept = leases.get(keptKey(holder, root, branch))
+  if (kept === undefined || kept.key !== at.path) return claimAt($, root, branch, at, false, true)
+  const secret = await leaseSecret($)
+  if (secret === undefined) return { down: 'the lease secret could not be saved' }
+  const answer = await relayCall($, at.relay, at.path, { op: 'beat', secret })
+  if ('down' in answer) return answer
+  if ('refused' in answer) {
+    leases.delete(keptKey(holder, root, branch))
+    return answer
+  }
+  const lease = leaseOf(answer.json.lease)
+  if (answer.status === 200 && lease !== undefined) {
+    await keepLease($, holder, root, branch, at.path, lease)
+    return { mine: lease }
+  }
+  leases.delete(keptKey(holder, root, branch))
+  const now = await $.clock.now()
+  const other = lease !== undefined && lease.until > now && lease.holder !== holder ? { held: lease } : {}
+  return { lost: answer.status === 410 ? 'the record moved' : `the lease is lost (HTTP ${answer.status})`, ...other }
+}
+
+/** Who holds the record's lease: this session's kept lease while it holds, with no network read; else the object's, read. */
+export async function readLease($: Engine, root: string, branch: string): Promise<LeaseAnswer> {
+  const at = await leaseAt($, root, branch)
+  if (at === undefined) return { local: true }
+  if ('local' in at) return { down: at.local }
+  const holder = await $.session.id()
+  const now = await $.clock.now()
+  const kept = leases.get(keptKey(holder, root, branch))
+  if (kept !== undefined && kept.key === at.path && kept.until > now) return { mine: { holder, token: kept.token, until: kept.until } }
+  const answer = await relayCall($, at.relay, at.path, { op: 'read' })
+  if ('refused' in answer || 'down' in answer) return answer
+  if (answer.status !== 200) return { down: `HTTP ${answer.status}` }
+  const lease = leaseOf(answer.json.lease)
+  if (lease === undefined || lease.until <= now) return { free: true }
+  if (lease.holder !== holder) return { held: lease }
+  await keepLease($, holder, root, branch, at.path, lease)
+  return { mine: lease }
+}
+
+/**
+ * Releases the lease this session keeps on the record, at the end of its run (spec §4): only one it claimed or took. A release that
+ * doesn't land is owed, as a move's is; one the relay answers otherwise (the lease lapsed or was taken) is done.
+ */
+export async function releaseLease($: Engine, root: string, branch: string): Promise<void> {
+  const holder = await $.session.id()
+  const kept = leases.get(keptKey(holder, root, branch))
+  if (kept === undefined) return
+  leases.delete(keptKey(holder, root, branch))
+  const at = await leaseAt($, root, branch)
+  if (at === undefined || 'local' in at) return
+  const secret = await leaseSecret($)
+  if (secret === undefined) return
+  const body = { op: 'release', secret }
+  const answer = await relayCall($, at.relay, kept.key, body)
+  if ('down' in answer) await owe($, root, branch, { path: kept.key, body })
+}
 
 // ------------------------------------------------------------------- log
 
