@@ -95,3 +95,13 @@ Task 6: fix round 2/5 dispatched
 Task 6: fix round 2/5 (2 addressed, 0 open; commit 8c57166)
 Task 6: minor (deferred): the kind:'check' test doesn't discriminate FIXED_KEYS (needle under the 8-char floor anyway); a short security `file` (a.ts) in free text is not scrubbed — accepted per the 8-char ruling
 Task 6: complete (commits dda210a..8c57166, review clean)
+Task 7: review — Important: (1) commit/claim 410 with a mismatched lifecycleId always fresh-starts with isFresh over the tombstone, reviving a dead lifecycle (spec §1 says stand down); (2) no client test for a mismatched tombstone; the leftover-tombstone-record fresh-start branch is never exercised
+Task 7: Ruling: on a 410, fresh-start only when the record's lifecycleId differs from the mirror's (a real new lifecycle: reset/adoption); a record whose id matches the mirror but not the tombstone stands down (RelayMoved + noteOnce) — spec §1 — cost if wrong: a legit new lifecycle needs one more load
+Task 7: Ruling: a failed release of the PR claim joins the owed queue (as moveDone) — cheap now, else 423s for up to 120 s — cost if wrong: none
+Task 8 carry: catch StaleRecord/RelayMoved at the non-pure sites; the PR claim/release window; the crash test's boundary assertion (`// Task 8:` note in shared-move.test.ts)
+Task 10 carry: liveRecords reads the index only when some local record has relayRev — a fresh checkout of an opted-in repo sees nothing (spec §9 narrowed)
+Task 7: minor (deferred): fresh-start moveDone assumes step 2 landed without checking the PR object's lifecycleId; crash test doesn't hold back the index or run a PR-key client; noteStop shares the 'relay down' noteOnce prefix; a non-200/non-down moveTo has no log line; a stale @b mirror's log lines go to the tombstoned object
+Task 7: fix round 1/5 dispatched
+Task 7: fix round 1/5 (4 addressed, 0 open; commit 8e5f996)
+Task 7: minor (deferred): noteOnce dedupes 'relay move refused' per lifecycle; a fresh start whose calls are dropped falls back local and, on next load, stands down with a 'under another lifecycle' text that is slightly misleading — no data lost, Task 8 recovery settles it
+Task 7: complete (commits 27be59b..8e5f996, review clean)
