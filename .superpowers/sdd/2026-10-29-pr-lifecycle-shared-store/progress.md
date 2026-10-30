@@ -72,3 +72,11 @@ Task 4: fix round 1/5 (7 addressed, 0 open; commit ba6c681)
 Task 4: minor (deferred): index send's 5 s AbortSignal timeout is not exercised under Miniflare
 Task 4: minor (deferred): archived-PR test asserts rev===2 right after the outbox drains; flaky only if that wait exceeds ~400 ms
 Task 4: complete (commits 91f3eb9..ba6c681, review clean)
+Task 5: review — Important: (1) plan-mandated "401/403 are down" contradicts spec §8 (fallback only on network error, 5xx, 5 s timeout) and §10 (revoke cuts a principal off on its next request): a revoked or read-only checkout would fall back and keep acting locally
+Task 5: Ruling: RelayAnswer gains `{ refused: string }` for 401 and 403; the caller stands down (does not act, does not fall back), logs once; `down` stays for network error, 5xx, timeout and a non-JSON body — the spec is the binding authority and the plan's Review Focus 2 was looser than it — cost if wrong: an expired person token stands the session down instead of continuing locally (re-auth fixes it)
+Task 5: Ruling: Task 6 consumes `refused` as stand-down; Tasks 6–9 dispatches carry it. Non-JSON (e.g. an Access login page on an expired token) stays `down` — check what Access actually answers at the Task 13 deploy — cost if wrong: one more branch in relayCall
+Task 5: Ruling: the relay answers 400 (not 500) for a body that isn't JSON (lifecycle, repo-index, grants) — a bad request is not an outage — cost if wrong: none
+Task 5: Ruling: Roster stays in hooks/github.ts; baseFileOf moves to relay.ts (no import cycle for Task 6); validate's env-name listing is checked in Task 6 when register.tsx reaches relayOf — cost if wrong: none
+Task 5: fix round 1/5 (5 addressed, 0 open; commit 3f5e274)
+Task 5: complete (commits ec1a7e9..3f5e274, review clean); .wrangler/ ignored in a chore commit
+Task 6 carry: relayCall returns `{ refused }` on 401/403 — the store stands down (no fallback, no local writes), logs once; only `down` means fallback. validate must list PR_GATE_RELAY_CLIENT_ID/_SECRET/_TOKEN, $.env.get and $.http.fetch once register.tsx reaches relayOf
