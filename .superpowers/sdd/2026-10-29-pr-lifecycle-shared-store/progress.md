@@ -105,3 +105,13 @@ Task 7: fix round 1/5 dispatched
 Task 7: fix round 1/5 (4 addressed, 0 open; commit 8e5f996)
 Task 7: minor (deferred): noteOnce dedupes 'relay move refused' per lifecycle; a fresh start whose calls are dropped falls back local and, on next load, stands down with a 'under another lifecycle' text that is slightly misleading — no data lost, Task 8 recovery settles it
 Task 7: complete (commits 27be59b..8e5f996, review clean)
+Task 8: dispatched (base cc845a1)
+Task 8: implementer DONE_WITH_CONCERNS (commit 617555f; 775 plugin tests)
+Task 8: review — Important: (1) a commit/move-claim 423 leaves the kept lease cached, so a stood-down session's watchBeat can `take` from the live driver; (2) the end-of-run release is re-claimed at once by deliver's boundary and lingers ≤120 s (headless start refused); (3) no boundary before fileTicket (Jira) in fileOnce/checkOnce
+Task 8: Ruling: a lost lease's beat answers 409 (relay contract), not the 423 spec §14 names — both stand down; the docs task rewords §14 — cost if wrong: none, behaviour identical
+Task 8: Ruling: a plain rev 409 at a non-pure site keeps the run (the next tick recovers, §14); only 423, RelayMoved and refused stand down — cost if wrong: one more tick before a stand-down
+Task 8: minor (deferred): beat() on down makes three failing calls per tick (≤15 s); Kept.token unused; CLAUDE.md slow-test count (Task 12 docs)
+Task 8: fix round 1/5 dispatched
+Task 8: fix round 1/5 (3 Important + ruling + minors addressed, 0 open; commit 0e34ea7)
+Task 8: minor (deferred): a fileOnce/checkOnce with no running run and no kept lease only reads at its boundary (no lease held during the write) — no concrete caller found; checkOnce's Jira boundary and watchBeat's finally-release have no dedicated test
+Task 8: complete (commits cc845a1..0e34ea7, review clean)
