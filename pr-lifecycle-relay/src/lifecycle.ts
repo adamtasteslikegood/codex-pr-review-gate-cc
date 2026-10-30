@@ -31,7 +31,15 @@ type State = {
   filings: Record<string, Filing>
   /** Who changed what, newest last. */
   writes: Write[]
+  /** Set once the record has moved to that PR's object: `record` is then a Tombstone and the branch cannot be driven (R103). */
+  movedTo?: number
 }
+
+/** What a frozen branch object holds as its record. `record` stays from `moveTo` until `moveDone`. */
+export type Tombstone = { movedTo: number; lifecycleId: string; record?: unknown }
+
+/** The ops a tombstone refuses with 410, apart from a fresh start: every record and lease op, so no boundary beat succeeds on the source. */
+const FROZEN_OPS = new Set(['commit', 'claim', 'beat', 'take', 'release', 'moveTo'])
 
 /** How many archives a PR keeps (open decision 3: retention). */
 export const ARCHIVE_CAP = 20
@@ -71,6 +79,8 @@ const NEEDS: Record<string, Need> = {
   claim: 'operate',
   beat: 'operate',
   release: 'operate',
+  moveTo: 'operate',
+  moveDone: 'operate',
   fileClaim: 'operate',
   fileDone: 'operate',
   fileAdopt: 'operate',
@@ -90,6 +100,7 @@ export class LifecycleObject {
   async fetch(request: Request): Promise<Response> {
     const who = JSON.parse(request.headers.get('x-relay-principal') ?? 'null') as Principal | null
     const repo = request.headers.get('x-relay-repo') ?? ''
+    const isBranch = (request.headers.get('x-relay-key') ?? '').startsWith('@')
     if (who === null) return reply(401, { error: 'no principal' })
     const body = (await request.json()) as { op?: string; [key: string]: unknown }
     const op = body.op ?? ''
@@ -114,6 +125,11 @@ export class LifecycleObject {
       await this.state.storage.put({ state: next })
     }
 
+    const tomb = s.movedTo !== undefined ? (s.record as Tombstone) : undefined
+    const frozen = tomb === undefined ? undefined : reply(410, { movedTo: tomb.movedTo, lifecycleId: tomb.lifecycleId })
+    // A fresh start (a new lifecycle over the old name) is the one commit a tombstone takes; every other record or lease op is refused.
+    if (frozen !== undefined && FROZEN_OPS.has(op) && !(op === 'commit' && body.isFresh === true)) return frozen
+
     switch (op) {
       case 'read':
         return reply(200, { rev: s.rev, record: s.record, lease: shown(s.lease), lastWrite: s.writes.at(-1) ?? null })
@@ -122,6 +138,17 @@ export class LifecycleObject {
       case 'filing':
         return reply(200, { filing: shown(filingOf(String(body.key))) })
       case 'commit': {
+        // `from` names the branch a record moves from: it only ever lands on an empty PR object. A non-empty one answers with its record,
+        // whose lifecycleId tells the client whether an earlier move got this far.
+        if (body.from !== undefined) {
+          if (isBranch || typeof body.from !== 'string' || !body.from.startsWith('@')) return reply(400, { error: 'from is a branch key, on a PR object only' })
+          if (s.rev !== 0 || s.record !== null) return reply(409, { error: 'the PR object is not empty', rev: s.rev, record: s.record })
+        }
+        if (frozen !== undefined) {
+          const id = (body.record as { lifecycleId?: unknown } | null | undefined)?.lifecycleId
+          if (typeof id !== 'string') return reply(400, { error: 'a fresh start needs a record with a lifecycleId' })
+          if (id === tomb!.lifecycleId) return frozen
+        }
         // A commit names the revision it read: a stale one is refused with what is there now, never merged blindly.
         if (body.rev !== s.rev) return reply(409, { error: 'stale revision', rev: s.rev, record: s.record })
         if (isLive(s.lease) && !isMine(s.lease)) return reply(423, { error: 'the lease is held', lease: shown(s.lease) })
@@ -129,7 +156,8 @@ export class LifecycleObject {
         const archive = body.archive as { at?: unknown; record?: unknown } | null | undefined
         if (archive !== undefined && (archive === null || typeof archive.at !== 'number' || archive.record === undefined)) return reply(400, { error: 'archive needs { at, record }' })
         const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
-        const next = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
+        const next: State = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
+        delete next.movedTo
         await save(next, archive !== undefined ? 'commit+archive' : 'commit')
         return reply(200, { rev: next.rev })
       }
@@ -156,6 +184,27 @@ export class LifecycleObject {
       case 'release': {
         if (!isLive(s.lease) || !isMine(s.lease)) return reply(409, { error: 'the lease is lost', lease: shown(s.lease) })
         await save({ ...s, lease: null }, 'release')
+        return reply(200, {})
+      }
+      case 'moveTo': {
+        if (!isBranch) return reply(404, { error: 'only a branch object moves' })
+        if (!isLive(s.lease) || !isMine(s.lease)) return reply(409, { error: 'the lease is lost', lease: shown(s.lease) })
+        const pr = body.pr
+        if (typeof pr !== 'number' || !Number.isInteger(pr) || pr < 1) return reply(400, { error: 'moveTo needs a pr number' })
+        const id = (s.record as { lifecycleId?: unknown } | null)?.lifecycleId
+        if (typeof id !== 'string') return reply(409, { error: 'no record with a lifecycleId to move' })
+        const tombstone: Tombstone = { movedTo: pr, lifecycleId: id, record: s.record }
+        const next: State = { ...s, rev: s.rev + 1, record: tombstone, lease: null, movedTo: pr }
+        await save(next, `moveTo #${pr}`)
+        return reply(200, { rev: next.rev })
+      }
+      case 'moveDone': {
+        if (!isBranch) return reply(404, { error: 'only a branch object moves' })
+        if (tomb === undefined || tomb.lifecycleId !== body.lifecycleId) return reply(409, { error: 'not moved with that lifecycleId' })
+        // Again is a no-op. The lease was released by moveTo, so this needs operate only.
+        if (tomb.record === undefined) return reply(200, {})
+        const bare: Tombstone = { movedTo: tomb.movedTo, lifecycleId: tomb.lifecycleId }
+        await save({ ...s, record: bare }, 'moveDone')
         return reply(200, {})
       }
       case 'breakLease':

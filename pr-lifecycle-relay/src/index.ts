@@ -11,6 +11,15 @@ export { LifecycleObject } from './lifecycle.ts'
 const NAME = /^[A-Za-z0-9_.-]{1,100}$/
 const ADMIN_GRANT_OPS = ['grants', 'grant', 'revoke']
 
+/** A branch name `git check-ref-format --branch` would accept, in 1 to 255 UTF-8 bytes (R103). */
+export const isBranchName = (name: string): boolean => {
+  const bytes = new TextEncoder().encode(name).length
+  if (bytes < 1 || bytes > 255) return false
+  if (/[\u0000-\u0020\u007f~^:?*[\\]/.test(name)) return false
+  if (name.includes('..') || name.includes('@{') || name.includes('//')) return false
+  return !/^[-/]|[/.]$|\.lock$/.test(name)
+}
+
 const refuse = (status: number, text: string): Response => new Response(text, { status })
 
 /** An internal call: only headers the Worker built itself reach an object, never the caller's. */
@@ -39,10 +48,23 @@ async function adminGrants(request: Request, env: Env, who: Principal): Promise<
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
-    const [, version, owner, repo, pr] = url.pathname.split('/')
+    const parts = url.pathname.split('/')
+    const [, version, owner, repo, pr] = parts
     const isAdminGrants = url.pathname === '/v1/admin/grants'
     if (request.method !== 'POST') return refuse(404, 'not found')
-    if (!isAdminGrants && (version !== 'v1' || !NAME.test(owner ?? '') || !NAME.test(repo ?? '') || !/^[1-9][0-9]{0,9}$/.test(pr ?? ''))) {
+    // `/v1/<owner>/<repo>/branch/<branch>`: the branch is one percent-encoded segment, decoded once and checked as git would.
+    let branch: string | undefined
+    if (!isAdminGrants && pr === 'branch') {
+      if (parts.length !== 6) return refuse(404, 'not found')
+      try {
+        branch = decodeURIComponent(parts[5] ?? '')
+      } catch {
+        return refuse(404, 'not found')
+      }
+      if (!isBranchName(branch)) return refuse(404, 'not found')
+    }
+    const isShapeOk = branch !== undefined || /^[1-9][0-9]{0,9}$/.test(pr ?? '')
+    if (!isAdminGrants && (version !== 'v1' || !NAME.test(owner ?? '') || !NAME.test(repo ?? '') || !isShapeOk)) {
       return refuse(404, 'not found')
     }
     const who = await verifyAccess(request, env, Date.now())
@@ -52,8 +74,9 @@ export default {
     const asked = await grantStore(env).fetch(internal(who, JSON.stringify({ op: 'presetOf', principal: who.id, repo: name })))
     if (!asked.ok) return refuse(502, 'grant lookup failed')
     const { preset } = (await asked.json()) as { preset: string | null }
-    const stub = env.LIFECYCLE.get(env.LIFECYCLE.idFromName(`${name}#${pr}`))
+    const key = branch !== undefined ? `@${branch}` : `#${pr}`
+    const stub = env.LIFECYCLE.get(env.LIFECYCLE.idFromName(`${name}${key}`))
     // Only what the Worker computed reaches the object: a header of the same name the caller sent is never copied.
-    return stub.fetch(internal(who, await request.text(), { 'x-relay-repo': name, 'x-relay-preset': preset ?? '' }))
+    return stub.fetch(internal(who, await request.text(), { 'x-relay-repo': name, 'x-relay-preset': preset ?? '', 'x-relay-key': key }))
   },
 }
