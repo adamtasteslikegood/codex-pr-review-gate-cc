@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.5.4. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.6.0. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request
@@ -318,7 +318,8 @@ overrides; the mod never falls back to HEAD.
   "mergeMethod": "merge",
   "issueSpec": "docs/spec.md",
   "mergeWatchMinutes": 5,
-  "jiraProject": "KAN"
+  "jiraProject": "KAN",
+  "sharedStore": { "url": "https://pr-gate-relay.example.workers.dev", "aud": "<Access application AUD tag>" }
 }
 ```
 
@@ -339,7 +340,7 @@ spec handle, cut to 80 characters, named in each filed issue's title.
 no run, a whole number of minutes from 1 to 60 (default 5; see Merged outside
 the gate). `jiraProject` is a Jira project key such as `KAN`; with it set, a
 security finding gets a Jira Bug through `acli` (see Merged outside the gate).
-All four are read from the base's file only.
+`sharedStore` opts the repo into the shared store (see The shared store). All five are read from the base's file only.
 
 - **Precedence.** The file on the base, then the person's plugin options, then
   the defaults.
@@ -400,6 +401,43 @@ pane says what to fix, and `/pr-gate resume` retries. A new interactive session 
 post-PR collection back up where it was once the session that ran it has been
 quiet for 2 minutes, and nothing already processed is done again. A headless
 session (`claude -p`, the SDK) in the same checkout never takes it over.
+
+## The shared store
+
+By default a lifecycle's record, lease, run log and filing ledger live in the checkout's plugin store. A repo can instead keep them on
+the relay (`pr-lifecycle-relay/`, #29 Part B), so that two checkouts or sessions of one PR share one record, one lease and one filing
+ledger. It is opt-in per repo and **off unless the base's `.github/pr-gate.json` has `sharedStore`**:
+
+```json
+"sharedStore": { "url": "https://<worker>.workers.dev", "aud": "<Access application AUD tag>" }
+```
+
+- `url` must be https with no query or fragment, and `aud` non-empty; anything else is ignored and the repo stays local. Like the rest of
+  the file, it is read from the base branch, never the PR's HEAD.
+- **Credentials are environment variables only.** A Cloudflare Access service token is `PR_GATE_RELAY_CLIENT_ID` and
+  `PR_GATE_RELAY_CLIENT_SECRET` (sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret`). A person's Access token is
+  `PR_GATE_RELAY_TOKEN` (sent as `cf-access-token`). A service token wins when both are set, and half of one is no credential. With none,
+  the repo stays local.
+- **The machine pins its relay.** `PR_GATE_RELAY_URL` names the relay this machine trusts with its credential. The credential is sent
+  only when the origin (scheme, host and port) of the base's `url` equals the origin of `PR_GATE_RELAY_URL`; anyone who can push to the
+  base can edit the file, and must not be able to point a credential at a host they control. With the pin unset, not a URL or of another
+  origin, nothing is sent, the lifecycle runs locally, and the run log names the mismatch once per lifecycle (never a credential).
+- **The relay grants access.** The principal needs a `read` or `operate` grant on the repo, which an admin gives (see the relay README).
+  Without one, calls answer 403 and the checkout stands down.
+- **Records.** Pre-PR records are kept under the branch and move to the PR when it exists (R103). Every relay commit is mirrored in the
+  local store, which is where fallback starts.
+- **Lease.** One driver per PR holds a 120 s lease, beaten every 60 s. An interactive session of the same principal can take a live
+  lease over (R105); a headless one, or another principal, waits for a lapse. A service token is one principal, so every machine that
+  shares it can take over from the others. A session that loses the lease starts nothing and stands down. A plain
+  stale-revision conflict keeps the run, and the next tick recovers from the relay's record.
+- **Fallback.** A call that fails (network error, 5xx, no answer within 5 s, or a body that isn't JSON) puts the lifecycle back on the
+  local record for that step, and the round goes on. On recovery the relay's record wins, and the local one is kept as a snapshot. A
+  refused credential (401, 403), a redirect (3xx) or an HTML page (Access's login) stands the session down instead of continuing locally.
+- **Security findings.** The relay holds a security finding as a reference only (R107): no title, detail, file or URL is sent. The
+  checkout that found it keeps the text, and another checkout shows a placeholder.
+- **`/pr-gate log`** shows the relay's run log, with who wrote each line, and a `stuck filings (known findings only)` section for claims
+  older than the step timeout. It lists only findings the record knows, because no relay op lists every filing.
+- **Nothing is deployed yet.** There is no relay to point `url` at until Adam confirms the first deploy (R108).
 
 ## What is held
 

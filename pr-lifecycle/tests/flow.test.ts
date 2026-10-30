@@ -7321,6 +7321,24 @@ test('A9.7: with jiraProject set, a security deferral left for the person files 
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
 })
 
+test('Task 8 review: a security-only filing pass crosses an action boundary before acli: a session that lost the record files no ticket', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider rotating this token')
+  w.git.roster = JIRA
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P1', isSecurity: true, note: 'needs a key rotation', replyId: '992' }]))
+  // Another session takes the record once the pass has marked its ticket as sent, before acli runs: the next owner read sees it.
+  w.beforeRead = async key => {
+    const rec = w.store.get(KEY) as LifecycleRecord | undefined
+    if (key === `${KEY}:owner` && rec?.findings.some(one => one.jiraError?.startsWith('a ticket was sent to Jira') === true) === true) {
+      w.store.set(key, { sessionId: 'session-2', beatAt: (w.clock as unknown as { now: () => number }).now() })
+    }
+  }
+  await done($, accept('r2-verify', w))
+  w.beforeRead = undefined
+  expect(creates(w)).toEqual([])
+  expect(w.acli.calls).toEqual([])
+})
+
 test('A9.7: without jiraProject, no acli call is made and the security deferral waits for the person as before', async ($, on) => {
   const w = world(on)
   await toSecurityDeferral($, w, false)

@@ -46,6 +46,11 @@ export type Finding = {
   url?: string
   severity: Severity
   isSecurity?: boolean
+  /**
+   * Set on a security finding as the shared store keeps it (R107): its text stays with the checkout that found it, and the relay holds a
+   * placeholder title. `restore` brings the text back from this checkout's own mirror of the same lifecycle.
+   */
+  ref?: 'local'
   /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
   severitySource?: 'tag' | 'hint'
   /**
@@ -79,6 +84,16 @@ export type Finding = {
    * repository's issues for it before filing another. Unlike issueError, an answer never clears it; a saved issue number does.
    */
   isIssueSent?: true
+  /**
+   * How many times the gate filed the finding anew after its issue closed with the finding still holding (#29 Part B, spec §7): its
+   * filing-ledger key is `<lifecycleId>:<id>:<fileAttempt + 1>`. Absent is 0. A retry after a lost answer never advances it.
+   */
+  fileAttempt?: number
+  /**
+   * The finding's issue is saved here but not yet in the relay's filing ledger (spec §7, §8): filed while the relay was down, or a
+   * marked issue another checkout's young claim still holds. The next filing pass or merge check settles the ledger.
+   */
+  isFilingOwed?: true
   /**
    * The Jira ticket that tracks a security finding (spec §5.13.7), such as `KAN-512`, filed through acli where the base sets
    * `jiraProject`. It tracks the finding but never settles it: before a merge, only the person's waiver releases it.
@@ -285,6 +300,16 @@ export type LifecycleRecord = {
    * another, so its findings of the same ids never take this one's issues.
    */
   lifecycleId?: string
+  /**
+   * The shared store's revision this local record mirrors (#29 Part B, R102): set by each commit to the relay and kept through a
+   * fallback. Absent on a record the relay has never held.
+   */
+  relayRev?: number
+  /**
+   * The relay object `relayRev` is a revision of (#29 Part B, R103): `@<branch>` before the move, `#<pr>` after it. A rev of one object
+   * says nothing about another's. Absent where the record's kind says it (`#<pr>` with a `pr`, else `@<branch>`).
+   */
+  relayKey?: string
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string

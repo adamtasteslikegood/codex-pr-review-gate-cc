@@ -217,6 +217,10 @@ a shared Durable Object store, is evaluated with wave 3 item 2.
 The P2 issues #21-#24 stay in the issue queue, highest severity first. #27
 goes with wave 3 item 2. Lanes (2c) move to wave 3.
 
+**Follow-up (1.6.0): the shared store, #29 Part B (built, not deployed; R100-R108).** The relay (`pr-lifecycle-relay/`) and the plugin's relay
+backend are built and tested under Miniflare. A repo opts in with `sharedStore` in the base's `.github/pr-gate.json`. Left: the development
+deploy and the latency measurement (R108), which wait for Adam's confirmation; then the validator (#33) and the conductor (decision O).
+
 ### Wave 2c: parallel fixers in lanes (moved to wave 3)
 
 1. **Parallel fixers in lanes (Adam, 2026-10-20).** With `fixer: 'subagent'`, the gate

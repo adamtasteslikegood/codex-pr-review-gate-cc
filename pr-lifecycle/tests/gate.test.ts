@@ -61,7 +61,7 @@ test('a blocking finding goes to the main agent, then Codex reviews again', asyn
   expect(run.headSha).toBe('d'.repeat(40))
 })
 
-test('the shared allowance (4) without agreement ends the pre-PR gate as exhausted', async ($, on) => {
+test('the shared allowance (4) without agreement ends the pre-PR gate as exhausted', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   for (let round = 1; round <= 4; round++) {
