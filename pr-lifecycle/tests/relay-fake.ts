@@ -225,7 +225,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
     let body: { op?: unknown; [key: string]: unknown } | undefined
     try {
       const read = JSON.parse(init?.body ?? '') as unknown
-      body = typeof read === 'object' && read !== null ? (read as { op?: unknown }) : undefined
+      body = typeof read === 'object' && read !== null && !Array.isArray(read) ? (read as { op?: unknown }) : undefined
     } catch {
       body = undefined
     }
@@ -236,8 +236,10 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
       const entries = [...(fake.index.get(name)?.values() ?? [])].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
       return json(200, { entries: copy(entries) })
     }
+    // The object reads the body itself, after the Worker found the caller: what isn't a JSON object is 400, as JSON.
+    if (body === undefined) return json(400, { error: 'body is not a JSON object' })
     const key = branch !== undefined ? `@${branch}` : `#${pr}`
-    return object(name, key, who, preset, body ?? {})
+    return object(name, key, who, preset, body)
   }
 
   /** One LifecycleObject's answer, check for check as the relay's. */

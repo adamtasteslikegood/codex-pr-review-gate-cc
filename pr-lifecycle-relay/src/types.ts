@@ -1,4 +1,14 @@
-// The few Workers runtime types the relay uses, declared here so it needs no @cloudflare/workers-types.
+// The few Workers runtime types the relay uses, declared here so it needs no @cloudflare/workers-types, and the one body reader the objects share.
+
+/** A request's body as a JSON object, or undefined when it isn't one: the object answers 400, never a 500 from a throw. */
+export async function bodyOf(request: Request): Promise<{ op?: unknown; [key: string]: unknown } | undefined> {
+  try {
+    const body = JSON.parse(await request.text()) as unknown
+    return typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as { op?: unknown }) : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export type Env = {
   /** The Access team's domain, e.g. `example.cloudflareaccess.com`: the JWT's issuer and where its keys are published. */

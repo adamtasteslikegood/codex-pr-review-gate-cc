@@ -185,16 +185,18 @@ export function readStatuses(text: string): Check[] {
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((one): one is string => typeof one === 'string' && one !== '') : [])
 
-/** `.github/pr-gate.json`: who and what to wait for. A file that is not a JSON object is ignored. */
 /** The relay a repo names: an https URL and a non-empty Access audience, or none. A credential never rides plain http. */
 const sharedStoreOf = (value: unknown): Roster['sharedStore'] => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const url = str((value as Row).url)
   const aud = str((value as Row).aud)
   if (url === undefined || aud === undefined || !URL.canParse(url) || new URL(url).protocol !== 'https:') return undefined
-  return { url, aud }
+  // The client appends each call's path to the url: a query or a fragment would swallow it. A trailing `/` is cut.
+  if (/[?#]/.test(url)) return undefined
+  return { url: url.replace(/\/+$/, ''), aud }
 }
 
+/** `.github/pr-gate.json`: who and what to wait for. A file that is not a JSON object is ignored. */
 export function readRoster(text: string): Roster | undefined {
   if (text.trim() === '') return undefined
   try {

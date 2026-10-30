@@ -6,7 +6,7 @@
 
 import { isAdmin, type Preset, type Principal } from './auth.ts'
 import type { IndexEntry, IndexUpdate } from './repo-index.ts'
-import type { DurableObjectState, Env } from './types.ts'
+import { bodyOf, type DurableObjectState, type Env } from './types.ts'
 
 /**
  * Who holds the lifecycle now (R74's owner, fenced). `token` is the public fence: each new holder gets a higher one. The holder's
@@ -160,8 +160,9 @@ export class LifecycleObject {
     const key = request.headers.get('x-relay-key') ?? ''
     const isBranch = key.startsWith('@')
     if (who === null) return reply(401, { error: 'no principal' })
-    const body = (await request.json()) as { op?: string; [key: string]: unknown }
-    const op = body.op ?? ''
+    const body = await bodyOf(request)
+    if (body === undefined) return reply(400, { error: 'body is not a JSON object' })
+    const op = typeof body.op === 'string' ? body.op : ''
     const need = NEEDS[op]
     if (need === undefined) return reply(400, { error: `unknown op ${op}` })
     // The Worker always overwrites this header with the GrantStore's answer; the object trusts it only for that reason.

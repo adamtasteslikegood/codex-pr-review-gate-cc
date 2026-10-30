@@ -4,15 +4,15 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 
-import { type As, CONTRACT, isMatch, PRINCIPALS, type Step } from '../../pr-lifecycle/tests/contract.ts'
+import { type As, CONTRACT, isMatch, PRINCIPALS, type Step, TIMES } from '../../pr-lifecycle/tests/contract.ts'
 import { ADAM, call, CODEX, grant, person, READER, seed, service, sign, start, stop } from './harness.ts'
 
 const tokens = new Map<As, string | undefined>()
 const pause = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 before(async () => {
-  // A case runs several steps on one object: a long lease and retention, so neither runs out under load mid-case.
-  await start({ RETENTION_MS: '600000', LEASE_MS: '600000' })
+  // The transcript's own times: a long lease and retention, and a filing claim stale after the waits it lets pass.
+  await start({ RETENTION_MS: String(TIMES.retentionMs), LEASE_MS: String(TIMES.leaseMs), FILING_STALE_MS: String(TIMES.filingStaleMs) })
   await seed()
   tokens.set('ADAM', await sign(person(ADAM)))
   tokens.set('CODEX', await sign(service(CODEX)))
@@ -24,12 +24,15 @@ after(async () => {
   await stop()
 })
 
-/** One step's answer, polled for up to 3 s when it comes from the index. */
+/** One step's answer, after its wait, polled for up to 3 s when it comes from the index. */
 async function replay(step: Step) {
+  if (step.waitMs !== undefined) await pause(step.waitMs)
   const deadline = Date.now() + 3000
   for (;;) {
-    const res = await call(tokens.get(step.as), step.body, step.path)
-    const isOk = res.status === step.status && (step.isText !== true || typeof res.json.text === 'string') && isMatch(res.json, step.match ?? {})
+    const res = await call(tokens.get(step.as), step.raw ?? step.body, step.path)
+    // The harness reads a body that isn't JSON as `{ text }`: a step is text exactly when it says so.
+    const isText = Object.keys(res.json).length === 1 && typeof res.json.text === 'string'
+    const isOk = res.status === step.status && isText === (step.isText === true) && isMatch(res.json, step.match ?? {})
     if (isOk || step.isEventual !== true || Date.now() > deadline) return { res, isOk }
     await pause(25)
   }

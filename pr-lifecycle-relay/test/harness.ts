@@ -41,11 +41,12 @@ const claimsOf = (who: Record<string, string>, extra: Record<string, unknown> = 
 export const person = (email: string) => claimsOf({ email })
 export const service = (id: string) => claimsOf({ common_name: id })
 
-export async function call(token: string | undefined, body: Record<string, unknown>, path = '/v1/owner/repo/7', headers: Record<string, string> = {}) {
+/** One call; a string `body` is sent as it is, to test a body that isn't JSON. */
+export async function call(token: string | undefined, body: Record<string, unknown> | string, path = '/v1/owner/repo/7', headers: Record<string, string> = {}) {
   const res = await mf.dispatchFetch(`https://relay${path}`, {
     method: 'POST',
     headers: { ...(token === undefined ? {} : { 'Cf-Access-Jwt-Assertion': token }), ...headers },
-    body: JSON.stringify(body),
+    body: typeof body === 'string' ? body : JSON.stringify(body),
   })
   const text = await res.text()
   let json: Record<string, unknown> = {}

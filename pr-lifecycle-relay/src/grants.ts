@@ -3,7 +3,7 @@
 // Worker's own lookup on every relay call. Nothing here is reachable from outside the Worker.
 
 import type { Preset, Principal } from './auth.ts'
-import type { DurableObjectState, Env } from './types.ts'
+import { bodyOf, type DurableObjectState, type Env } from './types.ts'
 
 export type Grant = { principal: string; repo: string; preset: Preset }
 
@@ -24,7 +24,8 @@ export class GrantStore {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const body = (await request.json()) as { op?: string; principal?: unknown; repo?: unknown; preset?: unknown }
+    const body = await bodyOf(request)
+    if (body === undefined) return reply(400, { error: 'body is not a JSON object' })
     const actor = (JSON.parse(request.headers.get('x-relay-principal') ?? 'null') as Principal | null)?.id ?? ''
     const s = (await this.state.storage.get<State>('state')) ?? { rev: 0, grants: [], history: [] }
     if (body.op === 'grants') return reply(200, s)

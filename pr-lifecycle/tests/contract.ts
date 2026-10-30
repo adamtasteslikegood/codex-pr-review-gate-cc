@@ -4,10 +4,16 @@
 //
 // `as` names who calls; each side maps it to its own credentials. `match` is a partial deep match: an object matches on the keys listed,
 // an array by its length and each element, anything else by equality. Nothing volatile is matched (a lease's `until`, a filing's or a
-// write's `at`, a secret). A status the plugin's client reads as the relay being down (401, 403, 5xx, or a body that isn't JSON, marked
-// `isText`) is checked by status on the relay side and as `{ down }` on the fake's.
+// write's `at`, a secret). Both sides check every step's status and whether its body is text; the fake's side also checks what the
+// plugin's client makes of it: 401 and 403 are `{ refused }`, a 5xx or a text body `{ down }`, anything else an answer.
 
 export const PRINCIPALS = { ADAM: 'adam@example.org', CODEX: 'codex-service.access', READER: 'reader@example.org' } as const
+
+/**
+ * The times both sides run the transcript with. A long lease and retention, so neither runs out under load mid-case; a filing claim goes
+ * stale after 2 s, which a step's `waitMs` lets pass (real time on the relay, the mocked clock on the fake).
+ */
+export const TIMES = { leaseMs: 600_000, retentionMs: 600_000, filingStaleMs: 2_000 } as const
 
 /** Who calls: a person, the Codex service token, a person who may only read, or no credential at all. */
 export type As = 'ADAM' | 'CODEX' | 'READER' | 'NOBODY'
@@ -20,6 +26,10 @@ export type Step = {
   match?: Record<string, unknown>
   /** The relay answers in plain text (a route refusal), not JSON. */
   isText?: true
+  /** Sent as the body instead of `body` as JSON: a body that isn't a JSON object. The plugin's client never sends one. */
+  raw?: string
+  /** How long passes before the call. */
+  waitMs?: number
   /** The answer comes from the repo's index, which the relay updates after the write: the relay side polls until it matches. */
   isEventual?: true
 }
@@ -189,6 +199,55 @@ export const CONTRACT: Case[] = [
       { as: 'ADAM', path: branch('feat..x'), body: { op: 'read' }, status: 404, isText: true },
       { as: 'ADAM', path: pr(0), body: { op: 'read' }, status: 404, isText: true },
       { as: 'ADAM', path: '/v1/owner/re po/7', body: { op: 'read' }, status: 404, isText: true },
+    ],
+  },
+  {
+    name: 'a body that isn\'t a JSON object is 400',
+    steps: [
+      { as: 'ADAM', path: pr(508), body: {}, raw: 'not json', status: 400, match: { error: 'body is not a JSON object' } },
+      { as: 'ADAM', path: pr(508), body: {}, raw: 'null', status: 400, match: { error: 'body is not a JSON object' } },
+      { as: 'ADAM', path: pr(508), body: {}, raw: '[{"op":"read"}]', status: 400, match: { error: 'body is not a JSON object' } },
+      { as: 'NOBODY', path: pr(508), body: {}, raw: 'not json', status: 401, isText: true },
+      { as: 'READER', path: '/v1/owner/repo', body: {}, raw: 'not json', status: 400, isText: true },
+      { as: 'READER', path: pr(508), body: { op: 'read' }, status: 200, match: { rev: 0, record: null } },
+    ],
+  },
+  {
+    name: 'fileAdopt: only the lease holder, only a stale claim, recorded as adoptedBy',
+    steps: [
+      { as: 'ADAM', path: pr(509), body: { op: 'claim', holder: 'session-a', secret: SECRET_A }, status: 200 },
+      { as: 'CODEX', path: pr(509), body: { op: 'fileClaim', key: 'L2:f1:1', secret: SECRET_C }, status: 200, match: { isFresh: true } },
+      { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A, result: { issue: 20 } }, status: 409, match: { error: 'the claim is not stale yet', filing: { state: 'claimed' } } },
+      { as: 'CODEX', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_C, result: { issue: 20 } }, status: 423, match: { lease: { holder: 'session-a' } } },
+      { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f9:1', secret: SECRET_A, result: { issue: 20 } }, status: 409, match: { error: 'no claim to adopt' } },
+      { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A }, status: 400 },
+      {
+        as: 'ADAM',
+        path: pr(509),
+        body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A, result: { issue: 20 } },
+        waitMs: TIMES.filingStaleMs + 200,
+        status: 200,
+        match: { filing: { state: 'done', actor: CODEX, adoptedBy: ADAM, result: { issue: 20 } } },
+      },
+      { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A, result: { issue: 20 } }, status: 200, match: { filing: { adoptedBy: ADAM } } },
+      { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A, result: { issue: 21 } }, status: 409, match: { filing: { result: { issue: 20 } } } },
+      { as: 'READER', path: pr(509), body: { op: 'filing', key: 'L2:f1:1' }, status: 200, match: { filing: { state: 'done', actor: CODEX, adoptedBy: ADAM } } },
+    ],
+  },
+  {
+    name: 'breakLease and fileDelete are an admin\'s, a person\'s only',
+    steps: [
+      { as: 'CODEX', path: pr(510), body: { op: 'claim', holder: 'session-c', secret: SECRET_C }, status: 200, match: { lease: { token: 1 } } },
+      { as: 'CODEX', path: pr(510), body: { op: 'breakLease' }, status: 403, match: { error: `${CODEX} may not breakLease on owner/repo` } },
+      { as: 'READER', path: pr(510), body: { op: 'breakLease' }, status: 403 },
+      { as: 'ADAM', path: pr(510), body: { op: 'breakLease' }, status: 200 },
+      { as: 'READER', path: pr(510), body: { op: 'read' }, status: 200, match: { lease: null, lastWrite: { actor: ADAM, op: 'breakLease' } } },
+      { as: 'ADAM', path: pr(510), body: { op: 'claim', holder: 'session-a', secret: SECRET_A }, status: 200, match: { lease: { holder: 'session-a', token: 2 } } },
+      { as: 'CODEX', path: pr(510), body: { op: 'fileClaim', key: 'L3:f1:1', secret: SECRET_C }, status: 200, match: { isFresh: true } },
+      { as: 'CODEX', path: pr(510), body: { op: 'fileDelete', key: 'L3:f1:1' }, status: 403 },
+      { as: 'ADAM', path: pr(510), body: { op: 'fileDelete', key: 'L3:f1:1' }, status: 200 },
+      { as: 'READER', path: pr(510), body: { op: 'filing', key: 'L3:f1:1' }, status: 200, match: { filing: null } },
+      { as: 'CODEX', path: pr(510), body: { op: 'fileClaim', key: 'L3:f1:1', secret: SECRET_C }, status: 200, match: { isFresh: true } },
     ],
   },
   {

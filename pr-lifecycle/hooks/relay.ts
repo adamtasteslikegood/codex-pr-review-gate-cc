@@ -1,7 +1,8 @@
 // The relay client (#29 Part B): where a repo's shared lifecycle store is, the credential that reaches it, one call to it, and the
 // secrets a checkout proves itself with. A repo opts in on its base branch (`sharedStore` in `.github/pr-gate.json`); the credential is
-// the person's or service's own, from the environment, never from plugin options. Anything that keeps the relay from answering (a network
-// error, a 5xx, Access refusing the credential, a timeout, a body that isn't JSON) is `down`, so the caller can fall back to the local store.
+// the person's or service's own, from the environment, never from plugin options. Only what keeps the relay from answering (a network
+// error, a 5xx, a timeout, a body that isn't JSON) is `down`, the one case the caller may fall back to the local store (spec §8). A 401 or
+// 403 is `refused`: a revoked or read-only principal is cut off on its next request (spec §10), never let fall back and keep acting.
 //
 // This file imports nothing of round.ts: store.ts will call it, and round.ts imports store.ts. That is why `baseFileOf` lives here.
 
@@ -14,8 +15,12 @@ type Engine = EngineInterface
 /** Where the relay is, the Access audience it sits behind, and the credential headers every call carries. */
 export type Relay = { url: string; aud: string; headers: Record<string, string> }
 
-/** The relay's answer to one call, or why there was none. A 4xx other than 401 and 403 is an answer: the op refused, with its reasons. */
-export type RelayAnswer = { status: number; json: Record<string, unknown> } | { down: string }
+/**
+ * The relay's answer to one call: an answer (any status but 401, 403 and 5xx, as JSON), `refused` (401 or 403: the credential or the grant
+ * says no), or `down` (no answer: a network error, a 5xx, a timeout, a body that isn't JSON).
+ */
+// The caller stands down on `refused` and never falls back: only `down` lets a lifecycle go on in the local store.
+export type RelayAnswer = { status: number; json: Record<string, unknown> } | { refused: string } | { down: string }
 
 /** Spec §8: a call the relay hasn't answered in 5 s is down. */
 export const RELAY_TIMEOUT_MS = 5_000
@@ -62,9 +67,10 @@ export function keyPath(slug: string, key: string): string {
   return key.startsWith('@') ? `/v1/${slug}/branch/${encodeURIComponent(key.slice(1))}` : `/v1/${slug}/${key.replace(/^#/, '')}`
 }
 
-/** What the relay answered, read: Access's refusals and the relay's own failures are down, as is anything but a JSON object. */
+/** What the relay answered, read: 401 and 403 are refused; the relay's own failures are down, as is anything but a JSON object. */
 const answerOf = (res: { status: number; text: string }): RelayAnswer => {
-  if (res.status === 401 || res.status === 403 || res.status >= 500) return { down: `HTTP ${res.status}` }
+  if (res.status === 401 || res.status === 403) return { refused: `HTTP ${res.status}` }
+  if (res.status >= 500) return { down: `HTTP ${res.status}` }
   try {
     const json = JSON.parse(res.text) as unknown
     return typeof json === 'object' && json !== null && !Array.isArray(json) ? { status: res.status, json: json as Record<string, unknown> } : { down: 'not JSON' }

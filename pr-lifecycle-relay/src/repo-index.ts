@@ -2,7 +2,7 @@
 // per-PR object can't (spec §9). Each LifecycleObject sends it updates from its outbox; the Worker asks it for `list`. Nothing reaches it
 // from outside the Worker: the repo route forwards only `list`, and `fault` and `update` come from a test-only admin route.
 
-import type { DurableObjectState, Env } from './types.ts'
+import { bodyOf, type DurableObjectState, type Env } from './types.ts'
 
 /** What `list` shows of one live record. `key` is the object's own key in the repo: `#<pr>` or `@<branch>` (R103). */
 export type IndexEntry = { key: string; pr?: number; branch: string; phase: string; rev: number; updatedAt: number; lifecycleId: string }
@@ -33,7 +33,8 @@ export class RepoIndex {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const body = (await request.json()) as { op?: unknown; [key: string]: unknown }
+    const body = await bodyOf(request)
+    if (body === undefined) return reply(400, { error: 'body is not a JSON object' })
     const storage = this.state.storage
     const now = Date.now()
     const retention = Number(this.env.RETENTION_MS ?? RETENTION_MS)

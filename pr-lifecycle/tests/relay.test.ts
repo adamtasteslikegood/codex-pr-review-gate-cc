@@ -5,7 +5,7 @@ import type { HttpInit, HttpResponse } from 'claude-code'
 import { readRoster } from '../hooks/github'
 import { filingSecret, keyPath, leaseSecret, RELAY_TIMEOUT_MS, relayCall, relayOf } from '../hooks/relay'
 import type { Relay, RelayAnswer } from '../hooks/relay'
-import { CONTRACT, isMatch, PRINCIPALS } from './contract'
+import { CONTRACT, isMatch, PRINCIPALS, TIMES } from './contract'
 import { fakeRelay, HEADERS_OF } from './relay-fake'
 import { world } from './world'
 import type { World } from './world'
@@ -53,19 +53,40 @@ function engineOf(w: World, fetch: Fetch, env: Record<string, string> = {}): nev
 
 const answer = (status: number, text: string): Promise<HttpResponse> => Promise.resolve({ status, ok: status >= 200 && status < 300, headers: {}, text })
 
+/** What the client makes of a step's answer: 401 and 403 refused, a 5xx or a text body down, anything else the answer itself. */
+const clientOf = (status: number, isText: boolean): 'refused' | 'down' | 'answer' =>
+  status === 401 || status === 403 ? 'refused' : status >= 500 || isText ? 'down' : 'answer'
+
 test('the fake relay passes the contract', async (_$, on) => {
   const w = world(on)
-  const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
-  const $ = engineOf(w, fake.fetch)
+  const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, leaseMs: TIMES.leaseMs, filingStaleMs: TIMES.filingStaleMs })
+  // The raw answer of each call, beside what the client made of it.
+  let raw: HttpResponse | undefined
+  const $ = engineOf(w, async (url, init) => (raw = await fake.fetch(url, init)))
   const failures: string[] = []
   for (const one of CONTRACT) {
     for (const given of one.grants ?? []) fake.grant(PRINCIPALS[given.as], given.repo, given.preset)
     for (const [n, step] of one.steps.entries()) {
-      const got: RelayAnswer = await relayCall($, relayAs(step.as), step.path, step.body)
-      // What the client reads as the relay being down never reaches the caller as an answer: only that it is down.
-      const isDown = step.status === 401 || step.status === 403 || step.status >= 500 || step.isText === true
-      const isOk = isDown ? 'down' in got : 'status' in got && got.status === step.status && isMatch(got.json, step.match ?? {})
-      if (!isOk) failures.push(`${one.name}, step ${n}: expected ${isDown ? 'down' : `${step.status} ${JSON.stringify(step.match ?? {})}`}, got ${JSON.stringify(got)}`)
+      if (step.waitMs !== undefined) await w.clock.advance(step.waitMs)
+      // The client never sends a body that isn't JSON: such a step goes to the fake as it is.
+      const init = { method: 'POST', headers: { ...HEADERS_OF[step.as], 'content-type': 'application/json' }, body: step.raw ?? '' }
+      const got: RelayAnswer | undefined = step.raw === undefined ? await relayCall($, relayAs(step.as), step.path, step.body) : undefined
+      if (step.raw !== undefined) raw = await fake.fetch(`${URL_}${step.path}`, init)
+      let json: unknown
+      try {
+        json = JSON.parse(raw?.text ?? '')
+      } catch {
+        json = undefined
+      }
+      const isText = json === undefined
+      const where = `${one.name}, step ${n} (${step.as} ${String(step.body.op ?? step.raw)} ${step.path})`
+      if (raw?.status !== step.status || isText !== (step.isText === true) || (!isText && !isMatch(json, step.match ?? {}))) {
+        failures.push(`${where}: expected ${step.status}${step.isText === true ? ' text' : ''} ${JSON.stringify(step.match ?? {})}, got ${raw?.status} ${raw?.text}`)
+      }
+      if (got === undefined) continue
+      const kind = clientOf(step.status, step.isText === true)
+      const isRead = kind === 'answer' ? 'status' in got && got.status === step.status : kind in got
+      if (!isRead) failures.push(`${where}: the client should read ${kind}, got ${JSON.stringify(got)}`)
     }
   }
   expect(failures).toEqual([])
@@ -84,6 +105,9 @@ test('no sharedStore or no credential stays local and says why', async (_$, on) 
   }
   expect(readRoster(roster({ sharedStore: { url: 'http://relay.example.org', aud: 'aud-tag' } }))).toEqual({ reviewers: ['alice'], checks: [], requestReview: [], trusted: [] })
   expect(readRoster(roster(SHARED))?.sharedStore).toEqual(SHARED.sharedStore)
+  // A query or a fragment would swallow the path the client appends; a trailing `/` is cut.
+  for (const url of [`${URL_}/?x=1`, `${URL_}?`, `${URL_}#top`, `${URL_}/relay#`]) expect(readRoster(roster({ sharedStore: { url, aud: 'aud-tag' } }))?.sharedStore).toBeUndefined()
+  expect(readRoster(roster({ sharedStore: { url: `${URL_}/relay//`, aud: 'aud-tag' } }))?.sharedStore).toEqual({ url: `${URL_}/relay`, aud: 'aud-tag' })
   w.git.roster = roster(SHARED)
   expect(await relayOf(engineOf(w, fake.fetch), '/repo', 'dev')).toEqual({ local: 'no relay credential' })
   // Half a service token is no credential.
@@ -166,14 +190,27 @@ test('a 5 s timeout is down', async (_$, on) => {
   expect(await relayCall($, relayAs('ADAM'), keyPath('owner/repo', '#7'), { op: 'read' })).toMatchObject({ status: 200, json: { rev: 0 } })
 })
 
-test('401, 403, 502 and a body that isn\'t JSON are down', async (_$, on) => {
+test('401 and 403 are refused, not down', async (_$, on) => {
   const w = world(on)
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
   const path = keyPath('owner/repo', '#7')
   const $ = engineOf(w, fake.fetch)
+  // Spec §8 and §10: a revoked or read-only principal is cut off, never let fall back to the local store and keep acting.
   const stranger: Relay = { url: URL_, aud: 'aud-tag', headers: { 'cf-access-token': 'stranger' } }
-  expect(await relayCall($, stranger, path, { op: 'read' })).toEqual({ down: 'HTTP 401' })
-  expect(await relayCall($, relayAs('READER'), path, { op: 'commit', rev: 0, record: {} })).toEqual({ down: 'HTTP 403' })
+  expect(await relayCall($, stranger, path, { op: 'read' })).toEqual({ refused: 'HTTP 401' })
+  expect(await relayCall($, relayAs('READER'), path, { op: 'commit', rev: 0, record: {} })).toEqual({ refused: 'HTTP 403' })
+  expect(await relayCall($, relayAs('CODEX'), path, { op: 'breakLease' })).toEqual({ refused: 'HTTP 403' })
+  // Whatever the body says: Access's own 403 page is HTML, the relay's is JSON.
+  for (const [status, text] of [[401, '<html>Sign in</html>'], [403, '{"error":"no"}'], [403, '']] as const) {
+    expect(await relayCall(engineOf(w, () => answer(status, text)), relayAs('ADAM'), path, { op: 'read' })).toEqual({ refused: `HTTP ${status}` })
+  }
+})
+
+test('502 and a body that isn\'t JSON are down', async (_$, on) => {
+  const w = world(on)
+  const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
+  const path = keyPath('owner/repo', '#7')
+  const $ = engineOf(w, fake.fetch)
   for (const [status, text, down] of [
     [502, 'bad gateway', 'HTTP 502'],
     [503, '{"error":"busy"}', 'HTTP 503'],
@@ -242,4 +279,20 @@ test('a branch with / or % encodes as one segment', async (_$, on) => {
   expect([...fake.objects.keys()]).toEqual(['owner/repo@feat/50%'])
   expect(fake.index.get('owner/repo')?.get('@feat/50%')).toMatchObject({ key: '@feat/50%', branch: 'feat/50%', phase: 'pre-pr', rev: 1 })
   expect(await relayCall($, relayAs('ADAM'), '/v1/owner/repo/branch/feat/50%25', { op: 'read' })).toEqual({ down: 'not JSON' })
+})
+
+test('the fake: a beat after the lease lapsed is 409, even from its holder', async (_$, on) => {
+  const w = world(on)
+  const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, leaseMs: 1_000 })
+  const $ = engineOf(w, fake.fetch)
+  const path = keyPath('owner/repo', '#7')
+  const secret = 's'.repeat(40)
+  expect(await relayCall($, relayAs('ADAM'), path, { op: 'claim', holder: 'h', secret })).toMatchObject({ status: 200 })
+  await w.clock.advance(600)
+  expect(await relayCall($, relayAs('ADAM'), path, { op: 'beat', secret })).toMatchObject({ status: 200 })
+  await w.clock.advance(1_100)
+  expect(await relayCall($, relayAs('ADAM'), path, { op: 'beat', secret })).toMatchObject({ status: 409, json: { error: 'the lease is lost' } })
+  expect(await relayCall($, relayAs('ADAM'), path, { op: 'release', secret })).toMatchObject({ status: 409 })
+  // Lapsed, it is anyone's to claim: another principal, with a token that fences the old holder out.
+  expect(await relayCall($, relayAs('CODEX'), path, { op: 'claim', holder: 'c', secret: 'c'.repeat(40) })).toMatchObject({ status: 200, json: { lease: { token: 2 } } })
 })
