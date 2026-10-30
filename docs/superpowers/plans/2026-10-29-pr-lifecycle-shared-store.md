@@ -33,7 +33,7 @@
 - Credentials are environment variables only: `PR_GATE_RELAY_CLIENT_ID` and `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token, sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret`), or `PR_GATE_RELAY_TOKEN` (a person's Access token, sent as `cf-access-token`). `userConfig` has no sensitive field to rely on. Access turning these into `Cf-Access-Jwt-Assertion` is exercised only by Task 12's deploy.
 - The move to the PR key happens inside the store: a relay commit on a branch key whose record now carries `pr` performs the move. No call site changes for it. The record gains `pr` in `register.tsx` at `onOpened` (≈:820) and at adoption (≈:334), and on a resume that finds the PR.
 - The mirror rule: every successful relay commit also writes the local key, with `relayRev` set to the new rev and the **full** record (security text included). Fallback starts from that mirror, and R(b) restores redacted findings from it.
-- R(b) redaction: a finding with `isSecurity: true` is sent as `{ id, round, source, reviewer, severity, isSecurity: true, headSeen, status, title: '[security finding: text kept by the checkout that found it]', ref: 'local' }`. It carries no `detail`, `note`, `file`, `line`, `url` or real title. On load, a redacted finding takes its text from the local mirror's finding with the same `id`, when there is one.
+- R(b) redaction: a finding with `isSecurity: true` is sent as `{ id, round, source, reviewer, severity, isSecurity: true, headSeen, status, title: '[security finding: text kept by the checkout that found it]', ref: 'local' }`. It carries no `detail`, `note`, `file`, `line`, `url` or real title. On load, a redacted finding takes its text from the local mirror only when the mirror's `lifecycleId` equals the remote record's and it holds a finding with the same `id`. Only the redacted fields come back (`title`, `detail`, `note`, `file`, `line`, `url`); everything else stays the relay's. Otherwise the placeholder stays (PR #51 review).
 - `list` URL: `POST /v1/<owner>/<repo>` with `{ "op": "list" }`. `/v1/admin/...` routes match before owner/repo parsing.
 - Index fault injection for tests: when the Worker binding `TEST_FAULTS` is `'1'`, the admin route `POST /v1/admin/index` takes `{ op: 'fault', repo, until }`, and that repo's `RepoIndex` answers 503 until then. With `TEST_FAULTS` unset (as in wrangler), the route answers 404.
 
@@ -69,7 +69,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 
 `log` stores `{ seq, at, kind, text, principal, holder }`, with `text` cut to 300 characters; `seq` goes up by one per append and never goes back. `snapshot` appends `{ at, record, actor, reason }` to the archives. Neither bumps `rev`.
 
-**Index entry:** `{ key, pr?, branch, phase, rev, updatedAt, lifecycleId }`. **Outbox entry:** `{ key, rev, entry } | { key, rev, removed: true }`. The index orders and removes by `key`, never by `pr`.
+**Index entry:** `{ key, pr?, branch, phase, rev, updatedAt, lifecycleId }`. **Outbox entry:** `{ key, born, rev, entry } | { key, born, rev, removed: true }`. The index orders and removes by `key`, never by `pr`, and keeps the highest `(born, rev)` per key, compared `born` first. `born` is the time of the object's first write after it was empty, kept in its state until it is deleted.
 
 **Tombstone:** `{ movedTo, lifecycleId, record? }`. `record` is there from `moveTo` until `moveDone`.
 
@@ -182,9 +182,9 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Modify: `pr-lifecycle-relay/src/lifecycle.ts` (the outbox written in the same `put` as the commit, `alarm()`), `src/index.ts` (the `list` route and the test-only fault route), `src/types.ts` (Env `REPO_INDEX`, `RETENTION_MS?`, `INDEX_RETRY_MS?`, `TEST_FAULTS?`; storage `setAlarm`, `getAlarm`, `deleteAlarm`, `deleteAll`, and `get`/`put` of several keys), `wrangler.jsonc` (a `REPO_INDEX` binding, `RepoIndex` added to migration `v2`), `test/harness.ts` (new bindings: `INDEX_RETRY_MS: '50'`, `RETENTION_MS: '400'`, `TEST_FAULTS: '1'`)
 
 **Interfaces:**
-- Produces: `RepoIndex` ops: `update { key, rev, entry | removed }`, where an update with a rev not above the held one is ignored and tombstones are kept; `list`, which answers `{ entries: IndexEntry[] }` without tombstones; and `fault { until }`.
+- Produces: `RepoIndex` ops: `update { key, born, rev, entry | removed }`, where an update whose `(born, rev)` is not above the held one is ignored and tombstones are kept; `list`, which answers `{ entries: IndexEntry[] }` without tombstones; and `fault { until }`.
 - Produces: each record commit, `moveTo` and archive commit writes an outbox entry. A record with `phase: 'archived'` or a tombstone writes `removed`. A non-empty outbox sets an alarm. The alarm sends the outbox to `env.REPO_INDEX.idFromName(repo)` and clears what was acknowledged. On failure it retries with doubling backoff from `INDEX_RETRY_MS` (default 1000), capped at 5 minutes.
-- Produces: retention. The alarm also deletes the object (`deleteAll`) once `RETENTION_MS` has passed since the PR's archive commit (a PR key) or since the last write (a branch key).
+- Produces: retention. Once `RETENTION_MS` has passed since the PR's archive commit (a PR key) or since the last write (a branch key), the alarm delivers a removal at `(born, rev + 1)` to the index, then deletes the object (`deleteAll`) once the index has acknowledged it.
 
 - [ ] **Step 1: Write the failing tests.** Alarms run in real time under Miniflare, so each test polls `list` every 25 ms for up to 3 s.
   - `list through the index matches the objects`: commits to `#7`, `#8` and `@feat/x` list three entries with their `rev` and `lifecycleId`.
@@ -195,6 +195,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `list needs read`: a principal with no grant gets 403.
   - `an archived PR object is deleted after RETENTION_MS`: after an archive commit and a wait above 400 ms, `read` gives `rev: 0`.
   - `a branch object is deleted RETENTION_MS after its last write`.
+  - `a recreated branch is found at once, and an update from before its deletion can't replace it`: commit `@x` up to rev 8, wait for retention, then commit `@x` again (rev 1, lifecycle L2). `list` shows `@x` at rev 1 with L2. A delayed `update { key: '@x', born: <old>, rev: 8 }` sent straight to the index leaves it unchanged.
 - [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/index.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS. Run it three times, because alarm timing is real.
@@ -280,6 +281,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `migration into a non-empty object adopts the relay's, archives and snapshots the local one`.
   - `no security finding's text reaches commit`: walk every `fake.calls` body with `op: 'commit'` or `'snapshot'`; no security finding's title, detail, note, file or url appears.
   - `a redacted finding is restored from the local mirror on load`, and `one found by another checkout shows the placeholder title`.
+  - `restore needs the same lifecycle`: a local mirror of lifecycle L1 with security finding G1-1, and a remote L2 record whose redacted G1-1 is another finding: `restore` keeps the placeholder and none of L1's text. With both at L1, the text comes back, but the remote `status` wins.
   - `a repo that does not opt in behaves exactly as before`: no `http.fetch` calls at all.
 - [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
 - [ ] **Step 3: Classify the call sites.** Run `grep -n "updateRecord(\|upsertRecord(" pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/register.tsx`. A site passes `{ isPure: true }` only when its `change` uses nothing from `$` and runs no git, gh, agent or filing, which is a plain object transform. List each site with its verdict in the task report.

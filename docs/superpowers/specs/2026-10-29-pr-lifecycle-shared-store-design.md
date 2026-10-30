@@ -208,7 +208,7 @@ A pre-PR record crosses over the same way, to its branch key (R103); one that ge
 | Archives | 20 per PR (`ARCHIVE_CAP`), as prototyped |
 | Filing results | as long as the PR's object exists |
 | Each PR's object | 90 days after its PR is merged or closed, after which an alarm deletes it. The issues on GitHub stay as the lasting record. |
-| Each branch object | 90 days after its last write, live record or tombstone (**Ruled**: a branch has no merge or close of its own). A later fresh start makes it again. |
+| Each branch object | 90 days after its last write, live record or tombstone (**Ruled**: a branch has no merge or close of its own). A later fresh start makes it again, as a new incarnation (section 9). |
 
 ## 9. Discovery and archives
 
@@ -219,7 +219,12 @@ A pre-PR record crosses over the same way, to its branch key (R103); one that ge
 - A second object class, `RepoIndex`, holds one object per `owner/repo`, with an entry `{ key, pr?, branch, phase, rev, updatedAt }` for each live record. `key` is the object's own key within the repo: `#<pr>` or `@<branch>` (R103). A move (section 1) writes the PR key's entry from the PR object and a removal from the branch object; for the moment between them both entries can show, and `liveRecords` drops a branch entry whose `lifecycleId` a PR entry already carries.
 - **Each commit queues an index update.** It writes an outbox entry `{ key, rev, entry | removed }` in the same storage step as the commit, and sets an alarm. `key` is the object's own key (`#<pr>` or `@<branch>`), so pre-PR records, which have no `pr`, are told apart (PR #51 review). Archiving the record or closing the PR writes a removal: a tombstone carrying its `rev`.
 - **The object sends its outbox to its repo's index** (object to object, inside the Worker), and clears it once the index acknowledges. If the update fails, the alarm retries it with backoff until it succeeds. No client and no further commit is needed, so a lifecycle whose controller exits right after its first commit is still discovered.
-- **The index applies updates by revision.** An update whose `rev` is not above the one it holds for that `key`, tombstones included, is ignored, so a delayed retry can't bring back an old entry or a removed one. Each tombstone is kept for its own object's retention period (section 8), by `key`.
+- **The index applies updates by incarnation, then revision (Ruled, PR #51 review).** Deleting an object resets its `rev` to 0, so `rev` alone can't order a key's updates across a deletion. Each object therefore records `born`, the time of its first write after it was empty, and keeps it until it is deleted. Every outbox entry carries `{ key, born, rev }`. The index keeps the highest `(born, rev)` per `key`, compared `born` first, and ignores any update not above it, tombstones included.
+  - A delayed retry from the same incarnation can't bring back an old entry or a removed one.
+  - A recreated object has a later `born`, so its first update replaces whatever the old incarnation left, and the new lifecycle can be found at once.
+  - A delayed update from before the deletion carries the old `born`, so it is ignored.
+  - Before the retention alarm deletes an object, it delivers a removal at its own `(born, rev + 1)` and deletes only once the index has acknowledged it.
+  - Each tombstone is kept for its own object's retention period (section 8), by `key`.
 - `liveRecords(root)` maps the root to its slug, then returns the index's entries, each read from its object, plus any local records of a repo or checkout that isn't on the relay. So the entry also carries `lifecycleId`.
 - A new `list` op reads the index. It needs `read` on the repo.
 
@@ -240,7 +245,7 @@ Access policy groups would also need a mirror, two places that can drift; leave 
 The record carries each finding's text, security findings included. R92 and R95 keep those off GitHub; they go to Jira where `jiraProject` is set. The relay would be a new place that text lives: a Cloudflare object any principal with `read` on the repo can read.
 
 - **(a) Full text, guarded by grants.** The simplest option. Who can read is exactly the grant list for that repo.
-- **(b) A reference only.** A security finding is stored as `{ id, severity, isSecurity: true, ref }`. Its text stays in the local record, or in Jira, and only the checkout that found it shows it in full.
+- **(b) A reference only.** A security finding is stored as `{ id, severity, isSecurity: true, ref }`. Its text stays in the local record, or in Jira, and only the checkout that found it shows it in full. **Ruled** (PR #51 review): on load, a redacted finding gets its text back from the local record only when both records carry the same `lifecycleId` and a finding with the same `id`. Finding ids such as `G1-1` start again in each lifecycle, so text from another lifecycle is never attached. Only the redacted fields come back (`title`, `detail`, `note`, `file`, `line`, `url`). Everything else, status included, is the relay's. Otherwise the placeholder stays.
 
 **Recommendation: (b) until the grant list holds anyone besides Adam and his own service identities**, then revisit. It costs one redaction step at the commit boundary, and a test that no security finding's body reaches `commit`.
 
