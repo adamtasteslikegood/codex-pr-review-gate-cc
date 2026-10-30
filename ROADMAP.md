@@ -271,6 +271,13 @@ Serves goals 3 and 4. It starts once waves 1-3 run live without errors.
   smooth.
 - **At exhaustion,** the gate either blocks the merge or allows it with an issue
   filed for each unresolved finding. **Either outcome goes to Adam.**
+- **A repo-level issue ledger in the relay, for td2do.** td2do (its own repo,
+  `adamtasteslikegood/td2do`) links every TODO comment to an issue and files
+  each issue once. An `IssueLedger` object per `owner/repo` (claim, done, get,
+  list, search) would close the race where two agents file the same TODO, and
+  pr-gate findings could share it. Adam's ruling (2026-10-30): after #29 Part B
+  ships, with its own design. See
+  `docs/superpowers/specs/2026-10-29-todo-tracker-design.md`.
 
 ## Parallel track: the cookbook repo
 
