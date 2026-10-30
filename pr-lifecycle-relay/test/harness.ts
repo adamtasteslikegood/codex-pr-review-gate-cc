@@ -71,13 +71,22 @@ export async function seed(): Promise<void> {
 }
 
 const source = (name: string): string => stripTypeScriptTypes(readFileSync(new URL(`../src/${name}`, import.meta.url), 'utf8'))
+/** A test-only module, served beside the relay's: its `../src/` imports name the relay's modules where Miniflare serves them. */
+const tested = (name: string): string => stripTypeScriptTypes(readFileSync(new URL(name, import.meta.url), 'utf8')).replaceAll("from '../src/", "from './")
 
-export async function start(bindings: Record<string, string> = {}): Promise<void> {
+/**
+ * Starts the relay. `entry`, a file in this folder, becomes the main module in front of the relay's own: a test-only wrapper that imports
+ * `../src/<name>` and re-exports the Worker and the object classes (request-count.test.ts counts requests this way).
+ */
+export async function start(bindings: Record<string, string> = {}, entry?: string): Promise<void> {
   team = (await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])) as CryptoKeyPair
   stranger = (await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])) as CryptoKeyPair
   const jwk = { ...(await crypto.subtle.exportKey('jwk', team.publicKey)), kid: 'k1', alg: 'RS256' }
   mf = new Miniflare({
-    modules: ['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'repo-index.ts', 'types.ts'].map(path => ({ type: 'ESModule', path, contents: source(path) })),
+    modules: [
+      ...(entry === undefined ? [] : [{ type: 'ESModule' as const, path: entry, contents: tested(entry) }]),
+      ...['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'repo-index.ts', 'types.ts'].map(path => ({ type: 'ESModule' as const, path, contents: source(path) })),
+    ],
     compatibilityDate: '2026-08-01',
     durableObjects: { LIFECYCLE: 'LifecycleObject', GRANTS: 'GrantStore', REPO_INDEX: 'RepoIndex' },
     bindings: {
