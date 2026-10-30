@@ -271,13 +271,20 @@ The first version of this table was a count from the code. It is now measured, f
 - **The beat** stays the lever: `LEASE_MS` 120 s with a beat every 60 s.
 - The count does not exercise the 60 s cadence itself; the harness sends the calls back to back. Comparing these counts with the prepaid Workers plan's included requests is left for Adam.
 
-### Latency (not measured yet)
+### Latency (measured 2026-10-30, Task 13)
 
-| Measurement | Status |
-| --- | --- |
-| The baseline: today's in-process lock plus plugin-store write | Can be measured locally; not yet run. |
-| A Miniflare round trip | In-process, so a floor at best: it leaves out the network and Access entirely. |
-| A real round trip (checkout → Access → Worker → object) | Needs a development deploy. **Adam's ruling (R108): yes, as the last step of the build**: one Worker and one Access application, removed afterwards. The agent stops and confirms with Adam immediately before creating them, since it changes his Cloudflare account. |
+The relay was deployed once for this (R108): `pr-lifecycle-relay-dev` on workers.dev, behind one Access application with a service-token policy, served from Cloudflare's LAX edge. The client was this machine on a home Wi-Fi access point that Adam notes is slow; a bare HTTPS GET to the edge took 138 ms from it, so the relay figures are an upper bound for this machine. Each run sends one uncounted warm-up `read`, claims the lease, then alternates 50 `read` and 50 `commit` calls (each commit a 2 KB record) and releases. Three runs:
+
+| Measurement | p50 | p95 | Range |
+| --- | --- | --- | --- |
+| Baseline: in-process lock plus a plugin-store write (an 842 KiB copy of the real pr-lifecycle store, rewritten whole and renamed, as the store file is) | 2.5–2.8 ms | 4.5–5.4 ms | 1.8–11.1 ms |
+| Relay `read` (checkout → Access → Worker → `GrantStore` → object) | 124–199 ms | 210–359 ms | 112–653 ms |
+| Relay `commit` (as `read`, plus the write and its outbox) | 185–258 ms | 228–1,382 ms | 170–4,415 ms |
+
+- A relay call costs about 50 to 100 times a local write. The one slow tail (a commit at 4.4 s, in the second run) did not repeat in the third, and stays under the 5 s fallback.
+- A Miniflare round trip is in-process and leaves out the network and Access, so it was not taken as a measure.
+- What the deploy needed beyond the plan: wrangler's OAuth login deploys the Worker but cannot touch Access, so the Access application and service token came from an account API token holding Access "Apps and Policies" and "Service Tokens" edit (with that token in the environment, wrangler uses it instead of OAuth, so the deploy ran without it). The first grant needs an admin, and only a person counts (R104): Adam signed in to the relay through Access with the Cloudflare login method and sent `grant` from the browser console, so his session cookie carried it.
+- Teardown: the Worker (and with it its Durable Object namespaces), the Access application and the service token were deleted the same day, and each was checked gone.
 
 The design keeps the network off the paths where latency would matter:
 
