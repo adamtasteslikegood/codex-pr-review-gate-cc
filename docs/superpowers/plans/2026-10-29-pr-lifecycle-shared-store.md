@@ -441,8 +441,8 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 
 This task changes Adam's Cloudflare account. The controller does **not** dispatch it. The controller asks Adam, in one message, for the go-ahead, the account, and the Access team domain. Only on his yes:
 
-- [ ] **Step 1:** Deploy the Worker as `pr-lifecycle-relay-dev` with wrangler, with `ADMINS` set to Adam's email. Create one Access application and one service token.
-- [ ] **Step 2:** Seed one grant (`operate` on this repo) for the service token.
-- [ ] **Step 3:** Measure 50 `read` and 50 `commit` round trips from this machine, giving p50 and p95. Measure the local baseline (in-process lock plus plugin-store write) the same way.
-- [ ] **Step 4:** Write the numbers into spec §12's latency table and commit.
-- [ ] **Step 5:** Tear down the Worker, the Access application and the service token, and confirm each is gone.
+- [x] **Step 1:** Deploy the Worker as `pr-lifecycle-relay-dev` with wrangler, with `ADMINS` set to Adam's email. Create one Access application and one service token.
+- [x] **Step 2:** Seed one grant (`operate` on this repo) for the service token.
+- [x] **Step 3:** Measure 50 `read` and 50 `commit` round trips from this machine, giving p50 and p95. Measure the local baseline (in-process lock plus plugin-store write) the same way.
+- [x] **Step 4:** Write the numbers into spec §12's latency table and commit.
+- [x] **Step 5:** Tear down the Worker, the Access application and the service token, and confirm each is gone.
