@@ -283,7 +283,7 @@ The relay was deployed once for this (R108): `pr-lifecycle-relay-dev` on workers
 
 - A relay call costs about 50 to 100 times a local write. The one slow tail (a commit at 4.4 s, in the second run) did not repeat in the third, and stays under the 5 s fallback.
 - A Miniflare round trip is in-process and leaves out the network and Access, so it was not taken as a measure.
-- What the deploy needed beyond the plan: wrangler's OAuth login deploys the Worker but cannot touch Access, so the Access application and service token came from a short-lived account API token holding Access "Apps and Policies" and "Service Tokens" edit (with that token in the environment, wrangler uses it instead of OAuth, so the deploy ran without it). The first grant needs an admin, and only a person counts (R104): Adam signed in to the relay through Access with the Cloudflare login method and sent `grant` from the browser console, so his session cookie carried it.
+- What the deploy needed beyond the plan: wrangler's OAuth login deploys the Worker but cannot touch Access, so the Access application and service token came from an account API token holding Access "Apps and Policies" and "Service Tokens" edit (with that token in the environment, wrangler uses it instead of OAuth, so the deploy ran without it). The first grant needs an admin, and only a person counts (R104): Adam signed in to the relay through Access with the Cloudflare login method and sent `grant` from the browser console, so his session cookie carried it.
 - Teardown: the Worker (and with it its Durable Object namespaces), the Access application and the service token were deleted the same day, and each was checked gone.
 
 The design keeps the network off the paths where latency would matter:
