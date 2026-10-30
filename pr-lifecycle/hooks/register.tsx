@@ -62,6 +62,7 @@ import {
   isMergeBlocked,
   isOwnedElsewhere,
   isStillCurrent,
+  isKeptBy,
   isStoodDownBy,
   isTurnOf,
   markPr,
@@ -347,8 +348,11 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     // The shared store would not take the start (Task 8): a stale commit, another session's lease, a moved record or a refusal.
     // This session stands down with a log line, and starts nothing.
     if (await isStoodDownBy($, { root, branch }, error)) return undefined
+    // A plain stale commit (spec §14): another writer committed first. Nothing was saved, and a second /pr-gate starts from its record.
+    if (isKeptBy(error)) return null
     throw error
   })
+  if (made === null) return 'Not started: another writer changed the shared lifecycle record meanwhile, and nothing was saved; run /pr-gate again.'
   if (made === undefined) return `Not started: ${heldNoteOf() ?? 'another session runs this lifecycle'}.`
   const { prior, rec, adopted, rebase } = made
   // One rescope only: a PR whose base moved again meanwhile is not chased; the next /pr-gate scopes against where it settled.
@@ -1365,7 +1369,8 @@ export const register: Register = (on, options) => {
       } catch (error) {
         const run = await getRun($)
         // The shared store would not take a change (Task 8): this session stands down with a log line, and its run is not failed.
-        if (run !== null && (await isStoodDownBy($, run, error))) return done
+        // A plain stale commit keeps the run: the next tick works from the relay's record (spec §14).
+        if (run !== null && (isKeptBy(error) || (await isStoodDownBy($, run, error)))) return done
         if (run !== null && run.status === 'running') {
           await finish($, run.id, 'error', `The gate itself failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300))
         }

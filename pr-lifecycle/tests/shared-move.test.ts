@@ -214,12 +214,14 @@ test('a stale checkout still driving the branch key follows the 410', async (_t,
 
 test('a crash after each move step is finished by the next load, and only the PR driver dispatches', { timeoutMs: 15_000 }, async (_t, on) => {
   const { w, fake, $, onSend } = setup(on)
-  const steps: [string, (body: Record<string, unknown>) => boolean][] = [
-    ['moveTo', body => body.op === 'moveTo'],
-    ['commit from', body => body.op === 'commit' && body.from !== undefined],
-    ['moveDone', body => body.op === 'moveDone'],
+  // Each step, and whether session 2's boundary passes after a crash right after it: the dead process's claim on the PR's object, taken
+  // after `moveTo`, holds it off until it lapses.
+  const steps: [string, (body: Record<string, unknown>) => boolean, boolean][] = [
+    ['moveTo', body => body.op === 'moveTo', true],
+    ['commit from', body => body.op === 'commit' && body.from !== undefined, false],
+    ['moveDone', body => body.op === 'moveDone', false],
   ]
-  for (const [i, [, isStep]] of steps.entries()) {
+  for (const [i, [, isStep, isFree]] of steps.entries()) {
     const branch = `feat/${'abc'[i]}`
     const pr = PR + i
     const key = recordKey('/repo', branch)
@@ -250,8 +252,6 @@ test('a crash after each move step is finished by the next load, and only the PR
     expect((other.store.get(key) as LifecycleRecord).relayKey).toBe(`#${pr}`)
     // Only the holder of the PR object's lease passes a boundary and dispatches (Task 8): while the dead process's claim there is
     // live, session 2 stands down; with none, its boundary claims the lease and it may go on.
-    const lease = fake.objects.get(prId)?.lease
-    const isFree = lease === null || lease === undefined || lease.until <= (w.clock as unknown as MockClock).now() || lease.holder === 'session-2'
     // Session 2 has no run of its own here: a stand-down drops none, and its status line goes nowhere.
     const state = { get: async () => ({ value: null }), set: async () => ({ isSet: true }) }
     const session2 = { ...(other.$ as object), state, ui: { status: () => undefined } }

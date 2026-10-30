@@ -3,7 +3,8 @@ import type { MockClock, TestBody } from 'claude-code/testing'
 import type { HttpInit, HttpResponse } from 'claude-code'
 
 import { newRecord } from '../hooks/lifecycle'
-import { beatLease, claimLease, forgetLeases, forgetOptIns, recordKey, saveRecord, StaleRecord, updateRecord } from '../hooks/store'
+import { isKeptBy, isOwnedElsewhere, isStoodDownBy, setSession } from '../hooks/round'
+import { beatLease, claimLease, forgetLeases, forgetOptIns, readLease, recordKey, saveRecord, StaleRecord, updateRecord } from '../hooks/store'
 import type { LifecycleRecord } from '../types'
 import { PRINCIPALS } from './contract'
 import { fakeRelay, HEADERS_OF } from './relay-fake'
@@ -63,6 +64,7 @@ function relayed(on: Parameters<typeof world>[0], isShared = true): Relayed {
   const seen: Seen[] = []
   const after: Relayed['after'] = {}
   const real: Fetch = fake.fetch
+  reals.set(fake, real)
   fake.fetch = async (url, init) => {
     const answer = await real(url, init)
     const body = JSON.parse(init?.body ?? '{}') as { op?: string; secret?: string; text?: string }
@@ -83,6 +85,9 @@ function relayed(on: Parameters<typeof world>[0], isShared = true): Relayed {
     (await real(`${URL_}${PATH}`, { method: 'POST', headers, body: JSON.stringify({ op: 'take', holder: 'session-2', secret: SECRET_2 }) })).status
   return { w, fake, seen, env, after, takeAs2 }
 }
+
+const reals = new WeakMap<FakeRelay, Fetch>()
+const realOf = (fake: FakeRelay): Fetch => reals.get(fake) as Fetch
 
 /** The lease secret a session of this checkout sends. */
 const secretOf = (w: World, sessionId = 'session-1'): string | undefined => w.store.get(`relay-secret:${sessionId}`) as string | undefined
@@ -110,7 +115,7 @@ test('the relay holder beats every 60 s, and its ownership checks make no networ
   expect(fake.objects.get(OBJECT)?.lease?.holder).toBe('session-1')
 })
 
-test('a take right after the old driver\'s beat: the old driver\'s next boundary gets 423, it stands down, and nothing is dispatched', { timeoutMs: 15_000 }, async ($, on) => {
+test('a take right after the old driver\'s beat: the old driver\'s next commit gets 423, it stands down, and nothing is dispatched', { timeoutMs: 15_000 }, async ($, on) => {
   const { w, fake, seen, after, takeAs2 } = relayed(on)
   await $.tool.call(createPr)
   const spawned = w.spawned.length
@@ -251,8 +256,8 @@ test('a takeover after a lapse fences out the old holder\'s commit', async (_$, 
   expect(error).toBeInstanceOf(StaleRecord)
   expect((error as StaleRecord).lease).toMatchObject({ holder: 'session-2', principal: ADAM, token: 2 })
   expect(fake.objects.get(OBJECT)?.rev).toBe(rev)
-  // Its next beat is lost too; session 2's own change is taken.
-  expect('lost' in (await beatLease(one, '/repo', 'feat/x'))).toBe(true)
+  // The 423 emptied its kept lease: its next boundary claims, and meets session 2's lease. Session 2's own change is taken.
+  expect(await beatLease(one, '/repo', 'feat/x')).toMatchObject({ held: { holder: 'session-2' } })
   await updateRecord(two, '/repo', 'feat/x', grant('driver'))
   expect((fake.objects.get(OBJECT)?.record as LifecycleRecord).grants.map(g => g.reason)).toEqual(['driver'])
 })
@@ -321,4 +326,70 @@ test('the local backend is unchanged', { timeoutMs: 15_000 }, async ($, on) => {
   await done($, turn(review('r1-review', 'FAIL', [P1])))
   expect(w.prompts.at(-1)).toContain('R1-1')
   expect(fake.calls).toEqual([])
+})
+
+
+// ------------------------------------------------------------------ Task 8 review, fix round 1
+
+test('a commit refused with 423 empties the kept lease: the next ownership check reads the relay, so the merge watcher takes nothing', async (_$, on) => {
+  const { w, fake } = relayed(on)
+  const one = engineOf(w, fake, w.store, 'session-1')
+  await saveRecord(one, seed())
+  expect('mine' in (await claimLease(one, '/repo', 'feat/x', false))).toBe(true)
+  // Session 2, Adam's at the keyboard, takes the live lease; session 1's next commit meets it.
+  const two = engineOf(w, fake, new Map<string, unknown>([[KEY, structuredClone(w.store.get(KEY))]]), 'session-2')
+  expect('mine' in (await claimLease(two, '/repo', 'feat/x', true))).toBe(true)
+  const error = await updateRecord(one, '/repo', 'feat/x', grant('stale')).then(() => undefined, (e: unknown) => e)
+  expect((error as StaleRecord).isHeld).toBe(true)
+  // Session 1 answers no ownership check from its cache: it reads the relay and sees session 2's lease (spec §4).
+  const calls = fake.calls.length
+  expect(await readLease(one, '/repo', 'feat/x')).toMatchObject({ held: { holder: 'session-2' } })
+  expect(fake.calls.slice(calls).map(call => (call.body as { op?: string }).op)).toEqual(['read'])
+  // The merge watcher skips a record owned elsewhere (watchBeat's first check), so it never claims or takes this one.
+  setSession(true)
+  expect(await isOwnedElsewhere(one, '/repo', 'feat/x')).toBe(true)
+  expect(fake.calls.slice(calls).filter(call => ['take', 'claim'].includes(String((call.body as { op?: string }).op)))).toEqual([])
+  expect(fake.objects.get(OBJECT)?.lease?.holder).toBe('session-2')
+})
+
+test('after a pre-PR pass ends, the relay holds no lease, and a headless start in the same checkout is not refused', { timeoutMs: 15_000 }, async ($, on) => {
+  const { w, fake, seen } = relayed(on)
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'PASS')))
+  await w.clock.advance(1_000)
+  // The run's end released its lease, and the ready prompt after it claimed none.
+  const lease = fake.objects.get(OBJECT)?.lease
+  expect(lease === null || lease === undefined).toBe(true)
+  const released = seen.findLastIndex(one => one.op === 'release')
+  expect(released).toBeGreaterThan(-1)
+  expect(seen.slice(released + 1).filter(one => one.op === 'claim' || one.op === 'take')).toEqual([])
+  // A hook's `claude -p` child, within the 120 s a lingering lease would have held: it is not told another session runs it.
+  w.clearState()
+  w.sessionId = 'child'
+  await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+  expect((await say($, 'start')).text).not.toContain('another session')
+})
+
+test('a refused credential at a claim says the relay refused this checkout, not that another session runs it', { timeoutMs: 15_000 }, async ($, on) => {
+  const { w, env } = relayed(on)
+  await $.tool.call(createPr)
+  // A person's second session whose token the relay does not know.
+  env.PR_GATE_RELAY_TOKEN = 'nobody-token'
+  w.clearState()
+  w.sessionId = 'second'
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true } as never)
+  const reply = (await say($, 'start')).text
+  expect(reply).toContain('Not started: the shared lifecycle store refused this checkout')
+  expect(reply).not.toContain('another session runs this lifecycle')
+})
+
+test('a plain stale commit (409) at a non-pure site keeps the run; only a 423, a moved record or a refusal stands down', async (_$, on) => {
+  const { w, fake } = relayed(on)
+  const one = engineOf(w, fake, w.store, 'session-1')
+  const plain = new StaleRecord(3, null, 'another writer committed first')
+  expect(isKeptBy(plain)).toBe(true)
+  // Not stood down: no stand-down line, and nothing reaches the relay; the next tick works from the relay's record (spec §14).
+  expect(await isStoodDownBy(one, { root: '/repo', branch: 'feat/x' }, plain)).toBe(false)
+  expect(fake.calls).toEqual([])
+  expect(isKeptBy(new StaleRecord(3, undefined, 'another checkout holds the lease'))).toBe(false)
 })

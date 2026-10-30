@@ -202,16 +202,22 @@ export async function upsertRecord(
  * A commit the relay refused because another writer, or a lease, got there first: `rev` and `record` are what the relay holds now. A
  * 423's `lease` says who holds the object until when (Task 8), so the session that stands down can say so; its `record` is then unknown.
  */
+/** Why a commit or a move's claim met a 423: another checkout holds the lease. */
+export const HELD = 'another checkout holds the lease'
+
 export class StaleRecord extends Error {
   rev: number
   record: unknown
   lease: LeaseHeld | undefined
+  /** A 423 (Task 8): another session holds the lease, and this one stands down. Any other stale commit keeps the run (spec §14). */
+  isHeld: boolean
   constructor(rev: number, record: unknown, why: string, lease?: LeaseHeld) {
     super(`the shared lifecycle record moved on (rev ${rev}): ${why}; this change was not written`)
     this.name = 'StaleRecord'
     this.rev = rev
     this.record = record
     this.lease = lease
+    this.isHeld = why === HELD
   }
 }
 
@@ -842,7 +848,11 @@ async function relayTx<T>(
       }
       return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs, shared: at } }
     }
-    if (answer.status === 423) return { retry: { error: new StaleRecord(rev, undefined, 'another checkout holds the lease', leaseOf(answer.json.lease)) } }
+    if (answer.status === 423) {
+      // Another session holds the lease (spec §4): this session's kept lease is gone, so its next ownership check reads the relay.
+      await dropLease($, root, branch)
+      return { retry: { error: new StaleRecord(rev, undefined, HELD, leaseOf(answer.json.lease)) } }
+    }
     // A fresh start the relay holds off: the old lifecycle's move isn't finished, and its frozen record stays in the tombstone.
     if (answer.status === 409) return { retry: { error: new StaleRecord(rev, answer.json, 'the old lifecycle has not finished its move to its PR') } }
     throw new Error(`the shared lifecycle store answered a commit with HTTP ${answer.status}`)
@@ -911,7 +921,10 @@ async function relayTx<T>(
   const claimed = await relayCall($, at.relay, at.path, { op: 'claim', holder: await $.session.id(), secret })
   if ('refused' in claimed || 'down' in claimed) return (await settle(at, claimed)) ?? { value }
   if (claimed.status === 410) return moved(at, claimed.json)
-  if (claimed.status === 423) return { retry: { error: new StaleRecord(rev, undefined, 'another checkout holds the lease', leaseOf(claimed.json.lease)) } }
+  if (claimed.status === 423) {
+    await dropLease($, root, branch)
+    return { retry: { error: new StaleRecord(rev, undefined, HELD, leaseOf(claimed.json.lease)) } }
+  }
   if (claimed.status !== 200) throw new Error(`the shared lifecycle store answered a claim with HTTP ${claimed.status}`)
   const answer = await relayCall($, at.relay, at.path, bodyAt(rev, { secret }))
   if (!('refused' in answer) && !('down' in answer) && answer.status !== 200 && answer.status !== 410) {
@@ -1022,6 +1035,11 @@ const leases = new Map<string, Kept>()
 
 const keptKey = (holder: string, root: string, branch: string): string => `${holder}\0${recordKey(root, branch)}`
 
+/** Forgets this session's kept lease on the record (a 409, 423 or stand-down, spec §4): its next ownership check reads the relay. */
+export async function dropLease($: Engine, root: string, branch: string): Promise<void> {
+  leases.delete(keptKey(await $.session.id(), root, branch))
+}
+
 /** Forgets every kept lease: a reload, or a test, starts with none. */
 export const forgetLeases = (): void => leases.clear()
 
@@ -1082,13 +1100,19 @@ async function claimAt($: Engine, root: string, branch: string, at: Shared, isTa
  * The beat at an action boundary (spec §4): a `beat` of the lease this session keeps, or, with none kept for this object, a `claim`
  * (never a take). `mine` only on a 200; a 409, 423 or 410 empties this session's kept lease and answers `lost`.
  */
-export async function beatLease($: Engine, root: string, branch: string): Promise<LeaseAnswer> {
+export async function beatLease(
+  $: Engine,
+  root: string,
+  branch: string,
+  mayClaim: () => Promise<boolean> = async () => true,
+): Promise<LeaseAnswer | { unkept: true }> {
   const at = await leaseAt($, root, branch)
   if (at === undefined) return { local: true }
   if ('local' in at) return { down: at.local }
   const holder = await $.session.id()
   const kept = leases.get(keptKey(holder, root, branch))
-  if (kept === undefined || kept.key !== at.path) return claimAt($, root, branch, at, false, true)
+  // With none kept for this object, `mayClaim` says whether to claim one (Task 8 review): `unkept` when it may not.
+  if (kept === undefined || kept.key !== at.path) return (await mayClaim()) ? claimAt($, root, branch, at, false, true) : { unkept: true }
   const secret = await leaseSecret($)
   if (secret === undefined) return { down: 'the lease secret could not be saved' }
   const answer = await relayCall($, at.relay, at.path, { op: 'beat', secret })

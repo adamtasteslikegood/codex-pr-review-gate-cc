@@ -121,6 +121,7 @@ import {
 import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
 import {
   beatLease,
+  dropLease,
   forgetLeases,
   isHeldByOther,
   liveRecords,
@@ -456,10 +457,9 @@ export async function claimRecord($: Engine, root: string, branch: string): Prom
   const lease = await setOwner($, root, branch, { sessionId: id, beatAt: now }, { isTake: isInteractive })
   if ('held' in lease || 'lost' in lease || 'refused' in lease || 'free' in lease) {
     const held = 'held' in lease ? lease.held : 'lost' in lease ? lease.held : undefined
-    if (held !== undefined) {
-      heldNote = heldText(held)
-      $.ui.status(`pr-gate: ${heldNote}`)
-    }
+    // A refused credential says so, as a stand-down on a refused commit does: never a bare "another session runs this lifecycle".
+    heldNote = held !== undefined ? heldText(held) : 'refused' in lease ? new RelayRefused(lease.refused).message : undefined
+    if (heldNote !== undefined) $.ui.status(`pr-gate: ${heldNote}`)
     return false
   }
   beatEvery = 'mine' in lease ? RELAY_BEAT_MS : BEAT_MS
@@ -508,8 +508,14 @@ export async function isStillMine($: Engine, run: Pick<Run, 'root' | 'branch'>):
  * session stands down. A relay down, or a record not on it, answers `isStillMine`. A step already in flight may finish.
  */
 export async function boundary($: Engine, run: Pick<Run, 'root' | 'branch'>): Promise<boolean> {
-  const lease = await beatLease($, run.root, run.branch)
-  if ('local' in lease || 'down' in lease) return isStillMine($, run)
+  // With no running run of this record, a boundary beats only a lease this session keeps (Task 8 review): never claims one, which
+  // nothing would beat or release. The end of a run's prompt, after its release, then leaves the relay with no lease.
+  const isRunning = async (): Promise<boolean> => {
+    const live = await getRun($)
+    return live !== null && live.status === 'running' && sameRecord(live, run)
+  }
+  const lease = await beatLease($, run.root, run.branch, isRunning)
+  if ('local' in lease || 'down' in lease || 'unkept' in lease) return isStillMine($, run)
   if ('mine' in lease) {
     // A boundary's beat is the ticker's too: its next falls RELAY_BEAT_MS after this one.
     beatEvery = RELAY_BEAT_MS
@@ -525,13 +531,19 @@ export async function boundary($: Engine, run: Pick<Run, 'root' | 'branch'>): Pr
  * moved under another lifecycle, or a refusal. This session stands down with a log line; never a crash. False for any other error.
  */
 export async function isStoodDownBy($: Engine, key: Pick<Run, 'root' | 'branch'>, error: unknown): Promise<boolean> {
-  if (!(error instanceof StaleRecord || error instanceof RelayMoved || error instanceof RelayRefused)) return false
+  if (!((error instanceof StaleRecord && error.isHeld) || error instanceof RelayMoved || error instanceof RelayRefused)) return false
   const held = error instanceof StaleRecord ? error.lease : undefined
   // A start refused here says why, as a refused claim does.
   heldNote = held === undefined ? error.message : heldText(held)
   await standDown($, key, held, error.message)
   return true
 }
+
+/**
+ * A plain stale commit at a non-pure site (a 409 with no lease held elsewhere): the run is kept, nothing of this change is written,
+ * and the next tick works from the relay's record (spec §14). Only a 423, a moved record or a refusal stands down.
+ */
+export const isKeptBy = (error: unknown): boolean => error instanceof StaleRecord && !error.isHeld
 
 /**
  * Another session runs this record's lifecycle: this one drops its copy of the run, unfinished, and leaves the record alone. Its
@@ -544,6 +556,8 @@ async function standDown($: Engine, run: Pick<Run, 'root' | 'branch'>, held?: Le
     isLive = false
     await update($, runAtom, () => null)
   }
+  // Its kept lease is gone too (spec §4): its next ownership check reads the relay, and never answers "mine" from the cache.
+  await dropLease($, run.root, run.branch)
   $.ui.status(held === undefined ? 'pr-gate: another session runs this lifecycle' : `pr-gate: ${heldText(held)}`)
   const text = `session ${(await sessionIdOf($)).slice(0, 8)} stood down: another session runs the record`
   const said = held !== undefined ? `${text} (${heldText(held)})` : why !== undefined ? `${text} (${why})` : text
@@ -810,7 +824,7 @@ export async function onNewHead($: Engine, run: Run, from: string, to: string, n
     })
   } catch (error) {
     // The shared store would not take it (Task 8): this session stands down, and its run's copy is gone with it.
-    if (await isStoodDownBy($, run, error)) return
+    if (isKeptBy(error) || (await isStoodDownBy($, run, error))) return
     throw error
   }
   if (saved === undefined) await move({ findings: [], waivers: [] })
@@ -1006,7 +1020,7 @@ async function takeLate($: Engine, run: Run, answer: string, reason: string): Pr
     })
   } catch (error) {
     // The shared store would not take it (Task 8): this session stands down, and keeps nothing of the late answer.
-    if (await isStoodDownBy($, run, error)) return
+    if (isKeptBy(error) || (await isStoodDownBy($, run, error))) return
     throw error
   }
   if (isResumed) await logEvent($, run.root, run.branch, 'stop', `${run.lifecycle}-PR round ${late.round}: the fixer stopped by the step timeout finished after a resume; nothing kept`)
@@ -1157,7 +1171,7 @@ export async function archiveLifecycle($: Engine, root: string, branch: string, 
     })
   } catch (error) {
     // The shared store would not take it (Task 8): this session stands down, and archived nothing.
-    if (await isStoodDownBy($, { root, branch }, error)) return false
+    if (isKeptBy(error) || (await isStoodDownBy($, { root, branch }, error))) return false
     throw error
   }
 }
@@ -1512,7 +1526,12 @@ async function watchBeat($: Engine): Promise<void> {
             isWaiting = true
             continue
           }
-          await holdingPrompts($, () => closeLifecycle($, rec.root, rec.branch, rec.pr, state, true))
+          try {
+            await holdingPrompts($, () => closeLifecycle($, rec.root, rec.branch, rec.pr, state, true))
+          } finally {
+            // The lease this beat claimed for the close is released (Task 8 review): no run beats it after.
+            await releaseLease($, rec.root, rec.branch)
+          }
         } catch {
           // One record's failure is not the others': it is read again at its next beat.
         }
@@ -3326,7 +3345,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
       })
     } catch (error) {
       // The shared store would not take it (Task 8): this session stands down, and records nothing of the round.
-      if (await isStoodDownBy($, run, error)) return
+      if (isKeptBy(error) || (await isStoodDownBy($, run, error))) return
       throw error
     }
     // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
@@ -3398,7 +3417,7 @@ async function endRound($: Engine, run: Run, isCompleted: boolean, outstanding?:
     })
   } catch (error) {
     // The shared store would not take it (Task 8): this session stands down, and records nothing of the round.
-    if (await isStoodDownBy($, run, error)) return
+    if (isKeptBy(error) || (await isStoodDownBy($, run, error))) return
     throw error
   }
   // A stop given after the write, before the controller reads the record, decides nothing more (gate R3-3).
@@ -3755,8 +3774,9 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: Merge
   try {
     return await fileOnce($, rec, merged)
   } catch (error) {
-    // A boundary this session lost (Task 8): it stood down, and decides nothing for the pass.
-    if (error instanceof StoodDown) return undefined
+    // A boundary this session lost (Task 8): it stood down, and decides nothing for the pass. A save the shared store would not take
+    // stands down the same way (a 423, a moved record), or, a plain stale one, ends the pass for the next to run again (spec §14).
+    if (error instanceof StoodDown || isKeptBy(error) || (await isStoodDownBy($, rec, error))) return undefined
     throw error
   } finally {
     filing.delete(key)
@@ -4003,6 +4023,8 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     await restamp()
     // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
     if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT, t.title.slice(0, SUMMARY_MAX))) === 'gone') return undefined
+    // An action boundary before acli files (Task 8 review): a security-only pass crosses one too.
+    if (!(await boundary($, rec))) throw new StoodDown()
     const got = await fileTicket($, rec.root, project, t, rec.pr, rec.slug)
     const said =
       got.error === undefined
@@ -4150,7 +4172,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
     return await checkOnce($, given)
   } catch (error) {
     // A boundary this session lost (Task 8): it stood down, and the caller writes, says and archives nothing, as for a move.
-    if (error instanceof StoodDown) return { moved: true }
+    if (error instanceof StoodDown || isKeptBy(error) || (await isStoodDownBy($, given, error))) return { moved: true }
     throw error
   }
 }
@@ -4413,6 +4435,7 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
     const summary = title.slice(0, SUMMARY_MAX)
     const marked: Finding = again.sent.includes(summary) ? f : { ...f, jiraSummaries: [...again.sent, summary] }
     if (marked !== f && (await keep(marked))) return { moved: true }
+    if (!(await boundary($, rec))) throw new StoodDown()
     const got = await fileTicket($, rec.root, project, again, rec.pr, rec.slug)
     if (got.error !== undefined) {
       if (await keep({ ...marked, jiraError: got.error })) return { moved: true }
