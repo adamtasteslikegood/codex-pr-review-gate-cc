@@ -191,6 +191,7 @@ test('a service token is sent as CF-Access-Client-Id and -Secret, a person token
       method: 'POST',
       headers: { 'cf-access-token': 'adam-token', 'content-type': 'application/json' },
       body: JSON.stringify({ op: 'claim', holder: 'h', secret: 't'.repeat(40) }),
+      redirect: 'manual',
     },
   })
   expect(fake.principalOf({ 'cf-access-client-id': 'Codex-Service.Access', 'cf-access-client-secret': 'codex-secret' })).toEqual({ id: 'codex-service.access', isService: true })
@@ -229,6 +230,30 @@ test('401 and 403 are refused, not down', async (_$, on) => {
   for (const [status, text] of [[401, '<html>Sign in</html>'], [403, '{"error":"no"}'], [403, '']] as const) {
     expect(await relayCall(engineOf(w, () => answer(status, text)), relayAs('ADAM'), path, { op: 'read' })).toEqual({ refused: `HTTP ${status}` })
   }
+})
+
+test('a redirect or an HTML page (Access\'s login) is refused, never down; a 5xx HTML page is still down', async (_$, on) => {
+  const w = world(on)
+  const path = keyPath('owner/repo', '#7')
+  const page = (status: number, headers: Record<string, string>, text: string) => () =>
+    Promise.resolve({ status, ok: status >= 200 && status < 300, headers, text })
+  const login = 'https://team.cloudflareaccess.com/cdn-cgi/access/login'
+  for (const [status, headers, text] of [
+    [302, { location: login }, ''],
+    [307, { location: login, 'content-type': 'text/html' }, '<html>Moved</html>'],
+    [200, { 'content-type': 'text/html; charset=UTF-8' }, '<html>Sign in with Cloudflare Access</html>'],
+  ] as const) {
+    const got = await relayCall(engineOf(w, page(status, headers, text)), relayAs('ADAM'), path, { op: 'read' })
+    expect('refused' in got && got.refused.startsWith(`HTTP ${status}: `)).toBe(true)
+  }
+  expect(await relayCall(engineOf(w, page(502, { 'content-type': 'text/html' }, '<html>Bad gateway</html>')), relayAs('ADAM'), path, { op: 'read' })).toEqual({ down: 'HTTP 502' })
+  // The request asks the host not to follow a redirect, so the credential never leaves the pinned host.
+  const inits: unknown[] = []
+  await relayCall(engineOf(w, (_url: string, init?: unknown) => {
+    inits.push(init)
+    return answer(200, '{}')
+  }), relayAs('ADAM'), path, { op: 'read' })
+  expect(inits.map(one => (one as { redirect?: string }).redirect)).toEqual(['manual'])
 })
 
 test('502 and a body that isn\'t JSON are down', async (_$, on) => {

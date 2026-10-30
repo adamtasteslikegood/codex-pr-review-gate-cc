@@ -68,6 +68,16 @@ const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 
 /** How many archives a PR keeps (open decision 3: retention). */
 export const ARCHIVE_CAP = 20
+/** A `commit` or `snapshot` body is at most 128 KiB (final review M6), answered 413 over it. */
+export const BODY_MAX = 128 * 1024
+const BOUNDED_OPS = new Set(['commit', 'snapshot'])
+/** The archives are also trimmed, oldest first, to 1 MiB of JSON, so the record, its archives and the rest stay one value under 2 MB. */
+export const ARCHIVE_BYTES = 1024 * 1024
+const trimmed = <T>(archives: T[]): T[] => {
+  let kept = archives.slice(-ARCHIVE_CAP)
+  while (kept.length > 1 && new TextEncoder().encode(JSON.stringify(kept)).length > ARCHIVE_BYTES) kept = kept.slice(1)
+  return kept
+}
 const WRITE_CAP = 100
 /** R74: a session quiet for 2 minutes may be taken over. */
 const LEASE_MS = 120_000
@@ -170,11 +180,14 @@ export class LifecycleObject {
     const preset: Preset | undefined = given === 'read' || given === 'operate' ? given : undefined
     const isAllowed = need === 'admin' ? isAdmin(this.env, who) : need === 'read' ? preset !== undefined : preset === 'operate'
     if (!isAllowed) return reply(403, { error: `${who.id} may not ${op} on ${repo}` })
+    // A body over the bound is refused before anything is read (final review M6): the state is one stored value, limited to 2 MB.
+    if (BOUNDED_OPS.has(op) && new TextEncoder().encode(JSON.stringify(body)).length > BODY_MAX) return reply(413, { error: `${op} body over ${BODY_MAX} bytes` })
+    // The digest comes before the state read (final review M5): no await other than storage may fall between the read and the write.
+    const proof = await verifierOf(body.secret)
     const now = Date.now()
     const s = (await this.state.storage.get<State>('state')) ?? empty()
     const leaseMs = Number(this.env.LEASE_MS ?? LEASE_MS)
     const isLive = (lease: Lease | null): lease is Lease => lease !== null && lease.until > now
-    const proof = await verifierOf(body.secret)
     const isMine = (one: { principal?: string; actor?: string; verifier: string }): boolean =>
       (one.principal ?? one.actor) === who.id && proof !== undefined && one.verifier === proof
     // A plain object inherits `__proto__` and `constructor`: a filing is only ever an own property.
@@ -234,7 +247,7 @@ export class LifecycleObject {
         // An archive keeps the record the caller archived (the local store's `tx.archive(rec, at)`), not whatever is stored now.
         const archive = body.archive as { at?: unknown; record?: unknown } | null | undefined
         if (archive !== undefined && (archive === null || typeof archive.at !== 'number' || archive.record === undefined)) return reply(400, { error: 'archive needs { at, record }' })
-        const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
+        const archives = archive !== undefined ? trimmed([...s.archives, { at: archive.at as number, record: archive.record }]) : s.archives
         const next: State = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
         delete next.movedTo
         // A PR key's retention runs from the commit that archives its record; a commit that revives it stops it.
@@ -285,7 +298,7 @@ export class LifecycleObject {
         if (typeof body.at !== 'number' || body.record === undefined || typeof body.reason !== 'string' || !SNAPSHOT_REASONS.has(body.reason)) {
           return reply(400, { error: 'snapshot needs { at, record, reason: fallback | migration | move }' })
         }
-        const archives = [...s.archives, { at: body.at, record: body.record, actor: who.id, reason: body.reason }].slice(-ARCHIVE_CAP)
+        const archives = trimmed([...s.archives, { at: body.at, record: body.record, actor: who.id, reason: body.reason }])
         await save({ ...s, archives }, `snapshot (${body.reason})`)
         return reply(200, {})
       }
@@ -342,7 +355,8 @@ export class LifecycleObject {
         const key = String(body.key ?? '')
         const known = filingOf(key)
         if (known === undefined) return reply(409, { error: 'no claim to finish' })
-        if (!isMine(known)) return reply(403, { error: 'only the claimant may finish a filing', filing: shown(known) })
+        // Not the claimant is a conflict, not an authorization (final review M3): a 403 would stand a granted session down.
+        if (!isMine(known)) return reply(409, { error: 'only the claimant may finish a filing', filing: shown(known) })
         // Done is terminal: the same answer again is a retry, a different one is refused. A rewrite is fileDelete, by an admin.
         if (known.state === 'done') {
           const isSame = JSON.stringify(known.result) === JSON.stringify(body.result)

@@ -1,9 +1,10 @@
 // The relay client (#29 Part B): where a repo's shared lifecycle store is, the credential that reaches it, one call to it, and the
 // secrets a checkout proves itself with. A repo opts in on its base branch (`sharedStore` in `.github/pr-gate.json`); the credential is
 // the person's or service's own, from the environment, never from plugin options, and goes only to the relay the machine pinned
-// (`PR_GATE_RELAY_URL`, final review I1). Only what keeps the relay from answering (a network
-// error, a 5xx, a timeout, a body that isn't JSON) is `down`, the one case the caller may fall back to the local store (spec §8). A 401 or
-// 403 is `refused`: a revoked or read-only principal is cut off on its next request (spec §10), never let fall back and keep acting.
+// (`PR_GATE_RELAY_URL`, final review I1). Only what keeps the relay from answering (a network error, a 5xx, a timeout, a body that isn't
+// JSON) is `down`, the one case the caller may fall back to the local store (spec §8). A 401 or 403 is `refused`, as is a redirect or an
+// HTML page (Access's login, final review M4): a revoked or read-only principal is cut off on its next request (spec §10), never let fall
+// back and keep acting.
 //
 // This file imports nothing of round.ts: store.ts will call it, and round.ts imports store.ts. That is why `baseFileOf` lives here.
 
@@ -17,8 +18,8 @@ type Engine = EngineInterface
 export type Relay = { url: string; aud: string; headers: Record<string, string> }
 
 /**
- * The relay's answer to one call: an answer (any status but 401, 403 and 5xx, as JSON), `refused` (401 or 403: the credential or the grant
- * says no), or `down` (no answer: a network error, a 5xx, a timeout, a body that isn't JSON).
+ * The relay's answer to one call: an answer (any status but 401, 403, 3xx and 5xx, as JSON), `refused` (401 or 403: the credential or the
+ * grant says no; a 3xx or an HTML page: Access's login), or `down` (no answer: a network error, a 5xx, a timeout, a body that isn't JSON).
  */
 // The caller stands down on `refused` and never falls back: only `down` lets a lifecycle go on in the local store.
 export type RelayAnswer = { status: number; json: Record<string, unknown> } | { refused: string } | { down: string }
@@ -104,10 +105,17 @@ export function keyPath(slug: string, key: string): string {
   return key.startsWith('@') ? `/v1/${slug}/branch/${encodeURIComponent(key.slice(1))}` : `/v1/${slug}/${key.replace(/^#/, '')}`
 }
 
-/** What the relay answered, read: 401 and 403 are refused; the relay's own failures are down, as is anything but a JSON object. */
-const answerOf = (res: { status: number; text: string }): RelayAnswer => {
+/**
+ * What the relay answered, read: 401 and 403 are refused; the relay's own failures are down, as is anything but a JSON object. A
+ * redirect (3xx) or an HTML page is refused, never down (final review M4): Cloudflare Access answers a missing or expired credential
+ * with a login redirect or page, and a session must stand down on it rather than go on locally. A 5xx stays down, HTML or not.
+ */
+const answerOf = (res: { status: number; headers?: Record<string, string>; text: string }): RelayAnswer => {
   if (res.status === 401 || res.status === 403) return { refused: `HTTP ${res.status}` }
   if (res.status >= 500) return { down: `HTTP ${res.status}` }
+  if (res.status >= 300 && res.status < 400) return { refused: `HTTP ${res.status}: a redirect, as Access answers a credential it won't take` }
+  const isHtml = (res.headers?.['content-type'] ?? '').toLowerCase().includes('text/html')
+  if (isHtml) return { refused: `HTTP ${res.status}: an HTML page, as Access answers a credential it won't take` }
   try {
     const json = JSON.parse(res.text) as unknown
     return typeof json === 'object' && json !== null && !Array.isArray(json) ? { status: res.status, json: json as Record<string, unknown> } : { down: 'not JSON' }
@@ -123,8 +131,11 @@ export async function relayCall($: Engine, relay: Relay, path: string, body: Rec
     settle = resolve
   })
   const timer = $.clock.after(RELAY_TIMEOUT_MS, () => settle({ down: 'timeout' }))
+  // A redirect is never followed (final review M4): the credential stays on the pinned host, and the 3xx itself is refused. `HttpInit`
+  // doesn't name `redirect`, so it rides a variable; a host that follows redirects anyway lands on a login page, which is refused too.
+  const init = { method: 'POST', headers: { ...relay.headers, 'content-type': 'application/json' }, body: JSON.stringify(body), redirect: 'manual' }
   const sent = $.http
-    .fetch(`${relay.url}${path}`, { method: 'POST', headers: { ...relay.headers, 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    .fetch(`${relay.url}${path}`, init)
     .then(answerOf, (error: unknown) => ({ down: `network: ${error instanceof Error ? error.message : String(error)}` }))
   try {
     return await Promise.race([sent, timedOut])

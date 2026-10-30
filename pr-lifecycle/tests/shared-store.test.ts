@@ -490,6 +490,24 @@ test('the scrub leaves fixed-value fields alone and cuts free text only', async 
   expect(sent.branch).toBe('feat/x')
 })
 
+test('a FIXED_KEYS field that names a security finding is kept, and a free-text field that names it is scrubbed (R107)', async () => {
+  const secret = finding('R1-1', 'SECRET-TITLE long enough to be a needle', { isSecurity: true })
+  const rec = seed({
+    lifecycleId: 'L1',
+    findings: [secret],
+    log: [
+      // `kind` and `by` are FIXED_KEYS: a needle that matched them would corrupt the record, so they pass as they are.
+      { at: 1, kind: `stop on ${secret.id}`, by: secret.title, text: `fix ${secret.id} first` } as never,
+      { at: 2, kind: 'session', text: `saw ${secret.title}` },
+    ],
+  })
+  const sent = redact(rec)
+  expect(sent.log).toEqual([
+    { at: 1, kind: `stop on ${secret.id}`, by: secret.title, text: HELD_PLACEHOLDER },
+    { at: 2, kind: 'session', text: HELD_PLACEHOLDER },
+  ])
+})
+
 test('restore puts text back into findings only, and the mirror of an own commit keeps every field whole', async (_t, on) => {
   const { $, w } = setup(on)
   const full = seed({ lifecycleId: 'L1', findings: [SECRET], message: `held: ${SECRET.title}`, log: [{ at: 1, kind: 'stop', text: `on ${SECRET.id}` }] })

@@ -5,6 +5,8 @@ import type { HttpInit, HttpResponse } from 'claude-code'
 import { newRecord } from '../hooks/lifecycle'
 import { boundary } from '../hooks/round'
 import {
+  beatLease,
+  claimLease,
   forgetLeases,
   forgetOptIns,
   HELD_PLACEHOLDER,
@@ -518,6 +520,30 @@ test('a fresh start over a tombstone whose PR object holds another lifecycle kee
   expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
 })
 
+test('a move snapshot that doesn\'t land leaves the record in the tombstone: moveDone waits until the relay holds the archive (final review M2)', async (_t, on) => {
+  const s = setup(on)
+  const { w, fake, $, onSend } = s
+  await saveRecord($, seed())
+  const old = local(w).lifecycleId
+  await movesUntil(s, body => body.op === 'moveTo')
+  const other = { ...seed({ phase: 'post', pr: PR }), slug: SLUG }
+  expect((await codex(fake, PR_PATH, { op: 'commit', rev: 0, record: other })).status).toBe(200)
+  onSend.fn = body => {
+    fake.down = body.op === 'snapshot'
+  }
+  const fresh = seed()
+  expect(await thrown(saveRecord($, fresh))).toBeInstanceOf(StaleRecord)
+  onSend.fn = undefined
+  fake.down = false
+  expect(opsOf(fake, 'moveDone')).toEqual([])
+  expect((fake.objects.get(OBJECT)?.record as { record?: LifecycleRecord }).record?.lifecycleId).toBe(old)
+  // Once the relay answers, the archive lands first, then moveDone, and the new lifecycle starts.
+  await saveRecord($, fresh)
+  const kept = (fake.objects.get(OBJECT)?.archives ?? []).filter(one => one.reason === 'move')
+  expect([...new Set(kept.map(one => (one.record as LifecycleRecord).lifecycleId))]).toEqual([old])
+  expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+})
+
 test('a fresh start from the PR key over an unfinished move meets the relay\'s 409 and loses nothing', async (_t, on) => {
   const s = setup(on)
   const { w, fake, $, onSend } = s
@@ -564,6 +590,28 @@ test('the claim the move takes is kept as the mover\'s lease; a lost release of 
   await updateRecord($, '/repo', 'feat/x', grant('next'), { isPure: true })
   expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['kept', 'next'])
   expect(w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
+})
+
+test('a plain 409 at the move\'s commit never releases the lease this session already drives with: its next beat renews it (final review M1)', async (_t, on) => {
+  const { w, fake, $, onSend } = setup(on)
+  await saveRecord($, seed())
+  expect(await claimLease($, '/repo', 'feat/x', false)).toMatchObject({ mine: { holder: w.sessionId } })
+  // Another writer commits on the branch's object between the move's claim (a renewal) and its commit: the commit is a plain 409.
+  let isArmed = true
+  onSend.fn = body => {
+    if (isArmed && body.op === 'commit' && body.secret !== undefined) {
+      isArmed = false
+      const object = fake.objects.get(OBJECT)
+      if (object !== undefined) object.rev += 1
+    }
+  }
+  await thrown(updateRecord($, '/repo', 'feat/x', opened(PR), { isPure: true }))
+  onSend.fn = undefined
+  expect(isArmed).toBe(false)
+  expect(opsOf(fake, 'release')).toEqual([])
+  expect(recordAt(fake, PR_OBJECT)?.pr).toBe(PR)
+  // The driver still holds its lease: its next beat renews it, on whichever object the record is on now.
+  expect(await beatLease($, '/repo', 'feat/x')).toMatchObject({ mine: { holder: w.sessionId } })
 })
 
 test('a moveTo the relay refuses says so in the run log', async (_t, on) => {

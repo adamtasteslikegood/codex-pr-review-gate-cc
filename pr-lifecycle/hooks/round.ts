@@ -3984,15 +3984,15 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       item.reuse !== undefined || was === undefined
         ? { kind: 'local', isOwed: false }
         : await ledgerOf($, rec, was, { repo, gh, title: item.title, label, stepTimeoutMs: c.stepTimeoutMs, isAdvancing: true })
+    // A fresh claim left with no POST stays claimed: one line names its key, so an admin knows a fileDelete is safe (spec §7). A
+    // lifecycle that moved, or was reset or replaced, gets no line in another lifecycle's log (gate G7-8): the person is told in a toast.
+    const left = async (why: string): Promise<void> => {
+      if (ledger.kind !== 'post') return
+      const text = `${item.id}: the filing claim ${ledger.key} was left with no issue filed (${why}): an admin's fileDelete on the relay is safe`
+      if (why === MOVED_AWAY || why === REPLACED) $.ui.toast(`pr-gate: ${text}.`)
+      else await logEvent($, rec.root, rec.branch, 'check', text)
+    }
     if (ledger.kind !== 'local') {
-      // A fresh claim left with no POST stays claimed: one line names its key, so an admin knows a fileDelete is safe (spec §7). A
-      // lifecycle that moved gets no line in another lifecycle's log (gate G7-8): the person is told in a toast instead.
-      const left = async (why: string): Promise<void> => {
-        if (ledger.kind !== 'post') return
-        const text = `${item.id}: the filing claim ${ledger.key} was left with no issue filed (${why}): an admin's fileDelete on the relay is safe`
-        if (why === MOVED_AWAY) $.ui.toast(`pr-gate: ${text}.`)
-        else await logEvent($, rec.root, rec.branch, 'check', text)
-      }
       const latest = await loadRecord($, rec.root, rec.branch)
       if (latest === undefined || isMoved(latest)) {
         await left(MOVED_AWAY)
@@ -4044,8 +4044,15 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved leaves an issueError, so the next pass reads the
       // list first and never files the issue twice. The answer's save below replaces it.
       const sent = await markSent($, rec, item.id, 'issueError', ISSUE_SENT)
-      if (sent === 'gone') return undefined
-      if (sent === 'secret') continue
+      // The claim is left on these exits too (final review, Task 9): its line is what tells an admin a fileDelete is safe.
+      if (sent === 'gone') {
+        await left(REPLACED)
+        return undefined
+      }
+      if (sent === 'secret') {
+        await left('the finding is security now')
+        continue
+      }
       const post = await ghWrite(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
       // The ledger is told before the answer's save (spec §7): a crash between them leaves the claim this checkout's, and its restart
@@ -4223,6 +4230,7 @@ const ledgerResult = (repo: string, n: number): { number: number; url: string } 
 
 /** What a finding's issueError says while another checkout's claim on its filing holds and no issue carries its mark (spec §7). */
 const MOVED_AWAY = 'the lifecycle moved'
+const REPLACED = 'the lifecycle was reset or replaced'
 const CLAIM_PENDING = "another checkout claimed this finding's filing on the relay and has not finished it: nothing is filed here; the next pass reads the claim again"
 const CLAIM_STUCK = "another checkout's claim on this finding's filing is stuck (older than the step timeout, and no issue carries its mark): it waits for an admin's fileDelete on the relay"
 

@@ -4,7 +4,7 @@ import type { HttpInit, HttpResponse } from 'claude-code'
 
 import { filingMark, newRecord } from '../hooks/lifecycle'
 import { checkIssuesAfterMerge, configOf, fileIssues, setup as useConfig } from '../hooks/round'
-import { claimLease, forgetLeases, forgetOptIns, logEvent, recordKey, saveRecord, updateRecord } from '../hooks/store'
+import { claimLease, forgetLeases, forgetOptIns, HELD_PLACEHOLDER, logEvent, recordKey, saveRecord, updateRecord } from '../hooks/store'
 import type { Finding, LifecycleRecord } from '../types'
 import { PRINCIPALS } from './contract'
 import { fakeRelay, HEADERS_OF } from './relay-fake'
@@ -54,7 +54,7 @@ function engineOf(w: World, fetch: Fetch, store: Map<string, unknown>, sessionId
     env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })[name] },
     session: { id: async () => sessionId },
     state: { get: async () => ({ value: null }), set: async () => ({ isSet: true }) },
-    ui: { status: () => undefined, toast: () => undefined },
+    ui: { status: () => undefined, toast: (text: string) => void w.toasts.push(text) },
     store: {
       get: async (key: string) => store.get(key),
       set: async (key: string, value: unknown) => void store.set(key, value),
@@ -317,16 +317,24 @@ const relayLines = (fake: FakeRelay): string[] => (fake.objects.get(PR_OBJECT)?.
 test('an owed call the relay refuses is dropped with a run-log line, and the calls owed after it are still paid', { timeoutMs: 15_000 }, async (_$, on) => {
   const s = setup(on)
   const rec = await seeded(s.$)
-  // An admin deleted this checkout's claim and another checkout claimed the key again: the fileDone still owed here answers 403.
+  // An admin deleted this checkout's claim and another checkout claimed the key again: the fileDone still owed here is not the
+  // claimant's, a conflict (409, final review M3), paid with no refusal line. One owed where the grant went answers 403, and is dropped.
   expect(await asOther(s.fake, { op: 'fileClaim', key: keyOf(rec), secret: OTHER_SECRET })).toBe(200)
   s.w.store.set(`${KEY}:relay-owed`, [
     { path: PR_PATH, body: { op: 'fileDone', key: keyOf(rec), result: result(21), secret: 'this-checkout-filing-secret-of-40-chars!!' } },
+    { path: PR_PATH, body: { op: 'fileDone', key: keyOf(rec), result: result(22), secret: 'this-checkout-filing-secret-of-40-chars!!' } },
     { path: PR_PATH, body: { op: 'log', at: 1, kind: 'session', text: 'an owed line', holder: 'session-1' } },
   ])
+  // The second fileDone meets a grant cut to read (403); it is back to operate by the call after it.
+  s.onSend.fn = body => {
+    const isSecond = body.op === 'fileDone' && (body.result as { number?: number } | undefined)?.number === 22
+    s.fake.grant(ADAM, SLUG, isSecond ? 'read' : 'operate')
+  }
   await logEvent(s.$, '/repo', 'feat/x', 'check', 'a line that lands')
+  s.onSend.fn = undefined
   expect(s.w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
   const lines = relayLines(s.fake)
-  expect(lines.some(one => one.includes('refused') && one.includes(`fileDone ${keyOf(rec)}`))).toBe(true)
+  expect(lines.filter(one => one.includes('refused') && one.includes(`fileDone ${keyOf(rec)}`))).toHaveLength(1)
   expect(lines).toContain('an owed line')
   expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
 })
@@ -382,6 +390,46 @@ test('a fresh claim a pass leaves with no POST is named in the run log, so an ad
   expect(s.w.gh.filed).toEqual([])
   expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
   expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)) && one.includes("an admin's fileDelete on the relay is safe"))).toBe(true)
+})
+
+/** At the mark saved before the POST (`markSent`), another writer changes the relay's record first: `change` makes its new state. */
+function changedAtMark(s: Setup, change: (rec: LifecycleRecord) => LifecycleRecord): void {
+  let isArmed = true
+  s.onSend.fn = body => {
+    const sent = (body.record as LifecycleRecord | undefined)?.findings?.some(one => one.isIssueSent === true)
+    if (!isArmed || body.op !== 'commit' || sent !== true) return
+    isArmed = false
+    const object = s.fake.objects.get(PR_OBJECT)
+    if (object === undefined) return
+    object.record = change(object.record as LifecycleRecord)
+    object.rev += 1
+  }
+}
+
+test('a claim left because the lifecycle was reset at the mark before the POST is named in a toast (final review, Task 9)', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  changedAtMark(s, one => ({ ...one, generation: (one.generation ?? 0) + 1 }))
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.onSend.fn = undefined
+  expect(s.w.gh.filed).toEqual([])
+  expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
+  expect(s.w.toasts.some(one => one.includes(keyOf(rec)) && one.includes('reset or replaced') && one.includes('fileDelete on the relay is safe'))).toBe(true)
+  // The new lifecycle's log never names the old one's claim (gate G7-8).
+  expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)))).toBe(false)
+})
+
+test('a claim left because the finding turned security at the mark before the POST is logged, scrubbed whole (final review, Task 9)', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  changedAtMark(s, one => ({ ...one, findings: one.findings.map(f => (f.id === HELD.id ? { ...f, isSecurity: true } : f)) }))
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.onSend.fn = undefined
+  expect(s.w.gh.filed).toEqual([])
+  expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
+  // The line names a security finding (its key holds the id): the relay's log takes it as the placeholder, whole (R107).
+  expect(relayLines(s.fake)).toContain(HELD_PLACEHOLDER)
+  expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)))).toBe(false)
 })
 
 test('a young claim\'s issue, used here and owed, settles to done once the claimant finishes it', { timeoutMs: 15_000 }, async (_$, on) => {

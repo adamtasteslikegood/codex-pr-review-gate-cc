@@ -79,6 +79,14 @@ const LOG_TEXT_MAX = 300
 const LOG_FIELD_MAX = 200
 const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 const ARCHIVE_CAP = 20
+const BODY_MAX = 128 * 1024
+const BOUNDED_OPS = new Set(['commit', 'snapshot'])
+const ARCHIVE_BYTES = 1024 * 1024
+const trimmed = <T>(archives: T[]): T[] => {
+  let kept = archives.slice(-ARCHIVE_CAP)
+  while (kept.length > 1 && new TextEncoder().encode(JSON.stringify(kept)).length > ARCHIVE_BYTES) kept = kept.slice(1)
+  return kept
+}
 const WRITE_CAP = 100
 const MIN_SECRET = 32
 const FROZEN_OPS = new Set(['commit', 'claim', 'beat', 'take', 'release', 'moveTo'])
@@ -250,6 +258,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
     if (need === undefined) return json(400, { error: `unknown op ${op}` })
     const isAllowed = need === 'admin' ? !who.isService && admins.includes(who.id) : need === 'read' ? preset !== undefined : preset === 'operate'
     if (!isAllowed) return json(403, { error: `${who.id} may not ${op} on ${repo}` })
+    if (BOUNDED_OPS.has(op) && new TextEncoder().encode(JSON.stringify(body)).length > BODY_MAX) return json(413, { error: `${op} body over ${BODY_MAX} bytes` })
     const now = clock.now()
     const id = `${repo}${key}`
     const s = copy(fake.objects.get(id)) ?? empty()
@@ -293,7 +302,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
         if (isLive(s.lease) && !isMine(s.lease)) return json(423, { error: 'the lease is held', lease: shown(s.lease) })
         const archive = body.archive as { at?: unknown; record?: unknown } | null | undefined
         if (archive !== undefined && (archive === null || typeof archive.at !== 'number' || archive.record === undefined)) return json(400, { error: 'archive needs { at, record }' })
-        const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
+        const archives = archive !== undefined ? trimmed([...s.archives, { at: archive.at as number, record: archive.record }]) : s.archives
         const next: FakeState = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
         delete next.movedTo
         save(next, archive !== undefined ? 'commit+archive' : 'commit', true)
@@ -335,7 +344,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
         if (typeof body.at !== 'number' || body.record === undefined || typeof body.reason !== 'string' || !SNAPSHOT_REASONS.has(body.reason)) {
           return json(400, { error: 'snapshot needs { at, record, reason: fallback | migration | move }' })
         }
-        const archives = [...s.archives, { at: body.at, record: body.record, actor: who.id, reason: body.reason }].slice(-ARCHIVE_CAP)
+        const archives = trimmed([...s.archives, { at: body.at, record: body.record, actor: who.id, reason: body.reason }])
         save({ ...s, archives }, `snapshot (${body.reason})`)
         return json(200, {})
       }
@@ -385,7 +394,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
         const name = String(body.key ?? '')
         const known = filingOf(name)
         if (known === undefined) return json(409, { error: 'no claim to finish' })
-        if (!isMine(known)) return json(403, { error: 'only the claimant may finish a filing', filing: shown(known) })
+        if (!isMine(known)) return json(409, { error: 'only the claimant may finish a filing', filing: shown(known) })
         if (known.state === 'done') {
           const isSame = JSON.stringify(known.result) === JSON.stringify(body.result)
           return json(isSame ? 200 : 409, isSame ? { filing: shown(known) } : { error: 'the filing is done', filing: shown(known) })

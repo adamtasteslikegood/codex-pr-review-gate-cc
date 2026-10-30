@@ -48,6 +48,12 @@ test('a service principal cannot run an admin operation, even when listed as an 
   assert.equal((await call(await sign(person(ADAM)), { op: 'breakLease' }, '/v1/owner/repo/9')).status, 200)
 })
 
+test('a forged x-relay-principal naming an admin is replaced: breakLease from a non-admin still answers 403', async () => {
+  const forged = { 'x-relay-principal': JSON.stringify({ id: ADAM, isService: false }), 'x-relay-preset': 'operate' }
+  assert.equal((await call(await sign(person(READER)), { op: 'breakLease' }, '/v1/owner/repo/9', forged)).status, 403)
+  assert.equal((await call(await sign(service(CODEX)), { op: 'breakLease' }, '/v1/owner/repo/9', forged)).status, 403)
+})
+
 test('each write records the principal that made it', async () => {
   const path = '/v1/owner/repo/10'
   assert.equal((await call(await sign(service(CODEX)), { op: 'commit', rev: 0, record: { by: 'codex' } }, path)).status, 200)
@@ -87,6 +93,18 @@ test('a commit that archives keeps the record it was given, not the one stored, 
   assert.equal((await call(adam, { op: 'read' }, path)).json.rev, 2)
   const archives = (await call(await sign(person(READER)), { op: 'archives' }, path)).json.archives as { at: number; record: unknown }[]
   assert.deepEqual(archives, [{ at: 5, record: kept }])
+})
+
+test('archives are trimmed oldest first to 1 MiB, so the stored value stays under 2 MB (final review M6)', async () => {
+  const path = '/v1/owner/repo/30'
+  const adam = await sign(person(ADAM))
+  for (let at = 1; at <= 12; at += 1) {
+    assert.equal((await call(adam, { op: 'snapshot', at, record: { pad: 'x'.repeat(120 * 1024) }, reason: 'fallback' }, path)).status, 200)
+  }
+  const archives = (await call(adam, { op: 'archives' }, path)).json.archives as { at: number }[]
+  assert.ok(archives.length < 12 && archives.length >= 7, `kept ${archives.length}`)
+  assert.equal(archives.at(-1)?.at, 12)
+  assert.ok(new TextEncoder().encode(JSON.stringify(archives)).length <= 1024 * 1024)
 })
 
 // ----------------------------------------------------------------- lease
@@ -213,7 +231,8 @@ test('a lost fileClaim answer is no dead end: the retry with the same secret fin
   // The same principal as another checkout (another secret) is not the claimant.
   const other = await call(adam, { op: 'fileClaim', key, secret: secretOf() }, path)
   assert.deepEqual([other.json.isFresh, other.json.isMine], [false, false])
-  assert.equal((await call(adam, { op: 'fileDone', key, secret: secretOf(), result: { issue: 7 } }, path)).status, 403)
+  // Not the claimant is a conflict (409), never a refusal (403) that would stand a granted session down (final review M3).
+  assert.equal((await call(adam, { op: 'fileDone', key, secret: secretOf(), result: { issue: 7 } }, path)).status, 409)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 7 } }, path)).status, 200)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 8 } }, path)).status, 409)
 })
@@ -225,9 +244,9 @@ test('only the claimant finishes a filing, and a done filing never changes: the 
   const key = 'lc-1:G1-1:1'
   const secret = secretOf()
   await call(adam, { op: 'fileClaim', key, secret }, path)
-  assert.equal((await call(codex, { op: 'fileDone', key, secret: secretOf(), result: { issue: 99 } }, path)).status, 403)
-  assert.equal((await call(codex, { op: 'fileDone', key, secret, result: { issue: 99 } }, path)).status, 403)
-  assert.equal((await call(adam, { op: 'fileDone', key, result: { issue: 99 } }, path)).status, 403)
+  assert.equal((await call(codex, { op: 'fileDone', key, secret: secretOf(), result: { issue: 99 } }, path)).status, 409)
+  assert.equal((await call(codex, { op: 'fileDone', key, secret, result: { issue: 99 } }, path)).status, 409)
+  assert.equal((await call(adam, { op: 'fileDone', key, result: { issue: 99 } }, path)).status, 409)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 42 } }, path)).status, 200)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 42 } }, path)).status, 200)
   assert.equal((await call(adam, { op: 'fileDone', key, secret, result: { issue: 99 } }, path)).status, 409)

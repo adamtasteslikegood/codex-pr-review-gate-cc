@@ -474,9 +474,10 @@ async function owe($: Engine, root: string, branch: string, one: Owed): Promise<
 
 /**
  * Sends what this checkout owes the relay, oldest first, after a call that landed. One that is down is kept, with every one after it;
- * one the relay answered otherwise is done (a `moveDone` another checkout finished first answers 409). One it refused (an owed
- * `fileDone` after an admin's fileDelete and another checkout's claim answers 403) is dropped with a run-log line, never kept at the
- * head of the queue: the call itself would be refused again, and the next one that isn't owed stands the store down if the grant went.
+ * one the relay answered otherwise is done (a `moveDone` another checkout finished first, or a `fileDone` after an admin's fileDelete
+ * and another checkout's claim, answers 409). One it refused (401 or 403: the grant or the credential went) is dropped with a run-log
+ * line, never kept at the head of the queue: the call itself would be refused again, and the next one that isn't owed stands the store
+ * down.
  */
 async function payOwed($: Engine, root: string, branch: string, relay: Relay): Promise<void> {
   const kept = (await $.store.get(owedKey(root, branch))) as Owed[] | undefined
@@ -635,8 +636,9 @@ async function readAt($: Engine, root: string, branch: string, at: Shared): Prom
 /**
  * Steps 2 and 3 of the move (R103): the record on the PR's object (a `commit` with `from`, under a claim of that object), then the
  * branch's tombstone cut to its pointer (`moveDone`). Answers the PR object's rev and record: `rec` itself, or what another checkout
- * placed there first (a 409, or a claim it holds). Another lifecycle there keeps this one by a snapshot on the branch's object. A
- * `moveDone` that doesn't land is owed; a claim or commit that doesn't is the caller's to note, and the next load finishes the move.
+ * placed there first (a 409, or a claim it holds). Another lifecycle there keeps this one by a snapshot on the branch's object, and
+ * `moveDone` is sent only once that snapshot lands. A `moveDone` that doesn't land is owed; a claim or commit that doesn't is the
+ * caller's to note, and the next load finishes the move.
  */
 async function publishMove(
   $: Engine,
@@ -679,8 +681,10 @@ async function publishMove(
     placed = read
   } else throw new Error(`the shared lifecycle store answered a move's claim with HTTP ${claimed.status}`)
   if ((placed.record as LifecycleRecord | null)?.lifecycleId !== rec.lifecycleId) {
-    // Another lifecycle holds the PR's object already: this one is kept, locally and in the archives of the branch's object.
-    await keepLocal($, from, rec, 'move')
+    // Another lifecycle holds the PR's object already: this one is kept, locally and in the archives of the branch's object. Until the
+    // relay holds that archive, moveDone waits and the tombstone keeps the record (final review M2): the next load sends both again.
+    const { lines } = await keepLocal($, from, rec, 'move')
+    if (lines.length > 0) return placed
   }
   const body = { op: 'moveDone', lifecycleId: rec.lifecycleId }
   const done = await relayCall($, from.relay, from.path, body)
@@ -971,7 +975,10 @@ async function relayTx<T>(
   // The move (R103, spec §1): the record has its PR. It is committed on the branch's object under a claim of it, then step 1 freezes
   // that object with the record in its tombstone, and `publishMove` takes steps 2 and 3. A step that doesn't land stops the move where
   // it is: the next load finds the record with its PR on the branch's object, or the tombstone, and finishes it.
-  const claimed = await relayCall($, at.relay, at.path, { op: 'claim', holder: await $.session.id(), secret })
+  const holder = await $.session.id()
+  // The lease this session already drives with, if any (final review M1): a claim that renews it keeps its token, and is never released.
+  const kept = leases.get(keptKey(holder, root, branch))
+  const claimed = await relayCall($, at.relay, at.path, { op: 'claim', holder, secret })
   if ('refused' in claimed || 'down' in claimed) return (await settle(at, claimed)) ?? { value }
   if (claimed.status === 410) return moved(at, claimed.json)
   if (claimed.status === 423) {
@@ -979,8 +986,10 @@ async function relayTx<T>(
     return { retry: { error: new StaleRecord(rev, undefined, HELD, leaseOf(claimed.json.lease)) } }
   }
   if (claimed.status !== 200) throw new Error(`the shared lifecycle store answered a claim with HTTP ${claimed.status}`)
+  const isRenewal = kept !== undefined && kept.key === at.path && leaseOf(claimed.json.lease)?.token === kept.token
   const answer = await relayCall($, at.relay, at.path, bodyAt(rev, { secret }))
-  if (!('refused' in answer) && !('down' in answer) && answer.status !== 200 && answer.status !== 410) {
+  // Only a claim this call newly took is released: a plain 409 keeps the run, and the driver's own lease with it.
+  if (!isRenewal && !('refused' in answer) && !('down' in answer) && answer.status !== 200 && answer.status !== 410) {
     await relayCall($, at.relay, at.path, { op: 'release', secret })
   }
   const settled = await settle(at, answer)

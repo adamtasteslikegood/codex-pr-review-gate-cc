@@ -181,7 +181,7 @@ export const CONTRACT: Case[] = [
       { as: 'ADAM', path: pr(507), body: { op: 'fileClaim', key: 'L1:f1:1', secret: SECRET_A }, status: 200, match: { isFresh: false, isMine: true, filing: { state: 'claimed', actor: ADAM } } },
       { as: 'CODEX', path: pr(507), body: { op: 'fileClaim', key: 'L1:f1:1', secret: SECRET_C }, status: 200, match: { isFresh: false, isMine: false, filing: { actor: ADAM } } },
       { as: 'ADAM', path: pr(507), body: { op: 'fileClaim', key: '', secret: SECRET_A }, status: 400 },
-      { as: 'CODEX', path: pr(507), body: { op: 'fileDone', key: 'L1:f1:1', secret: SECRET_C, result: { issue: 9 } }, status: 403 },
+      { as: 'CODEX', path: pr(507), body: { op: 'fileDone', key: 'L1:f1:1', secret: SECRET_C, result: { issue: 9 } }, status: 409, match: { error: 'only the claimant may finish a filing' } },
       { as: 'ADAM', path: pr(507), body: { op: 'fileDone', key: 'L1:f1:1', secret: SECRET_A, result: { issue: 9 } }, status: 200, match: { filing: { state: 'done', actor: ADAM, result: { issue: 9 } } } },
       { as: 'ADAM', path: pr(507), body: { op: 'fileDone', key: 'L1:f1:1', secret: SECRET_A, result: { issue: 9 } }, status: 200, match: { filing: { state: 'done', result: { issue: 9 } } } },
       { as: 'ADAM', path: pr(507), body: { op: 'fileDone', key: 'L1:f1:1', secret: SECRET_A, result: { issue: 10 } }, status: 409, match: { filing: { result: { issue: 9 } } } },
@@ -221,11 +221,19 @@ export const CONTRACT: Case[] = [
       { as: 'CODEX', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_C, result: { issue: 20 } }, status: 423, match: { lease: { holder: 'session-a' } } },
       { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f9:1', secret: SECRET_A, result: { issue: 20 } }, status: 409, match: { error: 'no claim to adopt' } },
       { as: 'ADAM', path: pr(509), body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A }, status: 400 },
+      // Stale now, and its claimant asks: another principal's live lease still holds it out.
+      {
+        as: 'CODEX',
+        path: pr(509),
+        body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_C, result: { issue: 20 } },
+        waitMs: TIMES.filingStaleMs + 200,
+        status: 423,
+        match: { error: 'only the lease holder adopts a filing', lease: { holder: 'session-a' } },
+      },
       {
         as: 'ADAM',
         path: pr(509),
         body: { op: 'fileAdopt', key: 'L2:f1:1', secret: SECRET_A, result: { issue: 20 } },
-        waitMs: TIMES.filingStaleMs + 200,
         status: 200,
         match: { filing: { state: 'done', actor: CODEX, adoptedBy: ADAM, result: { issue: 20 } } },
       },
@@ -248,6 +256,16 @@ export const CONTRACT: Case[] = [
       { as: 'ADAM', path: pr(510), body: { op: 'fileDelete', key: 'L3:f1:1' }, status: 200 },
       { as: 'READER', path: pr(510), body: { op: 'filing', key: 'L3:f1:1' }, status: 200, match: { filing: null } },
       { as: 'CODEX', path: pr(510), body: { op: 'fileClaim', key: 'L3:f1:1', secret: SECRET_C }, status: 200, match: { isFresh: true } },
+    ],
+  },
+  {
+    name: 'a commit or snapshot body over 128 KiB is 413, and changes nothing',
+    steps: [
+      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 0, record: { lifecycleId: 'L9', pad: 'x'.repeat(100 * 1024) } }, status: 200, match: { rev: 1 } },
+      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 1, record: { lifecycleId: 'L9', pad: 'x'.repeat(129 * 1024) } }, status: 413 },
+      { as: 'ADAM', path: pr(511), body: { op: 'snapshot', at: 1, record: { pad: 'x'.repeat(129 * 1024) }, reason: 'fallback' }, status: 413 },
+      { as: 'READER', path: pr(511), body: { op: 'read' }, status: 200, match: { rev: 1 } },
+      { as: 'READER', path: pr(511), body: { op: 'archives' }, status: 200, match: { archives: [] } },
     ],
   },
   {
