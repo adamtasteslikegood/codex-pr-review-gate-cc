@@ -47,7 +47,7 @@ function engineOf(w: World, fetch: Fetch, store: Map<string, unknown>, sessionId
       },
     },
     http: { fetch },
-    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token' })[name] },
+    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })[name] },
     session: { id: async () => sessionId },
     store: {
       get: async (key: string) => store.get(key),
@@ -67,7 +67,7 @@ function setup(on: Parameters<typeof world>[0], isShared = true): Setup {
   const w = world(on)
   if (isShared) w.git.roster = SHARED
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, grants: { [SLUG]: { [ADAM]: 'operate', [CODEX]: 'operate' } } })
-  const env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token' }
+  const env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ }
   on('env.get', (_$, e) => ({ value: env[e.name] }))
   return { w, fake, $: engineOf(w, fake.fetch, w.store, w.sessionId), env }
 }

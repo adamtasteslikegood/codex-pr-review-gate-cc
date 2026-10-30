@@ -9,7 +9,7 @@ import type { EngineInterface } from 'claude-code'
 
 import { slugOf } from './core'
 import { newLifecycleId } from './lifecycle'
-import { keyPath, leaseSecret, NO_CREDENTIAL, relayAt, relayCall, sharedStoreOf } from './relay'
+import { keyPath, leaseSecret, NO_CREDENTIAL, NOT_PINNED, relayAt, relayCall, sharedStoreOf } from './relay'
 import type { Relay, RelayAnswer, SharedStore } from './relay'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
 
@@ -522,13 +522,21 @@ async function standDown($: Engine, root: string, branch: string, why: string): 
   throw new RelayRefused(why)
 }
 
+/** A reason to stay local that a person who expected the shared store should see: no credential, or no pin that matches the base's. */
+const isUnsent = (why: string): boolean => why === NO_CREDENTIAL || why.startsWith(NOT_PINNED)
+
 /**
- * A base that opts in, and an environment with no relay credential (Task 8): the lifecycle stays local, and its run log says why once,
- * so a person who expected the shared store sees it isn't used. Any other reason to stay local (no opt-in) says nothing.
+ * A base that opts in, and an environment with no relay credential (Task 8), or a credential this machine has not pinned to the base's
+ * relay (final review I1): the lifecycle stays local, nothing is sent, and its run log says why once, so a person who expected the
+ * shared store sees it isn't used. The pin's line names the two origins, never a credential. Any other reason to stay local (no
+ * opt-in) says nothing.
  */
 async function noteNoCredential($: Engine, root: string, branch: string, why: string): Promise<void> {
-  if (why !== NO_CREDENTIAL) return
-  await noteOnce($, root, branch, NO_CREDENTIAL, `${NO_CREDENTIAL}: the base opts in to the shared store, but neither PR_GATE_RELAY_CLIENT_ID and _SECRET nor PR_GATE_RELAY_TOKEN is set; this lifecycle stays in the local store`)
+  if (why === NO_CREDENTIAL) {
+    await noteOnce($, root, branch, NO_CREDENTIAL, `${NO_CREDENTIAL}: the base opts in to the shared store, but neither PR_GATE_RELAY_CLIENT_ID and _SECRET nor PR_GATE_RELAY_TOKEN is set; this lifecycle stays in the local store`)
+  } else if (why.startsWith(NOT_PINNED)) {
+    await noteOnce($, root, branch, NOT_PINNED, `${why}; no credential is sent to a relay this machine has not pinned, and this lifecycle stays in the local store`)
+  }
 }
 
 /** The relay didn't answer (spec §8): the lifecycle goes on in the local store, and the run log says why once. */
@@ -570,8 +578,11 @@ async function runTx<T>($: Engine, root: string, branch: string, work: (tx: Reco
       return work(localTx($, root, branch))
     }
     // A record that has been on the relay, and the opt-in can't be read now: a fallback, never plain local, so a relay that moved on
-    // meanwhile archives these writes instead of overwriting them.
-    await noteDown($, root, branch, found.local)
+    // meanwhile archives these writes instead of overwriting them. No credential, or no matching pin, says so rather than "down".
+    if (isUnsent(found.local)) {
+      await noteNoCredential($, root, branch, found.local)
+      await setPending($, root, branch, true)
+    } else await noteDown($, root, branch, found.local)
     return work(fallbackTx($, root, branch, mirror.relayRev, keyOf(mirror)))
   }
   let shared = found !== undefined && 'local' in found ? undefined : found

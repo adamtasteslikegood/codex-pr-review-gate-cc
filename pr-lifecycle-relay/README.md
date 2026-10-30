@@ -3,7 +3,8 @@
 The shared lifecycle store for pr-lifecycle (#29 Part B): a Cloudflare Worker and Durable Objects that hold a PR's record, its lease, its run
 log and its filing ledger, so that checkouts of one PR share one record. It is built and tested under Miniflare. **Nothing is deployed**: no
 Cloudflare resource or Access application exists for it, and the first deploy waits for Adam's confirmation (R108). pr-lifecycle 1.6.0 calls
-it only for a repo that opts in (see the pr-lifecycle README, "The shared store").
+it only for a repo that opts in (see the pr-lifecycle README, "The shared store"), and only from a machine whose `PR_GATE_RELAY_URL` has the
+same origin as the repo's `sharedStore.url`: a checkout never sends its Access credential to a relay its own machine did not pin.
 
 ## Shape
 

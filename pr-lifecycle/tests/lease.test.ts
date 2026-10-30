@@ -59,7 +59,7 @@ function relayed(on: Parameters<typeof world>[0], isShared = true): Relayed {
     people: { 'adam-token': ADAM, 'bea-token': BEA },
     grants: { [SLUG]: { [ADAM]: 'operate', [CODEX]: 'operate', [BEA]: 'operate' } },
   })
-  const env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token' }
+  const env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ }
   on('env.get', (_$, e) => ({ value: env[e.name] }))
   const seen: Seen[] = []
   const after: Relayed['after'] = {}
@@ -222,7 +222,7 @@ function engineOf(w: World, fake: FakeRelay, store: Map<string, unknown>, sessio
       },
     },
     http: { fetch: (url: string, init?: HttpInit) => fake.fetch(url, init) },
-    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token' })[name] },
+    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })[name] },
     session: { id: async () => sessionId },
     store: {
       get: async (key: string) => store.get(key),
@@ -311,6 +311,54 @@ test('a base that opts in, with no relay credential, stays local and its run log
   const lines = ((w.store.get(KEY) as LifecycleRecord).log ?? []).filter(one => one.text.startsWith('no relay credential'))
   expect(lines).toHaveLength(1)
   expect(lines[0]?.text).toContain('PR_GATE_RELAY_TOKEN')
+})
+
+/** A lifecycle whose base names `url` as its relay, with `pin` as this machine's PR_GATE_RELAY_URL: every fetch the mod makes, and the record. */
+async function pinned($: Dispatch, on: Parameters<typeof world>[0], url: string, pin: string | undefined) {
+  const { w, fake, env } = relayed(on)
+  w.git.roster = JSON.stringify({ sharedStore: { url, aud: 'aud-tag' } })
+  if (pin === undefined) delete env.PR_GATE_RELAY_URL
+  else env.PR_GATE_RELAY_URL = pin
+  const fetched: { url: string; headers: Record<string, string> }[] = []
+  const inner = fake.fetch
+  fake.fetch = async (to, init) => {
+    fetched.push({ url: to, headers: init?.headers ?? {} })
+    return inner(to, init)
+  }
+  await $.tool.call(createPr)
+  await done($, turn(review('r1-review', 'FAIL', [P1])))
+  const rec = w.store.get(KEY) as LifecycleRecord
+  return { w, fake, fetched, rec, lines: (rec.log ?? []).filter(one => one.text.startsWith('relay not pinned')).map(one => one.text) }
+}
+
+test('a base that names another relay than the pinned one: no request carries a credential, and the lifecycle runs locally', { timeoutMs: 15_000 }, async ($, on) => {
+  // The base's file names a host its pusher controls; this machine pinned the real relay.
+  const { w, fake, fetched, rec, lines } = await pinned($, on, 'https://capture.example.net', URL_)
+  expect(fetched).toEqual([])
+  expect(fake.calls).toEqual([])
+  expect(rec.relayRev).toBeUndefined()
+  expect(w.prompts.at(-1)).toContain('R1-1')
+  // One line per lifecycle, naming both origins and no credential.
+  expect(lines).toHaveLength(1)
+  expect(lines[0]).toContain(`the base names https://capture.example.net, PR_GATE_RELAY_URL ${URL_}`)
+  expect(lines[0]).not.toContain('adam-token')
+})
+
+test('a credential with no pin is never sent: the lifecycle runs locally and says why once', { timeoutMs: 15_000 }, async ($, on) => {
+  const { w, fetched, rec, lines } = await pinned($, on, URL_, undefined)
+  expect(fetched).toEqual([])
+  expect(rec.relayRev).toBeUndefined()
+  expect(w.prompts.at(-1)).toContain('R1-1')
+  expect(lines).toHaveLength(1)
+  expect(lines[0]).toContain('PR_GATE_RELAY_URL is not set')
+})
+
+test('the pinned relay, named by the base: the lifecycle runs on it', { timeoutMs: 15_000 }, async ($, on) => {
+  const { fetched, rec, lines } = await pinned($, on, URL_, `${URL_}/`)
+  expect(fetched.length).toBeGreaterThan(0)
+  expect(fetched.every(one => one.url.startsWith(`${URL_}/v1/`) && one.headers['cf-access-token'] === 'adam-token')).toBe(true)
+  expect(rec.relayRev).toBeGreaterThan(0)
+  expect(lines).toEqual([])
 })
 
 test('the local backend is unchanged', { timeoutMs: 15_000 }, async ($, on) => {

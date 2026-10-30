@@ -51,8 +51,10 @@ the project's goals and their order.
   `RepoIndex`), tested under Miniflare. **Nothing is deployed**: the development deploy and its latency measurement (R108) wait for
   Adam's confirmation, immediately before they touch Cloudflare. pr-lifecycle 1.6.0 calls it only for a repo that opts in with
   `sharedStore` (`{ url, aud }`) in `.github/pr-gate.json` on the base branch, with a credential in `PR_GATE_RELAY_CLIENT_ID` and
-  `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token). With none, or on any failure
-  other than a refused credential, the lifecycle runs locally. No base opts in yet.
+  `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token), and only when the origin of
+  `sharedStore.url` equals the origin of the machine's pin, `PR_GATE_RELAY_URL`; the credential goes nowhere else. With no credential, no
+  pin or a pin of another origin, or with no answer (network, 5xx, timeout), the lifecycle runs locally. A refused credential (401, 403)
+  stands the session down instead. No base opts in yet.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
   creation, so two would gate the same PR twice. Switching
   `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.

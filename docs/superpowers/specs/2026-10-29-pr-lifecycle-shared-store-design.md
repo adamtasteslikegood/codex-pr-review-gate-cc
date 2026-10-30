@@ -65,6 +65,7 @@ In none of these can both objects be driven. A delayed index update can't change
   ```
 
 - **The credential is per machine and never in the repo.** It is an Access service token (client id and secret), read from the user's settings or the environment. A person's own session may instead use their Access sign-in token. With no credential, or no `sharedStore`, the local store is used and the run log says why, once per lifecycle.
+- **The machine pins the relay (final review I1).** `PR_GATE_RELAY_URL` names the relay this machine trusts. Credential headers are sent only when the origin of `sharedStore.url` equals the origin of `PR_GATE_RELAY_URL`, since the base's file is anyone's who can push to the base. With the pin unset or of another origin, no credential is sent, no relay call is made, the lifecycle runs locally, and the run log names the mismatch once per lifecycle, never a credential value.
 - **The backend is chosen inside the exported functions in `store.ts`.** The engine follows `$` only into function declarations, so the seam can't be an object. Each function reads the config and calls either the local implementation or a small `relay.ts` client, whose calls are `POST /v1/<owner>/<repo>/<pr>` for a post-PR record and `POST /v1/<owner>/<repo>/branch/<branch>` for a pre-PR one (section 1). Grant edits go to `POST /v1/admin/grants` (section 10).
 
 ## 3. `transact` against the relay

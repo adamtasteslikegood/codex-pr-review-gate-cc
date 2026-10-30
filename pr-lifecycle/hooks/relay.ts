@@ -1,6 +1,7 @@
 // The relay client (#29 Part B): where a repo's shared lifecycle store is, the credential that reaches it, one call to it, and the
 // secrets a checkout proves itself with. A repo opts in on its base branch (`sharedStore` in `.github/pr-gate.json`); the credential is
-// the person's or service's own, from the environment, never from plugin options. Only what keeps the relay from answering (a network
+// the person's or service's own, from the environment, never from plugin options, and goes only to the relay the machine pinned
+// (`PR_GATE_RELAY_URL`, final review I1). Only what keeps the relay from answering (a network
 // error, a 5xx, a timeout, a body that isn't JSON) is `down`, the one case the caller may fall back to the local store (spec §8). A 401 or
 // 403 is `refused`: a revoked or read-only principal is cut off on its next request (spec §10), never let fall back and keep acting.
 //
@@ -57,7 +58,24 @@ export type SharedStore = { url: string; aud: string }
 /** Why a base that opts in stays local: the environment has no credential for the relay. */
 export const NO_CREDENTIAL = 'no relay credential'
 
-/** As `relayOf`, for a `sharedStore` already read: the credential comes from the environment each time. */
+/** Why a base that opts in stays local: the machine's pin (`PR_GATE_RELAY_URL`) is unset, or names another origin than the base's. */
+export const NOT_PINNED = 'relay not pinned'
+
+/** A URL's origin (scheme, host and port), or undefined for one that doesn't parse. */
+const originOf = (url: string): string | undefined => {
+  try {
+    return new URL(url).origin
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * As `relayOf`, for a `sharedStore` already read: the credential comes from the environment each time. It goes only to the relay this
+ * machine pinned (`PR_GATE_RELAY_URL`): the base's file is anyone's who can push to the base, and must never choose where a credential
+ * is sent (final review I1). A pin unset or of another origin keeps the lifecycle local, and the reason names both origins, never a
+ * credential.
+ */
 export async function relayAt($: Engine, shared: SharedStore | undefined): Promise<Relay | { local: string }> {
   if (shared === undefined) return { local: 'no sharedStore in .github/pr-gate.json' }
   const id = await $.env.get('PR_GATE_RELAY_CLIENT_ID')
@@ -70,6 +88,11 @@ export async function relayAt($: Engine, shared: SharedStore | undefined): Promi
         ? { 'cf-access-token': token }
         : undefined
   if (headers === undefined) return { local: NO_CREDENTIAL }
+  const pin = await $.env.get('PR_GATE_RELAY_URL')
+  const pinned = pin === undefined || pin === '' ? undefined : originOf(pin)
+  const named = originOf(shared.url)
+  if (pinned === undefined) return { local: `${NOT_PINNED}: PR_GATE_RELAY_URL is ${pin === undefined || pin === '' ? 'not set' : 'not a URL'}` }
+  if (named !== pinned) return { local: `${NOT_PINNED}: the base names ${named ?? 'no valid URL'}, PR_GATE_RELAY_URL ${pinned}` }
   return { url: shared.url.replace(/\/+$/, ''), aud: shared.aud, headers }
 }
 

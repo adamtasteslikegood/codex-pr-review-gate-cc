@@ -28,7 +28,7 @@ type Fetch = (url: string, init?: HttpInit) => Promise<HttpResponse>
  * The mod's own engine, as the store sees it, over world's fake git and store and the test's mocked clock (relay.test.ts has the same
  * stand-in). `onSend` sees each call's body before it reaches the fake: a test delays or counts one there.
  */
-function engineOf(w: World, fetch: Fetch, env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token' }, onSend?: (body: Record<string, unknown>) => void): never {
+function engineOf(w: World, fetch: Fetch, env: Record<string, string> = { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ }, onSend?: (body: Record<string, unknown>) => void): never {
   const clock = w.clock as unknown as MockClock
   return {
     ...(w.engine as object),
@@ -240,7 +240,7 @@ test('relay down mid-round: the round goes on locally and the log says so once',
   forgetOptIns()
   const w = world(on)
   w.git.roster = SHARED
-  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token' })
+  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, grants: { [SLUG]: { [ADAM]: 'operate' } } })
   await $.tool.call(createPr)
   // The branch's object, or the PR's once the record has its number.
@@ -563,7 +563,7 @@ test('a 403 stands down: no local write, no fallback, the log says so once', asy
   expect(fake.objects.get(OBJECT)?.rev).toBe(1)
   expect(reasons(relayed(fake))).toEqual([])
   // No grant at all: the read itself is refused, and nothing changes either.
-  const reader = engineOf(w, fake.fetch, { PR_GATE_RELAY_TOKEN: 'reader-token' })
+  const reader = engineOf(w, fake.fetch, { PR_GATE_RELAY_TOKEN: 'reader-token', PR_GATE_RELAY_URL: URL_ })
   expect(await thrown(upsertRecord(reader, '/repo', 'feat/x', one => one && grant('x')(one), { isPure: true }))).toBeInstanceOf(RelayRefused)
   expect({ ...local(w), log: undefined }).toEqual({ ...before, log: undefined })
   expect(linesOf(local(w), 'relay refused')).toHaveLength(1)
@@ -572,7 +572,7 @@ test('a 403 stands down: no local write, no fallback, the log says so once', asy
 test('a repo that does not opt in behaves exactly as before', async ($, on) => {
   forgetOptIns()
   const w = world(on)
-  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token' })
+  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })
   let fetched = 0
   on('http.fetch', () => {
     fetched += 1

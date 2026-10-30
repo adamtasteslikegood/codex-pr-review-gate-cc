@@ -95,7 +95,7 @@ test('the fake relay passes the contract', async (_$, on) => {
 test('no sharedStore or no credential stays local and says why', async (_$, on) => {
   const w = world(on)
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
-  const token = { PR_GATE_RELAY_TOKEN: 'adam-token' }
+  const token = { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ }
   // No file on the base at all.
   expect(await relayOf(engineOf(w, fake.fetch, token), '/repo', 'dev')).toEqual({ local: 'no sharedStore in .github/pr-gate.json' })
   // A file without one, one that isn't https, and one with no aud.
@@ -122,7 +122,7 @@ test('no sharedStore or no credential stays local and says why', async (_$, on) 
 test('sharedStore is read from the base, never the HEAD', async (_$, on) => {
   const w = world(on)
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
-  const $ = engineOf(w, fake.fetch, { PR_GATE_RELAY_TOKEN: 'adam-token' })
+  const $ = engineOf(w, fake.fetch, { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })
   w.git.roster = roster()
   w.git.headRoster = roster(SHARED)
   expect(await relayOf($, '/repo', 'dev')).toEqual({ local: 'no sharedStore in .github/pr-gate.json' })
@@ -130,6 +130,31 @@ test('sharedStore is read from the base, never the HEAD', async (_$, on) => {
   w.git.byBase = { main: roster({ sharedStore: { url: `${URL_}/`, aud: 'main-aud' } }) }
   w.git.roster = ''
   expect(await relayOf($, '/repo', 'main')).toEqual({ url: URL_, aud: 'main-aud', headers: { 'cf-access-token': 'adam-token' } })
+})
+
+test('the credential goes only to the relay this machine pinned: a pin unset, unreadable or of another origin stays local', async (_$, on) => {
+  const w = world(on)
+  const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock })
+  const token = { PR_GATE_RELAY_TOKEN: 'adam-token' }
+  w.git.roster = roster(SHARED)
+  expect(await relayOf(engineOf(w, fake.fetch, token), '/repo', 'dev')).toEqual({ local: 'relay not pinned: PR_GATE_RELAY_URL is not set' })
+  expect(await relayOf(engineOf(w, fake.fetch, { ...token, PR_GATE_RELAY_URL: '' }), '/repo', 'dev')).toEqual({ local: 'relay not pinned: PR_GATE_RELAY_URL is not set' })
+  expect(await relayOf(engineOf(w, fake.fetch, { ...token, PR_GATE_RELAY_URL: 'relay.example.org' }), '/repo', 'dev')).toEqual({ local: 'relay not pinned: PR_GATE_RELAY_URL is not a URL' })
+  // Another host, a subdomain, another port or another scheme is another origin: the base's file never chooses where a credential goes.
+  for (const url of ['https://evil.example.org', 'https://relay.example.org.evil.example', 'https://x.relay.example.org', 'https://relay.example.org:8443']) {
+    w.git.roster = roster({ sharedStore: { url, aud: 'aud-tag' } })
+    const local = await relayOf(engineOf(w, fake.fetch, { ...token, PR_GATE_RELAY_URL: URL_ }), '/repo', 'dev')
+    expect(local).toEqual({ local: `relay not pinned: the base names ${new URL(url).origin}, PR_GATE_RELAY_URL ${URL_}` })
+    expect(JSON.stringify(local)).not.toContain('adam-token')
+  }
+  w.git.roster = roster(SHARED)
+  expect(await relayOf(engineOf(w, fake.fetch, { ...token, PR_GATE_RELAY_URL: 'http://relay.example.org' }), '/repo', 'dev')).toEqual({
+    local: `relay not pinned: the base names ${URL_}, PR_GATE_RELAY_URL http://relay.example.org`,
+  })
+  // The pin is an origin: a path on either side, or a trailing `/`, still matches.
+  w.git.roster = roster({ sharedStore: { url: `${URL_}/relay`, aud: 'aud-tag' } })
+  expect(await relayOf(engineOf(w, fake.fetch, { ...token, PR_GATE_RELAY_URL: `${URL_}/` }), '/repo', 'dev')).toEqual({ url: `${URL_}/relay`, aud: 'aud-tag', headers: { 'cf-access-token': 'adam-token' } })
+  expect(fake.calls).toEqual([])
 })
 
 test('a service token is sent as CF-Access-Client-Id and -Secret, a person token as cf-access-token', async (_$, on) => {
@@ -141,7 +166,7 @@ test('a service token is sent as CF-Access-Client-Id and -Secret, a person token
     return fake.fetch(url, init)
   }
   w.git.roster = roster(SHARED)
-  const service = { PR_GATE_RELAY_CLIENT_ID: 'codex-service.access', PR_GATE_RELAY_CLIENT_SECRET: 'codex-secret' }
+  const service = { PR_GATE_RELAY_CLIENT_ID: 'codex-service.access', PR_GATE_RELAY_CLIENT_SECRET: 'codex-secret', PR_GATE_RELAY_URL: URL_ }
   // A service token wins over a person's when both are set: a service runs where no person signs in.
   for (const env of [service, { ...service, PR_GATE_RELAY_TOKEN: 'adam-token' }]) {
     const $ = engineOf(w, fetch, env)
@@ -153,7 +178,7 @@ test('a service token is sent as CF-Access-Client-Id and -Secret, a person token
     })
     await relayCall($, relay as Relay, keyPath('owner/repo', '#7'), { op: 'release', secret: 's'.repeat(40) })
   }
-  const $ = engineOf(w, fetch, { PR_GATE_RELAY_TOKEN: 'adam-token' })
+  const $ = engineOf(w, fetch, { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })
   const relay = (await relayOf($, '/repo', 'dev')) as Relay
   expect(relay.headers).toEqual({ 'cf-access-token': 'adam-token' })
   expect(await relayCall($, relay, keyPath('owner/repo', '#7'), { op: 'claim', holder: 'h', secret: 't'.repeat(40) })).toMatchObject({

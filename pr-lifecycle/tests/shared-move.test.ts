@@ -65,7 +65,7 @@ function engineOf(w: World, fetch: Fetch, store: Map<string, unknown>, sessionId
         return fetch(url, init)
       },
     },
-    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token' })[name] },
+    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })[name] },
     session: { id: async () => sessionId },
     store: {
       get: async (key: string) => store.get(key),
@@ -160,7 +160,7 @@ test('a pre-PR record lives on the branch key and moves to the PR key on onOpene
   forgetOptIns()
   const w = world(on)
   w.git.roster = SHARED
-  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token' })
+  mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, grants: { [SLUG]: { [ADAM]: 'operate' } } })
   await $.tool.call(createPr)
   // Before the PR: the record is on the branch's object, and no PR object exists.

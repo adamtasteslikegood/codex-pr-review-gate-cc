@@ -418,6 +418,10 @@ ledger. It is opt-in per repo and **off unless the base's `.github/pr-gate.json`
   `PR_GATE_RELAY_CLIENT_SECRET` (sent as `CF-Access-Client-Id` and `CF-Access-Client-Secret`). A person's Access token is
   `PR_GATE_RELAY_TOKEN` (sent as `cf-access-token`). A service token wins when both are set, and half of one is no credential. With none,
   the repo stays local.
+- **The machine pins its relay.** `PR_GATE_RELAY_URL` names the relay this machine trusts with its credential. The credential is sent
+  only when the origin (scheme, host and port) of the base's `url` equals the origin of `PR_GATE_RELAY_URL`; anyone who can push to the
+  base can edit the file, and must not be able to point a credential at a host they control. With the pin unset, not a URL or of another
+  origin, nothing is sent, the lifecycle runs locally, and the run log names the mismatch once per lifecycle (never a credential).
 - **The relay grants access.** The principal needs a `read` or `operate` grant on the repo, which an admin gives (see the relay README).
   Without one, calls answer 403 and the checkout stands down.
 - **Records.** Pre-PR records are kept under the branch and move to the PR when it exists (R103). Every relay commit is mirrored in the

@@ -51,7 +51,7 @@ function engineOf(w: World, fetch: Fetch, store: Map<string, unknown>, sessionId
         return fetch(url, init)
       },
     },
-    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token' })[name] },
+    env: { get: async (name: string) => ({ PR_GATE_RELAY_TOKEN: 'adam-token', PR_GATE_RELAY_URL: URL_ })[name] },
     session: { id: async () => sessionId },
     state: { get: async () => ({ value: null }), set: async () => ({ isSet: true }) },
     ui: { status: () => undefined, toast: () => undefined },
