@@ -48,7 +48,7 @@ object keeps only its SHA-256 and never returns it.
 | `fileAdopt` | `operate` + the live lease | Finishes a claim older than `FILING_STALE_MS` with the issue the exact-mark search found, recorded as `adoptedBy`. 423 without the lease, 409 on a younger claim or one with no claim. |
 | `breakLease`, `fileDelete` | admin | Held by people listed in `ADMINS`, never by a service principal. |
 
-A `commit` or `snapshot` body over 128 KiB answers 413 and changes nothing.
+A `commit` or `snapshot` body over 512 KiB answers 413 and changes nothing. The plugin then keeps that lifecycle in its local store.
 
 Every write, a heartbeat included, records its principal.
 

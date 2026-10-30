@@ -540,28 +540,46 @@ async function noteNoCredential($: Engine, root: string, branch: string, why: st
   }
 }
 
+/**
+ * A record over the relay's size bound (final review N1): a 413 is read as a relay that is down, so the lifecycle goes on in the local
+ * store and the run never fails on it. Its line says so once, apart from a down relay's.
+ */
+const TOO_LARGE = 'HTTP 413'
+const tooLargeOf = (answer: RelayAnswer): RelayAnswer =>
+  !('refused' in answer) && !('down' in answer) && answer.status === 413 ? { down: `${TOO_LARGE}: the record is over the relay's size bound` } : answer
+
 /** The relay didn't answer (spec §8): the lifecycle goes on in the local store, and the run log says why once. */
 async function noteDown($: Engine, root: string, branch: string, why: string): Promise<void> {
-  await noteOnce($, root, branch, 'relay down', `relay down (${why}): this lifecycle goes on in the local store, and is sent to the relay when it answers`)
+  if (why.startsWith(TOO_LARGE)) {
+    await noteOnce($, root, branch, 'relay too large', `relay too large (${why}): this lifecycle goes on in the local store, and is sent to the relay once it fits`)
+  } else await noteOnce($, root, branch, 'relay down', `relay down (${why}): this lifecycle goes on in the local store, and is sent to the relay when it answers`)
   await setPending($, root, branch, true)
 }
 
 /**
  * Keeps a local record the relay's wins over (a fallback the relay moved on from, or a record from before the relay): whole in the
- * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is owed: the local archive holds it,
- * `lines` says the relay's copy is missing, and it is sent again after the next call that lands.
+ * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is owed (`isOwed`): the local archive
+ * holds it, `lines` says the relay's copy is missing, and it is sent again after the next call that lands. One over the relay's size
+ * bound (413) never lands, so it is not owed: the local archive is the only copy, and `lines` says so (final review N1).
  */
-async function keepLocal($: Engine, shared: Shared, rec: LifecycleRecord, reason: 'fallback' | 'migration' | 'move'): Promise<{ at: number; lines: string[] }> {
+async function keepLocal(
+  $: Engine,
+  shared: Shared,
+  rec: LifecycleRecord,
+  reason: 'fallback' | 'migration' | 'move',
+): Promise<{ at: number; lines: string[]; isOwed: boolean }> {
   const at = await $.clock.now()
   await writeArchive($, rec, at)
   const body = { op: 'snapshot', at, record: redact({ ...rec, phase: 'archived' }), reason }
   const answer = await relayCall($, shared.relay, shared.path, body)
   const why = 'refused' in answer ? answer.refused : 'down' in answer ? answer.down : answer.status === 200 ? undefined : `HTTP ${answer.status}`
-  if (why !== undefined) await owe($, rec.root, rec.branch, { path: shared.path, body })
-  return {
-    at,
-    lines: why === undefined ? [] : [`relay snapshot missing (${why}): the relay has no copy of the archive of ${at} yet; the local store keeps it, and sends it again`],
-  }
+  const isTooLarge = why === TOO_LARGE
+  const isOwed = why !== undefined && !isTooLarge
+  if (isOwed) await owe($, rec.root, rec.branch, { path: shared.path, body })
+  const line = isTooLarge
+    ? `relay snapshot too large (${why}): the archive of ${at} is over the relay's size bound; the local store keeps the only copy`
+    : `relay snapshot missing (${why}): the relay has no copy of the archive of ${at} yet; the local store keeps it, and sends it again`
+  return { at, lines: why === undefined ? [] : [line], isOwed }
 }
 
 const withLines = (rec: LifecycleRecord, at: number, lines: string[]): LifecycleRecord => lines.reduce((one, text) => withLine(one, at, text), rec)
@@ -656,7 +674,7 @@ async function publishMove(
   if ('down' in claimed) return claimed
   let placed: Given
   if (claimed.status === 200) {
-    const answer = await relayCall($, to.relay, to.path, { op: 'commit', rev: 0, record: redact(rec), from: from.key, secret })
+    const answer = tooLargeOf(await relayCall($, to.relay, to.path, { op: 'commit', rev: 0, record: redact(rec), from: from.key, secret }))
     if ('refused' in answer) return standDown($, root, branch, answer.refused)
     if ('down' in answer) return answer
     if (answer.status === 200) placed = { rev: Number(answer.json.rev), record: rec }
@@ -683,8 +701,9 @@ async function publishMove(
   if ((placed.record as LifecycleRecord | null)?.lifecycleId !== rec.lifecycleId) {
     // Another lifecycle holds the PR's object already: this one is kept, locally and in the archives of the branch's object. Until the
     // relay holds that archive, moveDone waits and the tombstone keeps the record (final review M2): the next load sends both again.
-    const { lines } = await keepLocal($, from, rec, 'move')
-    if (lines.length > 0) return placed
+    // One the relay can never take (413) does not wait: the local archive is its only copy (final review N1).
+    const { isOwed } = await keepLocal($, from, rec, 'move')
+    if (isOwed) return placed
   }
   const body = { op: 'moveDone', lifecycleId: rec.lifecycleId }
   const done = await relayCall($, from.relay, from.path, body)
@@ -866,7 +885,8 @@ async function relayTx<T>(
   })
 
   /** The relay's answer to a commit of `full` at `at`, settled: undefined once committed, else the transaction's outcome. */
-  const settle = async (at: Shared, answer: RelayAnswer): Promise<Ran<T> | undefined> => {
+  const settle = async (at: Shared, given: RelayAnswer): Promise<Ran<T> | undefined> => {
+    const answer = tooLargeOf(given)
     if ('refused' in answer) return standDown($, root, branch, answer.refused)
     if ('down' in answer) {
       // A commit with no answer may still have been applied: the next read tells (spec §8, Review Focus 1), and nothing is lost either way.

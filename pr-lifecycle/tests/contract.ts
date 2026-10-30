@@ -259,11 +259,11 @@ export const CONTRACT: Case[] = [
     ],
   },
   {
-    name: 'a commit or snapshot body over 128 KiB is 413, and changes nothing',
+    name: 'a commit or snapshot body over 512 KiB is 413, and changes nothing',
     steps: [
-      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 0, record: { lifecycleId: 'L9', pad: 'x'.repeat(100 * 1024) } }, status: 200, match: { rev: 1 } },
-      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 1, record: { lifecycleId: 'L9', pad: 'x'.repeat(129 * 1024) } }, status: 413 },
-      { as: 'ADAM', path: pr(511), body: { op: 'snapshot', at: 1, record: { pad: 'x'.repeat(129 * 1024) }, reason: 'fallback' }, status: 413 },
+      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 0, record: { lifecycleId: 'L9', pad: 'x'.repeat(500 * 1024) } }, status: 200, match: { rev: 1 } },
+      { as: 'ADAM', path: pr(511), body: { op: 'commit', rev: 1, record: { lifecycleId: 'L9', pad: 'x'.repeat(513 * 1024) } }, status: 413 },
+      { as: 'ADAM', path: pr(511), body: { op: 'snapshot', at: 1, record: { pad: 'x'.repeat(513 * 1024) }, reason: 'fallback' }, status: 413 },
       { as: 'READER', path: pr(511), body: { op: 'read' }, status: 200, match: { rev: 1 } },
       { as: 'READER', path: pr(511), body: { op: 'archives' }, status: 200, match: { archives: [] } },
     ],

@@ -68,8 +68,11 @@ const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 
 /** How many archives a PR keeps (open decision 3: retention). */
 export const ARCHIVE_CAP = 20
-/** A `commit` or `snapshot` body is at most 128 KiB (final review M6), answered 413 over it. */
-export const BODY_MAX = 128 * 1024
+/**
+ * A `commit` or `snapshot` body is at most 512 KiB (final review M6, N1), answered 413 over it: with the archives' 1 MiB, the state
+ * stays one value under 2 MB. The client keeps a lifecycle over it in its local store.
+ */
+export const BODY_MAX = 512 * 1024
 const BOUNDED_OPS = new Set(['commit', 'snapshot'])
 /** The archives are also trimmed, oldest first, to 1 MiB of JSON, so the record, its archives and the rest stay one value under 2 MB. */
 export const ARCHIVE_BYTES = 1024 * 1024

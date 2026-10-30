@@ -39,6 +39,8 @@ export type FakeRelay = {
   calls: { path: string; body: unknown }[]
   /** Set: every call fails as a network error would. */
   down: boolean
+  /** The bound on a `commit` or `snapshot` body, `BODY_MAX` unless a test lowers it to meet a 413. */
+  bodyMax: number
   /** The next call answers `ms` later on the test's clock. */
   delayNext: (ms: number) => void
   /** Who a call's credential headers sign in as, as Access would tell the relay; undefined when Access refuses them. */
@@ -79,7 +81,7 @@ const LOG_TEXT_MAX = 300
 const LOG_FIELD_MAX = 200
 const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 const ARCHIVE_CAP = 20
-const BODY_MAX = 128 * 1024
+const BODY_MAX = 512 * 1024
 const BOUNDED_OPS = new Set(['commit', 'snapshot'])
 const ARCHIVE_BYTES = 1024 * 1024
 const trimmed = <T>(archives: T[]): T[] => {
@@ -164,6 +166,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
     index: new Map(),
     calls: [],
     down: false,
+    bodyMax: BODY_MAX,
     delayNext: ms => {
       delay = ms
     },
@@ -258,7 +261,7 @@ export function fakeRelay(on: On, opts: FakeRelayOptions = {}): FakeRelay {
     if (need === undefined) return json(400, { error: `unknown op ${op}` })
     const isAllowed = need === 'admin' ? !who.isService && admins.includes(who.id) : need === 'read' ? preset !== undefined : preset === 'operate'
     if (!isAllowed) return json(403, { error: `${who.id} may not ${op} on ${repo}` })
-    if (BOUNDED_OPS.has(op) && new TextEncoder().encode(JSON.stringify(body)).length > BODY_MAX) return json(413, { error: `${op} body over ${BODY_MAX} bytes` })
+    if (BOUNDED_OPS.has(op) && new TextEncoder().encode(JSON.stringify(body)).length > fake.bodyMax) return json(413, { error: `${op} body over ${fake.bodyMax} bytes` })
     const now = clock.now()
     const id = `${repo}${key}`
     const s = copy(fake.objects.get(id)) ?? empty()

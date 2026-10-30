@@ -520,7 +520,7 @@ test('a fresh start over a tombstone whose PR object holds another lifecycle kee
   expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
 })
 
-test('a move snapshot that doesn\'t land leaves the record in the tombstone: moveDone waits until the relay holds the archive (final review M2)', async (_t, on) => {
+test('a move snapshot that doesn\'t land leaves the record in the tombstone: moveDone waits until the relay holds the archive, copies deduped (final review M2, N5)', async (_t, on) => {
   const s = setup(on)
   const { w, fake, $, onSend } = s
   await saveRecord($, seed())
@@ -540,8 +540,40 @@ test('a move snapshot that doesn\'t land leaves the record in the tombstone: mov
   // Once the relay answers, the archive lands first, then moveDone, and the new lifecycle starts.
   await saveRecord($, fresh)
   const kept = (fake.objects.get(OBJECT)?.archives ?? []).filter(one => one.reason === 'move')
+  // Two copies land, by design: the retried move sends its own snapshot before moveDone, and the snapshot owed from the failed
+  // try is paid after it. An archive is an append-only log, so a second copy of the same lifecycle is harmless; what matters is
+  // that every copy is the old lifecycle, and that one landed before moveDone.
+  expect(kept.length).toBeGreaterThanOrEqual(1)
   expect([...new Set(kept.map(one => (one.record as LifecycleRecord).lifecycleId))]).toEqual([old])
+  const ops = fake.calls.map(one => (one.body as { op?: string }).op)
+  expect(ops.indexOf('snapshot')).toBeLessThan(ops.indexOf('moveDone'))
   expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+})
+
+test('a move snapshot over the relay\'s size bound (413) is kept in the local archive only, and the move still finishes (final review N1)', async (_t, on) => {
+  const s = setup(on)
+  const { w, fake, $, onSend } = s
+  await saveRecord($, seed())
+  const old = local(w).lifecycleId
+  await movesUntil(s, body => body.op === 'moveTo')
+  const other = { ...seed({ phase: 'post', pr: PR }), slug: SLUG }
+  expect((await codex(fake, PR_PATH, { op: 'commit', rev: 0, record: other })).status).toBe(200)
+  onSend.fn = body => {
+    fake.bodyMax = body.op === 'snapshot' ? 64 : 512 * 1024
+  }
+  const fresh = seed()
+  await saveRecord($, fresh)
+  onSend.fn = undefined
+  fake.bodyMax = 512 * 1024
+  expect(opsOf(fake, 'snapshot')).toHaveLength(1)
+  expect(opsOf(fake, 'moveDone')).toHaveLength(1)
+  expect(fake.objects.get(OBJECT)?.archives ?? []).toEqual([])
+  const archived = [...w.store.entries()].filter(([key]) => key.startsWith(`${KEY}:archived:`)).map(([, one]) => (one as LifecycleRecord).lifecycleId)
+  expect(archived).toContain(old)
+  expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+  // Nothing is owed: a 413 never lands, so it is never sent again.
+  await saveRecord($, { ...fresh, message: 'later' })
+  expect(opsOf(fake, 'snapshot')).toHaveLength(1)
 })
 
 test('a fresh start from the PR key over an unfinished move meets the relay\'s 409 and loses nothing', async (_t, on) => {

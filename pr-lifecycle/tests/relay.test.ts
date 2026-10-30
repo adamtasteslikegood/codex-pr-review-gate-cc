@@ -247,6 +247,12 @@ test('a redirect or an HTML page (Access\'s login) is refused, never down; a 5xx
     expect('refused' in got && got.refused.startsWith(`HTTP ${status}: `)).toBe(true)
   }
   expect(await relayCall(engineOf(w, page(502, { 'content-type': 'text/html' }, '<html>Bad gateway</html>')), relayAs('ADAM'), path, { op: 'read' })).toEqual({ down: 'HTTP 502' })
+  // An HTML page with another 4xx (an edge 404: a mistyped url, a Worker not on the route) is down, not a credential problem (N2).
+  expect(await relayCall(engineOf(w, page(404, { 'content-type': 'text/html' }, '<html>Not found</html>')), relayAs('ADAM'), path, { op: 'read' })).toEqual({ down: 'not JSON' })
+  // 401 and 403 stay refused, HTML or not.
+  for (const status of [401, 403]) {
+    expect(await relayCall(engineOf(w, page(status, { 'content-type': 'text/html' }, '<html>Forbidden</html>')), relayAs('ADAM'), path, { op: 'read' })).toEqual({ refused: `HTTP ${status}` })
+  }
   // The request asks the host not to follow a redirect, so the credential never leaves the pinned host.
   const inits: unknown[] = []
   await relayCall(engineOf(w, (_url: string, init?: unknown) => {

@@ -563,6 +563,24 @@ test('restore needs the same lifecycle', async () => {
   expect(restore(redact(mirror), mirror).findings).toEqual(mirror.findings)
 })
 
+test('a commit over the relay\'s size bound (413) keeps the lifecycle in the local store, says so once, and never throws (final review N1)', async (_t, on) => {
+  const { w, fake, $ } = setup(on)
+  await saveRecord($, seed({ lifecycleId: 'L1' }))
+  expect(fake.objects.get(OBJECT)?.rev).toBe(1)
+  fake.bodyMax = 4 * 1024
+  const big = { ...local(w), message: 'x'.repeat(8 * 1024) }
+  await saveRecord($, big)
+  await saveRecord($, { ...big, message: `${big.message}y` })
+  expect(local(w).message).toBe(`${big.message}y`)
+  expect(fake.objects.get(OBJECT)?.rev).toBe(1)
+  expect((local(w).log ?? []).filter(one => one.text.startsWith('relay too large'))).toHaveLength(1)
+  expect((local(w).log ?? []).some(one => one.text.startsWith('relay down'))).toBe(false)
+  // Once the record fits again, the relay takes it: the lifecycle was never stood down.
+  fake.bodyMax = 512 * 1024
+  await saveRecord($, { ...big, message: 'small again' })
+  expect((fake.objects.get(OBJECT)?.record as LifecycleRecord).message).toBe('small again')
+})
+
 test('a 403 stands down: no local write, no fallback, the log says so once', async (_t, on) => {
   const { fake, $, w } = setup(on)
   await saveRecord($, seed())
