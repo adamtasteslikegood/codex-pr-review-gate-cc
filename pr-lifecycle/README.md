@@ -1,6 +1,6 @@
 # pr-lifecycle
 
-Version 1.6.0. Part of [pr-gate](../README.md); MIT licensed, see
+Version 1.6.1. Part of [pr-gate](../README.md); MIT licensed, see
 [LICENSE](../LICENSE).
 
 A Claude Code mod that takes a branch through the whole pull request

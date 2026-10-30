@@ -100,7 +100,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Produces: the Worker sets `x-relay-preset` on every object call. `LifecycleObject` reads the preset only from that header.
 - Produces: `test/harness.ts` exports `start(bindings?)`, `stop()`, `call(token, body, path?, headers?)`, `person(email)`, `service(id)`, `sign(...)`, `grant(adminToken, principal, repo, preset)`, and the constants `ADAM`, `CODEX`, `READER`.
 
-- [ ] **Step 1: Write the failing tests** in `grants.test.ts`:
+- [x] **Step 1: Write the failing tests** in `grants.test.ts`:
   - `a principal with no grant gets 403`: `call(person('new@example.org'), { op: 'read' })` gives 403.
   - `after grant it gets through, after revoke it gets 403 on its next request`: Adam `grant`s `read` and then `read` gives 200; Adam `revoke`s and then `read` gives 403.
   - `grant of an existing pair changes its preset`: `read` becomes `operate`, `grants` lists one entry, and `claim` then gives 200.
@@ -109,10 +109,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `every grant change is in the history with its actor`: after grant, grant and revoke, `grants` returns `history.length === 3`, each `actor === ADAM`, with rev 1, 2, 3.
   - `a grant names one lowercased repo; a wildcard or a malformed repo is 400`: `Owner/Repo` is stored as `owner/repo`; `*` and `owner` give 400.
   - `history keeps the last 500`: 501 grant writes leave `history.length === 500`, starting at rev 2.
-- [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/grants.test.ts`. Expected: FAIL, because the route doesn't exist.
-- [ ] **Step 3: Implement** `GrantStore` in `src/grants.ts` and the admin route in `index.ts`. The route matches `/v1/admin/grants` before owner/repo parsing, and `isAdmin` is checked in the Worker. For other calls, the Worker calls `presetOf` on `env.GRANTS.get(env.GRANTS.idFromName('grants'))`, with no cache. `LifecycleObject` drops its `presetOf(env, ...)` import and reads `x-relay-preset`.
-- [ ] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: all relay tests PASS, the 17 existing ones included, now seeded through `grant`.
-- [ ] **Step 5: Commit** with `feat(relay): grants stored in a GrantStore object, edited by admin ops; the Worker passes the preset (R104)`.
+- [x] **Step 2: Run** `node --test pr-lifecycle-relay/test/grants.test.ts`. Expected: FAIL, because the route doesn't exist.
+- [x] **Step 3: Implement** `GrantStore` in `src/grants.ts` and the admin route in `index.ts`. The route matches `/v1/admin/grants` before owner/repo parsing, and `isAdmin` is checked in the Worker. For other calls, the Worker calls `presetOf` on `env.GRANTS.get(env.GRANTS.idFromName('grants'))`, with no cache. `LifecycleObject` drops its `presetOf(env, ...)` import and reads `x-relay-preset`.
+- [x] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: all relay tests PASS, the 17 existing ones included, now seeded through `grant`.
+- [x] **Step 5: Commit** with `feat(relay): grants stored in a GrantStore object, edited by admin ops; the Worker passes the preset (R104)`.
 
 ### Task 2: Branch keys, the move and the tombstone (relay)
 
@@ -126,7 +126,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Produces: the object name `owner/repo@<branch>`, with owner and repo lowercased and the branch kept as is. `x-relay-key` is `@<branch>` or `#<pr>`.
 - Produces: tombstone state, where `record` is `{ movedTo: number, lifecycleId: string, record?: unknown }` (`record` kept from `moveTo` until `moveDone`) and the state gains `movedTo?: number`.
 
-- [ ] **Step 1: Write the failing tests** in `branch.test.ts`:
+- [x] **Step 1: Write the failing tests** in `branch.test.ts`:
   - `a branch with / round-trips`: a commit at `/v1/owner/repo/branch/feat%2Fa%2Fb` is read back from the same URL, and not from `.../branch/feat` (that read gives `rev: 0`).
   - `awkward names round-trip`: `fix-%C3%BC` and `100%25` work, and `a%252Fb` reaches the branch `a%2Fb`, not `a/b`.
   - `a name git would refuse gets 404`: for each of `a..b`, `-x`, `x.lock`, `x/`, `a%20b`, `a~b`, `a%5Cb`, `a@%7Bb`, and an empty name.
@@ -140,10 +140,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `isFresh with the tombstone's own lifecycleId is 410`: a fresh start must be a new lifecycle.
   - `moveTo and moveDone on a PR key are 404`.
   - `commit with from on a non-empty PR object is 409 with its record`: the client reads `lifecycleId` from that answer (spec §1 step 1).
-- [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/branch.test.ts`. Expected: FAIL.
-- [ ] **Step 3: Implement.** The Worker decodes the segment with `decodeURIComponent` once, validates it with `isBranchName`, and answers 404 when the decode throws. `LifecycleObject` reads `x-relay-key` to know whether it is a branch object.
-- [ ] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(relay): pre-PR records keyed by branch, frozen and moved to the PR key with a tombstone (R103)`.
+- [x] **Step 2: Run** `node --test pr-lifecycle-relay/test/branch.test.ts`. Expected: FAIL.
+- [x] **Step 3: Implement.** The Worker decodes the segment with `decodeURIComponent` once, validates it with `isBranchName`, and answers 404 when the decode throws. `LifecycleObject` reads `x-relay-key` to know whether it is a branch object.
+- [x] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(relay): pre-PR records keyed by branch, frozen and moved to the PR key with a tombstone (R103)`.
 
 ### Task 3: `take`, the lease-free log and `snapshot` (relay)
 
@@ -155,7 +155,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Produces: the ops `take`, `log`, `snapshot` and `fileAdopt` with the wire shapes above, `export const RELAY_LOG_CAP = 1000`, and `FILING_STALE_MS` 1 800 000 (env `FILING_STALE_MS` overrides it; the harness sets `'300'`). `Filing` gains `adoptedBy?: string`.
 - Produces: the log is stored under its own storage key `log` as `{ lines: LogLine[], dropped: number, seq: number }`. `read` returns `log` (lines with `seq` above `logSince` when it is given), `logDropped` and `logSeq`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `take by the same principal issues a new token and fences out the old holder`: Adam claims as `s1`, Adam takes as `s2`, the token rises, and `s1`'s `beat` and `commit` give 409 and 423.
   - `take by a different principal gets 423`: CODEX can't take Adam's live lease.
   - `take of a lapsed or empty lease acts as claim`.
@@ -169,10 +169,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `fileAdopt finishes a stale claim under the lease, without impersonating`: CODEX claims a filing with secret A; after `FILING_STALE_MS`, Adam (holding the lease, another secret) adopts with `{ number: 5, url }` and gets 200; `filing` gives `state: 'done'`, `actor: CODEX`, `adoptedBy: ADAM`; the write history names `fileAdopt` by ADAM.
   - `fileAdopt is refused without the live lease (423), on a claim younger than FILING_STALE_MS (409), on a missing claim (409), and with another result on a done filing (409)`; with the same result it gives 200.
   - `snapshot appends to archives without touching record or rev`: the archive's last entry is `{ reason: 'fallback', actor: ADAM }`, and `ARCHIVE_CAP` still applies.
-- [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/log.test.ts`. Expected: FAIL.
-- [ ] **Step 3: Implement** the three ops. The log is written with a single `storage.put({ log })` and never inside `state`.
-- [ ] **Step 4: Run** `npm run test:relay`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(relay): take within one principal, a lease-free log capped at 1000, snapshot, and fileAdopt (R101, R105, R106)`.
+- [x] **Step 2: Run** `node --test pr-lifecycle-relay/test/log.test.ts`. Expected: FAIL.
+- [x] **Step 3: Implement** the three ops. The log is written with a single `storage.put({ log })` and never inside `state`.
+- [x] **Step 4: Run** `npm run test:relay`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(relay): take within one principal, a lease-free log capped at 1000, snapshot, and fileAdopt (R101, R105, R106)`.
 
 ### Task 4: RepoIndex, the outbox and its alarm, `list`, retention (relay)
 
@@ -186,7 +186,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Produces: each record commit, `moveTo` and archive commit writes an outbox entry. A record with `phase: 'archived'` or a tombstone writes `removed`. A non-empty outbox sets an alarm. The alarm sends the outbox to `env.REPO_INDEX.idFromName(repo)` and clears what was acknowledged. On failure it retries with doubling backoff from `INDEX_RETRY_MS` (default 1000), capped at 5 minutes.
 - Produces: retention. Once `RETENTION_MS` has passed since the PR's archive commit (a PR key) or since the last write (a branch key), the alarm delivers a removal at `(born, rev + 1)` to the index, then deletes the object (`deleteAll`) once the index has acknowledged it.
 
-- [ ] **Step 1: Write the failing tests.** Alarms run in real time under Miniflare, so each test polls `list` every 25 ms for up to 3 s.
+- [x] **Step 1: Write the failing tests.** Alarms run in real time under Miniflare, so each test polls `list` every 25 ms for up to 3 s.
   - `list through the index matches the objects`: commits to `#7`, `#8` and `@feat/x` list three entries with their `rev` and `lifecycleId`.
   - `a failed first registration converges with no further commit`: set `fault` until now + 300 ms, commit once, and the entry appears after the fault ends.
   - `a delayed old update never brings back a removed or older entry`: send `update` rev 3, then `removed` at rev 4, then the old `update` rev 3 again; the entry stays gone.
@@ -196,10 +196,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `an archived PR object is deleted after RETENTION_MS`: after an archive commit and a wait above 400 ms, `read` gives `rev: 0`.
   - `a branch object is deleted RETENTION_MS after its last write`.
   - `a recreated branch is found at once, and an update from before its deletion can't replace it`: commit `@x` up to rev 8, wait for retention, then commit `@x` again (rev 1, lifecycle L2). `list` shows `@x` at rev 1 with L2. A delayed `update { key: '@x', born: <old>, rev: 8 }` sent straight to the index leaves it unchanged.
-- [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/index.test.ts`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS. Run it three times, because alarm timing is real.
-- [ ] **Step 5: Commit** with `feat(relay): a RepoIndex fed by an outbox and alarm, list, and 90-day retention`.
+- [x] **Step 2: Run** `node --test pr-lifecycle-relay/test/index.test.ts`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS. Run it three times, because alarm timing is real.
+- [x] **Step 5: Commit** with `feat(relay): a RepoIndex fed by an outbox and alarm, list, and 90-day retention`.
 
 ### Task 5: The relay client, its config, credentials and secrets (plugin)
 
@@ -219,7 +219,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `leaseSecret($): Promise<string | undefined>` and `filingSecret($, root, lifecycleId): Promise<string | undefined>`. Each makes the secret once, saves it before returning, and returns undefined when the save fails.
 - Produces, in `relay-fake.ts`: `fakeRelay(on, opts?): FakeRelay`, with `FakeRelay = { objects, index, calls: { path, body }[], down: boolean, delayNext(ms), principalOf(headers) }`. It answers like the relay for every op in the wire table, including 410, 409, 423 and `logSince`.
 
-- [ ] **Step 1: Write the contract transcript** in `tests/contract.ts`. Cover these cases, each step with its expected status and the fields it matches:
+- [x] **Step 1: Write the contract transcript** in `tests/contract.ts`. Cover these cases, each step with its expected status and the fields it matches:
   - claim, commit, read, beat and release;
   - a stale commit (409) and a commit under another holder's lease (423);
   - take, by the same principal and by a different one;
@@ -228,8 +228,8 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - moveTo, then 410, moveDone, then a fresh start;
   - fileClaim, fileDone and filing;
   - list.
-- [ ] **Step 2: Write `contract.test.ts`** (relay side), which replays every case against Miniflare. Run `npm run test:relay`. Expected: PASS, because Tasks 1–4 built the relay. A failure here is a relay bug or a transcript bug, to be fixed before going on.
-- [ ] **Step 3: Write the failing plugin tests** in `tests/relay.test.ts`:
+- [x] **Step 2: Write `contract.test.ts`** (relay side), which replays every case against Miniflare. Run `npm run test:relay`. Expected: PASS, because Tasks 1–4 built the relay. A failure here is a relay bug or a transcript bug, to be fixed before going on.
+- [x] **Step 3: Write the failing plugin tests** in `tests/relay.test.ts`:
   - `the fake relay passes the contract`: replay `contract.ts` through `relayCall` against `fakeRelay`.
   - `no sharedStore or no credential stays local and says why`: `relayOf` answers `{ local: 'no sharedStore in .github/pr-gate.json' }` or `{ local: 'no relay credential' }`.
   - `sharedStore is read from the base, never the HEAD`: `w.git.headRoster` carries `sharedStore` and the base doesn't, so the answer is local.
@@ -238,10 +238,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `401, 403, 502 and a body that isn't JSON are down` (Review Focus 2).
   - `a secret is saved before the first call that sends it, and a failed save sends nothing`: make `store.set` of `relay-secret:` fail, and `fake.calls` stays empty (Review Focus 4).
   - `a branch with / or % encodes as one segment`.
-- [ ] **Step 4: Run** `npm run test`. Expected: the new tests FAIL.
-- [ ] **Step 5: Implement** `relay.ts`, `relay-fake.ts` and the `readRoster` change.
-- [ ] **Step 6: Run** `npm run lint && npm run test && npm run validate`. Expected: PASS. `validate` lists the three env names.
-- [ ] **Step 7: Commit** with `feat(pr-lifecycle): a relay client, read from the base's sharedStore with env credentials; a fake relay held to the relay's contract`.
+- [x] **Step 4: Run** `npm run test`. Expected: the new tests FAIL.
+- [x] **Step 5: Implement** `relay.ts`, `relay-fake.ts` and the `readRoster` change.
+- [x] **Step 6: Run** `npm run lint && npm run test && npm run validate`. Expected: PASS. `validate` lists the three env names.
+- [x] **Step 7: Commit** with `feat(pr-lifecycle): a relay client, read from the base's sharedStore with env credentials; a fake relay held to the relay's contract`.
 
 ### Task 6: The relay backend in `store.ts`: transact, fallback, recovery, migration, redaction (plugin)
 
@@ -267,7 +267,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - A record without `lifecycleId` gets `newLifecycleId()` before its first relay commit.
   - The slug comes from `rec.slug`. When it is unset, the store resolves `slugOf(git remote get-url origin)` and saves it on the record. With no slug, the record stays local.
 
-- [ ] **Step 1: Write the failing tests** in `shared-store.test.ts`, each with `fakeRelay` and a `sharedStore` roster:
+- [x] **Step 1: Write the failing tests** in `shared-store.test.ts`, each with `fakeRelay` and a `sharedStore` roster:
   - `a pure update retries once on 409, against the returned record`: a second writer bumps rev between read and commit; the change runs twice and the commit lands.
   - `a transact whose work ran git is not retried: it throws StaleRecord`.
   - `the last of two saves is the one committed`.
@@ -283,11 +283,11 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `a redacted finding is restored from the local mirror on load`, and `one found by another checkout shows the placeholder title`.
   - `restore needs the same lifecycle`: a local mirror of lifecycle L1 with security finding G1-1, and a remote L2 record whose redacted G1-1 is another finding: `restore` keeps the placeholder and none of L1's text. With both at L1, the text comes back, but the remote `status` wins.
   - `a repo that does not opt in behaves exactly as before`: no `http.fetch` calls at all.
-- [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
-- [ ] **Step 3: Classify the call sites.** Run `grep -n "updateRecord(\|upsertRecord(" pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/register.tsx`. A site passes `{ isPure: true }` only when its `change` uses nothing from `$` and runs no git, gh, agent or filing, which is a plain object transform. List each site with its verdict in the task report.
-- [ ] **Step 4: Implement.** Keep the local paths byte-for-byte when `relayOf` answers `local`.
-- [ ] **Step 5: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS, all 713 existing tests included.
-- [ ] **Step 6: Commit** with `feat(pr-lifecycle): records on the relay through transact, with fallback, recovery, migration and redacted security text (R102, R107)`.
+- [x] **Step 2: Run** `npm run test`. Expected: FAIL.
+- [x] **Step 3: Classify the call sites.** Run `grep -n "updateRecord(\|upsertRecord(" pr-lifecycle/hooks/round.ts pr-lifecycle/hooks/register.tsx`. A site passes `{ isPure: true }` only when its `change` uses nothing from `$` and runs no git, gh, agent or filing, which is a plain object transform. List each site with its verdict in the task report.
+- [x] **Step 4: Implement.** Keep the local paths byte-for-byte when `relayOf` answers `local`.
+- [x] **Step 5: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS, all 713 existing tests included.
+- [x] **Step 6: Commit** with `feat(pr-lifecycle): records on the relay through transact, with fallback, recovery, migration and redacted security text (R102, R107)`.
 
 ### Task 7: The move, `logEvent` through `log`, `liveRecords` and archives from the relay (plugin)
 
@@ -309,7 +309,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   4. From then on the record's key is `#<pr>`.
   On load, a 410 or a tombstone whose `lifecycleId` matches is followed to the PR key. A tombstone that still carries `record` gets steps 2 and 3 run first, from that record. A tombstone whose id doesn't match means standing down.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `a pre-PR record lives on the branch key and moves to the PR key on onOpened`: the fake shows the tombstone on `@feat/x` and the record on `#7`.
   - `a stale checkout still driving the branch key follows the 410`.
   - `a crash after each move step is finished by the next load, and only the PR driver dispatches`: for each of the three steps, the fake drops every later step once and holds the index update back; then a branch-key client and a PR-key client each start a round, and only the PR-key one passes a boundary or dispatches.
@@ -319,10 +319,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `the 1001st line drops the oldest and /pr-gate log says how many earlier lines are gone`.
   - `liveRecords through the index matches the per-PR objects`.
   - `latestArchive reads the relay's newest archive`.
-- [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(pr-lifecycle): a pre-PR record moves from its branch key to its PR key; the run log, discovery and archives come from the relay (R103, R106)`.
+- [x] **Step 2: Run** `npm run test`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(pr-lifecycle): a pre-PR record moves from its branch key to its PR key; the run log, discovery and archives come from the relay (R103, R106)`.
 
 ### Task 8: The lease in `round.ts`: claim, beat, take, action boundaries, stand-down (plugin)
 
@@ -345,7 +345,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - each filing POST (≈:3823, ≈:4190).
   List each site in the report.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `the relay holder beats every 60 s, and its ownership checks make no network read while the lease holds`: count `fake.calls` of `read`.
   - `a take right after the old driver's beat: the old driver's next boundary gets 423, it stands down, and nothing is dispatched` (spec §14).
   - `a headless second session never takes a live lease; an interactive one by the same principal does` (Review Focus 5).
@@ -353,10 +353,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `a takeover after a lapse fences out the old holder's commit`.
   - `standDown logs through log, not a commit`.
   - `the local backend is unchanged`: the existing owner tests pass as they are.
-- [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(pr-lifecycle): the driver holds the relay's lease, beats at each action boundary, and a person takes over within one principal (R100, R105)`.
+- [x] **Step 2: Run** `npm run test`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(pr-lifecycle): the driver holds the relay's lease, beats at each action boundary, and a person takes over within one principal (R100, R105)`.
 
 ### Task 9: The filing ledger in `fileOnce` (plugin)
 
@@ -368,7 +368,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Consumes: `relayCall`, `filingSecret`, `boundary`.
 - Produces: the spec §7 order. First comes the exact-mark search, with adoption by the ledger's state (unclaimed, mine, another's, lost secret, done). Then `fileClaim` with key `${lifecycleId}:${findingId}:${attempt}`. Then the POST (after `boundary`), then `fileDone { number, url }`. `attempt` advances only when the same finding holds the merge again after its issue was closed, and it is kept on the finding as `fileAttempt?: number`. With several marked issues after a fallback, the lowest-numbered one is adopted and the others are named in the run log, never closed.
 
-- [ ] **Step 1: Write the failing tests** (spec §14, "Crash after a POST"):
+- [x] **Step 1: Write the failing tests** (spec §14, "Crash after a POST"):
   - `a crash after the POST: a new session in the same checkout sends no second POST and leaves the ledger done`.
   - `the same restart from another checkout leaves it claimed, with no second POST`.
   - `with the plugin store lost too, the lease holder adopts the marked issue with fileAdopt once the claim is stale: no second POST, no admin, the ledger ends done with adoptedBy`.
@@ -377,10 +377,10 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `a claim older than stepTimeoutMinutes shows as stuck`.
   - `two checkouts that both filed in fallback: on recovery the lowest-numbered issue is adopted and the other is reported, not closed`.
   - `attempt advances only after the earlier issue closed with the finding still holding`.
-- [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(pr-lifecycle): filing goes through the relay's ledger, so a finding is never filed twice (R101)`.
+- [x] **Step 2: Run** `npm run test`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** `npm run lint && npm run test && npm run typecheck`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(pr-lifecycle): filing goes through the relay's ledger, so a finding is never filed twice (R101)`.
 
 ### Task 10: `/pr-gate log` from the relay (plugin)
 
@@ -396,11 +396,11 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - each line's principal and short session id;
   - a `stuck filings` section listing claims older than `stepTimeoutMinutes` with no `fileDone`, each with its key and claimant, and the hint `the driver adopts it once its issue is found; otherwise an admin's fileDelete frees it`.
 
-- [ ] **Step 1: Write the failing tests** for each of those output parts, plus `a repo not on the relay prints as before`.
-- [ ] **Step 2: Run** `npm run test`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `npm run lint && npm run test`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(pr-lifecycle): /pr-gate log reads the relay's log, across a move, and lists stuck filings`.
+- [x] **Step 1: Write the failing tests** for each of those output parts, plus `a repo not on the relay prints as before`.
+- [x] **Step 2: Run** `npm run test`. Expected: FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** `npm run lint && npm run test`. Expected: PASS.
+- [x] **Step 5: Commit** with `feat(pr-lifecycle): /pr-gate log reads the relay's log, across a move, and lists stuck filings`.
 
 ### Task 11: Two-controller proofs and the request count
 
@@ -411,15 +411,15 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 **Interfaces:**
 - Consumes: everything above. The two controllers are two `world`s sharing one `fakeRelay` and one fake GitHub: two checkout roots, two session ids. Write a small `twoWorlds(on)` helper in the test file if `world` can't host two sessions. If neither works, run them in sequence against the shared fake, interleaving by clock advances, and say so in the report.
 
-- [ ] **Step 1: Write the tests** (spec §14):
+- [x] **Step 1: Write the tests** (spec §14):
   - `no new dispatch after a takeover; an acknowledged action may finish, its commit is refused, its filing goes through the ledger`;
   - `the other stands down`;
   - `a takeover after a lapse fences out the old holder's commit`;
   - `neither files a finding twice`;
   - `a stale startGate commit (409) is not retried and the next tick recovers`.
-- [ ] **Step 2: Write `request-count.test.ts`**, which runs one scripted lifecycle-hour against Miniflare: claim, 60 beats at 60 s simulated by direct calls, 10 commits, 20 log lines and 3 filings. Count requests at the Miniflare boundary (Worker requests, and Durable Object requests through a counter the harness wraps around the bindings). Assert DO requests ≈ 2 × Worker requests (±10 %), and print the table for the spec §12 note.
-- [ ] **Step 3: Run** `npm run check`. Expected: PASS.
-- [ ] **Step 4: Commit** with `test: two controllers on one PR through the relay, and the request count per lifecycle-hour`.
+- [x] **Step 2: Write `request-count.test.ts`**, which runs one scripted lifecycle-hour against Miniflare: claim, 60 beats at 60 s simulated by direct calls, 10 commits, 20 log lines and 3 filings. Count requests at the Miniflare boundary (Worker requests, and Durable Object requests through a counter the harness wraps around the bindings). Assert DO requests ≈ 2 × Worker requests (±10 %), and print the table for the spec §12 note.
+- [x] **Step 3: Run** `npm run check`. Expected: PASS.
+- [x] **Step 4: Commit** with `test: two controllers on one PR through the relay, and the request count per lifecycle-hour`.
 
 ### Task 12: Docs and version 1.6.0
 
@@ -433,9 +433,9 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `ROADMAP.md` (#29 Part B built, not yet deployed);
   - the spec §12, with the measured request count from Task 11.
 
-- [ ] **Step 1: Update the docs.** Run `npm run test` and `npm run test:relay` and copy the actual counts into `CLAUDE.md`.
-- [ ] **Step 2: Run** `npm run check`. Expected: PASS.
-- [ ] **Step 3: Commit** with `docs: pr-lifecycle 1.6.0, the shared store (#29 Part B)`.
+- [x] **Step 1: Update the docs.** Run `npm run test` and `npm run test:relay` and copy the actual counts into `CLAUDE.md`.
+- [x] **Step 2: Run** `npm run check`. Expected: PASS.
+- [x] **Step 3: Commit** with `docs: pr-lifecycle 1.6.0, the shared store (#29 Part B)`.
 
 ### Task 13: Development deploy and latency (R108). **STOP and confirm with Adam first.**
 
