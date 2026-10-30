@@ -1,6 +1,7 @@
-# `todo`: a CLI that keeps TODO comments tracked as issues
+# `td2do`: a CLI that keeps TODO comments tracked as issues
 
-Status: draft for Adam's review (2026-10-29). Nothing is built. Decisions still open are listed at the end.
+Status: decided (Adam, 2026-10-30); all six open decisions ruled, see the table at the end. Nothing is built. The tool gets its own repo
+(decision 2); this spec moves there when that repo is created, and stays here until then because section 10 depends on the relay design.
 
 Inputs:
 
@@ -29,7 +30,7 @@ canonical TODO, across every language. That is the gap.
 
 ## 2. Users
 
-- **Adam at the keyboard.** Reads the list, decides what gets tracked, sets the policy in `.todo.toml`.
+- **Adam at the keyboard.** Reads the list, decides what gets tracked, sets the policy in `.td2do.toml`.
 - **Agents** (local Claude Code sessions, cloud sessions, CI). They read the list as JSON, search before writing, and add TODOs only through
   the tool. Agents add TODOs faster and less consistently than a person, so the check exists mainly for them.
 
@@ -61,16 +62,16 @@ Two different things need identity; they are kept apart.
   and REF, lowercases, and collapses whitespace. It is used only to file an issue **once** (section 5), never as a lasting ID, so rewording
   a TODO later is harmless.
 
-Catching a reworded duplicate ("retry on 429" and "handle rate limit") is not identity: it is search (`todo find`, section 6), and the
+Catching a reworded duplicate ("retry on 429" and "handle rate limit") is not identity: it is search (`td2do find`, section 6), and the
 person or agent decides.
 
 ## 5. Filing an issue, once
 
-`todo track` and `todo add` file issues. Filing follows the same rule pr-gate's filing ledger uses (R96, relay design section 7): find an exact
+`td2do track` and `td2do add` file issues. Filing follows the same rule pr-gate's filing ledger uses (R96, relay design section 7): find an exact
 mark first, so a crash between creating the issue and writing the comment never files a second one.
 
 1. Compute the fingerprint.
-2. **Search for the mark.** Ask the backend for an issue whose body contains `<!-- todo: <fingerprint> -->`. If one exists, open or closed,
+2. **Search for the mark.** Ask the backend for an issue whose body contains `<!-- td2do: <fingerprint> -->`. If one exists, open or closed,
    adopt it: an open one becomes the REF; a closed one is reported and the TODO is left untracked, for the caller to decide (re-open or file
    anew with `--new`).
 3. Otherwise **create** the issue: title from the TODO text, body with the file, line, commit, the surrounding code, and the mark; label
@@ -78,7 +79,7 @@ mark first, so a crash between creating the issue and writing the comment never 
 4. **Rewrite the comment** in place to `TAG(gh#N): text`, changing nothing else on the line.
 
 A retry after any crash repeats step 2 and finds the mark. Two agents filing the same TODO at the same moment can still both pass step 2
-before either issue exists; the next `todo check` finds two issues with one mark, keeps the lowest number, and lists the other for Adam to
+before either issue exists; the next `td2do check` finds two issues with one mark, keeps the lowest number, and lists the other for Adam to
 close. It never closes anything itself (the same stance as the relay design, section 8). The relay ledger in section 10 removes this race.
 
 ## 6. Commands
@@ -88,18 +89,19 @@ Every command takes `--json`. JSON output carries `"schema": 1`. Exit codes: 0 s
 
 | Command | What it does | Who uses it |
 | --- | --- | --- |
-| `todo` / `todo list` | Every TODO: file:line, tag, text, REF, and, with `--online`, the issue's state. Filters: `--untracked`, `--ref gh#12`, `--path`, `--tag`. | Adam, agents |
-| `todo find <words>` | Searches TODO text in the code **and** open issues labelled `todo`, ranked by shared words. The step an agent runs before writing a TODO. | agents first |
-| `todo add <file>:<line> <text> [--tag FIXME] [--ref gh#12]` | Inserts a canonical TODO above that line in the file's comment syntax. With `--ref`, points to an existing issue; without it, files one (section 5). Prints the REF. | agents |
-| `todo track <file>:<line>` | Files an issue for an existing untracked TODO and rewrites it. `--all [--path]` tracks many, asking once with the count unless `--yes`. | Adam |
-| `todo show <REF or file:line>` | The issue and every TODO pointing at it, with a few lines of code around each. What an agent reads to pick up the work. | agents |
-| `todo check` | The policy check (section 7). | pre-commit, CI |
-| `todo init` | Writes `.todo.toml`, a pre-commit hook, a CI step, and the agent rule for `CLAUDE.md` (section 9), showing each before writing. | Adam, once |
+| `td2do` / `td2do list` | Every TODO: file:line, tag, text, REF, and, with `--online`, the issue's state. Filters: `--untracked`, `--ref gh#12`, `--path`, `--tag`. | Adam, agents |
+| `td2do find <words>` | Searches TODO text in the code **and** open issues labelled `todo`, ranked by shared words. The step an agent runs before writing a TODO. | agents first |
+| `td2do add <file>:<line> <text> [--tag FIXME] [--ref gh#12]` | Inserts a canonical TODO above that line in the file's comment syntax. With `--ref`, points to an existing issue; without it, files one (section 5). Prints the REF. | agents |
+| `td2do track <file>:<line>` | Files an issue for an existing untracked TODO and rewrites it. `--all [--path]` tracks many, asking once with the count unless `--yes`. | Adam |
+| `td2do show <REF or file:line>` | The issue and every TODO pointing at it, with a few lines of code around each. What an agent reads to pick up the work. | agents |
+| `td2do check` | The policy check (section 7). | pre-commit, CI |
+| `td2do removed --since <commit> [--comment]` | Lists issues whose last TODO was removed between `<commit>` and HEAD; with `--comment`, posts one comment on each (section 7, *When the last TODO goes*). | CI on the default branch |
+| `td2do init` | Writes `.td2do.toml`, a pre-commit hook, a CI step, and the agent rule for `CLAUDE.md` (section 9), showing each before writing. | Adam, once |
 
 Output on a terminal is grouped by file with colour; piped output is `path:line:col: TAG(REF) text`, which editors open directly. `NO_COLOR`
 is honoured.
 
-## 7. `todo check`
+## 7. `td2do check`
 
 By default it looks only at lines this branch **adds**, against the merge base with the default branch (`--base` to change it). Existing
 TODOs never fail it, so the first run on an old repo is green.
@@ -114,14 +116,26 @@ TODOs never fail it, so the first run on an old repo is green.
 
 `--all` checks every TODO, not only new ones, and is for reports, not gates. Offline rules give the same answer every run. `--online` rules
 need the backend; if it can't be reached, they are skipped with one warning and the exit code is not changed by them, so a flaky network never
-fails a build. Inline escape: `todo:ignore` on the line.
+fails a build. Inline escape: `td2do:ignore` on the line.
 
-Diff mode needs the merge base; a shallow CI clone must fetch it (`fetch-depth: 0`, or fetch the base branch), and `todo check` says so
+### When the last TODO goes (decision 4)
+
+Issues are never closed by the tool. A CI step on pushes to the default branch runs `td2do removed --since <before> --comment`:
+
+1. From the push's diff, collect the REFs of every TODO line removed.
+2. Keep only those no TODO in the tree at HEAD still points to, and whose issue is open and labelled `todo`.
+3. Post one comment on each: *The last TODO pointing here was removed in `<commit>` (`<file>`). Close this issue if the work is done.*
+   The comment carries `<!-- td2do removed: <commit> -->`, and an issue that already has a comment with that mark gets no second one, so a
+   re-run of the same push posts nothing new.
+
+Closing stays with Adam or an agent he asks. A TODO deleted without the work being done therefore never closes its issue silently.
+
+Diff mode needs the merge base; a shallow CI clone must fetch it (`fetch-depth: 0`, or fetch the base branch), and `td2do check` says so
 instead of guessing.
 
 ## 8. How it is built
 
-- **Language: Rust.** A single binary that starts in milliseconds, which matters in a pre-commit hook, and the crates below. (Open decision 1.)
+- **Language: Rust.** A single binary that starts in milliseconds, which matters in a pre-commit hook, and the crates below. (Decision 1.)
 - **Files:** `git ls-files` inside a repo, else the `ignore` crate's parallel walk, which honours `.gitignore`. Skips binaries (a NUL in the
   first 8 KB), files over 2 MB, lockfiles, minified and vendored code.
 - **Scanning in two layers:**
@@ -149,6 +163,7 @@ interface IssueBackend {
   get(ref): Issue                           // number, url, state, title
   search(words, label): Issue[]             // for todo find
   list(label, state): Issue[]
+  comment(ref, body): void                 // for td2do removed
 }
 ```
 
@@ -159,13 +174,13 @@ by a minute or so, so `findByMark` also lists recent issues labelled `todo` and 
 
 Agents use only the CLI; an MCP server or skill can wrap it later without changing it.
 
-`todo init` offers this rule for `CLAUDE.md` (or `AGENTS.md`):
+`td2do init` offers this rule for `CLAUDE.md` (or `AGENTS.md`):
 
-> Before writing a TODO, FIXME or HACK comment, run `todo find <a few words>`. If an issue covers it, add the comment with
-> `todo add <file>:<line> "<text>" --ref <REF>`; otherwise `todo add <file>:<line> "<text>"`, which files the issue. Never hand-write a TODO.
-> To pick up work, `todo list --json` and `todo show <REF>`.
+> Before writing a TODO, FIXME or HACK comment, run `td2do find <a few words>`. If an issue covers it, add the comment with
+> `td2do add <file>:<line> "<text>" --ref <REF>`; otherwise `td2do add <file>:<line> "<text>"`, which files the issue. Never hand-write a TODO.
+> To pick up work, `td2do list --json` and `td2do show <REF>`.
 
-The check catches an agent that ignores the rule. Cloud sessions need the binary and a GitHub token in their environment; `todo` works with no
+The check catches an agent that ignores the rule. Cloud sessions need the binary and a GitHub token in their environment; `td2do` works with no
 other setup there.
 
 ## 10. The relay, later
@@ -182,22 +197,22 @@ As the relay is designed today (R100–R108) it can't back this tool:
 
 | Op | Needs | What it does |
 | --- | --- | --- |
-| `claim { key, secret }` | `operate` | As `fileClaim`. `key` is `todo:<fingerprint>`; pr-gate could later use `finding:<…>` here too. |
+| `claim { key, secret }` | `operate` | As `fileClaim`. `key` is `td2do:<fingerprint>`; pr-gate could later use `finding:<…>` here too. |
 | `done { key, result: { ref, url }, secret }` | `operate` | As `fileDone`. A done entry never changes. |
 | `get { key }` / `byRef { ref }` | `read` | One entry; every key pointing at one issue. |
-| `list { state? }` | `read` | Every entry, for `todo list --online` without hitting GitHub's rate limit. |
-| `search { words }` | `read` | Word search over entry titles, for `todo find`. |
+| `list { state? }` | `read` | Every entry, for `td2do list --online` without hitting GitHub's rate limit. |
+| `search { words }` | `read` | Word search over entry titles, for `td2do find`. |
 
 With it, step 2 of section 5 becomes `claim`: the race between two agents is closed by the object, as it is for findings today. Entries are
 kept while their issue is open, and for 90 days after it closes. The relay adapter implements `IssueBackend` with GitHub still creating the
 issue, and falls back to the GitHub adapter after the same 5 s timeout the relay design uses. The repo opts in through the same
 `sharedStore` entry in `.github/pr-gate.json`, so there is one setting for both tools.
 
-This needs Adam's ruling (open decision 5) and its own design pass against the relay as built.
+Adam ruled it a later wave (decision 5); it needs its own design pass against the relay as built.
 
 ## 11. Configuration
 
-`.todo.toml` at the repo root; every key optional.
+`.td2do.toml` at the repo root; every key optional.
 
 ```toml
 tags = ["TODO", "FIXME", "HACK", "XXX", "BUG"]
@@ -221,17 +236,17 @@ duplicate_text = "warn"   # or "fail" / "off"
 ## 13. Phases
 
 1. `list`, `check` (offline rules), `init`. Useful on day one with no network.
-2. The GitHub adapter: `add`, `track`, `show`, `find`, `check --online`.
+2. The GitHub adapter: `add`, `track`, `show`, `find`, `check --online`, `removed`.
 3. The agent rule in use; tune `find` ranking from real misses.
 4. The relay adapter, once an `IssueLedger` exists.
 
-## Open decisions for Adam
+## Adam's decisions (2026-10-30)
 
-| | Decision | Recommendation |
+| | Decision | Ruling |
 | --- | --- | --- |
-| 1 | Language | Rust, for startup time and the ripgrep crates. TypeScript would match this repo's tooling but starts 10–50× slower in a hook. |
-| 2 | Where the tool lives | Its own repo; it isn't a Claude Code mod. |
-| 3 | Untracked TODOs already in a repo | Leave them; list with `--untracked`; track by hand or with `track --all`. |
-| 4 | Closing issues when their TODOs are removed | Never automatic in v1. `check --online --all` lists open `todo` issues no TODO points to. |
-| 5 | A repo-level `IssueLedger` in the relay (section 10) | Yes, as a later wave after #29 Part B ships, with its own design. |
-| 6 | Name | `todo` collides with existing tools; pick a distinct binary name before release. |
+| 1 | Language | **Rust**, as recommended: startup time in a hook, a single binary, the ripgrep crates. |
+| 2 | Where the tool lives | **Its own repo**, as recommended; it isn't a Claude Code mod. This spec moves there when the repo exists. |
+| 3 | Untracked TODOs already in a repo | **Leave them, track on demand**, as recommended: `check` ignores them, `list --untracked` shows them, `track` or `track --all` files issues. |
+| 4 | Issues whose last TODO is removed | **Comment, don't close** (overrides "report only"): a CI step on the default branch comments on the issue once, naming the commit; closing stays with a person (section 7). |
+| 5 | A repo-level `IssueLedger` in the relay (section 10) | **A later wave**, as recommended: after #29 Part B ships, with its own design against the relay as built. The current relay build is untouched. |
+| 6 | Name | **`td2do`**: the binary, the config file `.td2do.toml`, the issue mark `<!-- td2do: … -->` and the escape `td2do:ignore`. The GitHub label stays `todo` (configurable). Free on crates.io and Homebrew as of 2026-10-30 (both returned 404). |
