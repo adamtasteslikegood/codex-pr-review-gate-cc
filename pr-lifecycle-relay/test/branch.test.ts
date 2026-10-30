@@ -140,6 +140,16 @@ test('archives, filing and moveDone still work on a tombstone', async () => {
   assert.equal((await read(path)).status, 200)
 })
 
+test('take on a tombstone answers 410; log and snapshot answer 200', async () => {
+  const path = await frozen('gone-4')
+  const taken = await call(adam, { op: 'take', holder: 'h2', secret: SECRET }, path)
+  assert.equal(taken.status, 410)
+  assert.deepEqual(taken.json, { movedTo: 7, lifecycleId: 'L1' })
+  assert.equal((await call(adam, { op: 'log', at: 1, kind: 'info', text: 'after the move', holder: 'h1' }, path)).status, 200)
+  assert.equal((await call(adam, { op: 'snapshot', at: 2, record: { lifecycleId: 'L1' }, reason: 'move' }, path)).status, 200)
+  assert.equal((await read(path)).json.logSeq, 1)
+})
+
 test('a frozen branch takes no beat', async () => {
   const path = url('gone-3')
   await seedBranch(path)

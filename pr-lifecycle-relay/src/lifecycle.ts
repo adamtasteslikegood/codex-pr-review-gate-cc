@@ -27,7 +27,7 @@ type State = {
   lease: Lease | null
   /** The last lease token handed out: each new holder gets a higher one, so a stale holder's writes are refused. */
   fence: number
-  archives: { at: number; record: unknown }[]
+  archives: { at: number; record: unknown; actor?: string; reason?: string }[]
   filings: Record<string, Filing>
   /** Who changed what, newest last. */
   writes: Write[]
@@ -35,11 +35,22 @@ type State = {
   movedTo?: number
 }
 
+/** One line of the run log (R106): `seq` is the object's counter, so a cursor on it loses no line even when many share an `at`. */
+export type LogLine = { seq: number; at: number; kind: string; text: string; principal: string; holder: string }
+
+/** The log has its own storage key, so a long log never makes a record commit larger. */
+type LogStore = { lines: LogLine[]; dropped: number; seq: number }
+
 /** What a frozen branch object holds as its record. `record` stays from `moveTo` until `moveDone`. */
 export type Tombstone = { movedTo: number; lifecycleId: string; record?: unknown }
 
 /** The ops a tombstone refuses with 410, apart from a fresh start: every record and lease op, so no boundary beat succeeds on the source. */
 const FROZEN_OPS = new Set(['commit', 'claim', 'beat', 'take', 'release', 'moveTo'])
+
+/** R106: the relay keeps the last 1000 log lines per object; older ones are counted in `logDropped`. */
+export const RELAY_LOG_CAP = 1000
+const LOG_TEXT_MAX = 300
+const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 
 /** How many archives a PR keeps (open decision 3: retention). */
 export const ARCHIVE_CAP = 20
@@ -47,7 +58,7 @@ const WRITE_CAP = 100
 /** R74: a session quiet for 2 minutes may be taken over. */
 const LEASE_MS = 120_000
 /** A filing claim older than the step timeout (30 minutes) may be adopted by the lease holder (PR #51 review, G1-2). */
-const FILING_STALE_MS = 1_800_000
+export const FILING_STALE_MS = 1_800_000
 
 const empty = (): State => ({ rev: 0, record: null, lease: null, fence: 0, archives: [], filings: {}, writes: [] })
 
@@ -77,6 +88,9 @@ const NEEDS: Record<string, Need> = {
   filing: 'read',
   commit: 'operate',
   claim: 'operate',
+  take: 'operate',
+  log: 'operate',
+  snapshot: 'operate',
   beat: 'operate',
   release: 'operate',
   moveTo: 'operate',
@@ -125,6 +139,8 @@ export class LifecycleObject {
       await this.state.storage.put({ state: next })
     }
 
+    const logOf = async (): Promise<LogStore> => (await this.state.storage.get<LogStore>('log')) ?? { lines: [], dropped: 0, seq: 0 }
+
     const tomb = s.movedTo !== undefined ? (s.record as Tombstone) : undefined
     const frozen = tomb === undefined ? undefined : reply(410, { movedTo: tomb.movedTo, lifecycleId: tomb.lifecycleId })
     // A fresh start (a new lifecycle over the old name) is the one commit a tombstone takes; every other record or lease op is refused.
@@ -132,7 +148,13 @@ export class LifecycleObject {
 
     switch (op) {
       case 'read':
-        return reply(200, { rev: s.rev, record: s.record, lease: shown(s.lease), lastWrite: s.writes.at(-1) ?? null })
+      {
+        const log = await logOf()
+        const since = typeof body.logSince === 'number' ? body.logSince : 0
+        const lines = since > 0 ? log.lines.filter(line => line.seq > since) : log.lines
+        const lastWrite = s.writes.at(-1) ?? null
+        return reply(200, { rev: s.rev, record: s.record, lease: shown(s.lease), lastWrite, log: lines, logDropped: log.dropped, logSeq: log.seq })
+      }
       case 'archives':
         return reply(200, { archives: s.archives })
       case 'filing':
@@ -175,6 +197,38 @@ export class LifecycleObject {
         const next = { ...s, lease, fence: Math.max(s.fence, token) }
         await save(next, isRenewal ? 'claim (renewed)' : s.lease === null ? 'claim' : `claim (took over from ${s.lease.holder})`)
         return reply(200, { lease: shown(lease) })
+      }
+      case 'take': {
+        // Decision P(b): the same principal moves between its own sessions at once, with a new token that fences the old one out.
+        // Another principal waits for a lapse or an admin; a lapsed or empty lease is simply claimed.
+        const holder = String(body.holder ?? '')
+        if (holder === '') return reply(400, { error: 'take needs a holder' })
+        if (proof === undefined) return reply(400, { error: `take needs a secret of at least ${MIN_SECRET} characters` })
+        if (isLive(s.lease) && s.lease.principal !== who.id) return reply(423, { error: 'the lease is held by another principal', lease: shown(s.lease) })
+        const token = s.fence + 1
+        const lease: Lease = { holder, principal: who.id, token, until: now + leaseMs, verifier: proof }
+        await save({ ...s, lease, fence: token }, isLive(s.lease) ? `take from ${s.lease.holder}` : 'take')
+        return reply(200, { lease: shown(lease) })
+      }
+      case 'log': {
+        // Lease-free: standDown and takeover lines are logged by sessions that do not hold the lease. No rev, no write history.
+        if (typeof body.at !== 'number' || typeof body.kind !== 'string' || typeof body.text !== 'string') return reply(400, { error: 'log needs { at, kind, text }' })
+        const log = await logOf()
+        const seq = log.seq + 1
+        const line: LogLine = { seq, at: body.at, kind: body.kind, text: body.text.slice(0, LOG_TEXT_MAX), principal: who.id, holder: String(body.holder ?? '') }
+        const lines = [...log.lines, line]
+        const over = Math.max(0, lines.length - RELAY_LOG_CAP)
+        const next: LogStore = { lines: lines.slice(over), dropped: log.dropped + over, seq }
+        await this.state.storage.put({ log: next })
+        return reply(200, { logDropped: next.dropped })
+      }
+      case 'snapshot': {
+        if (typeof body.at !== 'number' || body.record === undefined || typeof body.reason !== 'string' || !SNAPSHOT_REASONS.has(body.reason)) {
+          return reply(400, { error: 'snapshot needs { at, record, reason: fallback | migration | move }' })
+        }
+        const archives = [...s.archives, { at: body.at, record: body.record, actor: who.id, reason: body.reason }].slice(-ARCHIVE_CAP)
+        await save({ ...s, archives }, `snapshot (${body.reason})`)
+        return reply(200, {})
       }
       case 'beat': {
         // A lapsed lease is lost even to its holder: reviving it would block a takeover that is already allowed.
