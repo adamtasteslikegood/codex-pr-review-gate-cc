@@ -9,8 +9,8 @@ import type { EngineInterface } from 'claude-code'
 
 import { slugOf } from './core'
 import { newLifecycleId } from './lifecycle'
-import { keyPath, relayCall, relayOf } from './relay'
-import type { Relay } from './relay'
+import { keyPath, relayAt, relayCall, sharedStoreOf } from './relay'
+import type { Relay, SharedStore } from './relay'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
 
 type Engine = EngineInterface
@@ -179,14 +179,53 @@ export const SECURITY_PLACEHOLDER = '[security finding: text kept by the checkou
 /** The fields a security finding keeps on the relay (R107, shape R(b)): what any checkout needs to hold the merge and rule on it. */
 const SHARED_FIELDS = ['id', 'round', 'source', 'reviewer', 'severity', 'isSecurity', 'headSeen', 'status'] as const
 
+/** What any other string of the record becomes on the relay when it names a security finding (R107): the whole string, not a part of it. */
+export const HELD_PLACEHOLDER = '[held locally: names a security finding]'
+
+/** A needle shorter than this (an id apart) would match too much: `a.ts` is kept, `fix` is not. */
+const MIN_NEEDLE = 4
+
+/** The record's own names for where it is (the relay's path is built from them): never text a reviewer wrote, so never cut. */
+const IDENTITY_FIELDS = new Set(['root', 'branch', 'base', 'slug', 'lifecycleId'])
+
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * Whether a string names one of `findings`' security findings: it holds one's title, detail, note, file, url or a Jira summary sent for
+ * it (each of `MIN_NEEDLE` characters or more), or its id as a word of its own (`G1-1` is not in `G1-10`). A string that is exactly an
+ * id is a reference (a waiver's `findingId`, an `asked` list), not text: the id is shared on the finding itself, and it stays.
+ */
+const namerOf = (findings: Finding[]): ((text: string) => boolean) | undefined => {
+  const secure = findings.filter(one => one.isSecurity === true)
+  if (secure.length === 0) return undefined
+  const ids = new Set(secure.map(one => one.id))
+  const texts = secure
+    .flatMap(one => [one.title, one.detail, one.note, one.file, one.url, ...(one.jiraSummaries ?? [])])
+    .filter((text): text is string => typeof text === 'string' && text.length >= MIN_NEEDLE && text !== SECURITY_PLACEHOLDER)
+  const idRe = new RegExp(`(?<![A-Za-z0-9_-])(?:${[...ids].map(escapeRe).join('|')})(?![A-Za-z0-9_-])`)
+  return text => !ids.has(text) && (texts.some(needle => text.includes(needle)) || idRe.test(text))
+}
+
+/** Every string under `value` that names a security finding, whole, as `HELD_PLACEHOLDER`; any other value as it is. */
+const scrub = (value: unknown, isNamed: (text: string) => boolean): unknown => {
+  if (typeof value === 'string') return isNamed(value) ? HELD_PLACEHOLDER : value
+  if (Array.isArray(value)) return value.map(one => scrub(one, isNamed))
+  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, one]) => [name, scrub(one, isNamed)]))
+  return value
+}
+
 /**
  * The record as it may leave the checkout (R107): each security finding is cut to `SHARED_FIELDS`, a placeholder title and `ref: 'local'`
- * (no detail, note, file, line, url or history), and `relayRev`, this checkout's own bookkeeping, is dropped.
+ * (no detail, note, file, line, url or history), every other string that names one (a message, a round's outstanding, a log line, a
+ * waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole, and `relayRev`, this checkout's own bookkeeping, is dropped.
  */
 export const redact = (rec: LifecycleRecord): LifecycleRecord => {
-  const { relayRev: _, ...rest } = rec
+  const { relayRev: _, findings: _findings, ...rest } = rec
+  const isNamed = namerOf(rec.findings)
+  const others =
+    isNamed === undefined ? rest : Object.fromEntries(Object.entries(rest).map(([name, one]) => [name, IDENTITY_FIELDS.has(name) ? one : scrub(one, isNamed)]))
   return {
-    ...rest,
+    ...(others as typeof rest),
     findings: rec.findings.map(one => {
       if (one.isSecurity !== true) return one
       const kept: Record<string, unknown> = {}
@@ -199,7 +238,8 @@ export const redact = (rec: LifecycleRecord): LifecycleRecord => {
 /**
  * The relay's record with this checkout's own security text put back (R107): a placeholder takes the text of the mirror's finding of the
  * same id, only when the mirror is of the same lifecycle, and the relay's fields (its status and ruling among them) win. Any other
- * placeholder stays one: another checkout found it.
+ * placeholder stays one: another checkout found it. Only findings are put back: a `HELD_PLACEHOLDER` elsewhere stays as the relay has it
+ * (the mirror of this checkout's own commit keeps the full text, so only a record another writer moved on loses it there).
  */
 export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefined): LifecycleRecord => {
   const isSame = local !== undefined && remote.lifecycleId !== undefined && local.lifecycleId === remote.lifecycleId
@@ -219,23 +259,47 @@ export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefi
 /** Where a record lives on the relay: the relay, the repo's slug, and the object's path (`#<pr>` once it has one, else `@<branch>`). */
 type Shared = { relay: Relay; slug: string; path: string }
 
+/** How long one answer to "does this repo opt in on its base" holds in this process: a change of the base is seen within a minute. */
+export const OPT_IN_TTL_MS = 60_000
+
+/** The answers, per root and base: what the base's `sharedStore` was, and when it was read. */
+const optIns = new Map<string, { at: number; shared: SharedStore | undefined }>()
+
+/** Forgets every answer `optInOf` holds: a test that changes the base's file within `OPT_IN_TTL_MS` calls it. */
+export const forgetOptIns = (): void => optIns.clear()
+
 /**
- * The relay `rec` lives on, or undefined to keep it local: the repo doesn't opt in on its base, there is no credential, or no slug.
- * A failure to tell (an engine with no `process`) is local too.
+ * The relay for a branch to `base`, as `relayOf`, with the base's file read at most once per `OPT_IN_TTL_MS` for a root and base:
+ * every transaction of every repo asks, under the lock, and the file is a `git show`. The credential is read from the environment each
+ * time; a read of the file that throws is never kept.
  */
-async function sharedOf($: Engine, root: string, rec: LifecycleRecord): Promise<Shared | undefined> {
+async function optInOf($: Engine, root: string, base: string): Promise<Relay | { local: string }> {
+  const now = await $.clock.now()
+  const key = `${root}\n${base}`
+  const kept = optIns.get(key)
+  if (kept !== undefined && now >= kept.at && now - kept.at < OPT_IN_TTL_MS) return relayAt($, kept.shared)
+  const shared = await sharedStoreOf($, root, base)
+  optIns.set(key, { at: now, shared })
+  return relayAt($, shared)
+}
+
+/**
+ * The relay `rec` lives on, or why it stays local: the repo doesn't opt in on its base, there is no credential, or no slug. A failure
+ * to tell (git fails, an engine with no `process`) is local too; the caller of a record that has been on the relay falls back instead.
+ */
+async function sharedOf($: Engine, root: string, rec: LifecycleRecord): Promise<Shared | { local: string }> {
   try {
-    const relay = await relayOf($, root, rec.base)
-    if ('local' in relay) return undefined
+    const relay = await optInOf($, root, rec.base)
+    if ('local' in relay) return relay
     let slug = rec.slug
     if (slug === undefined) {
       const ran = await $.process.run(['git', 'remote', 'get-url', 'origin'], { cwd: root, timeoutMs: 30_000 })
       slug = ran.exitCode === 0 ? slugOf(ran.stdout) : undefined
     }
-    if (slug === undefined) return undefined
+    if (slug === undefined) return { local: 'no slug for origin' }
     return { relay, slug, path: keyPath(slug, rec.pr !== undefined ? `#${rec.pr}` : `@${rec.branch}`) }
-  } catch {
-    return undefined
+  } catch (error) {
+    return { local: `the opt-in could not be read: ${error instanceof Error ? error.message : String(error)}` }
   }
 }
 
@@ -280,30 +344,40 @@ async function standDown($: Engine, root: string, branch: string, why: string): 
 
 /** The relay didn't answer (spec §8): the lifecycle goes on in the local store, and the run log says why once. */
 async function noteDown($: Engine, root: string, branch: string, why: string): Promise<void> {
-  if (await noteOnce($, root, branch, 'relay down', `relay down (${why}): this lifecycle goes on in the local store, and is sent to the relay when it answers`)) {
-    await setPending($, root, branch, true)
-  }
+  await noteOnce($, root, branch, 'relay down', `relay down (${why}): this lifecycle goes on in the local store, and is sent to the relay when it answers`)
+  await setPending($, root, branch, true)
 }
 
 /**
  * Keeps a local record the relay's wins over (a fallback the relay moved on from, or a record from before the relay): whole in the
- * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is not retried: the local archive holds it.
+ * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is not retried yet (Task 7): the local
+ * archive holds it, and `lines` says the relay's copy is missing.
  */
-async function keepLocal($: Engine, shared: Shared, rec: LifecycleRecord, reason: 'fallback' | 'migration'): Promise<number> {
+async function keepLocal($: Engine, shared: Shared, rec: LifecycleRecord, reason: 'fallback' | 'migration'): Promise<{ at: number; lines: string[] }> {
   const at = await $.clock.now()
   await writeArchive($, rec, at)
-  await relayCall($, shared.relay, shared.path, { op: 'snapshot', at, record: redact({ ...rec, phase: 'archived' }), reason })
-  return at
+  const answer = await relayCall($, shared.relay, shared.path, { op: 'snapshot', at, record: redact({ ...rec, phase: 'archived' }), reason })
+  const why = 'refused' in answer ? answer.refused : 'down' in answer ? answer.down : answer.status === 200 ? undefined : `HTTP ${answer.status}`
+  return { at, lines: why === undefined ? [] : [`relay snapshot missing (${why}): the relay has no copy of the archive of ${at}; the local store keeps it`] }
 }
+
+const withLines = (rec: LifecycleRecord, at: number, lines: string[]): LifecycleRecord => lines.reduce((one, text) => withLine(one, at, text), rec)
 
 /** What a 409 handed back, for the one retry of a pure transaction: no second read. */
 type Given = { rev: number; record: unknown }
 
 async function runTx<T>($: Engine, root: string, branch: string, work: (tx: RecordTx) => Promise<T>, isPure: boolean): Promise<T> {
   const mirror = await loadRecord($, root, branch)
-  const shared = mirror === undefined ? undefined : await sharedOf($, root, mirror)
-  // Today's local store, read afresh: the decision read the base's file, and a record may have changed meanwhile.
-  if (mirror !== undefined && shared === undefined) return work(localTx($, root, branch))
+  const found = mirror === undefined ? undefined : await sharedOf($, root, mirror)
+  if (mirror !== undefined && found !== undefined && 'local' in found) {
+    // Today's local store, read afresh: the decision read the base's file, and a record may have changed meanwhile.
+    if (mirror.relayRev === undefined) return work(localTx($, root, branch))
+    // A record that has been on the relay, and the opt-in can't be read now: a fallback, never plain local, so a relay that moved on
+    // meanwhile archives these writes instead of overwriting them.
+    await noteDown($, root, branch, found.local)
+    return work(fallbackTx($, root, branch, mirror.relayRev))
+  }
+  const shared = found !== undefined && 'local' in found ? undefined : found
   let given: Given | undefined
   for (let attempt = 0; ; attempt += 1) {
     const ran = await relayTx($, root, branch, shared, work, given)
@@ -318,6 +392,18 @@ function localTx($: Engine, root: string, branch: string): RecordTx {
   return {
     load: () => loadRecord($, root, branch),
     save: rec => writeRecord($, rec),
+    archive: (rec, at) => writeArchive($, rec, at),
+  }
+}
+
+/** The local store for a record that has been on the relay at `relayRev`: each write keeps that rev and marks the mirror pending. */
+function fallbackTx($: Engine, root: string, branch: string, relayRev: number): RecordTx {
+  return {
+    load: () => loadRecord($, root, branch),
+    save: async rec => {
+      await writeRecord($, { ...rec, relayRev: rec.relayRev ?? relayRev })
+      await setPending($, root, branch, true)
+    },
     archive: (rec, at) => writeArchive($, rec, at),
   }
 }
@@ -348,7 +434,8 @@ async function relayTx<T>(
 
   const decide = async (rec: LifecycleRecord): Promise<void> => {
     if (mode !== 'undecided') return
-    shared = await sharedOf($, root, rec)
+    const found = await sharedOf($, root, rec)
+    shared = 'local' in found ? undefined : found
     mode = shared === undefined ? 'local' : 'relay'
   }
   const fallbackWrite = async (rec: LifecycleRecord): Promise<void> => {
@@ -392,12 +479,12 @@ async function relayTx<T>(
       // Migration (a record from before the relay, met by one already there) or a fallback the relay moved on from: the relay's
       // record wins and is never overwritten, and the local one is kept, locally and in the relay's archives.
       const reason = local.relayRev === undefined ? 'migration' : 'fallback'
-      const at = await keepLocal($, shared, local, reason)
+      const { at, lines } = await keepLocal($, shared, local, reason)
       const line =
         reason === 'migration'
           ? `relay migration: the relay already held this lifecycle (rev ${rev}); the local record from before it is kept in the archive of ${at}`
           : `relay moved on (rev ${local.relayRev} to ${rev}) while this checkout was in fallback; its record is kept in the archive of ${at}`
-      loaded = withLine({ ...restore(remoteRec, local), root, branch, relayRev: rev }, await $.clock.now(), line)
+      loaded = withLines({ ...restore(remoteRec, local), root, branch, relayRev: rev }, await $.clock.now(), [line, ...lines])
       await writeMirror($, loaded, rev)
       await setPending($, root, branch, true)
     } else if (isPending) {
@@ -462,10 +549,18 @@ async function relayTx<T>(
     const local = await loadRecord($, root, branch)
     const remoteRec = theirs.record as LifecycleRecord | null | undefined
     if (remoteRec !== null && remoteRec !== undefined && typeof remoteRec === 'object' && Array.isArray(remoteRec.findings)) {
-      if (local !== undefined && (await $.store.get(pendingKey(root, branch))) === true) {
-        const at = await keepLocal($, shared, local, 'fallback')
-        const line = `relay moved on (rev ${local.relayRev ?? 0} to ${theirs.rev}) before this checkout's changes reached it; its record is kept in the archive of ${at}`
-        await writeMirror($, withLine({ ...restore(remoteRec, local), root, branch }, now, line), theirs.rev)
+      const isPending = (await $.store.get(pendingKey(root, branch))) === true
+      if (local !== undefined && (isPending || local.relayRev === undefined)) {
+        // A fallback's writes, or a record from before the relay (a save with no load meets one already there): kept before the
+        // relay's record replaces it, as on a load.
+        const reason = local.relayRev === undefined ? 'migration' : 'fallback'
+        const { at, lines } = await keepLocal($, shared, local, reason)
+        const line =
+          reason === 'migration'
+            ? `relay migration: the relay already held this lifecycle (rev ${theirs.rev}); the local record from before it is kept in the archive of ${at}`
+            : `relay moved on (rev ${local.relayRev ?? 0} to ${theirs.rev}) before this checkout's changes reached it; its record is kept in the archive of ${at}`
+        await writeMirror($, withLines({ ...restore(remoteRec, local), root, branch }, now, [line, ...lines]), theirs.rev)
+        await setPending($, root, branch, true)
       } else await writeMirror($, { ...restore(remoteRec, local), root, branch }, theirs.rev)
     }
     return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs } }

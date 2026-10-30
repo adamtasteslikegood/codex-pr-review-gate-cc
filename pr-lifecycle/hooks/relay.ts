@@ -43,8 +43,19 @@ export async function baseFileOf($: Engine, root: string, base: string): Promise
  * A service token wins when both are set, and half of one is no credential.
  */
 export async function relayOf($: Engine, root: string, base: string): Promise<Relay | { local: string }> {
+  return relayAt($, await sharedStoreOf($, root, base))
+}
+
+/** Where the base says the shared store is (`sharedStore` in its `.github/pr-gate.json`), or undefined when it doesn't opt in. */
+export async function sharedStoreOf($: Engine, root: string, base: string): Promise<SharedStore | undefined> {
   const file = await baseFileOf($, root, base)
-  const shared = file === undefined ? undefined : readRoster(file)?.sharedStore
+  return file === undefined ? undefined : readRoster(file)?.sharedStore
+}
+
+export type SharedStore = { url: string; aud: string }
+
+/** As `relayOf`, for a `sharedStore` already read: the credential comes from the environment each time. */
+export async function relayAt($: Engine, shared: SharedStore | undefined): Promise<Relay | { local: string }> {
   if (shared === undefined) return { local: 'no sharedStore in .github/pr-gate.json' }
   const id = await $.env.get('PR_GATE_RELAY_CLIENT_ID')
   const secret = await $.env.get('PR_GATE_RELAY_CLIENT_SECRET')

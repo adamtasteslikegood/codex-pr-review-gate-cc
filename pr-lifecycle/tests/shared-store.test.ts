@@ -4,7 +4,7 @@ import type { HttpInit, HttpResponse } from 'claude-code'
 
 import { newRecord } from '../hooks/lifecycle'
 import { RELAY_TIMEOUT_MS } from '../hooks/relay'
-import { loadRecord, recordKey, redact, RelayRefused, restore, saveRecord, StaleRecord, transact, updateRecord, upsertRecord } from '../hooks/store'
+import { forgetOptIns, HELD_PLACEHOLDER, loadRecord, OPT_IN_TTL_MS, recordKey, redact, RelayRefused, restore, saveRecord, StaleRecord, transact, updateRecord, upsertRecord } from '../hooks/store'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
 import { PRINCIPALS } from './contract'
 import { fakeRelay, HEADERS_OF } from './relay-fake'
@@ -58,6 +58,8 @@ type Setup = { w: World; fake: FakeRelay; $: never; sends: Record<string, unknow
 
 /** A repo that opts in on its base, Adam's token in the environment, and his grant (and Codex's) on me/repo. */
 function setup(on: Parameters<typeof world>[0]): Setup {
+  // Each test is its own repo: no answer about the base's opt-in is kept from another.
+  forgetOptIns()
   const w = world(on)
   w.git.roster = SHARED
   const fake = fakeRelay(on, { clock: w.clock as unknown as MockClock, grants: { [SLUG]: { [ADAM]: 'operate', [CODEX]: 'operate' } } })
@@ -96,8 +98,19 @@ const SECRET: Finding = finding('R1-1', 'SECRET-TITLE sql injection', {
   line: 12,
   url: 'https://example.org/SECRET-URL',
   history: [{ round: 1, status: 'open', note: 'SECRET-HISTORY', by: 'codex', at: 1 }],
+  jiraSummaries: ['KAN: SECRET-JIRA summary'],
 })
-const SECRET_TEXT = ['SECRET-TITLE', 'SECRET-DETAIL', 'SECRET-NOTE', 'SECRET-FILE', 'SECRET-URL', 'SECRET-HISTORY']
+const SECRET_TEXT = ['SECRET-TITLE', 'SECRET-DETAIL', 'SECRET-NOTE', 'SECRET-FILE', 'SECRET-URL', 'SECRET-HISTORY', 'SECRET-JIRA']
+
+/** Every string anywhere under `value`. */
+const stringsOf = (value: unknown): string[] =>
+  typeof value === 'string'
+    ? [value]
+    : Array.isArray(value)
+      ? value.flatMap(stringsOf)
+      : value !== null && typeof value === 'object'
+        ? Object.values(value).flatMap(stringsOf)
+        : []
 
 const grant = (reason: string) => (rec: LifecycleRecord): LifecycleRecord => ({ ...rec, grants: [...rec.grants, { n: 1, reason, head: rec.head, at: 1 }] })
 const reasons = (rec: unknown): string[] => ((rec as LifecycleRecord | undefined)?.grants ?? []).map(one => one.reason)
@@ -224,6 +237,7 @@ test('every relay commit mirrors the full record locally with relayRev', async (
 })
 
 test('relay down mid-round: the round goes on locally and the log says so once', async ($, on) => {
+  forgetOptIns()
   const w = world(on)
   w.git.roster = SHARED
   mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token' })
@@ -366,10 +380,28 @@ test('migration into a non-empty object adopts the relay\'s, archives and snapsh
   expect(linesOf(local(w), 'relay migration')).toHaveLength(1)
 })
 
-test('no security finding\'s text reaches commit', async (_t, on) => {
+test('no security finding\'s text reaches the relay, in any field of any commit, archive or snapshot', async (_t, on) => {
   const { fake, $, w } = setup(on)
-  // A commit, a commit carrying an archive, and a snapshot: each carries the security finding.
-  await saveRecord($, seed({ lifecycleId: 'L1', findings: [SECRET, finding('R1-2', 'plain finding')] }))
+  const at = 1
+  const plain = finding('R1-10', 'plain finding')
+  // The text a MERGE_SECURITY block, a round's outstanding, a log line, a waiver's and a grant's reason carry: each names R1-1.
+  const named = `${SECRET.id} [${SECRET.severity}] ${SECRET.title}`
+  const leaky = seed({
+    lifecycleId: 'L1',
+    findings: [SECRET, plain],
+    message: `Merge held for security: ${named}`,
+    rounds: [{ outstanding: `R1-1 still open`, evidence: [] } as unknown as LifecycleRecord['rounds'][number]],
+    log: [
+      { at, kind: 'stop', text: `stopped on ${named}` },
+      { at, kind: 'session', text: 'a line about src/SECRET-FILE.ts' },
+      { at, kind: 'session', text: 'filed KAN: SECRET-JIRA summary' },
+      { at, kind: 'session', text: 'R1-10 is plain and stays' },
+    ],
+    waivers: [{ scope: 'finding', findingId: 'R1-1', head: 'a'.repeat(40), reason: 'accepted: SECRET-DETAIL the query concatenates', by: 'adam', at }],
+    grants: [{ n: 1, reason: 'one more round for R1-1', head: 'a'.repeat(40), at }],
+  })
+  // A commit, a commit carrying an archive, a fallback, and the snapshot its recovery sends.
+  await saveRecord($, leaky)
   await transact($, '/repo', 'feat/x', async tx => {
     const last = (await tx.load())!
     await tx.archive(last, 7)
@@ -382,17 +414,44 @@ test('no security finding\'s text reaches commit', async (_t, on) => {
   await updateRecord($, '/repo', 'feat/x', rec => rec, { isPure: true })
   const bodies = fake.calls.map(one => one.body as Record<string, unknown>).filter(body => body.op === 'commit' || body.op === 'snapshot')
   expect(bodies.map(one => [one.op, one.archive !== undefined])).toEqual([['commit', false], ['commit', true], ['commit', false], ['snapshot', false]])
+  const isId = /(?<![A-Za-z0-9_-])R1-1(?![A-Za-z0-9_-])/
   for (const body of bodies) {
-    const text = JSON.stringify(body)
-    for (const secret of SECRET_TEXT) expect(text.includes(secret)).toBe(false)
-    expect(text).toContain(PLACEHOLDER)
-    expect(text).toContain('plain finding')
+    const strings = stringsOf(body)
+    for (const secret of SECRET_TEXT) expect(strings.filter(one => one.includes(secret))).toEqual([])
+    // The id is shared on the finding and as a waiver's reference, and in no text.
+    expect(strings.filter(one => one !== 'R1-1' && isId.test(one))).toEqual([])
+    expect(strings).toContain(PLACEHOLDER)
+    expect(strings).toContain(HELD_PLACEHOLDER)
+    expect(strings).toContain('plain finding')
+    expect(strings).toContain('R1-10 is plain and stays')
   }
+  // The record's own fields, as the first commit sent them: each string that named R1-1 is held whole; a reference stays.
+  const sent = bodies[0]?.record as LifecycleRecord
+  expect(sent.message).toBe(HELD_PLACEHOLDER)
+  expect(sent.rounds[0]?.outstanding).toBe(HELD_PLACEHOLDER)
+  expect((sent.log ?? []).map(one => one.text)).toEqual([HELD_PLACEHOLDER, HELD_PLACEHOLDER, HELD_PLACEHOLDER, 'R1-10 is plain and stays'])
+  expect(sent.waivers[0]).toEqual({ ...leaky.waivers[0], reason: HELD_PLACEHOLDER })
+  expect(sent.grants[0]?.reason).toBe(HELD_PLACEHOLDER)
+  expect(sent.branch).toBe('feat/x')
   // The sent shape is R(b)'s: no detail, note, file, line, url or history.
-  const sent = (bodies[0]?.record as LifecycleRecord).findings[0]
-  expect(sent).toEqual({ id: 'R1-1', round: 1, source: 'codex-review', reviewer: 'codex', severity: 'P1', isSecurity: true, headSeen: 'a'.repeat(40), status: 'open', title: PLACEHOLDER, ref: 'local' })
+  expect(sent.findings[0]).toEqual({ id: 'R1-1', round: 1, source: 'codex-review', reviewer: 'codex', severity: 'P1', isSecurity: true, headSeen: 'a'.repeat(40), status: 'open', title: PLACEHOLDER, ref: 'local' })
   // Locally, the text is all still there.
   expect(local(w).findings[0]).toEqual(SECRET)
+})
+
+test('restore puts text back into findings only, and the mirror of an own commit keeps every field whole', async (_t, on) => {
+  const { $, w } = setup(on)
+  const full = seed({ lifecycleId: 'L1', findings: [SECRET], message: `held: ${SECRET.title}`, log: [{ at: 1, kind: 'stop', text: `on ${SECRET.id}` }] })
+  await saveRecord($, full)
+  expect(local(w).message).toBe(full.message)
+  expect(local(w).log).toEqual(full.log)
+  const back = restore(redact(full), full)
+  expect(back.findings).toEqual(full.findings)
+  expect(back.message).toBe(HELD_PLACEHOLDER)
+  expect(back.log?.[0]?.text).toBe(HELD_PLACEHOLDER)
+  // No finding field takes the other placeholder, and no text is made up outside the findings.
+  expect(stringsOf(back.findings).filter(one => one === HELD_PLACEHOLDER)).toEqual([])
+  expect(stringsOf({ ...back, findings: [] }).filter(one => SECRET_TEXT.some(secret => one.includes(secret)))).toEqual([])
 })
 
 test('a redacted finding is restored from the local mirror on load, and one found by another checkout shows the placeholder title', async (_t, on) => {
@@ -460,6 +519,7 @@ test('a 403 stands down: no local write, no fallback, the log says so once', asy
 })
 
 test('a repo that does not opt in behaves exactly as before', async ($, on) => {
+  forgetOptIns()
   const w = world(on)
   mock.env(on, { PR_GATE_RELAY_TOKEN: 'adam-token' })
   let fetched = 0
@@ -475,19 +535,97 @@ test('a repo that does not opt in behaves exactly as before', async ($, on) => {
   expect(rec.relayRev).toBeUndefined()
   expect(rec.slug).toBeUndefined()
   expect((rec.log ?? []).some(one => one.text.startsWith('relay'))).toBe(false)
-  // The store's helpers, called directly, make no call either.
+  // The store's helpers, called directly, make no call either, and read the base's file at most once a minute.
   let direct = 0
-  const $$ = engineOf(w, async () => {
+  const shows: string[] = []
+  const plain = engineOf(w, async () => {
     direct += 1
     throw new Error('no relay here')
   })
+  const run = (plain as unknown as { process: { run: (argv: readonly string[], init?: object) => Promise<unknown> } }).process.run
+  const $$ = {
+    ...(plain as object),
+    process: {
+      run: (argv: readonly string[], init?: object) => {
+        if (argv.join(' ').includes('pr-gate.json')) shows.push(argv.join(' '))
+        return run(argv, init)
+      },
+    },
+  } as never
+  forgetOptIns()
   await updateRecord($$, '/repo', 'feat/x', grant('local'), { isPure: true })
   await transact($$, '/repo', 'feat/x', async tx => {
     const last = (await tx.load())!
     await tx.archive(last, 9)
     await tx.save(last)
   })
+  for (let n = 0; n < 5; n++) await updateRecord($$, '/repo', 'feat/x', rec => rec, { isPure: true })
   expect(direct).toBe(0)
+  expect(shows).toHaveLength(1)
+  await w.clock.advance(OPT_IN_TTL_MS)
+  await updateRecord($$, '/repo', 'feat/x', rec => rec, { isPure: true })
+  expect(shows).toHaveLength(2)
   expect(reasons(await loadRecord($$, '/repo', 'feat/x'))).toEqual(['local'])
   expect(local(w).relayRev).toBeUndefined()
+  expect(w.store.get(`${KEY}:relay-pending`)).toBeUndefined()
+})
+
+test('an opt-in that can\'t be read for a record that has been on the relay is a fallback, not plain local', async (_t, on) => {
+  const { fake, $, w } = setup(on)
+  await saveRecord($, seed())
+  expect(local(w).relayRev).toBe(1)
+  // The base's file can't be read (git show fails), then the credential is gone: each is a fallback that keeps relayRev.
+  w.git.roster = ''
+  forgetOptIns()
+  await updateRecord($, '/repo', 'feat/x', grant('no file'), { isPure: true })
+  w.git.roster = SHARED
+  forgetOptIns()
+  await updateRecord(engineOf(w, fake.fetch, {}), '/repo', 'feat/x', grant('no credential'), { isPure: true })
+  expect(local(w).relayRev).toBe(1)
+  expect(reasons(local(w))).toEqual(['no file', 'no credential'])
+  expect(w.store.get(`${KEY}:relay-pending`)).toBe(true)
+  expect(linesOf(local(w), 'relay down')).toHaveLength(1)
+  expect(fake.objects.get(OBJECT)?.rev).toBe(1)
+  // Meanwhile the relay moved on: the fallback's writes are archived and snapshotted, never overwritten without a copy.
+  await otherCommits(fake, grant('theirs'))
+  await w.clock.advance(1_000)
+  const at = nowOf(w)
+  await updateRecord($, '/repo', 'feat/x', rec => rec, { isPure: true })
+  expect(reasons(relayed(fake))).toEqual(['theirs'])
+  expect(reasons(local(w))).toEqual(['theirs'])
+  expect(reasons(w.store.get(`${KEY}:archived:${at}`))).toEqual(['no file', 'no credential'])
+  expect(opsOf(fake, 'snapshot').map(one => one.reason)).toEqual(['fallback'])
+  expect(linesOf(local(w), 'relay moved on')).toHaveLength(1)
+})
+
+test('a snapshot the relay does not take says so in the log', async (_t, on) => {
+  const { fake, $, w, onSend } = setup(on)
+  await otherCommits(fake, () => seed({ lifecycleId: 'relay-lifecycle', findings: [finding('R1-1', 'RELAY-ONLY')] }))
+  w.store.set(KEY, seed({ lifecycleId: 'local-lifecycle', findings: [finding('R1-1', 'LOCAL-ONLY')] }))
+  onSend.fn = body => {
+    fake.down = body.op === 'snapshot'
+  }
+  const at = nowOf(w)
+  await updateRecord($, '/repo', 'feat/x', rec => rec, { isPure: true })
+  expect(titles(w.store.get(`${KEY}:archived:${at}`))).toEqual(['LOCAL-ONLY'])
+  expect(fake.objects.get(OBJECT)?.archives).toEqual([])
+  expect(linesOf(local(w), 'relay snapshot missing')).toHaveLength(1)
+  expect(linesOf(local(w), 'relay migration')).toHaveLength(1)
+})
+
+test('a save with no load that meets the relay\'s record keeps the local one from before the relay first', async (_t, on) => {
+  const { fake, $, w } = setup(on)
+  await otherCommits(fake, () => seed({ lifecycleId: 'relay-lifecycle', findings: [finding('R1-1', 'RELAY-ONLY')] }))
+  w.store.set(KEY, seed({ lifecycleId: 'local-lifecycle', findings: [finding('R1-1', 'LOCAL-ONLY')] }))
+  const at = nowOf(w)
+  const error = await thrown(transact($, '/repo', 'feat/x', tx => tx.save(seed({ lifecycleId: 'local-lifecycle', findings: [finding('R1-1', 'SAVED')] }))))
+  expect(error).toBeInstanceOf(StaleRecord)
+  expect(titles(relayed(fake))).toEqual(['RELAY-ONLY'])
+  expect(titles(w.store.get(`${KEY}:archived:${at}`))).toEqual(['LOCAL-ONLY'])
+  const snapshots = opsOf(fake, 'snapshot')
+  expect(snapshots.map(one => one.reason)).toEqual(['migration'])
+  expect(titles(snapshots[0]?.record)).toEqual(['LOCAL-ONLY'])
+  expect(titles(local(w))).toEqual(['RELAY-ONLY'])
+  expect(local(w).relayRev).toBe(1)
+  expect(linesOf(local(w), 'relay migration')).toHaveLength(1)
 })
