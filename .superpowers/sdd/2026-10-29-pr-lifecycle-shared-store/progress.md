@@ -46,3 +46,13 @@ Task 1: minor (deferred): grant-path history tests use relative revs, not litera
 Task 1: minor (deferred): a thrown GrantStore fetch is an unmapped 500, a non-2xx presetOf a 502 (fails closed)
 Task 1: minor (deferred): re-granting the same preset writes rev + history
 Task 1: minor (deferred): relay README still describes the GRANTS env var (Task 12 updates docs)
+Task 2: review — Important: (1) fresh-start test reads PR 41 not PR 7; (2) isFresh over a tombstone still carrying `record` discards the only copy
+Task 2: Ruling: the relay refuses isFresh with 409 { error, movedTo, lifecycleId } while the tombstone still carries `record` (moveDone not yet run); the client finishes steps 2–3 first (Task 7 already does so on load) — spec §1 says a frozen record is never lost — cost if wrong: a fresh start waits one recovery step
+Task 2: Ruling: tighten isBranchName to also refuse a bare `@`, a component starting with `.`, and a component ending `.lock` (reviewer minor 2; matches the comment's git claim) — cost if wrong: a few legal-to-us names refused
+Task 2: minor (deferred): moveDone changes record without bumping rev (idempotent, harmless)
+Task 2: minor (deferred): a PR object once committed with record:null answers `from` with 409 record:null — client takes the snapshot path (note for Task 7)
+Task 2: minor (deferred): 410 Response built eagerly on every tombstone request; test title typo "tombstone own"
+Task 3 carry: add `take` to NEEDS so the tombstone's 410 is reached; add the deferred take-410 and log/snapshot-on-tombstone assertions
+Task 4 carry: moveTo queues the index removal (lifecycle.ts moveTo case)
+Task 2: fix round 1/5 (4 addressed, 0 open; commits 6181e2c..a006b8f)
+Task 2: complete (commits 1328059..a006b8f, review clean)
