@@ -115,7 +115,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 825)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 829)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run test:relay       # the #29 Part B relay under Miniflare (89)
@@ -126,7 +126,7 @@ npm run check      # all of the above
 - `typecheck` needs `pr-lifecycle/.claude-plugin/types/`, which the harness
   writes when a session loads that mod. With the types present, it runs in
   about 2 s with 0 errors.
-- 61 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
+- 63 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
   5 s under machine load (spec §7.3). The three-run load re-check is still
   owed: the machine ran low on memory. See
   `docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md`.

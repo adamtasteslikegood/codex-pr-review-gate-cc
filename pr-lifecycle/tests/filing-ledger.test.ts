@@ -419,6 +419,19 @@ test('a claim left because the lifecycle was reset at the mark before the POST i
   expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)))).toBe(false)
 })
 
+test('a claim left because the lifecycle was archived at the mark before the POST is named in its run log, not a toast (final review N6)', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  changedAtMark(s, one => ({ ...one, phase: 'archived' }))
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.onSend.fn = undefined
+  expect(s.w.gh.filed).toEqual([])
+  expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
+  // An archived lifecycle is still this one: the line lasts in its own log, where an admin finds the key.
+  expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)) && one.includes('was archived') && one.includes('fileDelete on the relay is safe'))).toBe(true)
+  expect(s.w.toasts.some(one => one.includes(keyOf(rec)))).toBe(false)
+})
+
 test('a claim left because the finding turned security at the mark before the POST is logged, scrubbed whole (final review, Task 9)', { timeoutMs: 15_000 }, async (_$, on) => {
   const s = setup(on)
   const rec = await seeded(s.$)
@@ -522,4 +535,21 @@ test('a refile while the relay was down, after the ledger\'s issue closed, settl
 
 test('the same refile after the ledger\'s issue was deleted or transferred (not listed at all) settles on the new issue too', { timeoutMs: 15_000 }, async (_$, on) => {
   await refiledWhileDown(on, 'missing')
+})
+
+// Final review N4: an owed finding whose saved issue is the ledger's own done issue settles on it, never advancing the attempt.
+
+test('an owed finding whose saved issue is the done attempt\'s own issue settles on it, even closed, with no next attempt claimed (final review N4)', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  // The ledger took #21, but this checkout never heard it did: the finding is still owed on #21, and #21 is closed meanwhile.
+  await updateRecord(s.$, '/repo', 'feat/x', r => ({ ...r, findings: r.findings.map(f => ({ ...f, followUp: '#21', isFilingOwed: true })) }))
+  s.w.gh.issueStates[21] = 'CLOSED'
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec, 2))).toBeUndefined()
+  expect(findingIn(s.w.store)?.followUp).toBe('#21')
+  expect(findingIn(s.w.store)?.fileAttempt).toBeUndefined()
+  expect(findingIn(s.w.store)?.isFilingOwed).toBeUndefined()
 })

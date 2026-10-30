@@ -3813,7 +3813,8 @@ const TICKET_SENT = 'a ticket was sent to Jira, but its answer was not saved (th
 
 /**
  * Marks a finding as filed-but-unanswered before the call that files it (wave 2b gate R1-10), unless an error is already there,
- * which makes the next pass look first anyway. 'gone' when the lifecycle was reset or replaced: the caller files nothing. 'secret' when
+ * which makes the next pass look first anyway. 'archived' when the lifecycle was archived, 'replaced' when it was reset or replaced:
+ * the caller files nothing either way (final review N6 tells them apart). 'secret' when
  * the finding is now security-classified: the caller files no public issue for it.
  */
 async function markSent(
@@ -3823,10 +3824,12 @@ async function markSent(
   field: 'issueError' | 'jiraError',
   text: string,
   summary?: string,
-): Promise<'gone' | 'secret' | 'sent'> {
+): Promise<'archived' | 'replaced' | 'secret' | 'sent'> {
+  let isArchived = false
   let isGone = false
   let isSecret = false
   const saved = await updateRecord($, rec.root, rec.branch, latest => {
+    isArchived = latest.phase === 'archived' && (latest.generation ?? 0) === (rec.generation ?? 0)
     isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
     if (isGone) return latest
     // A finding marked security since the pass was planned is never POSTed as a public issue (wave 2b gate R4-7): decided under the lock.
@@ -3842,7 +3845,7 @@ async function markSent(
       findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent, ...summaries(f) })),
     }
   }, { isPure: true })
-  return saved === undefined || isGone ? 'gone' : isSecret ? 'secret' : 'sent'
+  return saved === undefined ? 'replaced' : isArchived ? 'archived' : isGone ? 'replaced' : isSecret ? 'secret' : 'sent'
 }
 
 /**
@@ -4045,8 +4048,9 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       // list first and never files the issue twice. The answer's save below replaces it.
       const sent = await markSent($, rec, item.id, 'issueError', ISSUE_SENT)
       // The claim is left on these exits too (final review, Task 9): its line is what tells an admin a fileDelete is safe.
-      if (sent === 'gone') {
-        await left(REPLACED)
+      // An archived lifecycle is still this one, so its log keeps the line (final review N6); a replaced one gets a toast.
+      if (sent === 'archived' || sent === 'replaced') {
+        await left(sent === 'archived' ? ARCHIVED : REPLACED)
         return undefined
       }
       if (sent === 'secret') {
@@ -4088,7 +4092,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     if (isWaived(current)) return current
     await restamp()
     // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
-    if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT, t.title.slice(0, SUMMARY_MAX))) === 'gone') return undefined
+    if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT, t.title.slice(0, SUMMARY_MAX))) !== 'sent') return undefined
     // An action boundary before acli files (Task 8 review): a security-only pass crosses one too.
     if (!(await boundary($, rec))) throw new StoodDown()
     const got = await fileTicket($, rec.root, project, t, rec.pr, rec.slug)
@@ -4231,6 +4235,7 @@ const ledgerResult = (repo: string, n: number): { number: number; url: string } 
 /** What a finding's issueError says while another checkout's claim on its filing holds and no issue carries its mark (spec §7). */
 const MOVED_AWAY = 'the lifecycle moved'
 const REPLACED = 'the lifecycle was reset or replaced'
+const ARCHIVED = 'the lifecycle was archived'
 const CLAIM_PENDING = "another checkout claimed this finding's filing on the relay and has not finished it: nothing is filed here; the next pass reads the claim again"
 const CLAIM_STUCK = "another checkout's claim on this finding's filing is stuck (older than the step timeout, and no issue carries its mark): it waits for an admin's fileDelete on the relay"
 
@@ -4296,7 +4301,8 @@ async function ledgerOf(
   const result = filing.result as { number?: unknown } | undefined
   if (filing.state === 'done' && typeof result?.number === 'number') {
     const n = result.number
-    if (at.isAdvancing === true && !listed.issues.some(one => one.number === n)) {
+    // The issue a finding already names is never advanced past (final review N4): an owed finding settles on its own done issue.
+    if (at.isAdvancing === true && at.saved !== n && !listed.issues.some(one => one.number === n)) {
       // The ledger's issue is closed and the finding holds again before a merge (its follow-up no longer names an issue): the next
       // attempt is filed, as the merge check files it, never the closed issue adopted again.
       const fileAttempt = (f.fileAttempt ?? 0) + 1
