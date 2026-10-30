@@ -4,7 +4,7 @@ import type { HttpInit, HttpResponse } from 'claude-code'
 
 import { filingMark, newRecord } from '../hooks/lifecycle'
 import { checkIssuesAfterMerge, configOf, fileIssues, setup as useConfig } from '../hooks/round'
-import { claimLease, forgetLeases, forgetOptIns, recordKey, saveRecord } from '../hooks/store'
+import { claimLease, forgetLeases, forgetOptIns, logEvent, recordKey, saveRecord, updateRecord } from '../hooks/store'
 import type { Finding, LifecycleRecord } from '../types'
 import { PRINCIPALS } from './contract'
 import { fakeRelay, HEADERS_OF } from './relay-fake'
@@ -306,6 +306,135 @@ test('attempt advances only after the earlier issue closed with the finding stil
   expect(checked.moved).toBeUndefined()
   expect(s.w.gh.filed).toHaveLength(2)
   expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  expect(filingAt(s.fake, keyOf(rec, 2))).toMatchObject({ state: 'done', result: result(22) })
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#22', fileAttempt: 1 })
+})
+
+// Fix round 1 (Task 9 review).
+
+const relayLines = (fake: FakeRelay): string[] => (fake.objects.get(PR_OBJECT)?.log.lines ?? []).map(one => one.text)
+
+test('an owed call the relay refuses is dropped with a run-log line, and the calls owed after it are still paid', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  // An admin deleted this checkout's claim and another checkout claimed the key again: the fileDone still owed here answers 403.
+  expect(await asOther(s.fake, { op: 'fileClaim', key: keyOf(rec), secret: OTHER_SECRET })).toBe(200)
+  s.w.store.set(`${KEY}:relay-owed`, [
+    { path: PR_PATH, body: { op: 'fileDone', key: keyOf(rec), result: result(21), secret: 'this-checkout-filing-secret-of-40-chars!!' } },
+    { path: PR_PATH, body: { op: 'log', at: 1, kind: 'session', text: 'an owed line', holder: 'session-1' } },
+  ])
+  await logEvent(s.$, '/repo', 'feat/x', 'check', 'a line that lands')
+  expect(s.w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
+  const lines = relayLines(s.fake)
+  expect(lines.some(one => one.includes('refused') && one.includes(`fileDone ${keyOf(rec)}`))).toBe(true)
+  expect(lines).toContain('an owed line')
+  expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
+})
+
+test('adoption waits for the relay\'s own stale age: a step timeout shorter than it sends no fileAdopt that would be refused', { timeoutMs: 15_000 }, async (_$, on) => {
+  useConfig(configOf({ stepTimeoutMinutes: 10 }))
+  try {
+    const s = setup(on)
+    const rec = await seeded(s.$)
+    expect(await asOther(s.fake, { op: 'fileClaim', key: keyOf(rec), secret: OTHER_SECRET })).toBe(200)
+    markedIssue(s.w, rec, 21)
+    await s.w.clock.advance(11 * MINUTE)
+    expect('mine' in (await claimLease(s.$, '/repo', 'feat/x', false))).toBe(true)
+    await fileIssues(s.$, recordIn(s.w.store), MERGED)
+    expect(opsOf(s.fake, 'fileAdopt')).toEqual([])
+    expect(findingIn(s.w.store)).toMatchObject({ followUp: '#21', isFilingOwed: true })
+    // Past the relay's 30 minutes, the owed finding's next pass adopts the issue.
+    await s.w.clock.advance(20 * MINUTE)
+    expect('mine' in (await claimLease(s.$, '/repo', 'feat/x', false))).toBe(true)
+    await fileIssues(s.$, recordIn(s.w.store), MERGED)
+    expect(opsOf(s.fake, 'fileAdopt')).toHaveLength(1)
+    expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21), adoptedBy: ADAM })
+    expect(findingIn(s.w.store)?.isFilingOwed).toBeUndefined()
+    expect(s.w.gh.filed).toEqual([])
+  } finally {
+    useConfig(configOf({}))
+  }
+})
+
+test('a filing in a repo with no shared store keeps no filing secret and calls no relay', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  s.w.git.roster = '{}'
+  await seeded(s.$)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(s.w.gh.filed).toHaveLength(1)
+  expect(findingIn(s.w.store)?.followUp).toBe('#21')
+  expect([...s.w.store.keys()].filter(key => key.startsWith('relay-filing-secret:'))).toEqual([])
+  expect(s.fake.calls).toEqual([])
+})
+
+test('a fresh claim a pass leaves with no POST is named in the run log, so an admin knows a fileDelete is safe', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  // A waiver lands while the claim goes out: the pass files nothing more, and the claim stays. (A finding turned security meanwhile
+  // leaves too, but its line names a security finding, so it is held locally and never sent.)
+  s.onSend.fn = body => {
+    if (body.op !== 'fileClaim') return
+    const mirror = recordIn(s.w.store)
+    s.w.store.set(KEY, { ...mirror, waivers: [...mirror.waivers, { scope: 'post', head: 'a'.repeat(40), reason: 'x', by: 'composer', at: 2 }] })
+  }
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.onSend.fn = undefined
+  expect(s.w.gh.filed).toEqual([])
+  expect(filingAt(s.fake, keyOf(rec))?.state).toBe('claimed')
+  expect(relayLines(s.fake).some(one => one.includes(keyOf(rec)) && one.includes("an admin's fileDelete on the relay is safe"))).toBe(true)
+})
+
+test('a young claim\'s issue, used here and owed, settles to done once the claimant finishes it', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  expect(await asOther(s.fake, { op: 'fileClaim', key: keyOf(rec), secret: OTHER_SECRET })).toBe(200)
+  markedIssue(s.w, rec, 21)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#21', isFilingOwed: true })
+  expect(await asOther(s.fake, { op: 'fileDone', key: keyOf(rec), result: result(21), secret: OTHER_SECRET })).toBe(200)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(findingIn(s.w.store)?.followUp).toBe('#21')
+  expect(findingIn(s.w.store)?.isFilingOwed).toBeUndefined()
+  expect(s.w.gh.filed).toEqual([])
+  expect(opsOf(s.fake, 'fileAdopt')).toEqual([])
+})
+
+test('a fileDone the relay could not take after the POST is owed, and paid on the next relay call that lands', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  // The relay is down for the fileDone alone: the record's save right after it lands, and pays it.
+  let state: 'armed' | 'down' | 'done' = 'armed'
+  let sent = 0
+  s.onSend.fn = body => {
+    if (body.op === 'fileDone') sent += 1
+    if (state === 'armed' && body.op === 'fileDone') {
+      state = 'down'
+      s.fake.down = true
+    } else if (state === 'down') {
+      state = 'done'
+      s.fake.down = false
+    }
+  }
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.onSend.fn = undefined
+  expect(state).toBe('done')
+  expect(s.w.gh.filed).toHaveLength(1)
+  expect(sent).toBe(2)
+  expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  expect(s.w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
+  expect(findingIn(s.w.store)?.followUp).toBe('#21')
+})
+
+test('a filing pass never adopts the ledger\'s closed issue again: a finding holding again with no issue named files the next attempt', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  // #21 is closed, and an answer replaced the follow-up with words that name no issue: the finding holds and is planned again.
+  s.w.gh.issueStates[21] = 'CLOSED'
+  await updateRecord(s.$, '/repo', 'feat/x', r => ({ ...r, findings: r.findings.map(f => ({ ...f, followUp: 'see the design doc', followUpLabel: undefined })) }))
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(s.w.gh.filed).toHaveLength(2)
   expect(filingAt(s.fake, keyOf(rec, 2))).toMatchObject({ state: 'done', result: result(22) })
   expect(findingIn(s.w.store)).toMatchObject({ followUp: '#22', fileAttempt: 1 })
 })

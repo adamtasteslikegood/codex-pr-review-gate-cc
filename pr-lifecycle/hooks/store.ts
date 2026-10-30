@@ -438,8 +438,10 @@ async function owe($: Engine, root: string, branch: string, one: Owed): Promise<
 }
 
 /**
- * Sends what this checkout owes the relay, oldest first, after a call that landed. One that is down or refused is kept, with every one
- * after it; one the relay answered otherwise is done (a `moveDone` another checkout finished first answers 409).
+ * Sends what this checkout owes the relay, oldest first, after a call that landed. One that is down is kept, with every one after it;
+ * one the relay answered otherwise is done (a `moveDone` another checkout finished first answers 409). One it refused (an owed
+ * `fileDone` after an admin's fileDelete and another checkout's claim answers 403) is dropped with a run-log line, never kept at the
+ * head of the queue: the call itself would be refused again, and the next one that isn't owed stands the store down if the grant went.
  */
 async function payOwed($: Engine, root: string, branch: string, relay: Relay): Promise<void> {
   const kept = (await $.store.get(owedKey(root, branch))) as Owed[] | undefined
@@ -447,7 +449,12 @@ async function payOwed($: Engine, root: string, branch: string, relay: Relay): P
   let paid = 0
   for (const one of kept) {
     const answer = await relayCall($, relay, one.path, one.body)
-    if ('down' in answer || 'refused' in answer) break
+    if ('down' in answer) break
+    if ('refused' in answer) {
+      const what = typeof one.body.key === 'string' ? `${String(one.body.op)} ${one.body.key}` : String(one.body.op)
+      const text = `an owed relay call was refused (${answer.refused}) and dropped: ${what}`
+      await relayCall($, relay, one.path, { op: 'log', at: await $.clock.now(), kind: 'session', text, holder: await $.session.id() })
+    }
     paid += 1
   }
   if (paid === kept.length) await $.store.delete(owedKey(root, branch))
