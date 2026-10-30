@@ -10,7 +10,7 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 [README.md](README.md) for the component table and [VISION.md](VISION.md) for
 the project's goals and their order.
 
-## Current state (2026-10-28, after wave 2b and 1.5.4)
+## Current state (2026-10-30, after wave 2b and 1.6.0)
 
 - `codex-gate/` **0.3.1** is **not loaded** and **frozen**: don't change it
   unless Adam asks for a fix. Known, unfixed issues:
@@ -19,7 +19,7 @@ the project's goals and their order.
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.5.4** is the plugin in daily use, loaded through
+- `pr-lifecycle/` **1.6.0** is the plugin in daily use, loaded through
   `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. Since 2026-10-28
   its `enforce` and `enforceMerge` settings are off and the Codex models and
   efforts are set per repo (ROADMAP decision M), so it holds no PR create or
@@ -40,15 +40,19 @@ the project's goals and their order.
     R71–R78 after the first live run, R79–R87 in wave 2a, R88–R95 in
     wave 2b, R96 after 1.5.0 (#29, the lifecycle id in the filing mark)
     R97 in 1.5.2 (approvals settle on their verdict), R98 in 1.5.3
-    (a create whose head is not checked out here is held) and R99 in 1.5.4
-    (a step timeout tells the agent and keeps a late fixer's answer):
+    (a create whose head is not checked out here is held), R99 in 1.5.4
+    (a step timeout tells the agent and keeps a late fixer's answer) and
+    R100–R108 for the shared store (#29 Part B, 1.6.0):
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it. The goals are in
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
   - `/pr-gate log` sums up how a lifecycle went (R78).
-- `pr-lifecycle-relay/` is the local prototype of #29 Part B's shared store: a Worker
-  and one Durable Object per PR, tested under Miniflare. Nothing is deployed, and
-  pr-lifecycle doesn't call it yet.
+- `pr-lifecycle-relay/` is #29 Part B's shared store: a Worker and Durable Objects (a lifecycle object per PR or branch, `GrantStore`,
+  `RepoIndex`), tested under Miniflare. **Nothing is deployed**: the development deploy and its latency measurement (R108) wait for
+  Adam's confirmation, immediately before they touch Cloudflare. pr-lifecycle 1.6.0 calls it only for a repo that opts in with
+  `sharedStore` (`{ url, aud }`) in `.github/pr-gate.json` on the base branch, with a credential in `PR_GATE_RELAY_CLIENT_ID` and
+  `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token). With none, or on any failure
+  other than a refused credential, the lifecycle runs locally. No base opts in yet.
 - **Never load both folders at once.** Both register `/pr-gate` and hold PR
   creation, so two would gate the same PR twice. Switching
   `CLAUDE_CODE_PLUGIN_DIRS` is Adam's call.
@@ -109,10 +113,10 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 713)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 813)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
-npm run test:relay       # the #29 Part B relay prototype under Miniflare (18)
+npm run test:relay       # the #29 Part B relay under Miniflare (86)
 npm run typecheck:relay  # tsc -p pr-lifecycle-relay
 npm run check      # all of the above
 ```
@@ -120,7 +124,7 @@ npm run check      # all of the above
 - `typecheck` needs `pr-lifecycle/.claude-plugin/types/`, which the harness
   writes when a session loads that mod. With the types present, it runs in
   about 2 s with 0 errors.
-- 19 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
+- 53 slow tests carry `{ timeoutMs: 15_000 }` because they time out at
   5 s under machine load (spec §7.3). The three-run load re-check is still
   owed: the machine ran low on memory. See
   `docs/superpowers/plans/2026-10-21-wave2b-flaky-tests.md`.

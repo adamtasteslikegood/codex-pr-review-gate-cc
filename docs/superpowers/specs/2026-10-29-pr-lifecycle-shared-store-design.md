@@ -171,7 +171,7 @@ In a repo that opts in, filing one finding goes:
    - **done**: adopt its result.
 2. **`fileClaim`** with the key `lifecycleId:findingId:attempt`:
    - `isFresh: true`, or `isMine: true` (a retry after a lost answer): file the issue, then send `fileDone` with `{ number, url }`.
-   - `isFresh: false, isMine: false`, still `claimed`: another checkout is filing. Don't POST. Read `filing` again on the next tick. A claim older than the step timeout (`stepTimeoutMinutes`, 30) with no `fileDone` shows in `/pr-gate log` as stuck. It is never claimed afresh automatically, because its POST may already have gone out: the driver adopts it with `fileAdopt` once the exact-mark search finds its issue (step 1), and otherwise it waits for an admin's `fileDelete`.
+   - `isFresh: false, isMine: false`, still `claimed`: another checkout is filing. Don't POST. Read `filing` again on the next tick. A claim older than the step timeout (`stepTimeoutMinutes`, 30) with no `fileDone` shows in `/pr-gate log` as stuck, under the header `stuck filings (known findings only)`: no relay op lists every filing, so the section checks the keys of the findings the record knows, and says so if the relay was unreachable. It is never claimed afresh automatically, because its POST may already have gone out: the driver adopts it with `fileAdopt` once the exact-mark search finds its issue (step 1), and otherwise it waits for an admin's `fileDelete`.
    - `state: 'done'`: adopt its result.
 3. **When `attempt` advances:** only when the same finding holds the merge again in the same lifecycle after its earlier issue was closed. It starts at 1. A new lifecycle has a new `lifecycleId`, so its keys never collide with earlier ones.
 
@@ -251,22 +251,23 @@ The record carries each finding's text, security findings included. R92 and R95 
 
 ## 12. Request count and latency
 
-### Request count per active lifecycle-hour (a count from the code, not measured)
+### Request count per active lifecycle-hour (counted at the Miniflare boundary in Task 11)
 
-| Source | Rate in the code | Relay requests per hour |
+The first version of this table was a count from the code. It is now measured, for a scripted hour of one driving session: 1 claim, 60 beats (the beat is every 60 s, R100), 10 record changes (a `read` and a `commit` each), 20 log lines and 3 filings (`fileClaim` and `fileDone`).
+
+| Source | Worker requests | Durable Object requests |
 | --- | --- | --- |
-| Holder's beat (`BEAT_MS`, 30 s) | 1 per 30 s | 120 |
-| `isOwnedElsewhere` / `isStillMine` (5 sites, plus the watcher) | each check | 0 for the holder (section 4's cache). A non-holder's watcher reads once per 60 s per watched record (`WATCH_TICK_MS`): 60 |
-| Record commits (32 `updateRecord` sites, `transact` ×5) | a few per round transition | about 2 per change (`read` + `commit`), tens per round |
-| Log lines (24 sites) | a few per round | 1 each (`log`) |
-| Filing | per finding filed | 2 to 3 (`fileClaim`, `fileDone`, sometimes `filing`) |
-| Grant lookup (R104) | every relay call | 1 more Durable Object request per call, to `GrantStore`; Workers requests unchanged |
+| claim | 1 | 2 |
+| beat x 60 (one per 60 s) | 60 | 120 |
+| record change x 10 (`read` + `commit`) | 20 | 60 |
+| log x 20 | 20 | 40 |
+| filing x 3 (`fileClaim` + `fileDone`) | 6 | 12 |
+| **Total** | **107** | **234** |
 
-So the floor is about 120 requests per hour per lifecycle with a driving session, and roughly 180 to 300 in practice, plus a burst at each round's transitions. With grants in the relay, Durable Object requests are about twice the Worker requests. Pre-PR records on the relay (R103) add the same pattern for the pre-PR rounds, which used to make no relay requests at all.
-
-The lever is the beat. A `LEASE_MS` of 120 s with a beat every 60 s, instead of 30 s, halves the floor and still leaves two misses before a takeover.
-
-Comparing these counts with the prepaid Workers plan's included requests and Durable Object requests is left for Adam: the plan's figures aren't quoted here from memory.
+- **The identity.** Durable Object requests = 2 x W + 2 x commits, where W is the Worker requests: each Worker request costs one `GrantStore` lookup and one lifecycle-object request (R104), and each commit adds an outbox alarm and a `RepoIndex` update. Here 234 = 2 x 107 + 2 x 10. The ratio is 2 + 2 x commits / W, so it is 2.19 in this script, and about 2.37 with 20 commits among the 107 requests. "About twice" is the floor.
+- **What the script leaves out.** Each tick of a driving session sends a `list` and a `read` before its beat, and the first version of the table did not count them. That is 2 more Worker requests per tick, and 4 more Durable Object requests (a `GrantStore` lookup and an object or index request each). At one tick a minute, 120 more Worker requests and 240 more Durable Object requests an hour. So the true figure for a driving session is about 227 Worker requests and 474 Durable Object requests an hour in this script's shape, before bursts at round transitions. A non-holder's watcher reads once per 60 s per watched record (`WATCH_TICK_MS`), which is 60 more Worker requests an hour for each.
+- **The beat** stays the lever: `LEASE_MS` 120 s with a beat every 60 s.
+- The count does not exercise the 60 s cadence itself; the harness sends the calls back to back. Comparing these counts with the prepaid Workers plan's included requests is left for Adam.
 
 ### Latency (not measured yet)
 
@@ -318,7 +319,7 @@ The design keeps the network off the paths where latency would matter:
 
 - **Two controller clients** (two checkout roots, two session ids, one Miniflare relay, one fake GitHub) run one PR:
   - no new dispatch after a takeover: once the old driver's boundary `beat` is refused, it starts nothing, while the new holder dispatches. An action already acknowledged before the `take` may finish (section 4's bounded overlap): its commit is refused, its push is caught up by the new driver's fetch, its filing goes through the ledger with no second POST, and a reply it sent may appear twice;
-  - a `take` right after the old driver's beat, then an old-driver dispatch before its next beat: the action boundary's `beat` gets 423, the old driver stands down, and nothing is dispatched;
+  - a `take` right after the old driver's beat, then an old-driver dispatch before its next beat: the old driver's next `beat` is refused, and nothing is dispatched. A lost lease's `beat` answers 409 and a `commit` under another holder's live lease answers 423 (the relay's contract); both stand the old driver down. A plain revision 409 at a site that is not pure keeps the run, and the next tick recovers from the relay's record; only a 423, a moved record (410) or a refused credential (401, 403) stands down;
   - the other stands down;
   - a takeover after a lapse fences out the old holder's commit;
   - neither files a finding twice.
