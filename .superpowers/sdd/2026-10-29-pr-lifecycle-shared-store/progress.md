@@ -140,3 +140,7 @@ Task 11: fix round 1/5 dispatched
 Task 11: fix round 1/5 (4 addressed, 0 open; commit e529466) — test-only 27-line diff, re-reviewed inline by the controller
 Task 11: minor (deferred): the plain-409 keep-the-run path is not driven through the ticker in a two-controller test
 Task 11: complete (commits d2351b5..e529466, review clean)
+Task 12: dispatched (base d9a12ad)
+Task 12: implementer DONE (commit f8d5a82; 22/813/86; one flaky 5 s timeout on rerun-pass)
+Task 12: review — Approved (no Critical/Important); minors carried to the final fix dispatch: gate.test.ts:64 flaky 5 s test needs timeoutMs; ROADMAP 1.6.0 note placement; wrangler.jsonc lacks an ADMINS placeholder; relay README take row ("a live lease") and moveTo row (moveTo answers 200; later ops 410); pr-lifecycle README "same principal" and non-JSON body as down; CLAUDE.md relay bullet "no answer (network, 5xx, timeout)" runs locally; spec line 124 "of a lease op"
+Task 12: complete (commits d9a12ad..f8d5a82, review clean)
