@@ -115,3 +115,11 @@ Task 8: fix round 1/5 dispatched
 Task 8: fix round 1/5 (3 Important + ruling + minors addressed, 0 open; commit 0e34ea7)
 Task 8: minor (deferred): a fileOnce/checkOnce with no running run and no kept lease only reads at its boundary (no lease held during the write) — no concrete caller found; checkOnce's Jira boundary and watchBeat's finally-release have no dedicated test
 Task 8: complete (commits cc845a1..0e34ea7, review clean)
+Task 9: dispatched (base 42ae5bd)
+Task 9: implementer DONE (commit 8489357; 788 plugin tests)
+Task 9: review — Approved (spec ✅, no Critical/Important); minors: claim left with no POST on moved/waived/security exits; adopt gated at stepTimeoutMs not max(stepTimeout, 30 min); settleOwed lists issues per owed finding per pass; same-checkout crash + quick close → second POST (local path same, not a regression); a refused owed call jams the owed queue; local-only repos write a filing secret; coverage gaps (young-claim settle, owed fileDone paid)
+Task 9: Ruling: fix the queue jam (drop a refused owed entry), the adopt threshold, the local-only secret, and a log line for an abandoned claim, with tests — the jam is permanent and cheap to fix — cost if wrong: one short fix round
+Task 9: fix round 1/5 dispatched
+Task 9: fix round 1/5 (6 addressed incl. a real closed-issue re-adopt fixed, 0 open; commit a79be38)
+Task 9: minor (deferred): markSent exits (~4048 gone/secret) leave a post claim with no log line; the now-security abandoned-claim path has no assertion; a credential revocation drops every owed entry incl. a moveDone (payOwed runs only after a call that landed, so low risk); a deleted/transferred issue counts as closed and advances the attempt (matches the merge check)
+Task 9: complete (commits 42ae5bd..a79be38, review clean)
