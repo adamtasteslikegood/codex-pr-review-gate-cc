@@ -117,10 +117,12 @@ export class LifecycleObject {
         // A commit names the revision it read: a stale one is refused with what is there now, never merged blindly.
         if (body.rev !== s.rev) return reply(409, { error: 'stale revision', rev: s.rev, record: s.record })
         if (isLive(s.lease) && !isMine(s.lease)) return reply(423, { error: 'the lease is held', lease: shown(s.lease) })
-        const archives =
-          typeof body.archiveAt === 'number' && s.record !== null ? [...s.archives, { at: body.archiveAt, record: s.record }].slice(-ARCHIVE_CAP) : s.archives
+        // An archive keeps the record the caller archived (the local store's `tx.archive(rec, at)`), not whatever is stored now.
+        const archive = body.archive as { at?: unknown; record?: unknown } | null | undefined
+        if (archive !== undefined && (archive === null || typeof archive.at !== 'number' || archive.record === undefined)) return reply(400, { error: 'archive needs { at, record }' })
+        const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
         const next = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
-        await save(next, typeof body.archiveAt === 'number' ? 'commit+archive' : 'commit')
+        await save(next, archive !== undefined ? 'commit+archive' : 'commit')
         return reply(200, { rev: next.rev })
       }
       case 'claim': {
