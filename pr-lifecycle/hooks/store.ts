@@ -279,10 +279,10 @@ export class RelayMoved extends Error {
 export const SECURITY_PLACEHOLDER = '[security finding: text kept by the checkout that found it]'
 
 /**
- * The fields a security finding keeps on the relay (R107, shape R(b)): what any checkout needs to hold the merge and rule on it. A
- * linked duplicate keeps its `duplicateOf` too, an id: it holds, and settles, with its original (R90).
+ * A security finding's free text, which stays with the checkout that found it (R107, shape R(b)). Every other field is control (a status,
+ * a link and whether it was checked, a recheck owed, a filing): any checkout needs it to hold the merge and rule on it (PR #54 G1-2).
  */
-const SHARED_FIELDS = ['id', 'round', 'source', 'reviewer', 'severity', 'isSecurity', 'headSeen', 'status', 'duplicateOf'] as const
+const TEXT_FIELDS = ['title', 'file', 'line', 'detail', 'note', 'url', 'jiraSummaries', 'jiraError', 'issueError', 'followUpLabelError'] as const
 
 /** What any other string of the record becomes on the relay when it names a security finding (R107): the whole string, not a part of it. */
 export const HELD_PLACEHOLDER = '[held locally: names a security finding]'
@@ -346,31 +346,52 @@ const scrub = (value: unknown, isNamed: (text: string) => boolean): unknown => {
 }
 
 /**
- * The record as it may leave the checkout (R107): each security finding, and each linked to one, is cut to `SHARED_FIELDS`, a
- * placeholder title and `ref: 'local'` (no detail, note, file, line, url or history); every other free-text string that names one (a
- * message, a round's outstanding, a log line, a waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole; and `relayRev`, this
- * checkout's own bookkeeping, is dropped, as is `relayKey`.
+ * The record as it may leave the checkout (R107): each security finding, and each linked to one, loses its `TEXT_FIELDS` and its
+ * history's notes and evidence, and takes a placeholder title and `ref: 'local'`; every other free-text string that names one (in
+ * another finding, a message, a round's outstanding, a log line, a waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole; and
+ * `relayRev`, this checkout's own bookkeeping, is dropped, as is `relayKey`.
  */
 export const redact = (rec: LifecycleRecord): LifecycleRecord => {
   const { relayRev: _, relayKey: _key, findings: _findings, ...rest } = rec
   const secureIds = secureIdsOf(rec.findings)
   const isNamed = namerOf(rec.findings.filter(one => secureIds.has(one.id)))
+  if (isNamed === undefined) return { ...rest, findings: rec.findings }
   return {
-    ...((isNamed === undefined ? rest : scrub(rest, isNamed)) as typeof rest),
+    ...(scrub(rest, isNamed) as typeof rest),
     findings: rec.findings.map(one => {
-      if (!secureIds.has(one.id)) return one
-      const kept: Record<string, unknown> = {}
-      for (const name of SHARED_FIELDS) if (one[name] !== undefined) kept[name] = one[name]
-      return { ...kept, title: SECURITY_PLACEHOLDER, ref: 'local' } as unknown as Finding
+      if (!secureIds.has(one.id)) return scrub(one, isNamed) as Finding
+      const kept: Record<string, unknown> = { ...one }
+      for (const name of TEXT_FIELDS) delete kept[name]
+      if (one.history !== undefined) kept.history = one.history.map(({ note: _note, evidence: _evidence, ...event }) => event)
+      return { ...(scrub(kept, isNamed) as object), title: SECURITY_PLACEHOLDER, ref: 'local' } as unknown as Finding
     }),
   }
 }
 
+/** `theirs` with each `HELD_PLACEHOLDER` in it taken back from the same place in `mine`, where `mine` has a string there. */
+const refill = (theirs: unknown, mine: unknown): unknown => {
+  if (theirs === HELD_PLACEHOLDER) return typeof mine === 'string' ? mine : theirs
+  if (Array.isArray(theirs)) return theirs.map((one, at) => refill(one, Array.isArray(mine) ? mine[at] : undefined))
+  if (theirs !== null && typeof theirs === 'object') {
+    const own = mine !== null && typeof mine === 'object' && !Array.isArray(mine) ? mine as Record<string, unknown> : {}
+    return Object.fromEntries(Object.entries(theirs).map(([name, one]) => [name, refill(one, own[name])]))
+  }
+  return theirs
+}
+
+/** The relay's history of a security finding with this checkout's notes and evidence back on its own events (same index, time, author and status). */
+const historyOf = (theirs: Finding['history'], mine: Finding['history']): Finding['history'] => theirs.map((event, at) => {
+  const own = mine?.[at]
+  if (own === undefined || own.at !== event.at || own.by !== event.by || own.status !== event.status) return event
+  return { ...event, ...(own.note !== undefined ? { note: own.note } : {}), ...(own.evidence !== undefined ? { evidence: own.evidence } : {}) }
+})
+
 /**
- * The relay's record with this checkout's own security text put back (R107): a placeholder takes the text of the mirror's finding of the
- * same id, only when the mirror is of the same lifecycle, and the relay's fields (its status and ruling among them) win. Any other
- * placeholder stays one: another checkout found it. Only findings are put back: a `HELD_PLACEHOLDER` elsewhere stays as the relay has it
- * (the mirror of this checkout's own commit keeps the full text, so only a record another writer moved on loses it there).
+ * The relay's record with this checkout's own text put back (R107), only when the mirror is of the same lifecycle: a security
+ * finding's placeholder takes the `TEXT_FIELDS` and history notes of the mirror's finding of the same id, and a `HELD_PLACEHOLDER` in any
+ * finding takes the mirror's string at the same place. The relay's fields (its status, ruling and links among them) win. Any other
+ * placeholder stays one: another checkout found it. A `HELD_PLACEHOLDER` outside the findings stays as the relay has it (the mirror of
+ * this checkout's own commit keeps the full text, so only a record another writer moved on loses it there).
  */
 export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefined): LifecycleRecord => {
   const isSame = local !== undefined && remote.lifecycleId !== undefined && local.lifecycleId === remote.lifecycleId
@@ -378,11 +399,11 @@ export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefi
   return {
     ...remote,
     findings: remote.findings.map(one => {
-      if (one.ref !== 'local') return one
       const mine = own.get(one.id)
+      if (one.ref !== 'local') return mine === undefined ? one : refill(one, mine) as Finding
       if (mine === undefined) return { ...one, history: one.history ?? [] }
-      const { ref: _, title: _title, ...shared } = one
-      return { ...mine, ...shared }
+      const { ref: _, title: _title, ...shared } = refill(one, mine) as Finding
+      return { ...mine, ...shared, ...(one.history !== undefined ? { history: historyOf(one.history, mine.history) } : {}) }
     }),
   }
 }

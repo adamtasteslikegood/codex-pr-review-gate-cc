@@ -553,3 +553,32 @@ test('an owed finding whose saved issue is the done attempt\'s own issue settles
   expect(findingIn(s.w.store)?.fileAttempt).toBeUndefined()
   expect(findingIn(s.w.store)?.isFilingOwed).toBeUndefined()
 })
+
+// PR #54 G1-4: an advance through more than one closed attempt keeps the deepest attempt's count, not the first step's.
+
+test('an advance through two closed attempts from a stale saved count records the attempt it filed, and the next advance goes on from it (PR #54 G1-4)', { timeoutMs: 15_000 }, async (_$, on) => {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  const holdAgain = (fileAttempt: number | undefined) => updateRecord(s.$, '/repo', 'feat/x', r => ({
+    ...r,
+    findings: r.findings.map(f => ({ ...f, followUp: 'see the design doc', followUpLabel: undefined, fileAttempt })),
+  }))
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  s.w.gh.issueStates[21] = 'CLOSED'
+  await holdAgain(undefined)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec, 2))).toMatchObject({ state: 'done', result: result(22) })
+  // #22 closes too, and the saved count is stale (a mirror from before the second filing): both closed attempts are stepped past.
+  s.w.gh.issueStates[22] = 'CLOSED'
+  await holdAgain(undefined)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec, 3))).toMatchObject({ state: 'done', result: result(23) })
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#23', fileAttempt: 2 })
+  // #23 closes: the next filing is attempt 4, from the saved count.
+  s.w.gh.issueStates[23] = 'CLOSED'
+  await holdAgain(2)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec, 4))).toMatchObject({ state: 'done', result: result(24) })
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#24', fileAttempt: 3 })
+  expect(s.w.gh.filed).toHaveLength(4)
+})

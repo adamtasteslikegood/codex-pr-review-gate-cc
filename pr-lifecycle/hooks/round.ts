@@ -4306,7 +4306,9 @@ async function ledgerOf(
       // The ledger's issue is closed and the finding holds again before a merge (its follow-up no longer names an issue): the next
       // attempt is filed, as the merge check files it, never the closed issue adopted again.
       const fileAttempt = (f.fileAttempt ?? 0) + 1
-      return { ...(await ledgerOf($, rec, { ...f, fileAttempt }, { ...at, exclude: n })), fileAttempt }
+      // A deeper closed attempt advances again: its count wins over this one (PR #54 G1-4).
+      const next = await ledgerOf($, rec, { ...f, fileAttempt }, { ...at, exclude: n })
+      return { ...next, fileAttempt: next.fileAttempt ?? fileAttempt }
     }
     return { kind: 'found', issue: listedAs(n), others: marked.map(one => one.number).filter(one => one !== n), isOwed: false, how: 'the filing ledger has it' }
   }

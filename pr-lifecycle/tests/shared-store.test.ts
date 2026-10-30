@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { MockClock } from 'claude-code/testing'
 import type { HttpInit, HttpResponse } from 'claude-code'
 
-import { newRecord } from '../hooks/lifecycle'
+import { isLinked, isLinkOwed, isReverifyOwed, mergeHolds, newRecord, verificationOwed } from '../hooks/lifecycle'
 import { RELAY_TIMEOUT_MS } from '../hooks/relay'
 import { forgetOptIns, HELD_PLACEHOLDER, loadRecord, OPT_IN_TTL_MS, recordKey, redact, RelayRefused, restore, saveRecord, StaleRecord, transact, updateRecord, upsertRecord } from '../hooks/store'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
@@ -384,11 +384,18 @@ test('no security finding\'s text reaches the relay, in any field of any commit,
   const { fake, $, w } = setup(on)
   const at = 1
   const plain = finding('R1-10', 'plain finding')
+  // A plain finding whose words quote R1-1's detail, and whose history names it (PR #54 G1-3).
+  const quoting = finding('G1-2', 'another plain finding', {
+    source: 'github',
+    reviewer: 'alice',
+    detail: `same as ${SECRET.detail}`,
+    history: [{ round: 1, status: 'rebutted', note: 'see R1-1', by: 'agent', at: 2 }],
+  })
   // The text a MERGE_SECURITY block, a round's outstanding, a log line, a waiver's and a grant's reason carry: each names R1-1.
   const named = `${SECRET.id} [${SECRET.severity}] ${SECRET.title}`
   const leaky = seed({
     lifecycleId: 'L1',
-    findings: [SECRET, plain],
+    findings: [SECRET, plain, quoting],
     message: `Merge held for security: ${named}`,
     rounds: [{ outstanding: `R1-1 still open`, evidence: [] } as unknown as LifecycleRecord['rounds'][number]],
     log: [
@@ -433,10 +440,36 @@ test('no security finding\'s text reaches the relay, in any field of any commit,
   expect(sent.waivers[0]).toEqual({ ...leaky.waivers[0], reason: HELD_PLACEHOLDER })
   expect(sent.grants[0]?.reason).toBe(HELD_PLACEHOLDER)
   expect(sent.branch).toBe('feat/x')
-  // The sent shape is R(b)'s: no detail, note, file, line, url or history.
-  expect(sent.findings[0]).toEqual({ id: 'R1-1', round: 1, source: 'codex-review', reviewer: 'codex', severity: 'P1', isSecurity: true, headSeen: 'a'.repeat(40), status: 'open', title: PLACEHOLDER, ref: 'local' })
+  expect(sent.findings[2]).toEqual({ ...quoting, detail: HELD_PLACEHOLDER, history: [{ ...quoting.history[0]!, note: HELD_PLACEHOLDER }] })
+  // The sent shape is R(b)'s: no detail, note, file, line, url or Jira summary, and a history without its notes (PR #54 G1-2).
+  expect(sent.findings[0]).toEqual({
+    id: 'R1-1', round: 1, source: 'codex-review', reviewer: 'codex', severity: 'P1', isSecurity: true, headSeen: 'a'.repeat(40), status: 'open',
+    history: [{ round: 1, status: 'open', by: 'codex', at: 1 }], title: PLACEHOLDER, ref: 'local',
+  })
   // Locally, the text is all still there.
   expect(local(w).findings[0]).toEqual(SECRET)
+  expect(local(w).findings[2]).toEqual(quoting)
+  expect(restore(sent, leaky).findings).toEqual(leaky.findings)
+})
+
+test('a security finding\'s control fields survive the relay: another checkout still holds the merge on a recheck owed and an unchecked link (PR #54 G1-2)', async () => {
+  const owed = finding('R1-1', 'SECRET-TITLE long enough to be a needle', { isSecurity: true, status: 'verified-fixed', needsRecheck: true })
+  const link = finding('G2-1', 'a second report of SECRET-TITLE long enough to be a needle', {
+    source: 'github', reviewer: 'alice', isSecurity: true, duplicateOf: 'R1-1', linkBy: 'agent',
+  })
+  const mirror = seed({ lifecycleId: 'L1', findings: [owed, link] })
+  // Another checkout has no mirror of it: what it reads is the relay's record alone.
+  const theirs = restore(redact(mirror), undefined)
+  expect(theirs.findings.map(one => [one.id, one.status, one.needsRecheck, one.linkBy, one.isLinkChecked])).toEqual([
+    ['R1-1', 'verified-fixed', true, undefined, undefined],
+    ['G2-1', 'open', undefined, 'agent', undefined],
+  ])
+  expect(isReverifyOwed(theirs.findings[0]!)).toBe(true)
+  expect(isLinked(theirs.findings[1]!)).toBe(false)
+  expect(isLinkOwed(theirs.findings[1]!)).toBe(true)
+  expect(verificationOwed(theirs).map(one => one.id)).toEqual(verificationOwed(mirror).map(one => one.id))
+  expect(mergeHolds(theirs).map(one => one.id)).toEqual(mergeHolds(mirror).map(one => one.id))
+  expect(mergeHolds(theirs).map(one => one.id)).toContain('R1-1')
 })
 
 test('a finding linked to a security finding is redacted with it, and restored with it', async (_t, on) => {
@@ -462,7 +495,7 @@ test('a finding linked to a security finding is redacted with it, and restored w
     for (const text of texts) expect(strings.filter(one => one.includes(text))).toEqual([])
   }
   const sent = (bodies[0]?.record as LifecycleRecord).findings[1]
-  expect(sent).toEqual({ id: 'G2-1', round: 1, source: 'github', reviewer: 'alice', severity: 'P1', headSeen: 'a'.repeat(40), status: 'open', duplicateOf: 'R1-1', title: PLACEHOLDER, ref: 'local' })
+  expect(sent).toEqual({ id: 'G2-1', round: 1, source: 'github', reviewer: 'alice', severity: 'P1', headSeen: 'a'.repeat(40), status: 'open', duplicateOf: 'R1-1', history: [], title: PLACEHOLDER, ref: 'local' })
   // This checkout, of the same lifecycle, has both back whole; the relay keeps the placeholders.
   expect(local(w).findings.map(one => one.title)).toEqual([SECRET.title, linked.title])
   expect(local(w).findings[1]?.detail).toBe(linked.detail)
