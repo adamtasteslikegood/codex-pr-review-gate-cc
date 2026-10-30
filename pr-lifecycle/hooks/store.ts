@@ -1208,6 +1208,35 @@ async function logOnRelay($: Engine, root: string, branch: string, at: number, k
   return true
 }
 
+/**
+ * A call to the filing ledger (#29 Part B, spec §7) of the relay object the record is on. Undefined for a record not on the relay:
+ * its filing keeps the local path. A relay that can't be used now answers `down`, and the filing falls back to that path too. A
+ * refusal stands the store down. `isOwed`: a call that didn't land is sent again after the next one that does (a `fileDone` after
+ * its POST, so the claim never stays open on an issue GitHub has).
+ */
+export async function ledgerCall(
+  $: Engine,
+  root: string,
+  branch: string,
+  body: Record<string, unknown>,
+  opts: { isOwed?: boolean } = {},
+): Promise<RelayAnswer | undefined> {
+  return lockRecord(root, branch, async () => {
+    const mirror = await loadRecord($, root, branch)
+    if (mirror?.relayRev === undefined) return undefined
+    const shared = await sharedOf($, root, mirror)
+    if ('local' in shared) return { down: shared.local }
+    const answer = await relayCall($, shared.relay, shared.path, body)
+    if ('refused' in answer) return standDown($, root, branch, answer.refused)
+    if ('down' in answer) {
+      if (opts.isOwed === true) await owe($, root, branch, { path: shared.path, body })
+      return answer
+    }
+    await payOwed($, root, branch, shared.relay)
+    return answer
+  })
+}
+
 /** A relay object's run log (R106): its lines, oldest first, and how many earlier lines its cap of 1000 dropped. */
 export type RelayLog = { lines: LogEntry[]; dropped: number }
 

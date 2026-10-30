@@ -85,6 +85,16 @@ export type Finding = {
    */
   isIssueSent?: true
   /**
+   * How many times the gate filed the finding anew after its issue closed with the finding still holding (#29 Part B, spec §7): its
+   * filing-ledger key is `<lifecycleId>:<id>:<fileAttempt + 1>`. Absent is 0. A retry after a lost answer never advances it.
+   */
+  fileAttempt?: number
+  /**
+   * The finding's issue is saved here but not yet in the relay's filing ledger (spec §7, §8): filed while the relay was down, or a
+   * marked issue another checkout's young claim still holds. The next filing pass or merge check settles the ledger.
+   */
+  isFilingOwed?: true
+  /**
    * The Jira ticket that tracks a security finding (spec §5.13.7), such as `KAN-512`, filed through acli where the base sets
    * `jiraProject`. It tracks the finding but never settles it: before a merge, only the person's waiver releases it.
    */

@@ -124,6 +124,7 @@ import {
   dropLease,
   forgetLeases,
   isHeldByOther,
+  ledgerCall,
   liveRecords,
   LOG_CAP,
   loadRecord,
@@ -140,7 +141,7 @@ import {
 } from './store'
 import type { LeaseHeld } from './store'
 // `.github/pr-gate.json` as the base has it (R67): in relay.ts, which reads `sharedStore` from it and must not import this file.
-import { baseFileOf } from './relay'
+import { baseFileOf, filingSecret, leaseSecret } from './relay'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -1345,7 +1346,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
         if (f.followUp !== got.followUp && f.followUp !== filed.findings.find(one => one.id === f.id)?.followUp) return f
         return {
           ...f, followUp: got.followUp, followUpLabel: got.followUpLabel, followUpLabelError: got.followUpLabelError, issueError: got.issueError,
-          isIssueSent: got.isIssueSent,
+          isIssueSent: got.isIssueSent, fileAttempt: got.fileAttempt, isFilingOwed: got.isFilingOwed,
           jiraTicket: got.jiraTicket, jiraError: got.jiraError, jiraSummaries: got.jiraSummaries,
         }
       })
@@ -3753,7 +3754,7 @@ async function fileTicket(
 }
 
 /** What one filing did to a finding, written under the record's lock. */
-type Filed = { peak: Severity; was: string | undefined; followUp: string | undefined; issueError?: string; labelError?: string }
+type Filed = { peak: Severity; was: string | undefined; followUp: string | undefined; issueError?: string; labelError?: string; isFilingOwed?: boolean }
 
 /**
  * The filing pass (R92, spec §5): where the review can do no more, it first adds a round for a late blocker (`gateGrant`); else it
@@ -3772,7 +3773,9 @@ export async function fileIssues($: Engine, rec: LifecycleRecord, merged?: Merge
   if (filing.has(key)) return undefined
   filing.add(key)
   try {
-    return await fileOnce($, rec, merged)
+    // The filing ledger is settled first for each issue it still lacks (spec §7, §8): the pass then works from the record it left.
+    const ready = await settleOwed($, rec)
+    return ready === undefined ? undefined : await fileOnce($, ready, merged)
   } catch (error) {
     // A boundary this session lost (Task 8): it stood down, and decides nothing for the pass. A save the shared store would not take
     // stands down the same way (a 423, a moved record), or, a plain stale one, ends the pass for the next to run again (spec §14).
@@ -3919,7 +3922,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
   // a reset or a fresh lifecycle stops that save: a stop or a waiver does not undo an issue already filed. Written only where the
   // follow-up is still the one filed for: a later answer that moved it is filed anew. A peak that rose while gh ran keeps the issue
   // GitHub has (wave 2b gate R6-2): its label is the old peak's, so the next pass labels it as a reused issue, never files another.
-  const save = async (id: string, got: Filed, line: LogEntry): Promise<boolean> => {
+  const save = async (id: string, got: Filed, line: LogEntry | undefined): Promise<boolean> => {
     let isGone = false
     const next = await updateRecord($, rec.root, rec.branch, latest => {
       isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
@@ -3927,12 +3930,14 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       const findings = latest.findings.map((f): Finding => {
         if (f.id !== id || got.was !== f.followUp) return f
         if (got.issueError !== undefined) return got.peak !== filingPeak(f) ? f : { ...f, issueError: got.issueError }
+        const owed = got.isFilingOwed === true ? { isFilingOwed: true as const } : { isFilingOwed: undefined }
         if (got.labelError !== undefined) {
-          return { ...f, followUp: got.followUp, followUpLabel: undefined, followUpLabelError: got.labelError, issueError: undefined, isIssueSent: undefined }
+          const label = { followUpLabel: undefined, followUpLabelError: got.labelError }
+          return { ...f, followUp: got.followUp, ...label, issueError: undefined, isIssueSent: undefined, ...owed }
         }
-        return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
+        return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined, ...owed }
       })
-      return { ...latest, findings, log: [...(latest.log ?? []), line].slice(-LOG_CAP) }
+      return { ...latest, findings, log: line === undefined ? latest.log : [...(latest.log ?? []), line].slice(-LOG_CAP) }
     }, { isPure: true })
     return next !== undefined && !isGone
   }
@@ -3962,7 +3967,20 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     // The last POST's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title is taken, never filed twice. A failed read files nothing: the next pass reads again.
     const was = after.findings.find(one => one.id === item.id)
-    const isRetry = item.reuse === undefined && (was?.issueError !== undefined || was?.isIssueSent === true)
+    // A record on the relay files through its filing ledger (#29 Part B, spec §7): the repository's issues are always read first for
+    // the exact mark, then the claim decides. A record not on it, or a relay that is down, keeps the local path below as it was.
+    const ledger: Ledgered =
+      item.reuse !== undefined || was === undefined
+        ? { kind: 'local', isOwed: false }
+        : await ledgerOf($, rec, was, { repo, gh, title: item.title, label, stepTimeoutMs: c.stepTimeoutMs })
+    if (ledger.kind !== 'local') {
+      const latest = await loadRecord($, rec.root, rec.branch)
+      if (latest === undefined || isMoved(latest)) return undefined
+      if (isWaived(latest)) return latest
+      if (isSecretNow(latest, item.id)) continue
+    }
+    const isOwed = ledger.kind === 'local' ? ledger.isOwed : ledger.kind === 'found' && ledger.isOwed
+    const isRetry = ledger.kind === 'local' && item.reuse === undefined && (was?.issueError !== undefined || was?.isIssueSent === true)
     const listed = isRetry ? await listIssues(gh, repo) : undefined
     if (isRetry) {
       // The list is a gh call too: the record is read afresh after it, before the POST or the label edit.
@@ -3971,14 +3989,18 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       if (isWaived(latest)) return latest
       if (isSecretNow(latest, item.id)) continue
     }
-    const found = listed?.issues === undefined ? undefined : issueFiledFor(listed.issues, filingMark(item.id, rec), item.titles)
+    const found = ledger.kind === 'found' ? ledger.issue : listed?.issues === undefined ? undefined : issueFiledFor(listed.issues, filingMark(item.id, rec), item.titles)
     let got: Filed
-    let text: string
+    let text: string | undefined
     if (item.reuse !== undefined) {
       const edit = await ghWrite(['issue', 'edit', String(item.reuse.number), '--repo', repo, '--add-label', label])
       const labelError = edit.exitCode === 0 ? undefined : failure(edit)
       got = { ...base, ...(labelError === undefined ? {} : { labelError }) }
       text = labelError === undefined ? `${item.id}: labelled ${repo}#${item.reuse.number} ${label}` : `${item.id}: could not label ${repo}#${item.reuse.number} ${label}`
+    } else if (ledger.kind === 'held') {
+      // No POST: another checkout's claim holds it, or a read failed. A stuck claim is logged once, as it first shows (spec §7).
+      got = { ...base, issueError: ledger.issueError }
+      text = was?.issueError === ledger.issueError ? undefined : ledger.text
     } else if (listed?.error !== undefined) {
       got = { ...base, issueError: `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200) }
       text = `${item.id}: could not read the issues of ${repo} before filing again`
@@ -3986,8 +4008,9 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
       const edit = await relabelFound(ghWrite, repo, found, label, item.title)
       const labelError = edit === undefined || edit.exitCode === 0 ? undefined : failure(edit)
-      got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }) }
-      text = `${item.id}: found ${repo}#${found.number}, filed by an answer gh lost${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
+      got = { ...base, followUp: `#${found.number}`, ...(labelError === undefined ? {} : { labelError }), isFilingOwed: isOwed }
+      const how = ledger.kind === 'found' ? `${ledger.how}${othersLine(repo, ledger.others)}` : 'filed by an answer gh lost'
+      text = `${item.id}: found ${repo}#${found.number}, ${how}${labelError === undefined ? ` ${label}` : `; could not label it ${label}`}`
     } else {
       // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved leaves an issueError, so the next pass reads the
       // list first and never files the issue twice. The answer's save below replaces it.
@@ -3996,6 +4019,12 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       if (sent === 'secret') continue
       const post = await ghWrite(['api', '-X', 'POST', `repos/${repo}/issues`, '-f', `title=${item.title}`, '-f', `body=${item.body}`, '-f', `labels[]=${label}`])
       const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
+      // The ledger is told before the answer's save (spec §7): a crash between them leaves the claim this checkout's, and its restart
+      // finds the issue by its mark and finishes it. One that doesn't land is owed, and sent after the next call that does.
+      if (filed !== undefined && ledger.kind === 'post') {
+        const result = ledgerResult(repo, filed.number)
+        await ledgerCall($, rec.root, rec.branch, { op: 'fileDone', key: ledger.key, result, secret: ledger.secret }, { isOwed: true })
+      }
       if (filed === undefined) {
         const issueError = post.exitCode === 0 ? "GitHub did not give the new issue's number" : failure(post)
         got = { ...base, issueError }
@@ -4003,14 +4032,15 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       } else if (!filed.labels.includes(label)) {
         // Filed, but GitHub dropped the label (A7): the issue is kept, and the next pass labels it instead of filing another.
         const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-        got = { ...base, followUp: `#${filed.number}`, labelError }
+        got = { ...base, followUp: `#${filed.number}`, labelError, isFilingOwed: isOwed }
         text = `${item.id}: filed ${repo}#${filed.number} without ${label}`
       } else {
-        got = { ...base, followUp: `#${filed.number}` }
+        got = { ...base, followUp: `#${filed.number}`, isFilingOwed: isOwed }
         text = `${item.id}: filed ${repo}#${filed.number} ${label}`
       }
     }
-    if (!(await save(item.id, got, { at: await $.clock.now(), kind: 'check', text: text.slice(0, 300) }))) return undefined
+    const line = text === undefined ? undefined : { at: await $.clock.now(), kind: 'check' as const, text: text.slice(0, 300) }
+    if (!(await save(item.id, got, line))) return undefined
   }
   // Each security finding the review left for the person, or every one still holding at a merge, gets its Jira ticket where the base
   // sets jiraProject (spec §5.13.7). The ticket tracks it and never settles it. A failure keeps acli's words on the finding and the
@@ -4153,6 +4183,163 @@ async function relabelFound(
 /** The most pages of 100 `listIssues` reads before it fails rather than miss an issue a lost answer filed. */
 const ISSUE_PAGES = 10
 
+/** A bounded gh call as the filing pass and the merge check make it. */
+type Gh = (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+
+/** A finding's key in the relay's filing ledger (spec §7): `<lifecycleId>:<id>:<attempt>`, the attempt starting at 1. */
+const ledgerKey = (rec: WithId, f: Pick<Finding, 'id' | 'fileAttempt'>): string => `${rec.lifecycleId}:${f.id}:${(f.fileAttempt ?? 0) + 1}`
+
+/** An issue as the ledger records it: built the same way every time, so a retry's `fileDone` matches the first byte for byte. */
+const ledgerResult = (repo: string, n: number): { number: number; url: string } => ({ number: n, url: `https://github.com/${repo}/issues/${n}` })
+
+/** What a finding's issueError says while another checkout's claim on its filing holds and no issue carries its mark (spec §7). */
+const CLAIM_PENDING = "another checkout claimed this finding's filing on the relay and has not finished it: nothing is filed here; the next pass reads the claim again"
+const CLAIM_STUCK = "another checkout's claim on this finding's filing is stuck (older than the step timeout, and no issue carries its mark): it waits for an admin's fileDelete on the relay"
+
+/**
+ * What the relay's filing ledger says of one finding's filing (#29 Part B, spec §7), after the repository's open issues are read
+ * for its exact mark (`listIssues`, which reads its own writes):
+ * - `local`: the record is not on the relay, or no filing secret could be kept: the local path, as it was. `isOwed`: the relay is
+ *   down, so the issue the local path files is owed to the ledger (section 8);
+ * - `post`: this checkout's claim, fresh or its own after a lost answer, and no marked issue: POST, then `fileDone`;
+ * - `found`: the issue to use, the ledger's own result or the lowest-numbered marked issue (`others`: the rest, which a fallback
+ *   filed twice, for the person to close; never closed here). `isOwed`: the ledger doesn't have it yet (another checkout's young
+ *   claim, or an adoption the relay would not take);
+ * - `held`: no POST: a read that failed, or another checkout's claim with no marked issue (stuck once older than the step timeout).
+ * Another checkout's claim older than the step timeout, with a marked issue, is adopted with `fileAdopt` by this session as the
+ * lease's holder, after its boundary; a session that doesn't hold the lease is refused (423) and uses the issue locally. `saved`:
+ * the issue the record already names (a fallback's), finished in the ledger by this checkout's own claim when no open issue
+ * carries the mark. `exclude`: the closed issue a merge check files anew for.
+ */
+type Ledgered =
+  | { kind: 'local'; isOwed: boolean }
+  | { kind: 'post'; key: string; secret: string }
+  | { kind: 'found'; issue: ListedIssue; others: number[]; isOwed: boolean; how: string }
+  | { kind: 'held'; issueError: string; text: string }
+
+async function ledgerOf(
+  $: Engine,
+  rec: WithId,
+  f: Finding,
+  at: { repo: string; gh: Gh; title: string; label: string; stepTimeoutMs: number; saved?: number; exclude?: number },
+): Promise<Ledgered> {
+  const secret = await filingSecret($, rec.root, rec.lifecycleId)
+  if (secret === undefined) return { kind: 'local', isOwed: false }
+  const key = ledgerKey(rec, f)
+  const claim = await ledgerCall($, rec.root, rec.branch, { op: 'fileClaim', key, secret })
+  if (claim === undefined) return { kind: 'local', isOwed: false }
+  if ('down' in claim) return { kind: 'local', isOwed: true }
+  if (!('status' in claim) || claim.status !== 200) {
+    const status = 'status' in claim ? claim.status : 0
+    return { kind: 'held', issueError: `the relay would not take this finding's filing claim (HTTP ${status}); the next pass claims it again`, text: `${f.id}: the relay would not take the filing claim ${key} (HTTP ${status})` }
+  }
+  const filing = (claim.json.filing ?? {}) as { state?: unknown; at?: unknown; result?: unknown }
+  const isMine = claim.json.isMine === true
+  const listed = await listIssues(at.gh, at.repo)
+  if (listed.error !== undefined) {
+    return {
+      kind: 'held',
+      issueError: `could not read the repository's issues to find one already filed: ${listed.error}`.slice(0, 200),
+      text: `${f.id}: could not read the issues of ${at.repo} before filing`,
+    }
+  }
+  const mark = filingMark(f.id, rec)
+  const marked = listed.issues.filter(one => one.body.includes(mark) && one.number !== at.exclude).sort((a, b) => a.number - b.number)
+  const listedAs = (n: number): ListedIssue => listed.issues.find(one => one.number === n) ?? { number: n, title: at.title, body: '', labels: [at.label] }
+  const result = filing.result as { number?: unknown } | undefined
+  if (filing.state === 'done' && typeof result?.number === 'number') {
+    const n = result.number
+    return { kind: 'found', issue: listedAs(n), others: marked.map(one => one.number).filter(one => one !== n), isOwed: false, how: 'the filing ledger has it' }
+  }
+  const found = marked[0] ?? (isMine && at.saved !== undefined ? listedAs(at.saved) : undefined)
+  const others = marked.map(one => one.number).filter(one => one !== found?.number)
+  if (isMine) {
+    if (found === undefined) return { kind: 'post', key, secret }
+    // The claim is this checkout's (a restart after its POST): finished with its own filing secret. One that doesn't land is owed.
+    await ledgerCall($, rec.root, rec.branch, { op: 'fileDone', key, result: ledgerResult(at.repo, found.number), secret }, { isOwed: true })
+    return { kind: 'found', issue: found, others, isOwed: false, how: 'its mark found, and the filing ledger told' }
+  }
+  const age = (await $.clock.now()) - (typeof filing.at === 'number' ? filing.at : 0)
+  const isStale = age >= at.stepTimeoutMs
+  if (found === undefined) {
+    // Never claimed afresh: its POST may already be on its way. The driver adopts it once a marked issue shows, or an admin deletes it.
+    return isStale
+      ? { kind: 'held', issueError: CLAIM_STUCK, text: `${f.id}: the filing claim ${key} is stuck: another checkout claimed it over ${Math.round(at.stepTimeoutMs / 60_000)} minutes ago and no issue carries its mark; it waits for an admin's fileDelete` }
+      : { kind: 'held', issueError: CLAIM_PENDING, text: `${f.id}: another checkout is filing it (claim ${key}); nothing filed here` }
+  }
+  if (!isStale) return { kind: 'found', issue: found, others, isOwed: true, how: "another checkout's claim, still young, is left to it" }
+  // A stale claim whose issue the search found: adopted by the lease's holder, at an action boundary (PR #51 review G1-2).
+  if (!(await boundary($, rec))) throw new StoodDown()
+  const lease = await leaseSecret($)
+  const adopt = lease === undefined ? undefined : await ledgerCall($, rec.root, rec.branch, { op: 'fileAdopt', key, result: ledgerResult(at.repo, found.number), secret: lease })
+  const isAdopted = adopt !== undefined && 'status' in adopt && adopt.status === 200
+  return { kind: 'found', issue: found, others, isOwed: !isAdopted, how: isAdopted ? "a stale claim's issue, adopted in the filing ledger" : "a stale claim's issue; the relay did not take its adoption" }
+}
+
+/** The log words for marked issues a fallback filed twice (spec §8): named for the person to close, never closed by the gate. */
+const othersLine = (repo: string, others: readonly number[]): string =>
+  others.length === 0 ? '' : `; ${others.map(n => `${repo}#${n}`).join(', ')} carr${others.length === 1 ? 'ies' : 'y'} the same filing mark: close by hand`
+
+/**
+ * Settles the filing ledger for each finding whose issue it still lacks (`isFilingOwed`): filed while the relay was down, or the
+ * marked issue of another checkout's young claim (spec §7, §8). Runs before a filing pass and a merge check. The lowest-numbered
+ * marked issue is the one kept, and the record moves to it; the others are logged for the person to close. A relay still down, or
+ * a claim still young, leaves the finding owed. Undefined when the lifecycle was reset or replaced meanwhile.
+ */
+async function settleOwed($: Engine, given: LifecycleRecord): Promise<LifecycleRecord | undefined> {
+  const owed = given.findings.filter(f => f.isFilingOwed === true && f.isSecurity !== true && f.followUp !== undefined)
+  if (owed.length === 0 || given.slug === undefined) return given
+  const rec = await withLifecycleId($, given)
+  if (rec === undefined) return undefined
+  const repo = given.slug
+  const { config: c } = await configFor($, rec.root, rec.base)
+  const gh: Gh = async args => {
+    try {
+      return await $.process.run(['gh', ...args], { cwd: rec.root, timeoutMs: 30_000 })
+    } catch (e) {
+      return { exitCode: 1, stdout: '', stderr: e instanceof Error ? e.message : String(e) }
+    }
+  }
+  const ghWrite: Gh = async args => {
+    if (!(await boundary($, rec))) throw new StoodDown()
+    return gh(args)
+  }
+  for (const f of owed) {
+    const peak = filingPeak(f)
+    const label = `severity:${peak}`
+    const title = issueTitle(f, rec, c.issueSpec)
+    const saved = issueOf(f.followUp, repo)
+    const mine = saved?.repo === repo ? { saved: saved.number } : {}
+    const ledger = await ledgerOf($, rec, f, { repo, gh, title, label, stepTimeoutMs: c.stepTimeoutMs, ...mine })
+    if (ledger.kind !== 'found') continue
+    const n = ledger.issue.number
+    const isMoving = saved?.repo !== repo || saved.number !== n
+    const edit = isMoving ? await relabelFound(ghWrite, repo, ledger.issue, label, title) : undefined
+    const labelError = edit === undefined || edit.exitCode === 0 ? undefined : (edit.stderr.trim() || `gh exited ${edit.exitCode}`).slice(0, 200)
+    const at = await $.clock.now()
+    const text = `${f.id}: ${isMoving ? `moved from ${f.followUp ?? ''} to ${repo}#${n}` : `${repo}#${n}`} (${ledger.how})${othersLine(repo, ledger.others)}`
+    let isGone = false
+    await updateRecord($, rec.root, rec.branch, latest => {
+      isGone = isMovedFrom(rec, latest)
+      if (isGone) return latest
+      const findings = latest.findings.map((one): Finding => {
+        // A follow-up changed since it was read is someone else's, and kept.
+        if (one.id !== f.id || one.followUp !== f.followUp) return one
+        const moved: Partial<Finding> = !isMoving
+          ? {}
+          : labelError === undefined
+            ? { followUp: `#${n}`, followUpLabel: peak, followUpLabelError: undefined }
+            : { followUp: `#${n}`, followUpLabel: undefined, followUpLabelError: labelError }
+        return { ...one, ...moved, isFilingOwed: ledger.isOwed ? true : undefined }
+      })
+      return { ...latest, findings, log: [...(latest.log ?? []), { at, kind: 'check' as const, text: text.slice(0, 300) }].slice(-LOG_CAP) }
+    }, { isPure: true })
+    if (isGone) return undefined
+  }
+  const latest = await loadRecord($, rec.root, rec.branch)
+  return latest === undefined || isMovedFrom(rec, latest) ? undefined : latest
+}
+
 /**
  * What the post-merge check found (spec §5.12): each finding whose issue it could not confirm, with gh's words (`failed`), the log
  * lines, the findings with any issue filed again (`touched` names them). `moved`: the lifecycle was reset or replaced while gh ran,
@@ -4169,7 +4356,8 @@ export type MergeCheck = { moved: true } | { moved?: undefined; failed: string[]
  */
 export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): Promise<MergeCheck> {
   try {
-    return await checkOnce($, given)
+    const ready = await settleOwed($, given)
+    return ready === undefined ? { moved: true } : await checkOnce($, ready)
   } catch (error) {
     // A boundary this session lost (Task 8): it stood down, and the caller writes, says and archives nothing, as for a move.
     if (error instanceof StoodDown || isKeptBy(error) || (await isStoodDownBy($, given, error))) return { moved: true }
@@ -4236,7 +4424,7 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
       if (isChanged) return latest
       const findings = latest.findings.map((f): Finding => f.id !== next.id ? f : {
         ...f, followUp: next.followUp, followUpLabel: next.followUpLabel, followUpLabelError: next.followUpLabelError, issueError: next.issueError,
-        isIssueSent: next.isIssueSent,
+        isIssueSent: next.isIssueSent, fileAttempt: next.fileAttempt, isFilingOwed: next.isFilingOwed,
         jiraTicket: next.jiraTicket, jiraError: next.jiraError, jiraSummaries: next.jiraSummaries,
       })
       return { ...latest, findings }
@@ -4342,13 +4530,31 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
     if (await isMoved()) return { moved: true }
     const was = state === 'CLOSED' ? 'could not be reopened' : 'is gone'
     const title = issueTitle(f, rec, c.issueSpec)
+    // On the relay, a finding filed anew after its issue closed is a new attempt in the filing ledger (spec §7): its key advances,
+    // saved with the mark before the POST. A retry after a lost answer or a held claim (an issueError, a sent mark) keeps its key.
+    const isRetry = f.issueError !== undefined || f.isIssueSent === true
+    const ahead: Finding = isRetry ? f : { ...f, fileAttempt: (f.fileAttempt ?? 0) + 1 }
+    const exclude = ref.repo === rec.slug ? { exclude: ref.number } : {}
+    const ledger = await ledgerOf($, rec, ahead, { repo: rec.slug, gh, title, label, stepTimeoutMs: c.stepTimeoutMs, ...exclude })
+    if (ledger.kind !== 'local' && (await isMoved())) return { moved: true }
+    // The finding as this refile writes it: with the advanced attempt only where the ledger is used.
+    const g: Finding = ledger.kind === 'local' ? f : ahead
+    const isOwed = ledger.kind === 'local' ? ledger.isOwed : ledger.kind === 'found' && ledger.isOwed
+    const owed = isOwed ? { isFilingOwed: true as const } : { isFilingOwed: undefined }
+    if (ledger.kind === 'held') {
+      if (await keep({ ...g, issueError: ledger.issueError })) return { moved: true }
+      failed.push(`${f.id} (${why}; filing it again: ${ledger.issueError})`)
+      await log(ledger.text)
+      continue
+    }
     // The last refile's answer may have been lost after GitHub filed the issue (wave 2b gate R1-5): the repository's issues are read
     // first, and one with this exact title, other than the issue it replaces, is taken. A failed read files nothing this time.
-    const listed = f.issueError === undefined && f.isIssueSent !== true ? undefined : await listIssues(gh, rec.slug)
+    const listed = ledger.kind !== 'local' || !isRetry ? undefined : await listIssues(gh, rec.slug)
     if (listed !== undefined && (await isMoved())) return { moved: true }
     const others = (listed?.issues ?? []).filter(one => !(ref.repo === rec.slug && one.number === ref.number))
     const titles = titlesAtAnyPeak(f, one => issueTitle(one, rec, c.issueSpec))
-    const found = listed?.issues === undefined ? undefined : issueFiledFor(others, filingMark(f.id, rec), titles)
+    const found = ledger.kind === 'found' ? ledger.issue : listed?.issues === undefined ? undefined : issueFiledFor(others, filingMark(f.id, rec), titles)
+    const how = ledger.kind === 'found' ? `${ledger.how}${othersLine(rec.slug, ledger.others)}` : 'filed by an answer gh lost'
     if (listed?.error !== undefined) {
       const issueError = `could not read the repository's issues to find one a lost answer filed: ${listed.error}`.slice(0, 200)
       if (await keep({ ...f, issueError })) return { moved: true }
@@ -4360,20 +4566,20 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
       // Labelled as the R85 reuse path labels an issue, and retitled, where GitHub's list shows it at another peak.
       const edit = await relabelFound(ghWrite, rec.slug, found, label, title)
       if (edit === undefined || edit.exitCode === 0) {
-        const settled = { ...f, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
+        const settled = { ...g, followUp: `#${found.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined, ...owed }
         if (await keep(settled)) return { moved: true }
-        await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number} ${label}, filed by an answer gh lost`)
+        await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number} ${label}, ${how}`)
         continue
       }
-      const unlabelled = { ...f, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined, isIssueSent: undefined }
+      const unlabelled = { ...g, followUp: `#${found.number}`, followUpLabel: undefined, followUpLabelError: words(edit), issueError: undefined, isIssueSent: undefined, ...owed }
       if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: could not label ${rec.slug}#${found.number} ${label}: ${words(edit)})`)
-      await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, filed by an answer gh lost; could not label it ${label}`)
+      await log(`${f.id}: ${where} ${was}; found ${rec.slug}#${found.number}, ${how}; could not label it ${label}`)
       continue
     }
     const body = githubBody(f, rec)
     // Saved before the POST (wave 2b gate R1-10): a crash before its answer is saved makes the next check read the list first.
-    const sent: Finding = { ...f, issueError: f.issueError ?? ISSUE_SENT, isIssueSent: true }
+    const sent: Finding = { ...g, issueError: f.issueError ?? ISSUE_SENT, isIssueSent: true }
     if (await keep(sent, true)) return { moved: true }
     if (isSecret) {
       // Marked security while gh ran (wave 2b gate R5-1, R5-3): no public issue; a failed check, so the record is not archived.
@@ -4383,6 +4589,11 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
     }
     const post = await ghWrite(['api', '-X', 'POST', `repos/${rec.slug}/issues`, '-f', `title=${title}`, '-f', `body=${body}`, '-f', `labels[]=${label}`])
     const filed = post.exitCode === 0 ? filedIssueOf(post.stdout) : undefined
+    // The ledger is told before the answer's save, as the filing pass tells it (spec §7); one that doesn't land is owed.
+    if (filed !== undefined && ledger.kind === 'post') {
+      const result = ledgerResult(rec.slug, filed.number)
+      await ledgerCall($, rec.root, rec.branch, { op: 'fileDone', key: ledger.key, result, secret: ledger.secret }, { isOwed: true })
+    }
     // Each answer is written to the record as soon as GitHub gives it (wave 2b gate R1-6): a crash or a later throw before the close
     // saves never files the issue again, and a lost answer leaves its issueError, so the next check reads the list first.
     if (filed === undefined) {
@@ -4395,13 +4606,13 @@ async function checkOnce($: Engine, given: LifecycleRecord): Promise<MergeCheck>
     if (!filed.labels.includes(label)) {
       // Filed, but GitHub dropped the label (A7): the new issue is kept, and the next check labels it instead of filing another.
       const labelError = `GitHub filed #${filed.number} without its ${label} label (the account may lack push access to label it)`
-      const unlabelled = { ...f, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined, isIssueSent: undefined }
+      const unlabelled = { ...g, followUp: `#${filed.number}`, followUpLabel: undefined, followUpLabelError: labelError, issueError: undefined, isIssueSent: undefined, ...owed }
       if (await keep(unlabelled)) return { moved: true }
       failed.push(`${f.id} (label-failed: ${labelError})`)
       await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} without ${label}`)
       continue
     }
-    const settled = { ...f, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
+    const settled = { ...g, followUp: `#${filed.number}`, followUpLabel: peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined, ...owed }
     if (await keep(settled)) return { moved: true }
     await log(`${f.id}: ${where} ${was}; filed ${rec.slug}#${filed.number} ${label}`)
   }
