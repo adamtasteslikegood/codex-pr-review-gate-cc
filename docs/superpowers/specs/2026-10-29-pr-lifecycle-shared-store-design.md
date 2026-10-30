@@ -38,11 +38,19 @@ The validator (#33) and the conductor will read the same object, but they are no
 
 **The move to the PR key.** A record moves the moment it gets a PR number: after the PR create the gate sees, after an adoption, or when a resume finds an existing PR. Two objects can't be written in one step, so the move is ordered and every step is idempotent (**Ruled**):
 
-1. Under the branch object's lease, `claim` the PR object, then `commit` the record to it at `rev: 0`, with `from: '@<branch>'`. If the PR object is not at `rev: 0`, its record's `lifecycleId` decides: the same id means an earlier move got this far, so the move carries on at step 2; another id means the PR already has a lifecycle, and the record is kept by `snapshot` (`reason: 'move'`), as in section 8's recovery.
-2. Send `moveTo { pr }` to the branch object. It needs the lease. It replaces the record with a tombstone `{ movedTo: pr, lifecycleId }`, bumps `rev`, releases the lease and queues an index removal (section 9). Archives and filings stay where they are.
-3. Every later record or lease op on the branch object (`commit`, `claim`, `beat`, `take`, `release`, `moveTo`), except a fresh start (below), answers **410** with `{ movedTo, lifecycleId }`. `read` answers 200 with the tombstone as the record; `archives`, `filing`, `log` and `snapshot` work as before. A client whose `lifecycleId` matches follows it to the PR key, and so does a stale checkout still driving the branch key.
+1. **Freeze the source.** Under the branch object's lease, send `moveTo { pr }` to it. It replaces the record with a tombstone `{ movedTo: pr, lifecycleId, record }` that still carries the record, bumps `rev`, releases the lease and queues an index removal (section 9). From this step on, the branch object can't be driven (step 3), so the PR object is never made driveable while the branch still is (PR #51 review).
+2. **Publish the destination.** `claim` the PR object, then `commit` the tombstone's `record` to it at `rev: 0`, with `from: '@<branch>'`. If the PR object is not at `rev: 0`, its record's `lifecycleId` decides: the same id means an earlier move got this far, so the move carries on at step 3; another id means the PR already has a lifecycle, and the record is kept by `snapshot` (`reason: 'move'`), as in section 8's recovery.
+3. **Finish.** Send `moveDone` to the branch object. It needs `operate` and the tombstone's `lifecycleId`, not the lease, since the lease was released at step 1. It drops the record copy from the tombstone, leaving `{ movedTo, lifecycleId }`. Sending it again is a no-op. Archives and filings stay where they are.
 
-A crash between steps 1 and 2 leaves both objects live with the same `lifecycleId`. Whoever next loads the branch record sees the PR object holding it and finishes step 2, so it is never driven in both places.
+From step 1 on, every record or lease op on the branch object (`commit`, `claim`, `beat`, `take`, `release`, `moveTo`), except a fresh start (below), answers **410** with `{ movedTo, lifecycleId }`. So no action-boundary beat on the branch key succeeds, and no source client dispatches. `read` answers 200 with the tombstone as the record; `archives`, `filing`, `log`, `snapshot` and `moveDone` work as before. A client whose `lifecycleId` matches follows it to the PR key, and so does a stale checkout still driving the branch key.
+
+**Recovery is the same from each state (Ruled).** A client that meets a tombstone still carrying `record` runs steps 2 and 3 itself before following. Each step is idempotent:
+
+- A crash before step 1 leaves only the branch object live.
+- A crash between steps 1 and 2 leaves the frozen branch and an empty PR object. The record is still on the branch, so it isn't lost.
+- A crash between steps 2 and 3 leaves the PR object holding the record and the branch still frozen.
+
+In none of these can both objects be driven. A delayed index update can't change that, because the fence is the branch object's own state, not the index.
 
 **A branch name used again.** After a PR merges or closes, a branch of the same name can start a new lifecycle. A fresh start, an adoption or a reset (a new `lifecycleId`, R96) may `commit` over a tombstone at its `rev` with `isFresh: true`, so the old PR's object is left alone. A follower whose `lifecycleId` matches neither the tombstone nor the new record stands down.
 
@@ -128,9 +136,9 @@ The lease is **fenced**: every new holder gets a higher `token`. It is also **bo
 
 **Adam's ruling: the log lives in the object's own lease-free list, with a bigger cap than the recommended 200.**
 
-- A new `log` op needs `operate`, not the lease. It doesn't bump `rev`.
+- A new `log` op needs `operate`, not the lease. It doesn't bump `rev`. **Ruled:** each line gets `seq`, a per-object counter that goes up by one on every append and never goes back, even when old lines are dropped.
 - **Ruled:** the relay keeps the last `RELAY_LOG_CAP` = 1000 lines per object. When a line pushes the list past the cap, the oldest line is dropped and the object's `logDropped` count goes up by one, so `/pr-gate log` can say how many earlier lines are gone. The list is stored under its own storage key (`log`), apart from the record's `state`, so a long log never makes a record commit larger. The local store's `LOG_CAP` (200) is unchanged for repos that don't opt in.
-- `read` returns the list and `logDropped` beside the record. **Ruled:** with `logSince: <at>`, it returns only the lines after that time, so the watcher doesn't fetch 1000 lines each tick.
+- `read` returns the list, `logDropped` and `logSeq` (the last line's `seq`) beside the record. **Ruled:** with `logSince: <seq>`, it returns only the lines whose `seq` is above it, so the watcher doesn't fetch 1000 lines each tick. The cursor is the sequence, not the time: two lines with the same `at` are both delivered, once each (PR #51 review).
 - A tombstoned branch object (section 1) still takes `log`, so its history up to the move stays readable; `/pr-gate log` shows a moved lifecycle's branch log, then its PR log.
 - `/pr-gate log` (R78) reads it from there.
 - Each line records the principal and the session id.
@@ -205,9 +213,9 @@ A pre-PR record crosses over the same way, to its branch key (R103); one that ge
 **Discovery.** `liveRecords(root)` lists every live record under a checkout root. A per-PR object can't answer that, so:
 
 - A second object class, `RepoIndex`, holds one object per `owner/repo`, with an entry `{ key, pr?, branch, phase, rev, updatedAt }` for each live record. `key` is the object's own key within the repo: `#<pr>` or `@<branch>` (R103). A move (section 1) writes the PR key's entry from the PR object and a removal from the branch object; for the moment between them both entries can show, and `liveRecords` drops a branch entry whose `lifecycleId` a PR entry already carries.
-- **Each commit queues an index update.** It writes an outbox entry `{ pr, rev, entry | removed }` in the same storage step as the commit, and sets an alarm. Archiving the record or closing the PR writes a removal: a tombstone carrying its `rev`.
-- **The PR's object sends the outbox to its repo's index** (object to object, inside the Worker), and clears it once the index acknowledges. If the update fails, the alarm retries it with backoff until it succeeds. No client and no further commit is needed, so a lifecycle whose controller exits right after its first commit is still discovered.
-- **The index applies updates by revision.** An update whose `rev` is not above the one it holds for that PR, tombstones included, is ignored, so a delayed retry can't bring back an old entry or a removed one. Tombstones are kept for the PR object's retention period (section 8).
+- **Each commit queues an index update.** It writes an outbox entry `{ key, rev, entry | removed }` in the same storage step as the commit, and sets an alarm. `key` is the object's own key (`#<pr>` or `@<branch>`), so pre-PR records, which have no `pr`, are told apart (PR #51 review). Archiving the record or closing the PR writes a removal: a tombstone carrying its `rev`.
+- **The object sends its outbox to its repo's index** (object to object, inside the Worker), and clears it once the index acknowledges. If the update fails, the alarm retries it with backoff until it succeeds. No client and no further commit is needed, so a lifecycle whose controller exits right after its first commit is still discovered.
+- **The index applies updates by revision.** An update whose `rev` is not above the one it holds for that `key`, tombstones included, is ignored, so a delayed retry can't bring back an old entry or a removed one. Each tombstone is kept for its own object's retention period (section 8), by `key`.
 - `liveRecords(root)` maps the root to its slug, then returns the index's entries, each read from its object, plus any local records of a repo or checkout that isn't on the relay. So the entry also carries `lifecycleId`.
 - A new `list` op reads the index. It needs `read` on the repo.
 
@@ -281,7 +289,7 @@ The design keeps the network off the paths where latency would matter:
 
 - `take` (decision P);
 - `log`, `list` and `snapshot`;
-- branch keys, `moveTo` and the tombstone (decision 4);
+- branch keys, `moveTo`, `moveDone` and the tombstone (decision 4);
 - the index outbox and its alarm;
 - the `RepoIndex` class;
 - the `GrantStore` class, its admin ops, and the preset header (decision 5);
@@ -309,13 +317,13 @@ The design keeps the network off the paths where latency would matter:
 - **Fallback:** the relay goes down mid-round, the round continues locally, and recovery follows the rule in section 8 in both cases. Two checkouts that both file in fallback: on recovery, the lowest-numbered issue is adopted and the other is reported, not closed.
 - **Crash after a POST:** the issue POST succeeds, the session dies before `fileDone`, and a new session starts in the same checkout. The exact-mark hit sends no second POST, `fileDone` with the kept filing secret leaves the ledger `done`, and the same restart from another checkout leaves it `claimed`, with no second POST either. With the plugin store lost as well, the claim stays `claimed` until an admin `fileDelete`. The next pass then claims afresh, adopts the marked issue without a second POST, and ends `done`.
 - **Archive:** `commit` with `archive` keeps the record `tx.archive` was given, `phase: 'archived'`, matching the local store.
-- **Discovery:** `liveRecords` through the index matches the per-PR objects. A first registration that fails, followed by no client commit at all: after the transport recovers, the alarm's retry makes discovery converge. A delayed old update or tombstone never brings back a removed entry or an older one.
+- **Discovery:** `liveRecords` through the index matches the per-PR objects. Two pre-PR branches at the same `rev`, with delayed updates, both register, and moving one removes only its own `@<branch>` entry. A first registration that fails, followed by no client commit at all: after the transport recovers, the alarm's retry makes discovery converge. A delayed old update or tombstone never brings back a removed entry or an older one.
 - **Recovery and migration with different findings:** the local record and the relay's carry visibly different findings. After recovery, and after a migration to an object that isn't empty, the relay's record and `rev` are unchanged, and the local findings survive both in the local archive and in the relay's `snapshot`.
 - **Per decision:**
   - P(b): a different principal's `take` gets 423;
-  - Q: a non-holder's `log` succeeds and its commit gets 423; line 1001 drops the oldest line and `logDropped` counts it; `logSince` returns only newer lines;
+  - Q: a non-holder's `log` succeeds and its commit gets 423; line 1001 drops the oldest line and `logDropped` counts it; `logSince` returns only newer lines by `seq`, and with the clock frozen, append, read, append and read deliver every line once;
   - R(b): no security finding's text reaches `commit`;
-  - 4: a pre-PR lifecycle on its branch key moves to its PR key: the branch object answers 410 to record and lease ops, a stale checkout follows the 410, a crash between the move's two steps is finished by the next load and never driven in both places, the index ends with only the PR entry, and a fresh start over the tombstone leaves the old PR's object alone; a branch name with `/` round-trips through the URL, and a name git would refuse gets 404;
+  - 4: a pre-PR lifecycle on its branch key moves to its PR key: the branch object answers 410 to record and lease ops, a stale checkout follows the 410, a crash after each of the move's three steps, with the index update delayed, is finished by the next load: independent branch and PR clients start, and only the PR key's driver dispatches; the index ends with only the PR entry, and a fresh start over the tombstone leaves the old PR's object alone; a branch name with `/` round-trips through the URL, and a name git would refuse gets 404;
   - 5: a principal with no grant gets 403; after `grant` it gets through, after `revoke` it gets 403 on its next request; a non-admin's `grant` gets 403; a caller's own `x-relay-preset` or `x-relay-principal` header is replaced; every grant change is in the history with its actor.
 - **The request count** for one scripted lifecycle, counted at the Miniflare boundary, to check section 12's table.
 - **The repo's own gates:** `npm run check` (the plugin harness, the relay tests, both typechecks).

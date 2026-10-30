@@ -55,19 +55,22 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 
 | Op | Needs | Body | 200 answer | Refusals |
 | --- | --- | --- | --- | --- |
-| `read` | read | `{ logSince? }` | `{ rev, record, lease, lastWrite, log, logDropped }` | — |
+| `read` | read | `{ logSince? }` (a `seq`) | `{ rev, record, lease, lastWrite, log, logDropped, logSeq }` | — |
 | `commit` | operate + lease if live | `{ rev, record, archive?: { at, record }, from?: '@<branch>', isFresh? }` | `{ rev }` | 409 `{ rev, record }`, 423 `{ lease }`, 410 `{ movedTo, lifecycleId }` |
 | `claim` | operate | `{ holder, secret }` | `{ lease }` | 423, 410 |
 | `take` | operate, same principal as the live lease | `{ holder, secret }` | `{ lease }` (new token) | 423 for another principal, 410 |
 | `beat` / `release` | operate + own lease | `{ secret }` | `{ lease }` / `{}` | 409 `{ lease }`, 410 |
 | `moveTo` (branch only) | operate + own lease | `{ pr, secret }` | `{ rev }` | 409, 410, 404 on a PR key |
+| `moveDone` (branch only) | operate | `{ lifecycleId }` | `{}` (again: `{}`) | 409 when not moved or the id differs, 404 on a PR key |
 | `log` | operate | `{ at, kind, text, holder }` | `{ logDropped }` | — |
 | `snapshot` | operate | `{ at, record, reason: 'fallback' \| 'migration' \| 'move' }` | `{}` | — |
 | `archives` / `filing` / `fileClaim` / `fileDone` / `fileDelete` / `breakLease` | as prototyped | as prototyped | as prototyped | as prototyped |
 
-`log` stores `{ at, kind, text, principal, holder }`, with `text` cut to 300 characters. `snapshot` appends `{ at, record, actor, reason }` to the archives. Neither bumps `rev`.
+`log` stores `{ seq, at, kind, text, principal, holder }`, with `text` cut to 300 characters; `seq` goes up by one per append and never goes back. `snapshot` appends `{ at, record, actor, reason }` to the archives. Neither bumps `rev`.
 
-**Index entry:** `{ key, pr?, branch, phase, rev, updatedAt, lifecycleId }`. **Outbox entry:** `{ key, rev, entry } | { key, rev, removed: true }`.
+**Index entry:** `{ key, pr?, branch, phase, rev, updatedAt, lifecycleId }`. **Outbox entry:** `{ key, rev, entry } | { key, rev, removed: true }`. The index orders and removes by `key`, never by `pr`.
+
+**Tombstone:** `{ movedTo, lifecycleId, record? }`. `record` is there from `moveTo` until `moveDone`.
 
 ---
 
@@ -120,24 +123,26 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 - Consumes: Task 1's harness and the preset header.
 - Produces: `export const isBranchName = (name: string): boolean` in `index.ts`: 1–255 UTF-8 bytes, and no `..`, control characters, space, `~ ^ : ? * [ \`, `@{`, leading `-` or `/`, trailing `/`, `.` or `.lock`, or `//`.
 - Produces: the object name `owner/repo@<branch>`, with owner and repo lowercased and the branch kept as is. `x-relay-key` is `@<branch>` or `#<pr>`.
-- Produces: tombstone state, where `record` is `{ movedTo: number, lifecycleId: string }` and the state gains `movedTo?: number`.
+- Produces: tombstone state, where `record` is `{ movedTo: number, lifecycleId: string, record?: unknown }` (`record` kept from `moveTo` until `moveDone`) and the state gains `movedTo?: number`.
 
 - [ ] **Step 1: Write the failing tests** in `branch.test.ts`:
   - `a branch with / round-trips`: a commit at `/v1/owner/repo/branch/feat%2Fa%2Fb` is read back from the same URL, and not from `.../branch/feat` (that read gives `rev: 0`).
   - `awkward names round-trip`: `fix-%C3%BC` and `100%25` work, and `a%252Fb` reaches the branch `a%2Fb`, not `a/b`.
   - `a name git would refuse gets 404`: for each of `a..b`, `-x`, `x.lock`, `x/`, `a%20b`, `a~b`, `a%5Cb`, `a@%7Bb`, and an empty name.
   - `owner and repo are case-folded, the branch is not`: `Owner/Repo/branch/Feat` and `owner/repo/branch/Feat` are one object; `.../branch/feat` is another.
-  - `moveTo needs the lease, tombstones the record and releases the lease`: claim, commit `{ lifecycleId: 'L1' }`, `moveTo { pr: 7 }` gives 200; `read` gives `record: { movedTo: 7, lifecycleId: 'L1' }`, `lease: null`, and `rev` bumped.
+  - `moveTo needs the lease, freezes the record and releases the lease`: claim, commit `{ lifecycleId: 'L1', n: 1 }`, `moveTo { pr: 7 }` gives 200; `read` gives `record: { movedTo: 7, lifecycleId: 'L1', record: { lifecycleId: 'L1', n: 1 } }`, `lease: null`, and `rev` bumped.
+  - `moveDone drops the copy and is idempotent`: `moveDone { lifecycleId: 'L1' }` gives 200 twice, and `read` then gives `record: { movedTo: 7, lifecycleId: 'L1' }`; with `'L9'` it gives 409; it needs operate, not the lease.
   - `record and lease ops on a tombstone answer 410`: `commit`, `claim`, `beat`, `take`, `release` and `moveTo` each give 410 `{ movedTo: 7, lifecycleId: 'L1' }`.
-  - `archives, filing, log and snapshot still work on a tombstone`: each gives 200.
+  - `archives, filing, log, snapshot and moveDone still work on a tombstone`: each gives 200.
+  - `a frozen branch takes no beat`: the old holder's `beat` right after `moveTo` gives 410, so no source boundary passes.
   - `a fresh start over a tombstone`: `commit { rev, record: { lifecycleId: 'L2' }, isFresh: true }` gives 200; the PR 7 object's record is unchanged.
   - `isFresh with the tombstone's own lifecycleId is 410`: a fresh start must be a new lifecycle.
-  - `moveTo on a PR key is 404`.
+  - `moveTo and moveDone on a PR key are 404`.
   - `commit with from on a non-empty PR object is 409 with its record`: the client reads `lifecycleId` from that answer (spec §1 step 1).
 - [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/branch.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement.** The Worker decodes the segment with `decodeURIComponent` once, validates it with `isBranchName`, and answers 404 when the decode throws. `LifecycleObject` reads `x-relay-key` to know whether it is a branch object.
 - [ ] **Step 4: Run** `npm run test:relay && npm run typecheck:relay`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat(relay): pre-PR records keyed by branch, moved to the PR key with a tombstone (R103)`.
+- [ ] **Step 5: Commit** with `feat(relay): pre-PR records keyed by branch, frozen and moved to the PR key with a tombstone (R103)`.
 
 ### Task 3: `take`, the lease-free log and `snapshot` (relay)
 
@@ -147,7 +152,7 @@ The Worker sets internal headers, replacing any of the same name the caller sent
 
 **Interfaces:**
 - Produces: the ops `take`, `log` and `snapshot` with the wire shapes above, and `export const RELAY_LOG_CAP = 1000`.
-- Produces: the log is stored under its own storage key `log` as `{ lines: LogLine[], dropped: number }`. `read` returns `log` (lines after `logSince` when it is given) and `logDropped`.
+- Produces: the log is stored under its own storage key `log` as `{ lines: LogLine[], dropped: number, seq: number }`. `read` returns `log` (lines with `seq` above `logSince` when it is given), `logDropped` and `logSeq`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `take by the same principal issues a new token and fences out the old holder`: Adam claims as `s1`, Adam takes as `s2`, the token rises, and `s1`'s `beat` and `commit` give 409 and 423.
@@ -157,7 +162,8 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `log needs operate`: READER's `log` gives 403.
   - `log does not bump rev`.
   - `line 1001 drops the oldest line and logDropped counts it`: 1001 lines leave the first kept line at `at: 2` and `logDropped: 1`. This is a slow test: batch with `Promise.all` in chunks of 50.
-  - `logSince returns only newer lines`: lines at 1, 2 and 3 with `logSince: 2` return only the line at 3.
+  - `logSince returns only lines after the cursor`: lines with seq 1, 2 and 3 and `logSince: 2` return only seq 3.
+  - `a frozen clock loses no line`: with every line at the same `at`, append A, read (cursor = `logSeq`), append B, read from the cursor: B comes back once and A doesn't come back. After 1001 lines, `logSeq` is 1001 and `logDropped` is 1.
   - `each line records the principal and the holder`.
   - `snapshot appends to archives without touching record or rev`: the archive's last entry is `{ reason: 'fallback', actor: ADAM }`, and `ARCHIVE_CAP` still applies.
 - [ ] **Step 2: Run** `node --test pr-lifecycle-relay/test/log.test.ts`. Expected: FAIL.
@@ -181,7 +187,8 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `list through the index matches the objects`: commits to `#7`, `#8` and `@feat/x` list three entries with their `rev` and `lifecycleId`.
   - `a failed first registration converges with no further commit`: set `fault` until now + 300 ms, commit once, and the entry appears after the fault ends.
   - `a delayed old update never brings back a removed or older entry`: send `update` rev 3, then `removed` at rev 4, then the old `update` rev 3 again; the entry stays gone.
-  - `the move leaves only the PR entry`: after `moveTo`, `list` shows `#7` and no `@feat/x`.
+  - `the move leaves only the PR entry`: after `moveTo` and the commit to `#7`, `list` shows `#7` and no `@feat/x`.
+  - `two branches at the same rev both register, and moving one removes only its own entry`: commit once each to `@a` and `@b` (both rev 1), fault the index until now + 300 ms so updates arrive late, then move `@a` to `#9`; `list` ends with `@b` and `#9`.
   - `list needs read`: a principal with no grant gets 403.
   - `an archived PR object is deleted after RETENTION_MS`: after an archive commit and a wait above 400 ms, `read` gives `rev: 0`.
   - `a branch object is deleted RETENTION_MS after its last write`.
@@ -212,9 +219,9 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - claim, commit, read, beat and release;
   - a stale commit (409) and a commit under another holder's lease (423);
   - take, by the same principal and by a different one;
-  - log and logSince;
+  - log and logSince (by `seq`);
   - snapshot;
-  - moveTo, then 410, then a fresh start;
+  - moveTo, then 410, moveDone, then a fresh start;
   - fileClaim, fileDone and filing;
   - list.
 - [ ] **Step 2: Write `contract.test.ts`** (relay side), which replays every case against Miniflare. Run `npm run test:relay`. Expected: PASS, because Tasks 1–4 built the relay. A failure here is a relay bug or a transcript bug, to be fixed before going on.
@@ -291,16 +298,16 @@ The Worker sets internal headers, replacing any of the same name the caller sent
   - `liveRecords($, root)` gives the index's entries (`list`), each read from its object, plus local records of a repo not on the relay. A branch entry is dropped when a PR entry carries its `lifecycleId`.
   - `latestArchive` reads `archives` and returns the newest.
 - The move (spec §1), run by the store when a commit on a branch key saves a record with `pr` set:
-  1. `claim` the PR key.
-  2. `commit { rev: 0, record, from: '@<branch>' }`. On 409, the same `lifecycleId` carries on, and another id keeps the record by `snapshot { reason: 'move' }`.
-  3. `moveTo { pr }` on the branch key.
+  1. `moveTo { pr }` on the branch key, which freezes it with the record kept in the tombstone.
+  2. `claim` the PR key, then `commit { rev: 0, record, from: '@<branch>' }`. On 409, the same `lifecycleId` carries on, and another id keeps the record by `snapshot { reason: 'move' }`.
+  3. `moveDone { lifecycleId }` on the branch key.
   4. From then on the record's key is `#<pr>`.
-  On load, a 410 or a tombstone whose `lifecycleId` matches is followed to the PR key. A tombstone whose id doesn't match means standing down. A branch record whose PR object already holds its `lifecycleId` finishes step 3 first.
+  On load, a 410 or a tombstone whose `lifecycleId` matches is followed to the PR key. A tombstone that still carries `record` gets steps 2 and 3 run first, from that record. A tombstone whose id doesn't match means standing down.
 
 - [ ] **Step 1: Write the failing tests:**
   - `a pre-PR record lives on the branch key and moves to the PR key on onOpened`: the fake shows the tombstone on `@feat/x` and the record on `#7`.
   - `a stale checkout still driving the branch key follows the 410`.
-  - `a crash between commit-to-PR and moveTo is finished by the next load, never driven in both places`: the fake drops the `moveTo` once.
+  - `a crash after each move step is finished by the next load, and only the PR driver dispatches`: for each of the three steps, the fake drops every later step once and holds the index update back; then a branch-key client and a PR-key client each start a round, and only the PR-key one passes a boundary or dispatches.
   - `the index ends with only the PR entry`.
   - `a fresh start over the tombstone leaves the old PR's object alone`.
   - `a non-holder's logEvent lands while its commit would get 423`.
