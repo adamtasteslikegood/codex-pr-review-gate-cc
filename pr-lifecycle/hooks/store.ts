@@ -576,7 +576,10 @@ async function publishMove($: Engine, root: string, branch: string, from: Shared
     else if (answer.status === 409 && typeof answer.json.rev === 'number') placed = { rev: answer.json.rev, record: answer.json.record }
     else throw new Error(`the shared lifecycle store answered a move's commit with HTTP ${answer.status}`)
     // Task 8: the lease boundary goes here: only the holder of the PR object's lease passes a boundary and dispatches.
-    await relayCall($, to.relay, to.path, { op: 'release', secret })
+    const release = { op: 'release', secret }
+    const released = await relayCall($, to.relay, to.path, release)
+    // A release that doesn't land is owed: else this checkout's own lease holds its next commit off the PR's object until it lapses.
+    if ('down' in released) await owe($, root, branch, { path: to.path, body: release })
   } else if (claimed.status === 423) {
     // Another checkout holds the PR's object: one that moved this lifecycle first, or is moving it now.
     const read = await readAt($, root, branch, to)
@@ -592,7 +595,14 @@ async function publishMove($: Engine, root: string, branch: string, from: Shared
   const done = await relayCall($, from.relay, from.path, body)
   if ('refused' in done) return standDown($, root, branch, done.refused)
   if ('down' in done) await owe($, root, branch, { path: from.path, body })
+  else if (done.status !== 200) throw new StaleRecord(placed.rev, placed.record, `the branch's object was not moved with this lifecycle (moveDone answered HTTP ${done.status})`)
   return placed
+}
+
+/** A tombstone of another lifecycle than this checkout's (spec §1): neither followed nor started over. The store stands down, writing nothing. */
+async function standMoved($: Engine, root: string, branch: string, movedTo: number): Promise<never> {
+  await noteOnce($, root, branch, 'relay moved:', `relay moved: this branch's object moved to PR #${movedTo} under another lifecycle; this checkout stands down`)
+  throw new RelayMoved(movedTo)
 }
 
 /**
@@ -608,10 +618,7 @@ async function follow(
   tomb: Tomb,
   local: LifecycleRecord | undefined,
 ): Promise<{ shared: Shared; remote: Given } | { down: string }> {
-  if (local?.lifecycleId !== undefined && local.lifecycleId !== tomb.lifecycleId) {
-    await noteOnce($, root, branch, 'relay moved', `relay moved: this branch's object moved to PR #${tomb.movedTo} under another lifecycle; this checkout stands down`)
-    throw new RelayMoved(tomb.movedTo)
-  }
+  if (local?.lifecycleId !== undefined && local.lifecycleId !== tomb.lifecycleId) return standMoved($, root, branch, tomb.movedTo)
   const to = atKey(from, `#${tomb.movedTo}`)
   const remote =
     tomb.record === undefined
@@ -798,6 +805,8 @@ async function relayTx<T>(
       return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs, shared: at } }
     }
     if (answer.status === 423) return { retry: { error: new StaleRecord(rev, answer.json.lease, 'another checkout holds the lease') } }
+    // A fresh start the relay holds off: the old lifecycle's move isn't finished, and its frozen record stays in the tombstone.
+    if (answer.status === 409) return { retry: { error: new StaleRecord(rev, answer.json, 'the old lifecycle has not finished its move to its PR') } }
     throw new Error(`the shared lifecycle store answered a commit with HTTP ${answer.status}`)
   }
 
@@ -820,9 +829,27 @@ async function relayTx<T>(
       const error = new StaleRecord(to.remote.rev, to.remote.record, `the lifecycle moved to PR #${tomb.movedTo}`)
       return { retry: { error, given: to.remote, shared: to.shared } }
     }
-    if (tomb.record !== undefined) throw new StaleRecord(read.rev, read.record, 'the old lifecycle has not finished its move to its PR')
+    // Of another lifecycle: a new one of this checkout's (a reset, or an adoption) starts over the tombstone. The mirror's own lifecycle,
+    // which another checkout reset and moved on from, is never revived there (spec §1): the store stands down.
+    const mirror = await loadRecord($, root, branch)
+    if (mirror?.lifecycleId === full.lifecycleId) return standMoved($, root, branch, tomb.movedTo)
+    return startOver(at, read, tomb, mirror)
+  }
+
+  /**
+   * A new lifecycle's first commit on the branch's object at `at`, read as `read` (R103), over its tombstone with `isFresh`. A tombstone
+   * that still holds the old lifecycle's record (a move that stopped after `moveTo`) has steps 2 and 3 run first, from that record, so it
+   * is never lost: placed on its PR's object, or kept by a snapshot when another lifecycle holds that object. Until the old move's
+   * `moveDone` lands the relay answers 409, and the frozen record stays where it is.
+   */
+  const startOver = async (at: Shared, read: Given, tomb: Tomb | undefined, mirror: LifecycleRecord | undefined): Promise<Ran<T>> => {
+    if (tomb?.record !== undefined) {
+      const old = { ...restore(tomb.record as LifecycleRecord, mirror), root, branch, pr: tomb.movedTo }
+      const placed = await publishMove($, root, branch, at, atKey(at, `#${tomb.movedTo}`), old)
+      if ('down' in placed) return (await settle(at, placed)) ?? { value }
+    }
     rev = read.rev
-    return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev, { isFresh: true })))) ?? { value }
+    return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev, tomb === undefined ? {} : { isFresh: true })))) ?? { value }
   }
 
   let at = shared
@@ -836,13 +863,7 @@ async function relayTx<T>(
     if (tomb === undefined && there !== null && there.phase !== 'archived' && there.lifecycleId !== full.lifecycleId) {
       throw new StaleRecord(read.rev, read.record, 'another lifecycle drives this branch')
     }
-    if (tomb?.record !== undefined) {
-      // The move this mirror's PR came from: finished there (this checkout read the PR's object), so only its `moveDone` is left.
-      if (`#${tomb.movedTo}` !== shared.key) throw new StaleRecord(read.rev, read.record, 'the old lifecycle has not finished its move to its PR')
-      await relayCall($, at.relay, at.path, { op: 'moveDone', lifecycleId: tomb.lifecycleId })
-    }
-    rev = read.rev
-    return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev, tomb === undefined ? {} : { isFresh: true })))) ?? { value }
+    return startOver(at, read, tomb, await loadRecord($, root, branch))
   }
   if (!at.key.startsWith('@') || full.pr === undefined) return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev)))) ?? { value }
 
@@ -866,6 +887,9 @@ async function relayTx<T>(
   const froze = await relayCall($, at.relay, at.path, { op: 'moveTo', pr: full.pr, secret })
   if ('refused' in froze) return standDown($, root, branch, froze.refused)
   if ('down' in froze) await noteStop(froze.down)
+  else if (froze.status !== 200) {
+    await noteOnce($, root, branch, 'relay move refused', `relay move refused (HTTP ${froze.status}): the move to PR #${full.pr} did not start; the next transaction on this lifecycle tries again`)
+  }
   if ('down' in froze || froze.status !== 200) return { value }
   const to = atKey(at, `#${full.pr}`)
   const placed = await publishMove($, root, branch, at, to, full)

@@ -11,6 +11,7 @@ import {
   logEvent,
   recordKey,
   relayLog,
+  RelayMoved,
   saveRecord,
   StaleRecord,
   updateRecord,
@@ -418,4 +419,143 @@ test('a security title in a logEvent line never appears in any log body', async 
   expect(bodies.flatMap(stringsOf).some(one => one.includes('SECRET-TITLE'))).toBe(false)
   expect(stringsOf(fake.objects.get(OBJECT)?.log).some(one => one.includes('SECRET-TITLE'))).toBe(false)
   expect(fake.objects.get(OBJECT)?.log.lines.map(one => one.text)).toEqual([HELD_PLACEHOLDER, 'a line that names nothing'])
+})
+
+// ------------------------------------------------------------------ fix round 1
+
+const linesOf = (rec: LifecycleRecord, start: string): string[] => (rec.log ?? []).map(one => one.text).filter(text => text.startsWith(start))
+
+/** Codex's checkout resets feat/x to a new lifecycle and moves that one to PR `pr`: the branch's object is its tombstone. */
+async function codexResetsAndMoves(fake: FakeRelay, pr: number): Promise<LifecycleRecord> {
+  const reset = { ...seed(), slug: SLUG }
+  expect((await codex(fake, PATH, { op: 'commit', rev: fake.objects.get(OBJECT)?.rev ?? 0, record: reset })).status).toBe(200)
+  await codexMoves(fake, pr)
+  return reset
+}
+
+/** The first checkout's move of feat/x to PR 7, with every relay call after the step `isStep` down: the move stops right there. */
+async function movesUntil(s: Setup, isStep: (body: Record<string, unknown>) => boolean): Promise<void> {
+  let isPast = false
+  s.onSend.fn = body => {
+    if (isPast) s.fake.down = true
+    else if (isStep(body)) isPast = true
+  }
+  await updateRecord(s.$, '/repo', 'feat/x', opened(PR), { isPure: true })
+  s.onSend.fn = undefined
+  s.fake.down = false
+}
+
+test('a mismatched tombstone on the commit path stands down, and the relay is unchanged', async (_t, on) => {
+  const { w, fake, $ } = setup(on)
+  await saveRecord($, seed())
+  const mine = local(w)
+  await codexResetsAndMoves(fake, 9)
+  const before = structuredClone([...fake.objects])
+  // This checkout's save, with no load, of the lifecycle another checkout reset: never revived over the other's tombstone.
+  expect(await thrown(saveRecord($, grant('stale')(mine)))).toBeInstanceOf(RelayMoved)
+  expect([...fake.objects]).toEqual(before)
+  expect(opsOf(fake, 'commit').filter(body => body.isFresh === true)).toHaveLength(0)
+  expect(linesOf(local(w), 'relay moved:')).toHaveLength(1)
+  expect(reasons(local(w))).toEqual([])
+})
+
+test('a real reset over a tombstone fresh-starts', async (_t, on) => {
+  const { w, fake, $ } = setup(on)
+  await saveRecord($, seed())
+  await codexResetsAndMoves(fake, 9)
+  const theirs = structuredClone(fake.objects.get(`${SLUG}#9`))
+  const fresh = seed()
+  await saveRecord($, fresh)
+  expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+  expect(fake.objects.get(OBJECT)?.movedTo).toBeUndefined()
+  expect(fake.objects.get(`${SLUG}#9`)).toEqual(theirs)
+  expect(local(w).relayKey).toBe('@feat/x')
+})
+
+test('a fresh start over a tombstone still holding its record runs the move\'s steps 2 and 3 first', async (_t, on) => {
+  const s = setup(on)
+  const { w, fake, $ } = s
+  await saveRecord($, seed())
+  const old = local(w).lifecycleId
+  await movesUntil(s, body => body.op === 'moveTo')
+  expect((fake.objects.get(OBJECT)?.record as { record?: unknown }).record).toBeDefined()
+  expect(fake.objects.has(PR_OBJECT)).toBe(false)
+  const fresh = seed()
+  await saveRecord($, fresh)
+  // The old lifecycle is on its PR's object, and the new one on the branch's.
+  expect(recordAt(fake, PR_OBJECT).lifecycleId).toBe(old)
+  expect(recordAt(fake, PR_OBJECT).pr).toBe(PR)
+  expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+  expect(fake.objects.get(OBJECT)?.movedTo).toBeUndefined()
+})
+
+test('a fresh start over a tombstone whose PR object holds another lifecycle keeps the frozen record by a move snapshot', async (_t, on) => {
+  const s = setup(on)
+  const { w, fake, $ } = s
+  await saveRecord($, seed())
+  const old = local(w).lifecycleId
+  await movesUntil(s, body => body.op === 'moveTo')
+  const other = { ...seed({ phase: 'post', pr: PR }), slug: SLUG }
+  expect((await codex(fake, PR_PATH, { op: 'commit', rev: 0, record: other })).status).toBe(200)
+  const fresh = seed()
+  await saveRecord($, fresh)
+  expect(recordAt(fake, PR_OBJECT).lifecycleId).toBe(other.lifecycleId)
+  const kept = (fake.objects.get(OBJECT)?.archives ?? []).filter(one => one.reason === 'move')
+  expect(kept.map(one => (one.record as LifecycleRecord).lifecycleId)).toEqual([old])
+  expect(recordAt(fake, OBJECT).lifecycleId).toBe(fresh.lifecycleId)
+})
+
+test('a fresh start from the PR key over an unfinished move meets the relay\'s 409 and loses nothing', async (_t, on) => {
+  const s = setup(on)
+  const { w, fake, $, onSend } = s
+  await saveRecord($, seed())
+  const old = local(w).lifecycleId
+  // The move stops after its commit to the PR's object: the mirror is there, and the tombstone still holds the record.
+  await movesUntil(s, body => body.op === 'commit' && body.from !== undefined)
+  expect(local(w).relayKey).toBe(`#${PR}`)
+  // The new lifecycle's moveDone of the old move doesn't land: its fresh commit is held off with a 409.
+  onSend.fn = body => {
+    fake.down = body.op === 'moveDone'
+  }
+  const fresh = seed()
+  expect(await thrown(saveRecord($, fresh))).toBeInstanceOf(StaleRecord)
+  onSend.fn = undefined
+  fake.down = false
+  expect((fake.objects.get(OBJECT)?.record as { record?: LifecycleRecord }).record?.lifecycleId).toBe(old)
+  expect(recordAt(fake, PR_OBJECT).lifecycleId).toBe(old)
+  // Once the relay answers, the move finishes and the new lifecycle starts.
+  await saveRecord($, fresh)
+  expect(fake.objects.get(OBJECT)?.record).toMatchObject({ lifecycleId: fresh.lifecycleId })
+  expect(recordAt(fake, PR_OBJECT).lifecycleId).toBe(old)
+})
+
+test('a lost release of the PR claim is owed, and sent after the next call that lands', async (_t, on) => {
+  const { w, fake, $, onSend } = setup(on)
+  await saveRecord($, seed())
+  onSend.fn = body => {
+    fake.down = body.op === 'release'
+  }
+  await updateRecord($, '/repo', 'feat/x', opened(PR), { isPure: true })
+  onSend.fn = undefined
+  fake.down = false
+  expect(fake.objects.get(PR_OBJECT)?.lease).not.toBeNull()
+  expect((w.store.get(`${KEY}:relay-owed`) as { body: { op: string } }[]).map(one => one.body.op)).toEqual(['release'])
+  // No wait for the lease to lapse: the load's read lands, the release goes after it, and the commit is taken.
+  await updateRecord($, '/repo', 'feat/x', grant('next'), { isPure: true })
+  expect(reasons(recordAt(fake, PR_OBJECT))).toEqual(['next'])
+  expect(w.store.get(`${KEY}:relay-owed`)).toBeUndefined()
+})
+
+test('a moveTo the relay refuses says so in the run log', async (_t, on) => {
+  const { w, fake, $, onSend } = setup(on)
+  await saveRecord($, seed())
+  // The branch's lease is lost just before the moveTo: the relay answers 409.
+  onSend.fn = body => {
+    const s = fake.objects.get(OBJECT)
+    if (body.op === 'moveTo' && s !== undefined) s.lease = null
+  }
+  await updateRecord($, '/repo', 'feat/x', opened(PR), { isPure: true })
+  onSend.fn = undefined
+  expect(fake.objects.get(OBJECT)?.movedTo).toBeUndefined()
+  expect(linesOf(local(w), 'relay move refused (HTTP 409)')).toHaveLength(1)
 })
