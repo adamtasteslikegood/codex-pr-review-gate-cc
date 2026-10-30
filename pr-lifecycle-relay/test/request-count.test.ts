@@ -18,6 +18,14 @@ let adam: string
 type Counts = { worker: number; objects: Record<string, number> }
 const counts = async (op: 'count' | 'reset'): Promise<Counts> => (await call(undefined, '', `/__${op}`)).json as unknown as Counts
 const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+/** Waits until the RepoIndex has received `n` index updates in all. */
+async function delivered(n: number): Promise<void> {
+  for (let tries = 0; tries < 100; tries++) {
+    if (((await counts('count')).objects.RepoIndex ?? 0) >= n) return
+    await wait(10)
+  }
+  assert.fail(`the RepoIndex never received index update ${n}`)
+}
 
 before(async () => {
   await start({}, 'count-entry.ts')
@@ -57,6 +65,9 @@ test('one lifecycle-hour: Durable Object requests are about twice the Worker req
       rev = Number((await ok({ op: 'read' })).rev)
       const record = { lifecycleId: 'L1', branch: 'feat/x', phase: 'post', pr: 900, round: n }
       rev = Number((await ok({ op: 'commit', rev, record, secret: SECRET })).rev ?? rev + 1)
+      // Each commit's outbox is delivered before the next: two commits inside one alarm's delay would share one delivery (the outbox
+      // keeps the latest entry only), and the count below would no longer be exact.
+      await delivered(n + 1)
     }
   })
   await step(`log × ${LINES}`, async () => {
@@ -99,7 +110,13 @@ test('one lifecycle-hour: Durable Object requests are about twice the Worker req
   assert.equal(end.worker, worker)
   assert.equal(end.objects.GrantStore, worker)
   assert.equal(end.objects.LifecycleObject, worker)
-  // §12's estimate: about twice, within 10 %. The outbox adds at most one alarm and one RepoIndex update per commit on top.
+  // On top, each commit writes one outbox entry, which costs one alarm invocation of its object and one update to the RepoIndex. So the
+  // object requests are exactly 2·W + 2·commits, and the ratio is 2 + 2·commits / W: 2 + 20/107 here. It passes 2.2 once commits are
+  // more than a tenth of the Worker requests, as in a round-transition burst; §12's "about twice" is the floor.
+  assert.equal(end.objects['LifecycleObject alarm'], CHANGES)
+  assert.equal(end.objects.RepoIndex, CHANGES)
+  assert.equal(all, 2 * worker + 2 * CHANGES)
+  // A sanity bound for this script only, §12's estimate within 10 %; the identity above is the assertion.
   const ratio = all / end.worker
   assert.ok(ratio >= 1.8 && ratio <= 2.2, `object requests / Worker requests is ${ratio.toFixed(3)}`)
 })

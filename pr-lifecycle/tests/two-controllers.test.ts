@@ -224,7 +224,9 @@ test('the other stands down', { timeoutMs: 15_000 }, async ($, on) => {
   await $.session.start({ cwd: ROOT_A, surface: 'terminal', isInteractive: true } as never)
   await $.tool.call(createPr)
   expect(w.spawned).toHaveLength(1)
-  // B, a headless session in its own checkout, only claims: A's live lease holds it off, B's change is refused, and B stands down.
+  // B's half is driven at engine level, through the mod's own store and round code (claimLease, updateRecord, isStoodDownBy) over B's
+  // engine, not by a second instance of the mod. B, a headless session in its own checkout, only claims: A's live lease holds it off,
+  // B's change is refused, and B stands down.
   mirror(a, b)
   const lease = fake.objects.get(OBJECT)?.lease
   expect(await claimLease(b.$, ROOT_B, BRANCH, false)).toMatchObject({ held: { holder: a.sessionId } })
@@ -301,12 +303,12 @@ test('neither files a finding twice', { timeoutMs: 15_000 }, async (_$, on) => {
   expect(w.gh.filed).toHaveLength(1)
   expect(findingIn(a)?.followUp).toBe('#21')
   expect(filingOf(fake, rec)).toMatchObject({ state: 'done', result: { number: 21 } })
-  // A's run ends and releases the lease; B claims it and runs its pass again, and A runs another without the lease. Neither POSTs.
+  // A's run ends and releases the lease; B claims it and runs its pass again, with no followUp in its record yet. It doesn't POST.
   await releaseLease(a.$, ROOT_A, PR_BRANCH)
   expect(await claimLease(b.$, ROOT_B, PR_BRANCH, false)).toMatchObject({ mine: { holder: b.sessionId } })
+  expect(findingIn(b)?.followUp).toBeUndefined()
   const from = seen.length
   await fileIssues(b.$, recordIn(b), MERGED)
-  await fileIssues(a.$, recordIn(a), MERGED)
   expect(w.gh.filed).toHaveLength(1)
   expect(findingIn(b)?.followUp).toBe('#21')
   expect(seen.slice(from).filter(one => one.op === 'fileDone')).toEqual([])
@@ -314,7 +316,7 @@ test('neither files a finding twice', { timeoutMs: 15_000 }, async (_$, on) => {
   expect(Object.keys(fake.objects.get(PR_OBJECT)?.filings ?? {})).toHaveLength(1)
 })
 
-test('a stale startGate commit (409) is not retried and the next tick recovers', { timeoutMs: 15_000 }, async ($, on) => {
+test('a stale startGate commit (409) is not retried and a second start recovers', { timeoutMs: 15_000 }, async ($, on) => {
   const two = twoWorlds(on)
   const { w, fake, seen, after, a, b } = two
   // B started the lifecycle earlier and left it; A's checkout holds a mirror of it at the relay's rev 1.
@@ -342,9 +344,11 @@ test('a stale startGate commit (409) is not retried and the next tick recovers',
   expect(by(seen.slice(from), a.sessionId).filter(one => one.op === 'commit').map(one => one.status)).toEqual([409])
   expect(reply).toContain('Not started: another writer changed the shared lifecycle record meanwhile')
   expect(w.spawned).toEqual([])
+  expect(w.run ?? null).toBeNull()
   expect(fake.objects.get(OBJECT)?.rev).toBe(2)
   expect(reasons(fake.objects.get(OBJECT)?.record)).toEqual(['b'])
-  // The next start works from the relay's record, B's change in it: A's commit lands at rev 3 and its review is dispatched.
+  // A second /pr-gate start recovers. It is not the ticker: the failed start left no run for a tick to drive, so the path that keeps
+  // a run through a plain 409 is not driven here. The start works from the relay's record, B's change in it: A's commit lands at rev 3.
   const next = seen.length
   expect((await say($, 'start')).text).toContain('Lifecycle resumed for feat/x')
   expect(by(seen.slice(next), a.sessionId).filter(one => one.op === 'commit').map(one => one.status)).toEqual([200])
