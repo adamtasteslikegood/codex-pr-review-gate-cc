@@ -9,8 +9,8 @@ import type { EngineInterface } from 'claude-code'
 
 import { slugOf } from './core'
 import { newLifecycleId } from './lifecycle'
-import { keyPath, relayAt, relayCall, sharedStoreOf } from './relay'
-import type { Relay, SharedStore } from './relay'
+import { keyPath, leaseSecret, relayAt, relayCall, sharedStoreOf } from './relay'
+import type { Relay, RelayAnswer, SharedStore } from './relay'
 import type { Finding, LifecycleRecord, LogEntry } from '../types'
 
 type Engine = EngineInterface
@@ -60,7 +60,60 @@ export async function liveRecords($: Engine, root: string): Promise<LifecycleRec
     const value = (await $.store.get(key)) as LifecycleRecord | undefined | null
     if (value !== null && value !== undefined && value.version === 1 && value.phase !== 'archived' && recordKey(value.root, value.branch) === key) found.push(value)
   }
-  return found
+  // A repo on the relay (a record of it there): the relay's index says which lifecycles are live, every checkout's (R106).
+  const onRelay = found.filter(one => one.relayRev !== undefined)
+  return onRelay.length === 0 ? found : relayRecords($, root, found, onRelay)
+}
+
+/**
+ * The repo's live lifecycles as the relay's index lists them (R106), each read from its own object. A branch entry is dropped when a
+ * PR entry carries its lifecycle (the index learns of a move after it), as is an object that is empty or archived by the time it is
+ * read; a tombstone still holding its record (a move that stopped after `moveTo`) is its PR's lifecycle. A local record the relay
+ * hasn't had (no `relayRev`, or a pending one it doesn't list) is added. A relay that can't be asked, or an object that can't be read,
+ * leaves the local records as the answer, and a refusal leaves those the relay never had: the watcher goes on either way.
+ */
+async function relayRecords($: Engine, root: string, locals: LifecycleRecord[], onRelay: LifecycleRecord[]): Promise<LifecycleRecord[]> {
+  let shared: Shared | undefined
+  for (const one of onRelay) {
+    const found = await sharedOf($, root, one)
+    if (!('local' in found)) {
+      shared = found
+      break
+    }
+  }
+  if (shared === undefined) return locals
+  const listed = await relayCall($, shared.relay, `/v1/${shared.slug}`, { op: 'list' })
+  if ('refused' in listed) return locals.filter(one => one.relayRev === undefined)
+  if ('down' in listed || listed.status !== 200 || !Array.isArray(listed.json.entries)) return locals
+  const entries = listed.json.entries as { key: string; branch: string; lifecycleId: string }[]
+  const onPr = new Set(entries.filter(one => one.key.startsWith('#')).map(one => one.lifecycleId))
+  const byBranch = new Map(locals.map(one => [one.branch, one]))
+  const out: LifecycleRecord[] = []
+  const seen = new Set<string>()
+  const add = (rec: LifecycleRecord): void => {
+    out.push(rec)
+    if (rec.lifecycleId !== undefined) seen.add(rec.lifecycleId)
+  }
+  for (const entry of entries) {
+    if (entry.key.startsWith('@') && onPr.has(entry.lifecycleId)) continue
+    const mirror = byBranch.get(entry.branch)
+    const answer = await relayCall($, shared.relay, keyPath(shared.slug, entry.key), { op: 'read' })
+    if ('refused' in answer || 'down' in answer || answer.status !== 200) {
+      if (mirror?.relayRev !== undefined && keyOf(mirror) === entry.key) add(mirror)
+      continue
+    }
+    const tomb = tombOf(answer.json.record)
+    let rec = (tomb === undefined ? answer.json.record : tomb.record) as LifecycleRecord | null | undefined
+    if (tomb !== undefined && rec !== null && rec !== undefined && !onPr.has(tomb.lifecycleId)) rec = { ...rec, pr: tomb.movedTo }
+    else if (tomb !== undefined) continue
+    if (rec === null || rec === undefined || typeof rec !== 'object' || !Array.isArray(rec.findings) || rec.phase === 'archived') continue
+    add({ ...restore(rec, mirror), root })
+  }
+  for (const one of locals) {
+    if (one.lifecycleId !== undefined && seen.has(one.lifecycleId)) continue
+    if (one.relayRev === undefined || (await $.store.get(pendingKey(root, one.branch))) === true) out.push(one)
+  }
+  return out
 }
 
 async function writeRecord($: Engine, rec: LifecycleRecord): Promise<void> {
@@ -165,10 +218,13 @@ export class RelayRefused extends Error {
   }
 }
 
-/** The relay's object for the branch has moved to its PR (410, or a tombstone read): following a move is Task 7's, not built yet. */
+/**
+ * The branch's object moved to a PR under another lifecycle than the one this checkout holds (a tombstone whose `lifecycleId` isn't
+ * the mirror's): this checkout's record is not that one, so it stands down and writes nothing (R103).
+ */
 export class RelayMoved extends Error {
   constructor(movedTo: unknown) {
-    super(`the shared lifecycle record moved to PR #${String(movedTo)}; following a move is not built yet, so nothing was written`)
+    super(`the shared lifecycle record of this branch moved to PR #${String(movedTo)} under another lifecycle; this checkout stands down, so nothing was written`)
     this.name = 'RelayMoved'
   }
 }
@@ -247,10 +303,10 @@ const scrub = (value: unknown, isNamed: (text: string) => boolean): unknown => {
  * The record as it may leave the checkout (R107): each security finding, and each linked to one, is cut to `SHARED_FIELDS`, a
  * placeholder title and `ref: 'local'` (no detail, note, file, line, url or history); every other free-text string that names one (a
  * message, a round's outstanding, a log line, a waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole; and `relayRev`, this
- * checkout's own bookkeeping, is dropped.
+ * checkout's own bookkeeping, is dropped, as is `relayKey`.
  */
 export const redact = (rec: LifecycleRecord): LifecycleRecord => {
-  const { relayRev: _, findings: _findings, ...rest } = rec
+  const { relayRev: _, relayKey: _key, findings: _findings, ...rest } = rec
   const secureIds = secureIdsOf(rec.findings)
   const isNamed = namerOf(rec.findings.filter(one => secureIds.has(one.id)))
   return {
@@ -285,8 +341,21 @@ export const restore = (remote: LifecycleRecord, local: LifecycleRecord | undefi
   }
 }
 
-/** Where a record lives on the relay: the relay, the repo's slug, and the object's path (`#<pr>` once it has one, else `@<branch>`). */
-type Shared = { relay: Relay; slug: string; path: string }
+/** Where a record lives on the relay: the relay, the repo's slug, the object's key (`#<pr>` once moved, else `@<branch>`) and its path. */
+type Shared = { relay: Relay; slug: string; key: string; path: string }
+
+/** The relay object a mirror is of: the one it was last committed at, else where a record of its kind lives. */
+const keyOf = (rec: LifecycleRecord): string => rec.relayKey ?? (rec.pr !== undefined ? `#${rec.pr}` : `@${rec.branch}`)
+
+const atKey = (shared: Shared, key: string): Shared => ({ ...shared, key, path: keyPath(shared.slug, key) })
+
+/** A branch object's record once it moved (R103): where to, under which lifecycle, and the record itself until `moveDone`. */
+type Tomb = { movedTo: number; lifecycleId: string; record?: unknown }
+
+const tombOf = (record: unknown): Tomb | undefined => {
+  const one = record as Partial<Tomb> | null | undefined
+  return one !== null && typeof one === 'object' && typeof one.movedTo === 'number' ? (one as Tomb) : undefined
+}
 
 /** How long one answer to "does this repo opt in on its base" holds in this process: a change of the base is seen within a minute. */
 export const OPT_IN_TTL_MS = 60_000
@@ -326,7 +395,8 @@ async function sharedOf($: Engine, root: string, rec: LifecycleRecord): Promise<
       slug = ran.exitCode === 0 ? slugOf(ran.stdout) : undefined
     }
     if (slug === undefined) return { local: 'no slug for origin' }
-    return { relay, slug, path: keyPath(slug, rec.pr !== undefined ? `#${rec.pr}` : `@${rec.branch}`) }
+    const key = keyOf(rec)
+    return { relay, slug, key, path: keyPath(slug, key) }
   } catch (error) {
     return { local: `the opt-in could not be read: ${error instanceof Error ? error.message : String(error)}` }
   }
@@ -340,9 +410,37 @@ async function setPending($: Engine, root: string, branch: string, isPending: bo
   else if ((await $.store.get(pendingKey(root, branch))) !== undefined) await $.store.delete(pendingKey(root, branch))
 }
 
-/** The mirror of the relay's record at `rev`, written as it is (no `updatedAt` of its own). */
-async function writeMirror($: Engine, rec: LifecycleRecord, rev: number): Promise<void> {
-  await $.store.set(recordKey(rec.root, rec.branch), { ...rec, relayRev: rev })
+/** The mirror of the relay's record at `rev` of the object `key`, written as it is (no `updatedAt` of its own). */
+async function writeMirror($: Engine, rec: LifecycleRecord, rev: number, key: string): Promise<void> {
+  await $.store.set(recordKey(rec.root, rec.branch), { ...rec, relayRev: rev, relayKey: key })
+}
+
+/** A call this checkout owes the relay (a snapshot, or a move's `moveDone`) that didn't land: sent again after the next one that does. */
+type Owed = { path: string; body: Record<string, unknown> }
+
+/** Kept beside the record, never under `:archived:` (`latestArchive` reads every key there as an archive). */
+const owedKey = (root: string, branch: string): string => `${recordKey(root, branch)}:relay-owed`
+
+async function owe($: Engine, root: string, branch: string, one: Owed): Promise<void> {
+  const kept = ((await $.store.get(owedKey(root, branch))) as Owed[] | undefined) ?? []
+  await $.store.set(owedKey(root, branch), [...kept, one])
+}
+
+/**
+ * Sends what this checkout owes the relay, oldest first, after a call that landed. One that is down or refused is kept, with every one
+ * after it; one the relay answered otherwise is done (a `moveDone` another checkout finished first answers 409).
+ */
+async function payOwed($: Engine, root: string, branch: string, relay: Relay): Promise<void> {
+  const kept = (await $.store.get(owedKey(root, branch))) as Owed[] | undefined
+  if (kept === undefined || kept.length === 0) return
+  let paid = 0
+  for (const one of kept) {
+    const answer = await relayCall($, relay, one.path, one.body)
+    if ('down' in answer || 'refused' in answer) break
+    paid += 1
+  }
+  if (paid === kept.length) await $.store.delete(owedKey(root, branch))
+  else await $.store.set(owedKey(root, branch), kept.slice(paid))
 }
 
 const withLine = (rec: LifecycleRecord, at: number, text: string): LifecycleRecord => ({
@@ -379,15 +477,20 @@ async function noteDown($: Engine, root: string, branch: string, why: string): P
 
 /**
  * Keeps a local record the relay's wins over (a fallback the relay moved on from, or a record from before the relay): whole in the
- * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is not retried yet (Task 7): the local
- * archive holds it, and `lines` says the relay's copy is missing.
+ * local store first, then in the relay's archives by `snapshot` (redacted). A snapshot that fails is owed: the local archive holds it,
+ * `lines` says the relay's copy is missing, and it is sent again after the next call that lands.
  */
-async function keepLocal($: Engine, shared: Shared, rec: LifecycleRecord, reason: 'fallback' | 'migration'): Promise<{ at: number; lines: string[] }> {
+async function keepLocal($: Engine, shared: Shared, rec: LifecycleRecord, reason: 'fallback' | 'migration' | 'move'): Promise<{ at: number; lines: string[] }> {
   const at = await $.clock.now()
   await writeArchive($, rec, at)
-  const answer = await relayCall($, shared.relay, shared.path, { op: 'snapshot', at, record: redact({ ...rec, phase: 'archived' }), reason })
+  const body = { op: 'snapshot', at, record: redact({ ...rec, phase: 'archived' }), reason }
+  const answer = await relayCall($, shared.relay, shared.path, body)
   const why = 'refused' in answer ? answer.refused : 'down' in answer ? answer.down : answer.status === 200 ? undefined : `HTTP ${answer.status}`
-  return { at, lines: why === undefined ? [] : [`relay snapshot missing (${why}): the relay has no copy of the archive of ${at}; the local store keeps it`] }
+  if (why !== undefined) await owe($, rec.root, rec.branch, { path: shared.path, body })
+  return {
+    at,
+    lines: why === undefined ? [] : [`relay snapshot missing (${why}): the relay has no copy of the archive of ${at} yet; the local store keeps it, and sends it again`],
+  }
 }
 
 const withLines = (rec: LifecycleRecord, at: number, lines: string[]): LifecycleRecord => lines.reduce((one, text) => withLine(one, at, text), rec)
@@ -404,15 +507,17 @@ async function runTx<T>($: Engine, root: string, branch: string, work: (tx: Reco
     // A record that has been on the relay, and the opt-in can't be read now: a fallback, never plain local, so a relay that moved on
     // meanwhile archives these writes instead of overwriting them.
     await noteDown($, root, branch, found.local)
-    return work(fallbackTx($, root, branch, mirror.relayRev))
+    return work(fallbackTx($, root, branch, mirror.relayRev, keyOf(mirror)))
   }
-  const shared = found !== undefined && 'local' in found ? undefined : found
+  let shared = found !== undefined && 'local' in found ? undefined : found
   let given: Given | undefined
   for (let attempt = 0; ; attempt += 1) {
     const ran = await relayTx($, root, branch, shared, work, given)
     if (!('retry' in ran)) return ran.value
     if (!isPure || attempt > 0) throw ran.retry.error
     given = ran.retry.given
+    // A retry at another object: the PR's, after a move followed, or the branch's, for a new lifecycle after the PR's.
+    if (ran.retry.shared !== undefined) shared = ran.retry.shared
   }
 }
 
@@ -425,19 +530,95 @@ function localTx($: Engine, root: string, branch: string): RecordTx {
   }
 }
 
-/** The local store for a record that has been on the relay at `relayRev`: each write keeps that rev and marks the mirror pending. */
-function fallbackTx($: Engine, root: string, branch: string, relayRev: number): RecordTx {
+/** The local store for a record that has been on the relay at `relayRev` of `relayKey`: each write keeps both and marks the mirror pending. */
+function fallbackTx($: Engine, root: string, branch: string, relayRev: number, relayKey: string): RecordTx {
   return {
     load: () => loadRecord($, root, branch),
     save: async rec => {
-      await writeRecord($, { ...rec, relayRev: rec.relayRev ?? relayRev })
+      await writeRecord($, { ...rec, relayRev: rec.relayRev ?? relayRev, relayKey: rec.relayKey ?? relayKey })
       await setPending($, root, branch, true)
     },
     archive: (rec, at) => writeArchive($, rec, at),
   }
 }
 
-type Ran<T> = { value: T } | { retry: { error: StaleRecord; given?: Given } }
+type Ran<T> = { value: T } | { retry: { error: StaleRecord; given?: Given; shared?: Shared } }
+
+/** The mirror's rev of the object `key`, if it is a mirror of that object: a rev of one object says nothing about another's. */
+const revAt = (rec: LifecycleRecord | undefined, key: string): number | undefined => (rec !== undefined && keyOf(rec) === key ? rec.relayRev : undefined)
+
+/** A `read` of the object at `at`: its rev and record, or why it didn't answer. A refusal stands the store down. */
+async function readAt($: Engine, root: string, branch: string, at: Shared): Promise<Given | { down: string }> {
+  const answer = await relayCall($, at.relay, at.path, { op: 'read' })
+  if ('refused' in answer) return standDown($, root, branch, answer.refused)
+  if ('down' in answer) return answer
+  if (answer.status !== 200) throw new Error(`the shared lifecycle store answered a read with HTTP ${answer.status}`)
+  return { rev: Number(answer.json.rev), record: answer.json.record }
+}
+
+/**
+ * Steps 2 and 3 of the move (R103): the record on the PR's object (a `commit` with `from`, under a claim of that object), then the
+ * branch's tombstone cut to its pointer (`moveDone`). Answers the PR object's rev and record: `rec` itself, or what another checkout
+ * placed there first (a 409, or a claim it holds). Another lifecycle there keeps this one by a snapshot on the branch's object. A
+ * `moveDone` that doesn't land is owed; a claim or commit that doesn't is the caller's to note, and the next load finishes the move.
+ */
+async function publishMove($: Engine, root: string, branch: string, from: Shared, to: Shared, rec: LifecycleRecord): Promise<Given | { down: string }> {
+  const secret = await leaseSecret($)
+  const claimed = await relayCall($, to.relay, to.path, { op: 'claim', holder: await $.session.id(), secret })
+  if ('refused' in claimed) return standDown($, root, branch, claimed.refused)
+  if ('down' in claimed) return claimed
+  let placed: Given
+  if (claimed.status === 200) {
+    const answer = await relayCall($, to.relay, to.path, { op: 'commit', rev: 0, record: redact(rec), from: from.key, secret })
+    if ('refused' in answer) return standDown($, root, branch, answer.refused)
+    if ('down' in answer) return answer
+    if (answer.status === 200) placed = { rev: Number(answer.json.rev), record: rec }
+    else if (answer.status === 409 && typeof answer.json.rev === 'number') placed = { rev: answer.json.rev, record: answer.json.record }
+    else throw new Error(`the shared lifecycle store answered a move's commit with HTTP ${answer.status}`)
+    // Task 8: the lease boundary goes here: only the holder of the PR object's lease passes a boundary and dispatches.
+    await relayCall($, to.relay, to.path, { op: 'release', secret })
+  } else if (claimed.status === 423) {
+    // Another checkout holds the PR's object: one that moved this lifecycle first, or is moving it now.
+    const read = await readAt($, root, branch, to)
+    if ('down' in read) return read
+    if (read.record === null) throw new StaleRecord(read.rev, null, 'another checkout is moving this lifecycle to its PR')
+    placed = read
+  } else throw new Error(`the shared lifecycle store answered a move's claim with HTTP ${claimed.status}`)
+  if ((placed.record as LifecycleRecord | null)?.lifecycleId !== rec.lifecycleId) {
+    // Another lifecycle holds the PR's object already: this one is kept, locally and in the archives of the branch's object.
+    await keepLocal($, from, rec, 'move')
+  }
+  const body = { op: 'moveDone', lifecycleId: rec.lifecycleId }
+  const done = await relayCall($, from.relay, from.path, body)
+  if ('refused' in done) return standDown($, root, branch, done.refused)
+  if ('down' in done) await owe($, root, branch, { path: from.path, body })
+  return placed
+}
+
+/**
+ * A branch's object that moved (R103), followed to its PR's: the move is finished first when the tombstone still holds the record
+ * (a mover that stopped after `moveTo`), from that record. A tombstone of another lifecycle than the mirror's is not followed: the
+ * store stands down and writes nothing.
+ */
+async function follow(
+  $: Engine,
+  root: string,
+  branch: string,
+  from: Shared,
+  tomb: Tomb,
+  local: LifecycleRecord | undefined,
+): Promise<{ shared: Shared; remote: Given } | { down: string }> {
+  if (local?.lifecycleId !== undefined && local.lifecycleId !== tomb.lifecycleId) {
+    await noteOnce($, root, branch, 'relay moved', `relay moved: this branch's object moved to PR #${tomb.movedTo} under another lifecycle; this checkout stands down`)
+    throw new RelayMoved(tomb.movedTo)
+  }
+  const to = atKey(from, `#${tomb.movedTo}`)
+  const remote =
+    tomb.record === undefined
+      ? await readAt($, root, branch, to)
+      : await publishMove($, root, branch, from, to, { ...restore(tomb.record as LifecycleRecord, local), root, branch, pr: tomb.movedTo })
+  return 'down' in remote ? remote : { shared: to, remote }
+}
 
 /**
  * One run of `work` against the relay. With no local record yet (`shared` undefined), the first save or archive says where the record
@@ -453,7 +634,7 @@ async function relayTx<T>(
 ): Promise<Ran<T>> {
   let shared = start
   let mode: 'undecided' | 'local' | 'relay' | 'fallback' = start === undefined ? 'undecided' : 'relay'
-  let rev = (await loadRecord($, root, branch))?.relayRev ?? 0
+  let rev = (start === undefined ? undefined : revAt(await loadRecord($, root, branch), start.key)) ?? 0
   let loaded: LifecycleRecord | undefined
   let isLoaded = false
   /** The mirror's own changes the relay hasn't had, committed with this transaction even if `work` saves nothing. */
@@ -468,8 +649,14 @@ async function relayTx<T>(
     mode = shared === undefined ? 'local' : 'relay'
   }
   const fallbackWrite = async (rec: LifecycleRecord): Promise<void> => {
-    await writeRecord($, { ...rec, relayRev: rev })
+    await writeRecord($, { ...rec, relayRev: rev, relayKey: shared?.key ?? keyOf(rec) })
     await setPending($, root, branch, true)
+  }
+  const toFallback = async (why: string): Promise<LifecycleRecord | undefined> => {
+    mode = 'fallback'
+    await noteDown($, root, branch, why)
+    loaded = await loadRecord($, root, branch)
+    return loaded
   }
 
   const load = async (): Promise<LifecycleRecord | undefined> => {
@@ -479,32 +666,33 @@ async function relayTx<T>(
     let remote: Given
     if (given !== undefined) remote = given
     else {
-      const answer = await relayCall($, shared.relay, shared.path, { op: 'read' })
-      if ('refused' in answer) return standDown($, root, branch, answer.refused)
-      if ('down' in answer) {
-        mode = 'fallback'
-        await noteDown($, root, branch, answer.down)
-        loaded = await loadRecord($, root, branch)
-        return loaded
-      }
-      if (answer.status === 410) throw new RelayMoved(answer.json.movedTo)
-      if (answer.status !== 200) throw new Error(`the shared lifecycle store answered a read with HTTP ${answer.status}`)
-      remote = { rev: Number(answer.json.rev), record: answer.json.record }
+      const read = await readAt($, root, branch, shared)
+      if ('down' in read) return toFallback(read.down)
+      await payOwed($, root, branch, shared.relay)
+      remote = read
     }
-    const tomb = remote.record as { movedTo?: unknown } | null
-    if (tomb !== null && typeof tomb === 'object' && tomb.movedTo !== undefined) throw new RelayMoved(tomb.movedTo)
+    const tomb = tombOf(remote.record)
+    if (tomb !== undefined) {
+      // The branch's lifecycle moved to its PR (R103): it is read, and goes on, there.
+      const to = await follow($, root, branch, shared, tomb, await loadRecord($, root, branch))
+      if ('down' in to) return toFallback(to.down)
+      shared = to.shared
+      remote = to.remote
+    }
     rev = remote.rev
     const local = await loadRecord($, root, branch)
     const isPending = (await $.store.get(pendingKey(root, branch))) === true
     const remoteRec = remote.record as LifecycleRecord | null
+    // A mirror of another object (the branch's, before a move followed here) is never at this one's rev, whatever its number.
+    const localRev = revAt(local, shared.key)
     if (remoteRec === null) {
       // An empty object: what this checkout holds goes up (a record from before the relay, or one the relay never had).
       loaded = local
       owed = local
     } else if (local === undefined) {
-      loaded = { ...restore(remoteRec, undefined), root, branch, relayRev: rev }
-      await writeMirror($, loaded, rev)
-    } else if (local.relayRev === undefined || (isPending && local.relayRev !== rev)) {
+      loaded = { ...restore(remoteRec, undefined), root, branch, relayRev: rev, relayKey: shared.key }
+      await writeMirror($, loaded, rev, shared.key)
+    } else if (local.relayRev === undefined || (isPending && localRev !== rev)) {
       // Migration (a record from before the relay, met by one already there) or a fallback the relay moved on from: the relay's
       // record wins and is never overwritten, and the local one is kept, locally and in the relay's archives.
       const reason = local.relayRev === undefined ? 'migration' : 'fallback'
@@ -512,20 +700,24 @@ async function relayTx<T>(
       const line =
         reason === 'migration'
           ? `relay migration: the relay already held this lifecycle (rev ${rev}); the local record from before it is kept in the archive of ${at}`
-          : `relay moved on (rev ${local.relayRev} to ${rev}) while this checkout was in fallback; its record is kept in the archive of ${at}`
-      loaded = withLines({ ...restore(remoteRec, local), root, branch, relayRev: rev }, await $.clock.now(), [line, ...lines])
-      await writeMirror($, loaded, rev)
+          : localRev === undefined
+            ? `relay moved on (the lifecycle moved to ${shared.key}) while this checkout was in fallback; its record is kept in the archive of ${at}`
+            : `relay moved on (rev ${local.relayRev} to ${rev}) while this checkout was in fallback; its record is kept in the archive of ${at}`
+      loaded = withLines({ ...restore(remoteRec, local), root, branch, relayRev: rev, relayKey: shared.key }, await $.clock.now(), [line, ...lines])
+      await writeMirror($, loaded, rev, shared.key)
       await setPending($, root, branch, true)
     } else if (isPending) {
       // The relay is where this checkout left it: the fallback's writes go up now.
       loaded = local
       owed = local
-    } else if (local.relayRev === rev) {
+    } else if (localRev === rev) {
       loaded = local
     } else {
-      loaded = { ...restore(remoteRec, local), root, branch, relayRev: rev }
-      await writeMirror($, loaded, rev)
+      loaded = { ...restore(remoteRec, local), root, branch, relayRev: rev, relayKey: shared.key }
+      await writeMirror($, loaded, rev, shared.key)
     }
+    // A record on the branch's object that has its PR is owed its move, even by a change that saves nothing: a mover stopped short.
+    if (shared.key.startsWith('@') && loaded?.pr !== undefined && loaded.phase !== 'archived') owed ??= loaded
     return loaded
   }
 
@@ -551,51 +743,139 @@ async function relayTx<T>(
     return { value }
   }
   const now = await $.clock.now()
-  const { relayRev: _, ...bare } = next
+  const { relayRev: _, relayKey: _key, ...bare } = next
   const lifecycleId = next.lifecycleId ?? newLifecycleId()
   const full: LifecycleRecord = { ...bare, root, branch, slug: shared.slug, lifecycleId, updatedAt: Math.max(next.updatedAt, now) }
-  const body: Record<string, unknown> = { op: 'commit', rev, record: redact(full) }
-  if (archived !== undefined) body.archive = { at: archived.at, record: redact({ ...archived.rec, phase: 'archived' }) }
-  const answer = await relayCall($, shared.relay, shared.path, body)
-  if ('refused' in answer) return standDown($, root, branch, answer.refused)
-  if ('down' in answer) {
-    // A commit with no answer may still have been applied: the next read tells (spec §8, Review Focus 1), and nothing is lost either way.
-    await fallbackWrite(full)
+  const keepArchive = async (): Promise<void> => {
     if (archived !== undefined) await writeArchive($, archived.rec, archived.at)
-    await noteDown($, root, branch, answer.down)
-    return { value }
   }
-  if (answer.status === 200) {
-    // The mirror rule: every commit the relay took is kept locally whole, security text and all, at its new revision.
-    await writeMirror($, full, Number(answer.json.rev))
-    await setPending($, root, branch, false)
-    if (archived !== undefined) await writeArchive($, archived.rec, archived.at)
-    return { value }
-  }
-  if (answer.status === 410) throw new RelayMoved(answer.json.movedTo)
-  if (answer.status === 409 && typeof answer.json.rev === 'number') {
-    const theirs = { rev: answer.json.rev, record: answer.json.record }
-    const local = await loadRecord($, root, branch)
-    const remoteRec = theirs.record as LifecycleRecord | null | undefined
-    if (remoteRec !== null && remoteRec !== undefined && typeof remoteRec === 'object' && Array.isArray(remoteRec.findings)) {
-      const isPending = (await $.store.get(pendingKey(root, branch))) === true
-      if (local !== undefined && (isPending || local.relayRev === undefined)) {
-        // A fallback's writes, or a record from before the relay (a save with no load meets one already there): kept before the
-        // relay's record replaces it, as on a load.
-        const reason = local.relayRev === undefined ? 'migration' : 'fallback'
-        const { at, lines } = await keepLocal($, shared, local, reason)
-        const line =
-          reason === 'migration'
-            ? `relay migration: the relay already held this lifecycle (rev ${theirs.rev}); the local record from before it is kept in the archive of ${at}`
-            : `relay moved on (rev ${local.relayRev ?? 0} to ${theirs.rev}) before this checkout's changes reached it; its record is kept in the archive of ${at}`
-        await writeMirror($, withLines({ ...restore(remoteRec, local), root, branch }, now, [line, ...lines]), theirs.rev)
-        await setPending($, root, branch, true)
-      } else await writeMirror($, { ...restore(remoteRec, local), root, branch }, theirs.rev)
+  const bodyAt = (at: number, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    op: 'commit',
+    rev: at,
+    record: redact(full),
+    ...(archived === undefined ? {} : { archive: { at: archived.at, record: redact({ ...archived.rec, phase: 'archived' }) } }),
+    ...extra,
+  })
+
+  /** The relay's answer to a commit of `full` at `at`, settled: undefined once committed, else the transaction's outcome. */
+  const settle = async (at: Shared, answer: RelayAnswer): Promise<Ran<T> | undefined> => {
+    if ('refused' in answer) return standDown($, root, branch, answer.refused)
+    if ('down' in answer) {
+      // A commit with no answer may still have been applied: the next read tells (spec §8, Review Focus 1), and nothing is lost either way.
+      await fallbackWrite(full)
+      await keepArchive()
+      await noteDown($, root, branch, answer.down)
+      return { value }
     }
-    return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs } }
+    if (answer.status === 200) {
+      // The mirror rule: every commit the relay took is kept locally whole, security text and all, at its new revision.
+      await writeMirror($, full, Number(answer.json.rev), at.key)
+      await setPending($, root, branch, false)
+      await keepArchive()
+      await payOwed($, root, branch, at.relay)
+      return undefined
+    }
+    if (answer.status === 410) return moved(at, answer.json)
+    if (answer.status === 409 && typeof answer.json.rev === 'number') {
+      const theirs = { rev: answer.json.rev, record: answer.json.record }
+      const local = await loadRecord($, root, branch)
+      const remoteRec = theirs.record as LifecycleRecord | null | undefined
+      if (remoteRec !== null && remoteRec !== undefined && typeof remoteRec === 'object' && Array.isArray(remoteRec.findings)) {
+        const isPending = (await $.store.get(pendingKey(root, branch))) === true
+        if (local !== undefined && (isPending || local.relayRev === undefined)) {
+          // A fallback's writes, or a record from before the relay (a save with no load meets one already there): kept before the
+          // relay's record replaces it, as on a load.
+          const reason = local.relayRev === undefined ? 'migration' : 'fallback'
+          const { at: kept, lines } = await keepLocal($, at, local, reason)
+          const line =
+            reason === 'migration'
+              ? `relay migration: the relay already held this lifecycle (rev ${theirs.rev}); the local record from before it is kept in the archive of ${kept}`
+              : `relay moved on (rev ${local.relayRev ?? 0} to ${theirs.rev}) before this checkout's changes reached it; its record is kept in the archive of ${kept}`
+          await writeMirror($, withLines({ ...restore(remoteRec, local), root, branch }, now, [line, ...lines]), theirs.rev, at.key)
+          await setPending($, root, branch, true)
+        } else await writeMirror($, { ...restore(remoteRec, local), root, branch }, theirs.rev, at.key)
+      }
+      return { retry: { error: new StaleRecord(theirs.rev, theirs.record, 'another writer committed first'), given: theirs, shared: at } }
+    }
+    if (answer.status === 423) return { retry: { error: new StaleRecord(rev, answer.json.lease, 'another checkout holds the lease') } }
+    throw new Error(`the shared lifecycle store answered a commit with HTTP ${answer.status}`)
   }
-  if (answer.status === 423) return { retry: { error: new StaleRecord(rev, answer.json.lease, 'another checkout holds the lease') } }
-  throw new Error(`the shared lifecycle store answered a commit with HTTP ${answer.status}`)
+
+  /**
+   * A 410: the branch's object at `at` moved. Of this lifecycle (a stale checkout still driving the branch's object), the move is
+   * followed and the change runs again at the PR's object. Of another, this record starts fresh over the tombstone (`isFresh`), and the
+   * old PR's object is left as it is.
+   */
+  const moved = async (at: Shared, json: Record<string, unknown>): Promise<Ran<T>> => {
+    const read = await readAt($, root, branch, at)
+    if ('down' in read) return (await settle(at, read)) ?? { value }
+    const tomb = tombOf(read.record)
+    if (tomb === undefined) throw new Error(`the shared lifecycle store answered 410 for ${at.key}, and reads no tombstone there`)
+    if (json.lifecycleId === full.lifecycleId) {
+      const local = await loadRecord($, root, branch)
+      const to = await follow($, root, branch, at, tomb, local)
+      if ('down' in to) return (await settle(at, to)) ?? { value }
+      await writeMirror($, { ...restore(to.remote.record as LifecycleRecord, local), root, branch }, to.remote.rev, to.shared.key)
+      await setPending($, root, branch, false)
+      const error = new StaleRecord(to.remote.rev, to.remote.record, `the lifecycle moved to PR #${tomb.movedTo}`)
+      return { retry: { error, given: to.remote, shared: to.shared } }
+    }
+    if (tomb.record !== undefined) throw new StaleRecord(read.rev, read.record, 'the old lifecycle has not finished its move to its PR')
+    rev = read.rev
+    return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev, { isFresh: true })))) ?? { value }
+  }
+
+  let at = shared
+  if (at.key.startsWith('#') && full.pr === undefined && full.phase !== 'archived') {
+    // A new lifecycle after its PR's (R103): it starts on the branch's object again, and the old PR's object is left as it is.
+    at = atKey(shared, `@${branch}`)
+    const read = await readAt($, root, branch, at)
+    if ('down' in read) return (await settle(at, read)) ?? { value }
+    const tomb = tombOf(read.record)
+    const there = read.record as LifecycleRecord | null
+    if (tomb === undefined && there !== null && there.phase !== 'archived' && there.lifecycleId !== full.lifecycleId) {
+      throw new StaleRecord(read.rev, read.record, 'another lifecycle drives this branch')
+    }
+    if (tomb?.record !== undefined) {
+      // The move this mirror's PR came from: finished there (this checkout read the PR's object), so only its `moveDone` is left.
+      if (`#${tomb.movedTo}` !== shared.key) throw new StaleRecord(read.rev, read.record, 'the old lifecycle has not finished its move to its PR')
+      await relayCall($, at.relay, at.path, { op: 'moveDone', lifecycleId: tomb.lifecycleId })
+    }
+    rev = read.rev
+    return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev, tomb === undefined ? {} : { isFresh: true })))) ?? { value }
+  }
+  if (!at.key.startsWith('@') || full.pr === undefined) return (await settle(at, await relayCall($, at.relay, at.path, bodyAt(rev)))) ?? { value }
+
+  // The move (R103, spec §1): the record has its PR. It is committed on the branch's object under a claim of it, then step 1 freezes
+  // that object with the record in its tombstone, and `publishMove` takes steps 2 and 3. A step that doesn't land stops the move where
+  // it is: the next load finds the record with its PR on the branch's object, or the tombstone, and finishes it.
+  const secret = await leaseSecret($)
+  const claimed = await relayCall($, at.relay, at.path, { op: 'claim', holder: await $.session.id(), secret })
+  if ('refused' in claimed || 'down' in claimed) return (await settle(at, claimed)) ?? { value }
+  if (claimed.status === 410) return moved(at, claimed.json)
+  if (claimed.status === 423) return { retry: { error: new StaleRecord(rev, claimed.json.lease, 'another checkout holds the lease') } }
+  if (claimed.status !== 200) throw new Error(`the shared lifecycle store answered a claim with HTTP ${claimed.status}`)
+  const answer = await relayCall($, at.relay, at.path, bodyAt(rev, { secret }))
+  if (!('refused' in answer) && !('down' in answer) && answer.status !== 200 && answer.status !== 410) {
+    await relayCall($, at.relay, at.path, { op: 'release', secret })
+  }
+  const settled = await settle(at, answer)
+  if (settled !== undefined) return settled
+  const noteStop = (why: string): Promise<boolean> =>
+    noteOnce($, root, branch, 'relay down', `relay down (${why}): the move to PR #${full.pr} stopped short; the next transaction on this lifecycle finishes it`)
+  const froze = await relayCall($, at.relay, at.path, { op: 'moveTo', pr: full.pr, secret })
+  if ('refused' in froze) return standDown($, root, branch, froze.refused)
+  if ('down' in froze) await noteStop(froze.down)
+  if ('down' in froze || froze.status !== 200) return { value }
+  const to = atKey(at, `#${full.pr}`)
+  const placed = await publishMove($, root, branch, at, to, full)
+  if ('down' in placed) {
+    await noteStop(placed.down)
+    return { value }
+  }
+  const isOurs = placed.record === full
+  await writeMirror($, isOurs ? full : { ...restore(placed.record as LifecycleRecord, full), root, branch }, placed.rev, to.key)
+  return { value }
 }
 
 // ----------------------------------------------------------------- owner
@@ -629,13 +909,96 @@ export const LOG_CAP = 200
 /** Adds a line to the record's run log (`/pr-gate log`). Takes the record's lock: never call it from inside `updateRecord`. */
 export async function logEvent($: Engine, root: string, branch: string, kind: LogEntry['kind'], text: string): Promise<void> {
   const at = await $.clock.now()
+  if (await lockRecord(root, branch, () => logOnRelay($, root, branch, at, kind, text))) return
   await updateRecord($, root, branch, rec => ({ ...rec, log: [...(rec.log ?? []), { at, kind, text: text.slice(0, 300) }].slice(-LOG_CAP) }), { isPure: true })
 }
 
-/** The branch's newest archived record (R47), for a log asked for after the lifecycle closed. */
+/**
+ * A line of a record on the relay goes to its object's own log (R106): apart from the record, so with no rev and no lease, and a
+ * checkout that doesn't hold the lease logs too. Its text is scrubbed as the record's is (R107). A line the relay doesn't take is kept
+ * in the local record's log and the round goes on; a refusal stands the store down. False for a record not on the relay.
+ */
+async function logOnRelay($: Engine, root: string, branch: string, at: number, kind: LogEntry['kind'], text: string): Promise<boolean> {
+  const mirror = await loadRecord($, root, branch)
+  if (mirror?.relayRev === undefined) return false
+  const shared = await sharedOf($, root, mirror)
+  if ('local' in shared) return false
+  const line = text.slice(0, 300)
+  const secureIds = secureIdsOf(mirror.findings)
+  const isNamed = namerOf(mirror.findings.filter(one => secureIds.has(one.id)))
+  const sent = isNamed === undefined ? line : (scrub(line, isNamed) as string)
+  const answer = await relayCall($, shared.relay, shared.path, { op: 'log', at, kind, text: sent, holder: await $.session.id() })
+  if ('refused' in answer) return standDown($, root, branch, answer.refused)
+  if (!('down' in answer) && answer.status === 200) {
+    await payOwed($, root, branch, shared.relay)
+    return true
+  }
+  await $.store.set(recordKey(root, branch), { ...mirror, log: [...(mirror.log ?? []), { at, kind, text: line }].slice(-LOG_CAP) })
+  if ('down' in answer) {
+    await noteOnce($, root, branch, 'relay down', `relay down (${answer.down}): this lifecycle's run log goes on in the local store meanwhile`)
+  }
+  return true
+}
+
+/** A relay object's run log (R106): its lines, oldest first, and how many earlier lines its cap of 1000 dropped. */
+export type RelayLog = { lines: LogEntry[]; dropped: number }
+
+/**
+ * The branch lifecycle's run log as the relay keeps it, for `/pr-gate log`: the object's log, and for a lifecycle that moved to its
+ * PR, the branch object's log from before the move as `movedFrom`. A record not on the relay, or a relay that can't be asked, answers
+ * the local record's own log; a refusal stands the store down.
+ */
+export async function relayLog($: Engine, root: string, branch: string): Promise<RelayLog & { movedFrom?: RelayLog }> {
+  const mirror = await loadRecord($, root, branch)
+  const own: RelayLog = { lines: mirror?.log ?? [], dropped: 0 }
+  if (mirror?.relayRev === undefined) return own
+  const found = await sharedOf($, root, mirror)
+  if ('local' in found) return own
+  const read = async (at: Shared): Promise<{ log: RelayLog; record: unknown } | undefined> => {
+    const answer = await relayCall($, at.relay, at.path, { op: 'read' })
+    if ('refused' in answer) return standDown($, root, branch, answer.refused)
+    if ('down' in answer || answer.status !== 200) return undefined
+    const lines = (Array.isArray(answer.json.log) ? answer.json.log : []) as { at: number; kind: LogEntry['kind']; text: string }[]
+    const log = { lines: lines.map(one => ({ at: one.at, kind: one.kind, text: one.text })), dropped: Number(answer.json.logDropped ?? 0) }
+    return { log, record: answer.json.record }
+  }
+  const here = await read(found)
+  if (here === undefined) return own
+  const tomb = tombOf(here.record)
+  if (tomb !== undefined && tomb.lifecycleId === mirror.lifecycleId) {
+    // The branch's object, moved since this checkout last read it: its log comes first, the PR's after.
+    const after = await read(atKey(found, `#${tomb.movedTo}`))
+    return after === undefined ? { ...own, movedFrom: here.log } : { ...after.log, movedFrom: here.log }
+  }
+  if (!found.key.startsWith('#')) return here.log
+  const before = await read(atKey(found, `@${branch}`))
+  const was = before === undefined ? undefined : tombOf(before.record)
+  const isMoved = before !== undefined && was !== undefined && `#${was.movedTo}` === found.key && was.lifecycleId === mirror.lifecycleId
+  return isMoved ? { ...here.log, movedFrom: before.log } : here.log
+}
+
+/**
+ * The branch's newest archived record (R47), for a log asked for after the lifecycle closed. A record on the relay reads its object's
+ * `archives` too, and the branch object's for one that moved to its PR: the newest of all wins, a local copy over the relay's of the
+ * same time (it keeps the security text).
+ */
 export async function latestArchive($: Engine, root: string, branch: string): Promise<LifecycleRecord | undefined> {
   const prefix = `${recordKey(root, branch)}:archived:`
   const keys = (await $.store.keys()).filter(key => key.startsWith(prefix))
   const newest = keys.sort((a, b) => Number(a.slice(prefix.length)) - Number(b.slice(prefix.length))).at(-1)
-  return newest === undefined ? undefined : ((await $.store.get(newest)) as LifecycleRecord | undefined)
+  const kept = newest === undefined ? undefined : ((await $.store.get(newest)) as LifecycleRecord | undefined)
+  const mirror = await loadRecord($, root, branch)
+  if (mirror?.relayRev === undefined) return kept
+  const found = await sharedOf($, root, mirror)
+  if ('local' in found) return kept
+  let best = { at: newest === undefined ? -Infinity : Number(newest.slice(prefix.length)), record: kept }
+  for (const at of found.key.startsWith('#') ? [found, atKey(found, `@${branch}`)] : [found]) {
+    const answer = await relayCall($, at.relay, at.path, { op: 'archives' })
+    if ('refused' in answer) return standDown($, root, branch, answer.refused)
+    if ('down' in answer || answer.status !== 200 || !Array.isArray(answer.json.archives)) continue
+    for (const one of answer.json.archives as { at: number; record: LifecycleRecord }[]) {
+      if (one.at > best.at) best = { at: one.at, record: { ...restore(one.record, mirror), root, branch } }
+    }
+  }
+  return best.record
 }

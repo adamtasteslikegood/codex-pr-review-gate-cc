@@ -295,6 +295,11 @@ export type LifecycleRecord = {
    * fallback. Absent on a record the relay has never held.
    */
   relayRev?: number
+  /**
+   * The relay object `relayRev` is a revision of (#29 Part B, R103): `@<branch>` before the move, `#<pr>` after it. A rev of one object
+   * says nothing about another's. Absent where the record's kind says it (`#<pr>` with a `pr`, else `@<branch>`).
+   */
+  relayKey?: string
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string
