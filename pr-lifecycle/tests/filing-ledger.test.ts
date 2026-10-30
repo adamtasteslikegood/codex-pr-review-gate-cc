@@ -438,3 +438,40 @@ test('a filing pass never adopts the ledger\'s closed issue again: a finding hol
   expect(filingAt(s.fake, keyOf(rec, 2))).toMatchObject({ state: 'done', result: result(22) })
   expect(findingIn(s.w.store)).toMatchObject({ followUp: '#22', fileAttempt: 1 })
 })
+
+// Final review I2: a refile made while the relay was down, after the ledger's issue closed, settles on the new issue.
+
+/** #21 is filed and done in the ledger, then `gone` (closed, or deleted or transferred so it isn't listed), and the finding holds again. */
+async function refiledWhileDown(on: Parameters<typeof world>[0], gone: 'CLOSED' | 'missing') {
+  const s = setup(on)
+  const rec = await seeded(s.$)
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  s.w.gh.issueStates[21] = gone
+  await updateRecord(s.$, '/repo', 'feat/x', r => ({ ...r, findings: r.findings.map(f => ({ ...f, followUp: 'see the design doc', followUpLabel: undefined })) }))
+  // The relay is down for the refile: #22 is filed locally, and its ledger entry is owed.
+  s.fake.down = true
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(s.w.gh.filed).toHaveLength(2)
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#22', isFilingOwed: true })
+  expect(findingIn(s.w.store)?.fileAttempt).toBeUndefined()
+  // The relay answers again: the owed finding settles on #22 as attempt 2, never back on #21.
+  s.fake.down = false
+  await fileIssues(s.$, recordIn(s.w.store), MERGED)
+  expect(s.w.gh.filed).toHaveLength(2)
+  expect(filingAt(s.fake, keyOf(rec))).toMatchObject({ state: 'done', result: result(21) })
+  expect(filingAt(s.fake, keyOf(rec, 2))).toMatchObject({ state: 'done', result: result(22) })
+  expect(findingIn(s.w.store)).toMatchObject({ followUp: '#22', fileAttempt: 1 })
+  expect(findingIn(s.w.store)?.isFilingOwed).toBeUndefined()
+  const lines = (recordIn(s.w.store).log ?? []).map(one => one.text)
+  expect(lines.filter(one => one.includes('close by hand') || one.includes(`moved from #22`))).toEqual([])
+  expect(s.w.gh.calls.filter(one => one.startsWith('issue edit 21'))).toEqual([])
+}
+
+test('a refile while the relay was down, after the ledger\'s issue closed, settles on the new issue as the next attempt, with no duplicate reported', { timeoutMs: 15_000 }, async (_$, on) => {
+  await refiledWhileDown(on, 'CLOSED')
+})
+
+test('the same refile after the ledger\'s issue was deleted or transferred (not listed at all) settles on the new issue too', { timeoutMs: 15_000 }, async (_$, on) => {
+  await refiledWhileDown(on, 'missing')
+})

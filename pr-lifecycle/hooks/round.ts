@@ -4356,8 +4356,11 @@ async function settleOwed($: Engine, given: LifecycleRecord): Promise<LifecycleR
     const title = issueTitle(f, rec, c.issueSpec)
     const saved = issueOf(f.followUp, repo)
     const mine = saved?.repo === repo ? { saved: saved.number } : {}
-    const ledger = await ledgerOf($, rec, f, { repo, gh, title, label, stepTimeoutMs: c.stepTimeoutMs, ...mine })
+    // A refile made while the relay was down, after the ledger's issue closed (final review I2): the done attempt's issue is no longer
+    // open, so the next attempt is claimed and finished with the refile's marked issue, never the closed one taken back.
+    const ledger = await ledgerOf($, rec, f, { repo, gh, title, label, stepTimeoutMs: c.stepTimeoutMs, ...mine, isAdvancing: true })
     if (ledger.kind !== 'found') continue
+    const advanced = ledger.fileAttempt !== undefined ? { fileAttempt: ledger.fileAttempt } : {}
     const n = ledger.issue.number
     const isMoving = saved?.repo !== repo || saved.number !== n
     const edit = isMoving ? await relabelFound(ghWrite, repo, ledger.issue, label, title) : undefined
@@ -4376,7 +4379,7 @@ async function settleOwed($: Engine, given: LifecycleRecord): Promise<LifecycleR
           : labelError === undefined
             ? { followUp: `#${n}`, followUpLabel: peak, followUpLabelError: undefined }
             : { followUp: `#${n}`, followUpLabel: undefined, followUpLabelError: labelError }
-        return { ...one, ...moved, isFilingOwed: ledger.isOwed ? true : undefined }
+        return { ...one, ...moved, ...advanced, isFilingOwed: ledger.isOwed ? true : undefined }
       })
       return { ...latest, findings, log: [...(latest.log ?? []), { at, kind: 'check' as const, text: text.slice(0, 300) }].slice(-LOG_CAP) }
     }, { isPure: true })
