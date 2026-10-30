@@ -28,9 +28,18 @@ export type Check = { name: string; status: string; conclusion: string | null }
 
 /**
  * A repository's `.github/pr-gate.json` roster: `reviewers` are trusted and waited for, `checks` are waited for, `trusted` are
- * trusted only (#14): their feedback is triaged, but collection never waits on them.
+ * trusted only (#14): their feedback is triaged, but collection never waits on them. `sharedStore` opts the repo into the relay
+ * (#29 Part B): its https URL and the Cloudflare Access audience in front of it.
  */
-export type Roster = { reviewers: string[]; checks: string[]; requestReview: string[]; trusted: string[]; quietMinutes?: number; waitCapMinutes?: number }
+export type Roster = {
+  reviewers: string[]
+  checks: string[]
+  requestReview: string[]
+  trusted: string[]
+  quietMinutes?: number
+  waitCapMinutes?: number
+  sharedStore?: { url: string; aud: string }
+}
 
 type Row = Record<string, unknown>
 
@@ -177,6 +186,15 @@ export function readStatuses(text: string): Check[] {
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((one): one is string => typeof one === 'string' && one !== '') : [])
 
 /** `.github/pr-gate.json`: who and what to wait for. A file that is not a JSON object is ignored. */
+/** The relay a repo names: an https URL and a non-empty Access audience, or none. A credential never rides plain http. */
+const sharedStoreOf = (value: unknown): Roster['sharedStore'] => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const url = str((value as Row).url)
+  const aud = str((value as Row).aud)
+  if (url === undefined || aud === undefined || !URL.canParse(url) || new URL(url).protocol !== 'https:') return undefined
+  return { url, aud }
+}
+
 export function readRoster(text: string): Roster | undefined {
   if (text.trim() === '') return undefined
   try {
@@ -191,6 +209,7 @@ export function readRoster(text: string): Roster | undefined {
     }
     const quietMinutes = minutes(r.quietMinutes)
     const waitCapMinutes = minutes(r.waitCapMinutes)
+    const sharedStore = sharedStoreOf(r.sharedStore)
     return {
       reviewers: strings(r.reviewers),
       checks: strings(r.checks),
@@ -198,6 +217,7 @@ export function readRoster(text: string): Roster | undefined {
       trusted: strings(r.trusted),
       ...(quietMinutes === undefined ? {} : { quietMinutes }),
       ...(waitCapMinutes === undefined ? {} : { waitCapMinutes }),
+      ...(sharedStore === undefined ? {} : { sharedStore }),
     }
   } catch {
     return undefined

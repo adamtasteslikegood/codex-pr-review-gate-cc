@@ -120,6 +120,8 @@ import {
 } from './lifecycle'
 import type { Allowances, MergeKind, Next, TicketItem, TriageClass, WithId } from './lifecycle'
 import { isHeldByOther, liveRecords, LOG_CAP, loadRecord, logEvent, ownerOf, recordKey, setOwner, transact, updateRecord } from './store'
+// `.github/pr-gate.json` as the base has it (R67): in relay.ts, which reads `sharedStore` from it and must not import this file.
+import { baseFileOf } from './relay'
 
 export const PANE = 'pr-lifecycle'
 const RUN = { plugin: 'pr-lifecycle', key: 'run' } as const
@@ -1715,18 +1717,6 @@ async function guessCover($: Engine, rec: LifecycleRecord, roster: Roster, arriv
     }
   }
   return cover.map(one => (counted.has(one.id) ? { ...one, head } : one))
-}
-
-/**
- * `.github/pr-gate.json` as the base has it (R67, `refs/remotes/origin/<base>`), never as the branch's own HEAD has it: a PR must not
- * loosen its own gate, add a bot to the trusted roster (R1-8) or lower its allowance. Read from the ref the last fetch left, with no
- * fetch of its own; a base with no such file, or no fetched ref, has none.
- */
-async function baseFileOf($: Engine, root: string, base: string): Promise<string | undefined> {
-  if (base === '') return undefined
-  // The remote-tracking ref by its full name (M4): a local tag or branch called origin/<base> would win over a bare origin/<base>.
-  const file = await git($, root, ['show', `refs/remotes/origin/${base}:.github/pr-gate.json`])
-  return file.isOk ? file.out : undefined
 }
 
 /** The round settings for a branch to `base` (R67): the base's file over the plugin options, over the defaults. */
