@@ -46,6 +46,11 @@ export type Finding = {
   url?: string
   severity: Severity
   isSecurity?: boolean
+  /**
+   * Set on a security finding as the shared store keeps it (R107): its text stays with the checkout that found it, and the relay holds a
+   * placeholder title. `restore` brings the text back from this checkout's own mirror of the same lifecycle.
+   */
+  ref?: 'local'
   /** GitHub: the reviewer's own words ('tag') or a guess from them ('hint', R84). */
   severitySource?: 'tag' | 'hint'
   /**
@@ -285,6 +290,11 @@ export type LifecycleRecord = {
    * another, so its findings of the same ids never take this one's issues.
    */
   lifecycleId?: string
+  /**
+   * The shared store's revision this local record mirrors (#29 Part B, R102): set by each commit to the relay and kept through a
+   * fallback. Absent on a record the relay has never held.
+   */
+  relayRev?: number
   /** The pre-PR verdict, and the head it is for. */
   preStatus?: RunStatus
   preHead?: string

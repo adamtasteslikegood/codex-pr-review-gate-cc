@@ -1020,7 +1020,7 @@ export async function finish($: Engine, id: string, status: RunStatus, message: 
       passedEffort: isBelow ? passedEffort : undefined,
       ...(ended.lifecycle === 'post' && (status === 'error' || status === 'stopped') ? { postStatus: status } : {}),
     }
-  })
+  }, { isPure: true })
   $.ui.status(undefined)
   $.ui.toast(`pr-gate ${status}: ${message}`.slice(0, 300))
   // A post-PR run that ends leaves a record with a PR and no run: the merge watcher reads its state from now on (spec §5.13.3).
@@ -1250,7 +1250,7 @@ async function closeOnce($: Engine, root: string, branch: string, pr: number | u
       if (why !== '') return { ...latest, findings, postStatus: 'blocked', message: why.slice(0, 1000), log }
       // A check that failed before and passes now: its block and message go, so the archive does not keep a stale failure.
       return { ...latest, findings, log, ...(isMergeBlocked(latest) ? { postStatus: undefined, message: undefined } : {}) }
-    })
+    }, { isPure: true })
     if (isGone || saved === undefined) return replaced
     const key = recordKey(root, branch)
     if (why !== '') {
@@ -1662,6 +1662,7 @@ export async function noteArrival(
   if (next !== stored) {
     await updateRecord($, root, branch, one =>
       one.headArrival === undefined || one.headArrival.head === read?.head || one.headArrival.head === head ? { ...one, headArrival: next } : one,
+      { isPure: true },
     )
   }
   return next
@@ -1713,6 +1714,7 @@ async function guessCover($: Engine, rec: LifecycleRecord, roster: Roster, arriv
       const dated = committedAt === undefined ? {} : { committedAt }
       await updateRecord($, rec.root, rec.branch, one =>
         one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, asked: [...asked], counted: [...counted], ...dated } },
+        { isPure: true },
       )
     }
   }
@@ -1865,7 +1867,7 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
     self = who.exitCode === 0 ? who.stdout.trim() : ''
     if (self === '') return fail('gh did not say which gh login this machine uses, so its own replies cannot be told from reviews; check gh auth login')
     const found = self
-    await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }))
+    await updateRecord($, rec.root, rec.branch, one => ({ ...one, self: found }), { isPure: true })
   }
   const pr = await $.process.run(['gh', 'pr', 'view', String(rec.pr), '--json', 'headRefOid,state,headRefName,headRepository,headRepositoryOwner,isCrossRepository'], {
     cwd: rec.root,
@@ -1901,7 +1903,9 @@ async function fetchFeedback($: Engine, rec: LifecycleRecord): Promise<Fetched> 
   }
   // Where the head branch lives, kept for the steps that read push times without asking gh for the PR (#24).
   const place = { ...rec.headPlace, ...where }
-  if (JSON.stringify(place) !== JSON.stringify(rec.headPlace ?? {})) await updateRecord($, rec.root, rec.branch, one => ({ ...one, headPlace: place }))
+  if (JSON.stringify(place) !== JSON.stringify(rec.headPlace ?? {})) {
+    await updateRecord($, rec.root, rec.branch, one => ({ ...one, headPlace: place }), { isPure: true })
+  }
   const at = `repos/${rec.slug}`
   const [reviews, inline, comments, checks, requests, status] = await Promise.all([
     ghJson($, rec.root, `${at}/pulls/${rec.pr}/reviews`),
@@ -2065,6 +2069,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
     )
     await updateRecord($, run.root, run.branch, one =>
       one.headArrival?.head !== got.prHead ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } },
+      { isPure: true },
     )
     return
   }
@@ -2090,6 +2095,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
   // This poll saw the head on the PR: a later head reached it after now, the lower bound of a guess about it (#24).
   await updateRecord($, run.root, run.branch, one =>
     one.headArrival?.head !== got.prHead ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } },
+    { isPure: true },
   )
   const roster = await rosterOf($, run.root, run.base)
   let cover = got.cover ?? got.feedback
@@ -2139,7 +2145,7 @@ async function pollOnce($: Engine, seen: Run): Promise<void> {
         if (was !== undefined && was.head !== got.prHead) return one
         const kept = { ...(was?.since === undefined ? {} : { since: was.since }), ...(was?.committedAt === undefined ? {} : { committedAt: was.committedAt }) }
         return { ...one, headArrival: { head: got.prHead, at, isPushTime: true, ...kept, seenAt: now } }
-      })
+      }, { isPure: true })
       await patch($, run.id, one => (one.collect === undefined ? one : { ...one, collect: { ...one.collect, headAt: at } }))
       done = judge()
     }
@@ -2198,7 +2204,13 @@ async function closeCollect(
 async function rollOver($: Engine, run: Run, startedAt: number, head: string, now: number): Promise<void> {
   const from = run.roundStartHead
   // This poll saw the new head on the PR: a later head reached it after now (#24).
-  await updateRecord($, run.root, run.branch, one => (one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } }))
+  await updateRecord(
+    $,
+    run.root,
+    run.branch,
+    one => (one.headArrival?.head !== head ? one : { ...one, headArrival: { ...one.headArrival, seenAt: now } }),
+    { isPure: true },
+  )
   // Judged from the head the round had (R56). Placing a finding at a head is idempotent, so a stand-down below harms nothing.
   await onNewHead($, run, from, head, now)
   // Only the collection this poll read, still collecting: a turn begun, a stop or a reset meanwhile owns the run.
@@ -2312,7 +2324,7 @@ async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCo
   // Replies this machine already posted in a thread count as replies (R35), whatever an earlier turn reported.
   const own = got.ownReplies ?? {}
   const rec = Object.keys(own).some(key => prior.replies[key] === undefined)
-    ? ((await updateRecord($, run.root, run.branch, one => ({ ...one, replies: { ...own, ...one.replies } }))) ?? prior)
+    ? ((await updateRecord($, run.root, run.branch, one => ({ ...one, replies: { ...own, ...one.replies } }), { isPure: true })) ?? prior)
     : prior
   const handed = new Set(run.handed ?? [])
   const items = got.feedback.filter(one => one.isFinding && !rec.processed.includes(one.id) && !(isMidCollect && handed.has(one.id)))
@@ -2322,7 +2334,8 @@ async function beginTriage($: Engine, id: string, isFromCommand = false, isMidCo
   const settled = got.feedback.filter(one => !one.isFinding && one.body.trim() !== '' && !rec.processed.includes(one.id))
   for (const one of settled) await logEvent($, run.root, run.branch, 'approval', `${one.reviewer}: ${one.body.split('\n')[0]?.slice(0, 120) ?? ''}`)
   if (settled.length > 0) {
-    await updateRecord($, run.root, run.branch, one => ({ ...one, processed: [...new Set([...one.processed, ...settled.map(each => each.id)])] }))
+    const processed = (one: LifecycleRecord): string[] => [...new Set([...one.processed, ...settled.map(each => each.id)])]
+    await updateRecord($, run.root, run.branch, one => ({ ...one, processed: processed(one) }), { isPure: true })
   }
   const ledger = mergeFindings(rec.findings, run.findings)
   // Changed files are read from a finding's own head (or the previous post round's start) to this round's head (R33).
@@ -2619,7 +2632,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
         ),
       },
     }
-  })
+  }, { isPure: true })
   if (isReset) return
   if (rec === undefined) {
     // The record went while the answers were read (A4): stop with the reason, never leave a settling turn to freeze collection. Only
@@ -2732,7 +2745,7 @@ async function afterTriage($: Engine, run: Run): Promise<void> {
     const answeredNow = new Set(said.map(each => each.id))
     const exempt = (findings: readonly Finding[]): Finding[] =>
       findings.map(f => (run.isAnswer !== true && answeredNow.has(f.id) && f.status !== 'reported-fixed' ? { ...f, needsRecheck: undefined } : f))
-    await updateRecord($, run.root, run.branch, one => ({ ...one, findings: exempt(one.findings) }))
+    await updateRecord($, run.root, run.branch, one => ({ ...one, findings: exempt(one.findings) }), { isPure: true })
     await patch($, run.id, one => ({ ...one, findings: exempt(one.findings) }))
   }
   const ended = await getRun($)
@@ -2820,7 +2833,7 @@ async function holdPost($: Engine, run: Run, why: string): Promise<void> {
   const nextStep = `run /pr-gate resume to have Codex ${what}, or fix ${ids} and push`
   await noteAttempt($, run, why)
   await finish($, run.id, 'blocked', `${why}. Next: ${nextStep}`)
-  const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }))
+  const saved = await updateRecord($, run.root, run.branch, one => ({ ...one, postStatus: 'blocked', message: why }), { isPure: true })
   if (saved === undefined) return
   // The whole standing, CI included (R79), as the report a round ends with lists it.
   const pr = saved.pr === undefined ? undefined : { number: saved.pr, baseRefName: saved.base, headRefOid: saved.head }
@@ -3294,6 +3307,7 @@ async function noteAttempt($: Engine, run: Run, why: string): Promise<void> {
         endedAt: now,
       }),
     ),
+    { isPure: true },
   )
 }
 
@@ -3365,7 +3379,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
   }
   // A ready record the controller no longer finds ready is back in post-PR review.
   if (next.kind !== 'ready' && rec.phase === 'ready') {
-    await updateRecord($, root, branch, one => (one.phase === 'ready' && decideNext(one).kind !== 'ready' ? { ...one, phase: 'post' } : one))
+    await updateRecord($, root, branch, one => (one.phase === 'ready' && decideNext(one).kind !== 'ready' ? { ...one, phase: 'post' } : one), { isPure: true })
   }
   const run = await getRun($)
   const id = run !== null && run.status === 'running' ? run.id : undefined
@@ -3374,7 +3388,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     return
   }
   if (next.kind === 'open-pr') {
-    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, preStatus: next.status, preHead: one.head })))
+    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, preStatus: next.status, preHead: one.head })), { isPure: true })
     if (isStale) return advance($, root, branch, isResume, pass)
     const seen = saved ?? rec
     const hasSecurity = hasSecurityBlocker(seen)
@@ -3413,7 +3427,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     }
     // Read before the currency check below, so no await sits between that check and the say.
     const method = (await configFor($, rec.root, rec.base)).config.mergeMethod
-    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })))
+    const saved = await updateRecord($, root, branch, ifStill(one => ({ ...one, phase: 'ready', postStatus: undefined, message: undefined })), { isPure: true })
     if (isStale) return advance($, root, branch, isResume, pass)
     const at = (saved ?? rec).head.slice(0, 7)
     if (id !== undefined) await finish($, id, 'passed', `Lifecycle review complete at ${at}: no review finding holds the merge.`)
@@ -3446,6 +3460,7 @@ export async function advance($: Engine, root: string, branch: string, isResume 
     root,
     branch,
     ifStill(one => (isPre ? { ...one, preStatus: runStatus, preHead: one.head, message: next.why } : { ...one, postStatus: next.kind, message: next.why })),
+    { isPure: true },
   )
   if (isStale) return advance($, root, branch, isResume, pass)
   if (id !== undefined) await finish($, id, runStatus, `${next.why}. Next: ${next.nextStep}`)
@@ -3653,7 +3668,7 @@ async function markSent(
       ...latest,
       findings: latest.findings.map(f => (f.id !== id ? f : { ...f, ...(f[field] === undefined ? { [field]: text } : {}), ...sent, ...summaries(f) })),
     }
-  })
+  }, { isPure: true })
   return saved === undefined || isGone ? 'gone' : isSecret ? 'secret' : 'sent'
 }
 
@@ -3665,10 +3680,12 @@ async function withLifecycleId($: Engine, rec: LifecycleRecord): Promise<WithId 
   if (rec.lifecycleId !== undefined) return { ...rec, lifecycleId: rec.lifecycleId }
   let id: string | undefined
   await updateRecord($, rec.root, rec.branch, latest => {
+    // Decided afresh on each run: a pure change runs again after a stale commit (#29 Part B).
+    id = undefined
     if (latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)) return latest
     id = latest.lifecycleId ?? newLifecycleId()
     return latest.lifecycleId === undefined ? { ...latest, lifecycleId: id } : latest
-  })
+  }, { isPure: true })
   return id === undefined ? undefined : { ...rec, lifecycleId: id }
 }
 
@@ -3696,6 +3713,8 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     let text: string | undefined
     // Decided again under the lock: two passes at once never add more than GATE_ROUNDS between them.
     const saved = await updateRecord($, rec.root, rec.branch, latest => {
+      // Decided afresh on each run: a pure change runs again after a stale commit (#29 Part B).
+      text = undefined
       isGone = isMoved(latest)
       if (isGone || isWaived(latest)) return latest
       const grant = gateGrant(latest, now)
@@ -3704,7 +3723,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       const late = lateBlockers(latest).map(one => one.id)
       text = `the gate added a round for ${late.join(', ')}, first raised after the allowance was spent (${n} of ${GATE_ROUNDS}): the PR's scope may be too wide`
       return { ...latest, grants: [...latest.grants, grant], log: [...(latest.log ?? []), { at: now, kind: 'check' as const, text }].slice(-LOG_CAP) }
-    })
+    }, { isPure: true })
     if (isGone) return undefined
     if (text !== undefined) $.ui.toast(`pr-gate: ${text}.`)
     return saved ?? rec
@@ -3749,7 +3768,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
         return { ...f, followUp: got.followUp, followUpLabel: got.peak, followUpLabelError: undefined, issueError: undefined, isIssueSent: undefined }
       })
       return { ...latest, findings, log: [...(latest.log ?? []), line].slice(-LOG_CAP) }
-    })
+    }, { isPure: true })
     return next !== undefined && !isGone
   }
   for (const item of plan.items) {
@@ -3840,15 +3859,18 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
     // Saved before acli files it (wave 2b gate R1-10): a crash before the answer is saved makes the next pass search Jira first.
     if ((await markSent($, rec, t.id, 'jiraError', TICKET_SENT, t.title.slice(0, SUMMARY_MAX))) === 'gone') return undefined
     const got = await fileTicket($, rec.root, project, t, rec.pr, rec.slug)
-    let text =
+    const said =
       got.error === undefined
         ? `${t.id}: ${got.isFound ? `found Jira ${got.key}, filed by an answer acli lost` : `filed Jira ${got.key}`} (security, severity-${t.peak})`
         : `${t.id}: could not file its Jira ticket in ${project}: ${got.error}`
+    let text = said
     const at = await $.clock.now()
     let isGone = false
     let isFirstFailure = false
     // Saved as soon as acli answers, so a ticket Jira has is never filed twice; a ticket another pass saved meanwhile is kept.
     const next = await updateRecord($, rec.root, rec.branch, latest => {
+      // Decided afresh on each run: a pure change runs again after a stale commit (#29 Part B).
+      text = said
       isGone = latest.phase === 'archived' || (latest.generation ?? 0) !== (rec.generation ?? 0)
       if (isGone) return latest
       const findings = latest.findings.map((f): Finding => {
@@ -3863,7 +3885,7 @@ async function fileOnce($: Engine, given: LifecycleRecord, merged: MergeKind | u
       isFirstFailure = got.error !== undefined && latest.isJiraLoginSaid !== true
       const log = [...(latest.log ?? []), { at, kind: 'check' as const, text: text.slice(0, 300) }].slice(-LOG_CAP)
       return { ...latest, findings, log, ...(isFirstFailure ? { isJiraLoginSaid: true } : {}) }
-    })
+    }, { isPure: true })
     if (next === undefined || isGone) return undefined
     if (isFirstFailure) {
       $.ui.toast(
@@ -4036,7 +4058,7 @@ export async function checkIssuesAfterMerge($: Engine, given: LifecycleRecord): 
         jiraTicket: next.jiraTicket, jiraError: next.jiraError, jiraSummaries: next.jiraSummaries,
       })
       return { ...latest, findings }
-    })
+    }, { isPure: true })
     if (saved === undefined) isGone = true
     if (!isGone && !isChanged && !isSecret) touched.set(next.id, next)
     return isGone
@@ -4406,7 +4428,7 @@ async function afterReview($: Engine, run: Run): Promise<void> {
     return
   }
   // Codex's ruling goes into the record's ledger at once, not only when the round ends.
-  const rec = await updateRecord($, run.root, run.branch, one => ({ ...one, findings: mergeFindings(one.findings, after.findings) }))
+  const rec = await updateRecord($, run.root, run.branch, one => ({ ...one, findings: mergeFindings(one.findings, after.findings) }), { isPure: true })
   if (rec === undefined) return
   // Every finding is answered inside its round, blocking and advisory alike (R17): fixing costs no review round.
   // A rebuttal or fix Codex held is open again, and goes back to the fixer with the round's new findings.
@@ -4503,7 +4525,7 @@ async function afterFix($: Engine, run: Run): Promise<void> {
     ),
   }))
   if (after === null) return
-  if (replyIdsOf(answer).length > 0) await updateRecord($, run.root, run.branch, one => ({ ...one, ...withOwnReplies(one, answer) }))
+  if (replyIdsOf(answer).length > 0) await updateRecord($, run.root, run.branch, one => ({ ...one, ...withOwnReplies(one, answer) }), { isPure: true })
   // A finding of this round left without an answer gets the fix step once more (no round consumed); then it stays open.
   // One the person waived while the round ran is not asked about again.
   const waived = waivedIds((await loadRecord($, run.root, run.branch)) ?? { waivers: [] })

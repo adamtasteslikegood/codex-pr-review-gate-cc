@@ -556,7 +556,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
     if (since.isOk && files.length > 0 && classify(files, 0, now.highRisk).tier === 'trivial') {
-      await updateRecord($, root, branch, one => ({ ...one, preHead: head }))
+      await updateRecord($, root, branch, one => ({ ...one, preHead: head }), { isPure: true })
       return undefined
     }
   }
@@ -817,7 +817,7 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   const pr = await openPrOf($, root, branch)
   if (pr === undefined) return
   const who = await identityOf($, root)
-  const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }))
+  const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }), { isPure: true })
   // When the head reached the PR (#24): GitHub's push time, else now.
   if (saved !== undefined) await noteArrival($, root, branch, pr.headRefOid, await $.clock.now())
   await markOpened($)
@@ -1065,7 +1065,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (!Number.isInteger(n) || n < 1 || n > 5 || reason === '') return `Say how many and why: /${COMMAND} allow <1-5> <reason>`
     if (rec === undefined) return none
     await take()
-    await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
+    await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }), { isPure: true })
     await tellAgent($, { root, branch }, `allowed ${n} more round${n === 1 ? '' : 's'}: ${reason}`,
       'the gate continues the review. Leave the branch alone until it sends you what needs an answer.')
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
@@ -1105,7 +1105,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       if (refusal !== undefined) return one
       // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
       return { ...one, waivers: [...one.waivers, { scope: 'finding' as const, findingId: scope, head: one.head, reason, by: origin, at: now }] }
-    })
+    }, { isPure: true })
     if (refusal !== undefined) return refusal
     await take()
     // A PR merged before the gate finished, blocked on this finding or on an issue it could not confirm (spec §5.12, §5.13.2): the
@@ -1207,7 +1207,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
           : one
       const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
-    })
+    }, { isPure: true })
     if (refusal !== undefined || waived === undefined) return refusal ?? `/${COMMAND}: no pre waiver was recorded.`
     await take()
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
@@ -1254,7 +1254,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         }
         : one
     return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
-  })
+  }, { isPure: true })
   // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
@@ -1414,7 +1414,7 @@ export const register: Register = (on, options) => {
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
         // One still open is left as it is, unless its review was under way or stopped on an error.
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
-          if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
+          if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }), { isPure: true })
           await holdingPrompts($, () => advance($, top.out, branch))
         }
       } catch {
