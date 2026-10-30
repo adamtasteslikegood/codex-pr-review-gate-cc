@@ -148,6 +148,8 @@ export class LifecycleObject {
           const id = (body.record as { lifecycleId?: unknown } | null | undefined)?.lifecycleId
           if (typeof id !== 'string') return reply(400, { error: 'a fresh start needs a record with a lifecycleId' })
           if (id === tomb!.lifecycleId) return frozen
+          // Until moveDone, the tombstone holds the only copy of a record the PR object may not have yet.
+          if (tomb!.record !== undefined) return reply(409, { error: 'the move is not finished', movedTo: tomb!.movedTo, lifecycleId: tomb!.lifecycleId })
         }
         // A commit names the revision it read: a stale one is refused with what is there now, never merged blindly.
         if (body.rev !== s.rev) return reply(409, { error: 'stale revision', rev: s.rev, record: s.record })

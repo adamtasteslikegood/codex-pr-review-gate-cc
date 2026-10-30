@@ -17,7 +17,8 @@ export const isBranchName = (name: string): boolean => {
   if (bytes < 1 || bytes > 255) return false
   if (/[\u0000-\u0020\u007f~^:?*[\\]/.test(name)) return false
   if (name.includes('..') || name.includes('@{') || name.includes('//')) return false
-  return !/^[-/]|[/.]$|\.lock$/.test(name)
+  if (name === '@') return false
+  return !/^[-/]|[/.]$|\.lock$/.test(name) && name.split('/').every(part => !part.startsWith('.') && !part.endsWith('.lock'))
 }
 
 const refuse = (status: number, text: string): Response => new Response(text, { status })

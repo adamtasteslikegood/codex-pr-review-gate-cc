@@ -57,7 +57,7 @@ test('awkward names round-trip', async () => {
 })
 
 test('a name git would refuse gets 404', async () => {
-  for (const name of ['a..b', '-x', 'x.lock', 'x/', 'a%20b', 'a~b', 'a%5Cb', 'a@%7Bb', 'a%2F%2Fb', 'x.', '%2Fx', 'a%00b', 'a:b', 'a%3Fb', 'a*b', 'a%5Bb', 'a^b', '']) {
+  for (const name of ['a..b', '-x', 'x.lock', 'x/', 'a%20b', 'a~b', 'a%5Cb', 'a@%7Bb', 'a%2F%2Fb', 'x.', '@', '.x', 'a%2F.b', 'a.lock%2Fb', '%2Fx', 'a%00b', 'a:b', 'a%3Fb', 'a*b', 'a%5Bb', 'a^b', '']) {
     assert.equal((await read(url(name))).status, 404, `branch ${JSON.stringify(name)}`)
   }
   assert.equal((await read(url('%E0%A4%A'))).status, 404, 'a bad percent escape')
@@ -148,8 +148,11 @@ test('a frozen branch takes no beat', async () => {
   assert.equal((await call(adam, { op: 'beat', secret: SECRET }, path)).status, 410)
 })
 
+const moveDone = (path: string, lifecycleId = 'L1') => call(adam, { op: 'moveDone', lifecycleId }, path)
+
 test('a fresh start over a tombstone', async () => {
   const path = await frozen('fresh-1')
+  assert.equal((await moveDone(path)).status, 200)
   const { rev } = (await read(path)).json as { rev: number }
   // A stale revision is still refused.
   assert.equal((await call(adam, { op: 'commit', rev: rev - 1, record: { lifecycleId: 'L2' }, isFresh: true }, path)).status, 409)
@@ -159,19 +162,38 @@ test('a fresh start over a tombstone', async () => {
   assert.deepEqual(after.record, { lifecycleId: 'L2' })
   // Live again: it can be claimed.
   assert.equal((await claim(path)).status, 200)
-  assert.equal((await call(adam, { op: 'moveDone', lifecycleId: 'L2' }, path)).status, 409)
+  assert.equal((await moveDone(path, 'L2')).status, 409)
+})
+
+test('a fresh start before moveDone is 409 and keeps the frozen record', async () => {
+  const path = await frozen('fresh-4')
+  const before = (await read(path)).json as { rev: number; record: unknown }
+  const res = await call(adam, { op: 'commit', rev: before.rev, record: { lifecycleId: 'L2' }, isFresh: true }, path)
+  assert.equal(res.status, 409)
+  assert.deepEqual(res.json, { error: 'the move is not finished', movedTo: 7, lifecycleId: 'L1' })
+  const after = (await read(path)).json
+  assert.deepEqual(after.record, { movedTo: 7, lifecycleId: 'L1', record: { lifecycleId: 'L1', n: 1 } })
+  assert.equal(after.rev, before.rev)
 })
 
 test('a fresh start leaves the PR object alone', async () => {
-  const prPath = '/v1/owner/repo/41'
-  const before = (await read(prPath)).json
   const path = await frozen('fresh-2')
+  // Step 2 of the move: publish the record to PR 7, then finish.
+  const pr = '/v1/owner/repo/7'
+  assert.equal((await claim(pr)).status, 200)
+  const published = await call(adam, { op: 'commit', rev: 0, record: { lifecycleId: 'L1', n: 1 }, from: '@fresh-2', secret: SECRET }, pr)
+  assert.equal(published.status, 200)
+  assert.equal((await moveDone(path)).status, 200)
+  const before = (await read(pr)).json
   const { rev } = (await read(path)).json as { rev: number }
   assert.equal((await call(adam, { op: 'commit', rev, record: { lifecycleId: 'L2' }, isFresh: true }, path)).status, 200)
-  assert.deepEqual((await read(prPath)).json, before)
+  const after = (await read(pr)).json
+  assert.deepEqual(after.record, { lifecycleId: 'L1', n: 1 })
+  assert.equal(after.rev, 1)
+  assert.deepEqual(after, before)
 })
 
-test('isFresh with the tombstone own lifecycleId is 410', async () => {
+test("isFresh with the tombstone's own lifecycleId is 410", async () => {
   const path = await frozen('fresh-3')
   const { rev } = (await read(path)).json as { rev: number }
   const res = await call(adam, { op: 'commit', rev, record: { lifecycleId: 'L1' }, isFresh: true }, path)
