@@ -5,8 +5,6 @@ export type Env = {
   ACCESS_TEAM_DOMAIN: string
   /** The Access application's AUD tag. */
   ACCESS_AUD: string
-  /** The v1 grants, as JSON: `[{ "principal", "repo": "owner/name", "preset": "read" | "operate" }]`. */
-  GRANTS?: string
   /** Comma-separated people who hold admin. */
   ADMINS?: string
   /** How long a lease lasts without a beat, in ms; R74's 2 minutes when unset. */
@@ -14,6 +12,8 @@ export type Env = {
   /** How old a filing claim must be before the lease holder may adopt it, in ms; 30 minutes when unset. */
   FILING_STALE_MS?: string
   LIFECYCLE: DurableObjectNamespace
+  /** The one GrantStore object (R104): who may read or operate on which repo. */
+  GRANTS: DurableObjectNamespace
 }
 
 export interface DurableObjectId {

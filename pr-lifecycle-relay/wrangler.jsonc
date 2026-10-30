@@ -3,7 +3,15 @@
   "name": "pr-lifecycle-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
-  "durable_objects": { "bindings": [{ "name": "LIFECYCLE", "class_name": "LifecycleObject" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "LIFECYCLE", "class_name": "LifecycleObject" },
+      { "name": "GRANTS", "class_name": "GrantStore" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] },
+    { "tag": "v2", "new_sqlite_classes": ["GrantStore"] }
+  ],
   "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>" }
 }

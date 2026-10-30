@@ -2,7 +2,7 @@
 // (#29 Part B). A Durable Object runs one request at a time and every request here touches only its own storage, so each operation is
 // atomic: the grant, the lease and the revision are checked in the same step that writes.
 
-import { isAdmin, presetOf, type Principal } from './auth.ts'
+import { isAdmin, type Preset, type Principal } from './auth.ts'
 import type { DurableObjectState, Env } from './types.ts'
 
 /**
@@ -95,7 +95,9 @@ export class LifecycleObject {
     const op = body.op ?? ''
     const need = NEEDS[op]
     if (need === undefined) return reply(400, { error: `unknown op ${op}` })
-    const preset = presetOf(this.env, who, repo)
+    // The Worker always overwrites this header with the GrantStore's answer; the object trusts it only for that reason.
+    const given = request.headers.get('x-relay-preset')
+    const preset: Preset | undefined = given === 'read' || given === 'operate' ? given : undefined
     const isAllowed = need === 'admin' ? isAdmin(this.env, who) : need === 'read' ? preset !== undefined : preset === 'operate'
     if (!isAllowed) return reply(403, { error: `${who.id} may not ${op} on ${repo}` })
     const now = Date.now()
