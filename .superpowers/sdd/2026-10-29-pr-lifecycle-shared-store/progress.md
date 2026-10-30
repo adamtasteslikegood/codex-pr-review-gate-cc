@@ -123,3 +123,11 @@ Task 9: fix round 1/5 dispatched
 Task 9: fix round 1/5 (6 addressed incl. a real closed-issue re-adopt fixed, 0 open; commit a79be38)
 Task 9: minor (deferred): markSent exits (~4048 gone/secret) leave a post claim with no log line; the now-security abandoned-claim path has no assertion; a credential revocation drops every owed entry incl. a moveDone (payOwed runs only after a call that landed, so low risk); a deleted/transferred issue counts as closed and advances the attempt (matches the merge check)
 Task 9: complete (commits 42ae5bd..a79be38, review clean)
+Task 10: dispatched (base d09a411)
+Task 10: implementer DONE (commit 5902b7e after trailer fix; 805 plugin tests)
+Task 10: review — Important: (1) fresh-checkout discovery hardcodes dev,main instead of config.bases (a repo with other bases is never discovered); (2) the stuck listing skips findings with no followUp/issueError, possibly hiding early claims; (3) stuck probe: serial calls, stacks 5 s timeouts on down, can flush the owed queue from a read-only command
+Task 10: Ruling: stuck filings list known findings only (no relay list op this wave), labelled "(known findings only)", and the probe stops at the first down with the unreachable note — §7.2 asks only that a stuck claim show in the log — cost if wrong: a dead second checkout's claim stays unlisted until an admin looks
+Task 10: fix round 1/5 dispatched
+Task 10: fix round 1/5 (2 Important + ruling + minors addressed, 0 open; commit 3a72327)
+Task 10: minor (deferred): the unreachable line also shows when sharedOf resolves local (no credential/slug); the log's stuck-section catch is broad; the slug memo lives for the process
+Task 10: complete (commits d09a411..3a72327, review clean)
