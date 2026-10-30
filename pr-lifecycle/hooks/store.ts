@@ -52,7 +52,11 @@ export async function loadRecord($: Engine, root: string, branch: string): Promi
  * Every live lifecycle record under the repository's `root` (spec §5.13.4), whichever branch is checked out: the keys
  * `lifecycle:<root>:<branch>`, never an owner or an archive key (a branch name holds no ':'), and never an archived seed.
  */
-export async function liveRecords($: Engine, root: string): Promise<LifecycleRecord[]> {
+export async function liveRecords(
+  $: Engine,
+  root: string,
+  bases: readonly string[] = FRESH_BASES,
+): Promise<LifecycleRecord[]> {
   const prefix = recordKey(root, '')
   const keys = (await $.store.keys()).filter(key => key.startsWith(prefix) && key.length > prefix.length && !key.slice(prefix.length).includes(':'))
   const found: LifecycleRecord[] = []
@@ -62,25 +66,26 @@ export async function liveRecords($: Engine, root: string): Promise<LifecycleRec
   }
   // A repo on the relay: the relay's index says which lifecycles are live, every checkout's (R106). A record of it there says so; so does
   // a base that opts in, with a credential, for a fresh checkout that holds no record yet (spec §9).
-  const shared = await sharedForRoot($, root, found)
+  const shared = await sharedForRoot($, root, found, bases)
   return shared === undefined ? found : relayRecords($, root, found, shared)
 }
 
-/** The bases a checkout with no record is asked about (the default `bases` of the settings): where it looks for a `sharedStore`. */
-const FRESH_BASES = ['dev', 'main']
+/** The default `bases` option: where a checkout with no record looks for a `sharedStore` when the caller names no bases. */
+const FRESH_BASES: readonly string[] = ['dev', 'main']
 
 /**
  * The relay and slug the root's live records are listed from: the first record already on the relay names them; otherwise the first
- * base (those of the records, then `FRESH_BASES`) that opts in, with a credential and an `origin` slug. Undefined for a repo that stays
+ * base that opts in (the records' bases, then the configured `bases` in their order: the first that opts in wins), with a credential
+ * and an `origin` slug. Undefined for a repo that stays
  * local. The opt-in is the memoised one (`optInOf`), so a watcher's tick doesn't read the base's file each time.
  */
-async function sharedForRoot($: Engine, root: string, locals: LifecycleRecord[]): Promise<Pick<Shared, 'relay' | 'slug'> | undefined> {
+async function sharedForRoot($: Engine, root: string, locals: LifecycleRecord[], bases: readonly string[]): Promise<Pick<Shared, 'relay' | 'slug'> | undefined> {
   for (const one of locals.filter(rec => rec.relayRev !== undefined)) {
     const found = await sharedOf($, root, one)
     if (!('local' in found)) return found
   }
   try {
-    for (const base of new Set([...locals.map(one => one.base), ...FRESH_BASES])) {
+    for (const base of new Set([...locals.map(one => one.base), ...bases])) {
       const relay = await optInOf($, root, base)
       if ('local' in relay) continue
       const slug = locals.find(one => one.slug !== undefined)?.slug ?? (await originSlug($, root))
@@ -92,9 +97,16 @@ async function sharedForRoot($: Engine, root: string, locals: LifecycleRecord[])
   return undefined
 }
 
+/** The slug of each root's `origin`, read once per process: the watcher asks every tick. A root with no usable origin is asked again. */
+const slugs = new Map<string, string>()
+
 async function originSlug($: Engine, root: string): Promise<string | undefined> {
+  const kept = slugs.get(root)
+  if (kept !== undefined) return kept
   const ran = await $.process.run(['git', 'remote', 'get-url', 'origin'], { cwd: root, timeoutMs: 30_000 })
-  return ran.exitCode === 0 ? slugOf(ran.stdout) : undefined
+  const slug = ran.exitCode === 0 ? slugOf(ran.stdout) : undefined
+  if (slug !== undefined) slugs.set(root, slug)
+  return slug
 }
 
 /**
@@ -1323,27 +1335,35 @@ export type StuckFiling = { key: string; actor: string; ageMs: number }
 
 /**
  * The record's filing claims still open past `stepTimeoutMs`, for `/pr-gate log` (spec §7.2). The relay lists no filings, so it asks
- * after the keys the record's own findings would claim (`<lifecycleId>:<id>:<attempt>`, attempts 1 up to the finding's next one), for
- * the findings that name an issue or carry a filing error; security findings are never filed (R92). Empty for a record not on the relay.
+ * after the key each of the record's own non-security findings would claim now (`<lifecycleId>:<id>:<fileAttempt + 1>`; a claim comes
+ * before the POST, so a finding may hold one with no issue named yet). Read-only: plain `filing` reads, no owed call paid, no stand-down.
+ * It stops at the first read the relay doesn't answer, `unreachable` saying why. Empty for a record not on the relay.
  */
-export async function stuckFilings($: Engine, root: string, branch: string, stepTimeoutMs: number): Promise<StuckFiling[]> {
+export async function stuckFilings(
+  $: Engine,
+  root: string,
+  branch: string,
+  stepTimeoutMs: number,
+): Promise<{ stuck: StuckFiling[]; unreachable?: string }> {
   const mirror = await loadRecord($, root, branch)
-  if (mirror?.relayRev === undefined || mirror.lifecycleId === undefined) return []
+  if (mirror?.relayRev === undefined || mirror.lifecycleId === undefined) return { stuck: [] }
+  const found = await sharedOf($, root, mirror)
+  if ('local' in found) return { stuck: [], unreachable: found.local }
   const now = await $.clock.now()
-  const out: StuckFiling[] = []
+  const stuck: StuckFiling[] = []
   for (const f of mirror.findings) {
-    if (f.isSecurity === true || (f.followUp === undefined && f.issueError === undefined)) continue
-    for (let attempt = 1; attempt <= (f.fileAttempt ?? 0) + 1; attempt += 1) {
-      const key = `${mirror.lifecycleId}:${f.id}:${attempt}`
-      const answer = await ledgerCall($, root, branch, { op: 'filing', key })
-      if (answer === undefined || !('status' in answer) || answer.status !== 200) continue
-      const filing = answer.json.filing as { state?: unknown; actor?: unknown; at?: unknown } | null | undefined
-      if (filing === null || filing === undefined || filing.state !== 'claimed') continue
-      const ageMs = claimAgeMs(filing, now)
-      if (ageMs >= stepTimeoutMs) out.push({ key, actor: typeof filing.actor === 'string' ? filing.actor : '?', ageMs })
-    }
+    if (f.isSecurity === true) continue
+    const key = `${mirror.lifecycleId}:${f.id}:${(f.fileAttempt ?? 0) + 1}`
+    const answer = await relayCall($, found.relay, found.path, { op: 'filing', key })
+    if ('refused' in answer) return { stuck, unreachable: `refused: ${answer.refused}` }
+    if ('down' in answer) return { stuck, unreachable: answer.down }
+    if (answer.status !== 200) continue
+    const filing = answer.json.filing as { state?: unknown; actor?: unknown; at?: unknown } | null | undefined
+    if (filing === null || filing === undefined || filing.state !== 'claimed') continue
+    const ageMs = claimAgeMs(filing, now)
+    if (ageMs >= stepTimeoutMs) stuck.push({ key, actor: typeof filing.actor === 'string' ? filing.actor : '?', ageMs })
   }
-  return out
+  return { stuck }
 }
 
 /**

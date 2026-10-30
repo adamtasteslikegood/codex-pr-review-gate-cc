@@ -209,3 +209,45 @@ test('a repo that does not opt in lists no relay', async (_t, on) => {
   expect(await liveRecords(engineOf(w, fake.fetch, new Map<string, unknown>(), 'session-2'), '/repo')).toEqual([])
   expect(fake.calls).toEqual([])
 })
+
+test('a fresh checkout looks in the configured bases, in their order', async (_t, on) => {
+  const { w, fake, $: engine } = setup(on)
+  w.git.rosterOn = 'develop'
+  await saveRecord(engine, seed({ phase: 'post', pr: PR, slug: SLUG, base: 'develop' }))
+  const fresh = engineOf(w, fake.fetch, new Map<string, unknown>(), 'session-2')
+  expect(await liveRecords(fresh, '/repo')).toEqual([])
+  forgetOptIns()
+  expect((await liveRecords(fresh, '/repo', ['develop', 'main'])).map(one => one.pr)).toEqual([PR])
+})
+
+test('a claim made before any issue was named shows as stuck once old', async ($, on) => {
+  const { w, fake, $: engine } = setup(on)
+  const bare: Finding = { ...HELD, id: 'R1-4', followUp: undefined }
+  await saveRecord(engine, seed({ phase: 'post', pr: PR, slug: SLUG, findings: [bare] }))
+  const id = (w.store.get(KEY) as LifecycleRecord).lifecycleId ?? ''
+  await codexClaims(fake, `${id}:R1-4:1`)
+  await w.clock.advance(STEP_MS + 60_000)
+  const out = await say($, 'log')
+  expect(out).toContain('stuck filings (known findings only)')
+  expect(out).toContain(`${id}:R1-4:1 claimed by ${CODEX}`)
+})
+
+test('the stuck probe is read-only and stops at a relay that stops answering', async ($, on) => {
+  const { w, fake, $: engine } = setup(on)
+  await saveRecord(engine, seed({ phase: 'post', pr: PR, slug: SLUG, findings: [HELD, { ...HELD, id: 'R1-2' }] }))
+  const real = fake.fetch
+  let probes = 0
+  fake.fetch = async (url, init) => {
+    const body = JSON.parse(init?.body ?? '{}') as { op?: string }
+    if (body.op === 'filing') {
+      probes += 1
+      throw new Error('connection reset')
+    }
+    return real(url, init)
+  }
+  const out = await say($, 'log')
+  expect(probes).toBe(1)
+  expect(out).toContain('The relay was unreachable (')
+  expect(out).toContain('stuck filings could not all be checked')
+  expect(w.store.get(`${KEY}:relay-pending`)).toBeUndefined()
+})

@@ -951,7 +951,8 @@ async function waiveTarget($: Engine, root: string, checkedOut: string, arg: str
   if (!FINDING_ID.test(arg)) return { branch: checkedOut }
   const own = await loadRecord($, root, checkedOut)
   const isOwn = own !== undefined && own.phase !== 'archived' && own.findings.some(each => each.id === arg)
-  const blocked = (await liveRecords($, root)).filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
+  const live = await liveRecords($, root, config.bases)
+  const blocked = live.filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
   const all = [...(isOwn ? [checkedOut] : []), ...blocked]
   if (all.length > 1) {
     return {
@@ -1020,18 +1021,18 @@ async function relayLogText($: Engine, here: { root: string; branch: string }, l
   if (log.unreachable !== undefined) lines.push(`The relay was unreachable (${log.unreachable}): this is the local log.`)
   else {
     try {
-      const { config } = await configFor($, here.root, live.base)
-      const stuck = await stuckFilings($, here.root, here.branch, config.stepTimeoutMs)
-      if (stuck.length > 0) {
+      const { config: settings } = await configFor($, here.root, live.base)
+      const probe = await stuckFilings($, here.root, here.branch, settings.stepTimeoutMs)
+      if (probe.stuck.length > 0) {
         lines.push(
-          'stuck filings',
-          ...stuck.map(one => `  ${one.key} claimed by ${one.actor}, ${Math.round(one.ageMs / 60_000)} minutes ago`),
+          'stuck filings (known findings only)',
+          ...probe.stuck.map(one => `  ${one.key} claimed by ${one.actor}, ${Math.round(one.ageMs / 60_000)} minutes ago`),
           "the driver adopts it once its issue is found; otherwise an admin's fileDelete frees it",
         )
       }
-    } catch (error) {
-      if (error instanceof RelayRefused) lines.push(`The relay refused this checkout (${error.message}).`)
-      else throw error
+      if (probe.unreachable !== undefined) lines.push(`The relay was unreachable (${probe.unreachable}): the stuck filings could not all be checked.`)
+    } catch {
+      // The settings or the probe could not be read: the log goes without its stuck section.
     }
   }
   return lines.join('\n')
@@ -1454,7 +1455,7 @@ export const register: Register = (on, options) => {
         // (spec §5.12) and the filing of what still holds (§5.13.1), whatever the record waits on (final review m1); it is not
         // collected again (R62). Only a session a person is at does this, and never on a record a live session elsewhere owns (#13).
         if (top.isOk && e.isInteractive) {
-          for (const one of await liveRecords($, top.out)) {
+          for (const one of await liveRecords($, top.out, config.bases)) {
             if (one.pr === undefined || (one.phase !== 'ready' && one.phase !== 'post')) continue
             const pr = one.pr
             try {

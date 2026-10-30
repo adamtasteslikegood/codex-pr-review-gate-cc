@@ -1500,7 +1500,7 @@ async function watchBeat($: Engine): Promise<void> {
     // may die, and the run's end may not restart it (review minor 2).
     let isWaiting = false
     for (const root of watchRoots) {
-      for (const rec of await liveRecords($, root)) {
+      for (const rec of await liveRecords($, root, config.bases)) {
         try {
           if (!isWatchable(rec)) continue
           if ((run !== null && run.status === 'running' && run.root === rec.root && run.branch === rec.branch) || (await isOwnedElsewhere($, rec.root, rec.branch))) {
