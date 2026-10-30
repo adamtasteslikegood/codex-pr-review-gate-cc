@@ -439,6 +439,57 @@ test('no security finding\'s text reaches the relay, in any field of any commit,
   expect(local(w).findings[0]).toEqual(SECRET)
 })
 
+test('a finding linked to a security finding is redacted with it, and restored with it', async (_t, on) => {
+  const { fake, $, w } = setup(on)
+  const linked = finding('G2-1', 'query in src/SECRET-FILE.ts concatenates input', {
+    source: 'github',
+    reviewer: 'alice',
+    file: 'src/SECRET-FILE.ts',
+    detail: 'LINKED-DETAIL the caller passes raw input',
+    duplicateOf: 'R1-1',
+  })
+  const texts = [...SECRET_TEXT, 'query in src/SECRET-FILE.ts concatenates input', 'LINKED-DETAIL']
+  await saveRecord($, seed({ lifecycleId: 'L1', findings: [SECRET, linked], log: [{ at: 1, kind: 'session', text: `linked ${linked.title}` }] }))
+  fake.down = true
+  await updateRecord($, '/repo', 'feat/x', grant('offline'), { isPure: true })
+  fake.down = false
+  await otherCommits(fake, grant('theirs'))
+  await updateRecord($, '/repo', 'feat/x', rec => rec, { isPure: true })
+  const bodies = fake.calls.map(one => one.body as Record<string, unknown>).filter(body => body.op === 'commit' || body.op === 'snapshot')
+  expect(bodies.map(one => one.op)).toEqual(['commit', 'commit', 'snapshot'])
+  for (const body of bodies) {
+    const strings = stringsOf(body)
+    for (const text of texts) expect(strings.filter(one => one.includes(text))).toEqual([])
+  }
+  const sent = (bodies[0]?.record as LifecycleRecord).findings[1]
+  expect(sent).toEqual({ id: 'G2-1', round: 1, source: 'github', reviewer: 'alice', severity: 'P1', headSeen: 'a'.repeat(40), status: 'open', duplicateOf: 'R1-1', title: PLACEHOLDER, ref: 'local' })
+  // This checkout, of the same lifecycle, has both back whole; the relay keeps the placeholders.
+  expect(local(w).findings.map(one => one.title)).toEqual([SECRET.title, linked.title])
+  expect(local(w).findings[1]?.detail).toBe(linked.detail)
+  expect(titles(relayed(fake))).toEqual([PLACEHOLDER, PLACEHOLDER])
+  const mirror = seed({ lifecycleId: 'L1', findings: [SECRET, linked] })
+  expect(restore(redact(mirror), mirror).findings).toEqual(mirror.findings)
+  expect(restore(redact(mirror), { ...mirror, lifecycleId: 'L2' }).findings.map(one => one.title)).toEqual([PLACEHOLDER, PLACEHOLDER])
+})
+
+test('the scrub leaves fixed-value fields alone and cuts free text only', async () => {
+  const short = finding('R1-1', 'SECRET-TITLE long enough to be a needle', { isSecurity: true, note: 'check', file: 'a.ts' })
+  const rec = seed({
+    lifecycleId: 'L1',
+    findings: [short],
+    log: [
+      { at: 1, kind: 'check', text: 'check passed' },
+      { at: 2, kind: 'session', text: 'saw SECRET-TITLE long enough to be a needle again' },
+    ],
+  })
+  const sent = redact(rec)
+  expect(sent.log).toEqual([{ at: 1, kind: 'check', text: 'check passed' }, { at: 2, kind: 'session', text: HELD_PLACEHOLDER }])
+  expect(sent.phase).toBe(rec.phase)
+  expect(sent.lane).toBe(rec.lane)
+  expect(sent.head).toBe(rec.head)
+  expect(sent.branch).toBe('feat/x')
+})
+
 test('restore puts text back into findings only, and the mirror of an own commit keeps every field whole', async (_t, on) => {
   const { $, w } = setup(on)
   const full = seed({ lifecycleId: 'L1', findings: [SECRET], message: `held: ${SECRET.title}`, log: [{ at: 1, kind: 'stop', text: `on ${SECRET.id}` }] })

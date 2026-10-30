@@ -176,27 +176,54 @@ export class RelayMoved extends Error {
 /** The title a security finding has on the relay (R107): its text never leaves the checkout that found it. */
 export const SECURITY_PLACEHOLDER = '[security finding: text kept by the checkout that found it]'
 
-/** The fields a security finding keeps on the relay (R107, shape R(b)): what any checkout needs to hold the merge and rule on it. */
-const SHARED_FIELDS = ['id', 'round', 'source', 'reviewer', 'severity', 'isSecurity', 'headSeen', 'status'] as const
+/**
+ * The fields a security finding keeps on the relay (R107, shape R(b)): what any checkout needs to hold the merge and rule on it. A
+ * linked duplicate keeps its `duplicateOf` too, an id: it holds, and settles, with its original (R90).
+ */
+const SHARED_FIELDS = ['id', 'round', 'source', 'reviewer', 'severity', 'isSecurity', 'headSeen', 'status', 'duplicateOf'] as const
 
 /** What any other string of the record becomes on the relay when it names a security finding (R107): the whole string, not a part of it. */
 export const HELD_PLACEHOLDER = '[held locally: names a security finding]'
 
-/** A needle shorter than this (an id apart) would match too much: `a.ts` is kept, `fix` is not. */
-const MIN_NEEDLE = 4
+/** A text needle shorter than this (an id apart) is too likely a common word (`check`, `open`, `fix`) to say a string names a finding. */
+const MIN_NEEDLE = 8
 
-/** The record's own names for where it is (the relay's path is built from them): never text a reviewer wrote, so never cut. */
-const IDENTITY_FIELDS = new Set(['root', 'branch', 'base', 'slug', 'lifecycleId'])
+/**
+ * The keys whose values are never free text, at any depth: enums (a log line's `kind`, a phase, a lane, a waiver's `scope`, a status, a
+ * severity, a source, a tier, a role or step state), heads and other SHAs, and the record's own names for where it is (the relay's path
+ * is built from them). The scrub never rewrites them: a needle that matched one would corrupt the record, and none holds a reviewer's words.
+ */
+const FIXED_KEYS = new Set([
+  'kind', 'phase', 'lane', 'scope', 'status', 'severity', 'source', 'tier', 'role', 'state', 'bucket', 'effort', 'lifecycle',
+  'head', 'headSha', 'headSeen', 'startHead', 'endHead', 'roundStartHead', 'diffBase', 'preHead', 'lapsedHead', 'lineHead', 'self',
+  'root', 'branch', 'base', 'slug', 'lifecycleId', 'cwd', 'id', 'findingId', 'agentId', 'turnId', 'by', 'reviewer',
+])
 
 const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 /**
- * Whether a string names one of `findings`' security findings: it holds one's title, detail, note, file, url or a Jira summary sent for
- * it (each of `MIN_NEEDLE` characters or more), or its id as a word of its own (`G1-1` is not in `G1-10`). A string that is exactly an
- * id is a reference (a waiver's `findingId`, an `asked` list), not text: the id is shared on the finding itself, and it stays.
+ * The ids of the findings the relay holds as security (R107): each security finding, and each finding linked to one through its
+ * `duplicateOf` chain (a link marks only the original as security, lifecycle.ts `withLinkedPeak`, yet names the same problem).
  */
-const namerOf = (findings: Finding[]): ((text: string) => boolean) | undefined => {
-  const secure = findings.filter(one => one.isSecurity === true)
+const secureIdsOf = (findings: Finding[]): Set<string> => {
+  const byId = new Map(findings.map(one => [one.id, one]))
+  const isSecure = (one: Finding): boolean => {
+    const seen = new Set<string>()
+    for (let at: Finding | undefined = one; at !== undefined && !seen.has(at.id); at = at.duplicateOf === undefined ? undefined : byId.get(at.duplicateOf)) {
+      if (at.isSecurity === true) return true
+      seen.add(at.id)
+    }
+    return false
+  }
+  return new Set(findings.filter(isSecure).map(one => one.id))
+}
+
+/**
+ * Whether a string names one of the `secure` findings: it holds one's title, detail, note, file, url or a Jira summary sent for it (each
+ * of `MIN_NEEDLE` characters or more), or its id as a word of its own (`G1-1` is not in `G1-10`). A string that is exactly an id is a
+ * reference (a waiver's `findingId`, an `asked` list), not text: the id is shared on the finding itself, and it stays.
+ */
+const namerOf = (secure: Finding[]): ((text: string) => boolean) | undefined => {
   if (secure.length === 0) return undefined
   const ids = new Set(secure.map(one => one.id))
   const texts = secure
@@ -206,28 +233,30 @@ const namerOf = (findings: Finding[]): ((text: string) => boolean) | undefined =
   return text => !ids.has(text) && (texts.some(needle => text.includes(needle)) || idRe.test(text))
 }
 
-/** Every string under `value` that names a security finding, whole, as `HELD_PLACEHOLDER`; any other value as it is. */
+/** Every free-text string under `value` that names a security finding, whole, as `HELD_PLACEHOLDER`; a `FIXED_KEYS` value, or any other, as it is. */
 const scrub = (value: unknown, isNamed: (text: string) => boolean): unknown => {
   if (typeof value === 'string') return isNamed(value) ? HELD_PLACEHOLDER : value
   if (Array.isArray(value)) return value.map(one => scrub(one, isNamed))
-  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, one]) => [name, scrub(one, isNamed)]))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([name, one]) => [name, FIXED_KEYS.has(name) ? one : scrub(one, isNamed)]))
+  }
   return value
 }
 
 /**
- * The record as it may leave the checkout (R107): each security finding is cut to `SHARED_FIELDS`, a placeholder title and `ref: 'local'`
- * (no detail, note, file, line, url or history), every other string that names one (a message, a round's outstanding, a log line, a
- * waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole, and `relayRev`, this checkout's own bookkeeping, is dropped.
+ * The record as it may leave the checkout (R107): each security finding, and each linked to one, is cut to `SHARED_FIELDS`, a
+ * placeholder title and `ref: 'local'` (no detail, note, file, line, url or history); every other free-text string that names one (a
+ * message, a round's outstanding, a log line, a waiver's or grant's reason) becomes `HELD_PLACEHOLDER` whole; and `relayRev`, this
+ * checkout's own bookkeeping, is dropped.
  */
 export const redact = (rec: LifecycleRecord): LifecycleRecord => {
   const { relayRev: _, findings: _findings, ...rest } = rec
-  const isNamed = namerOf(rec.findings)
-  const others =
-    isNamed === undefined ? rest : Object.fromEntries(Object.entries(rest).map(([name, one]) => [name, IDENTITY_FIELDS.has(name) ? one : scrub(one, isNamed)]))
+  const secureIds = secureIdsOf(rec.findings)
+  const isNamed = namerOf(rec.findings.filter(one => secureIds.has(one.id)))
   return {
-    ...(others as typeof rest),
+    ...((isNamed === undefined ? rest : scrub(rest, isNamed)) as typeof rest),
     findings: rec.findings.map(one => {
-      if (one.isSecurity !== true) return one
+      if (!secureIds.has(one.id)) return one
       const kept: Record<string, unknown> = {}
       for (const name of SHARED_FIELDS) if (one[name] !== undefined) kept[name] = one[name]
       return { ...kept, title: SECURITY_PLACEHOLDER, ref: 'local' } as unknown as Finding
