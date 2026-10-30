@@ -449,7 +449,7 @@ test('a graphql create whose PR comes from another branch does not move this one
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))
   w.gh.headRef = 'dev'
-  const create = "gh api graphql -f query='mutation { createPullRequest(input: {}) { pullRequest { number } } }'"
+  const create = "gh api graphql -f query='mutation { createPullRequest(input: {headRefName: \"feat/x\"}) { pullRequest { number } } }'"
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: create }))).toBe(false)
   expect((await recordOf(w)).phase).toBe('pre')
 })
@@ -3191,7 +3191,8 @@ test('R1-8: feedback from an author without write access is dropped; a rostered 
 test('F1: a GraphQL or REST create whose base cannot be read is held against the first gated base, whatever the default branch', async ($, on) => {
   const w = world(on)
   w.gh.defaultBranch = 'release'
-  const graphql = "gh api graphql -f query='mutation { createPullRequest(input: {baseRefName: \"dev\"}) { pullRequest { number } } }'"
+  // Its base is a variable with no readable value; its head is the checked-out branch (#39 holds a create with no readable head).
+  const graphql = "gh api graphql -f query='mutation($b: String!) { createPullRequest(input: {baseRefName: $b, headRefName: \"feat/x\"}) { pullRequest { number } } }' -F b=@base.txt"
   const held = (await $.tool.call({ tool: 'Bash', command: graphql })).deny ?? ''
   expect(held).toContain('waits for the pre-PR review')
   expect((await recordOf(w)).base).toBe('dev')

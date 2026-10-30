@@ -183,6 +183,32 @@ test('gh api REST and GraphQL calls that open or merge a PR', async () => {
   expect(bash('gh api repos/me/repo/pulls/12/comments')).toBeUndefined()
 })
 
+test('#39: a GraphQL create carries its headRefName and baseRefName, and a head it cannot read is marked', async () => {
+  const literal = "gh api graphql -f query='mutation { createPullRequest(input: {repositoryId: \"R\", baseRefName: \"main\", headRefName: \"feature/x\", title: \"t\"}) { clientMutationId } }'"
+  expect(bash(literal)).toMatchObject({ action: 'create', base: 'main', head: 'feature/x' })
+  expect(bash(literal)?.isHeadUnread).toBeUndefined()
+  // A variable is read from its -f or -F value.
+  const variable = "gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: \"R\", baseRefName: \"dev\", headRefName: $h}) { clientMutationId } }' -f h=fix/y"
+  expect(bash(variable)).toMatchObject({ action: 'create', base: 'dev', head: 'fix/y' })
+  // A JSON body through curl, its quotes escaped, and its variables.
+  const curl =
+    'curl -X POST https://api.github.com/graphql -d \'{"query":"mutation($h: String!) { createPullRequest(input: {baseRefName: \\"main\\", headRefName: $h}) { clientMutationId } }","variables":{"h":"feature"}}\''
+  expect(bash(curl)).toMatchObject({ action: 'create', base: 'main', head: 'feature' })
+  // No headRefName, a variable with no readable value, or a head in another repository: never taken for the checked-out branch.
+  expect(bash("gh api graphql -f query='mutation { createPullRequest(input: {}) { clientMutationId } }'")).toMatchObject({ action: 'create', isHeadUnread: true })
+  expect(bash("gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {baseRefName: \"dev\", headRefName: $h}) { clientMutationId } }' -F h=@head.txt")).toMatchObject({
+    action: 'create',
+    isHeadUnread: true,
+  })
+  expect(
+    bash("gh api graphql -f query='mutation { createPullRequest(input: {baseRefName: \"dev\", headRefName: \"dev\", headRepositoryId: \"F\"}) { clientMutationId } }'"),
+  ).toMatchObject({ action: 'create', head: 'dev', isHeadUnread: true })
+  // An MCP tool that sends the mutation, with its variables as an object.
+  const query = 'mutation($h: String!) { createPullRequest(input: {baseRefName: "main", headRefName: $h}) { clientMutationId } }'
+  expect(readPrAction('mcp__github__graphql', { query, variables: { h: 'feature' } })).toMatchObject({ action: 'create', base: 'main', head: 'feature' })
+  expect(readPrAction('mcp__github__graphql', { query })).toMatchObject({ action: 'create', isHeadUnread: true })
+})
+
 test('both GitHub MCP connectors', async () => {
   expect(readPrAction('mcp__plugin_github_github__create_pull_request', { owner: 'me', repo: 'repo', base: 'dev', head: 'feat/x' })).toMatchObject({
     action: 'create',

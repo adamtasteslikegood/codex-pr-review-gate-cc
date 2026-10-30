@@ -480,6 +480,8 @@ export type PrAction = {
   cwd?: string
   /** A GitHub tool this mod does not know, held because it reads as opening or merging a PR. */
   isUnknown?: boolean
+  /** A GraphQL create whose head the guard cannot read, or that names a head in another repository (#39). */
+  isHeadUnread?: boolean
 }
 
 // ------------------------------------------------------------------ Bash
@@ -676,9 +678,33 @@ function mutationIn(text: string): 'merge' | 'create' | undefined {
   return CREATE_MUTATIONS.some((name) => text.includes(name)) ? 'create' : undefined
 }
 
+/** Quotes and the backslashes that escape them, as a JSON body or a stringified input carries them. */
+const Q = `[\\\\"']*`
+/** A branch name's end: a closing quote, then a space, `,`, `}`, `)` or the end. */
+const END = `(?=${Q}(?:[\\s,})]|$))`
+
+/**
+ * A createPullRequest field's value: a literal, or a `$variable` read from its `-f`/`-F` value or a JSON `variables` entry. undefined
+ * when it is missing or its value can't be read (a file, a shell variable).
+ */
+function refIn(text: string, field: string): string | undefined {
+  const raw = text.match(new RegExp(`\\b${field}\\s*:\\s*${Q}(\\$?[\\w./-]+)${END}`))?.[1]
+  if (raw === undefined || !raw.startsWith('$')) return raw
+  // The name after a space, `{` or `,`, never after `$`: so not the declaration `$h: String!` nor the use `headRefName: $h`.
+  return text.match(new RegExp(`(?:^|[\\s{,])${Q}${raw.slice(1)}${Q}\\s*[:=]\\s*${Q}([\\w./-]+)${END}`))?.[1]
+}
+
+/** A GraphQL create's base and head. A head the guard can't read, or one in another repository, is marked, never guessed (#39). */
+function refsOf(text: string): Pick<PrAction, 'base' | 'head' | 'isHeadUnread'> {
+  const head = refIn(text, 'headRefName')
+  const isHeadUnread = head === undefined || /\bheadRepositoryId\b/.test(text)
+  return { base: refIn(text, 'baseRefName'), head, ...(isHeadUnread ? { isHeadUnread } : {}) }
+}
+
 /** GraphQL names are matched over the whole command: its braces and parentheses split segments. An unreadable query is held as unknown. */
 function readGraphql(normal: string, isUnreadable: boolean, via: string, cwd: string | undefined): PrAction | undefined {
   const mutation = mutationIn(normal)
+  if (mutation === 'create') return { action: mutation, via, cwd, ...refsOf(normal) }
   if (mutation !== undefined) return { action: mutation, via, cwd }
   return isUnreadable ? { action: 'merge', via, cwd, isUnknown: true } : undefined
 }
@@ -844,7 +870,7 @@ function readUnknownTool(tool: string, input: Record<string, unknown>, repo: str
   if (hasPr && (MERGE_WORDS.test(name) || MERGE_WORDS.test(operation) || (path?.isMerge === true && isWrite))) {
     return { ...merge(), number: path?.number ?? number, repo: path?.repo ?? repo }
   }
-  if (mutation === 'create') return create()
+  if (mutation === 'create') return { ...create(), ...refsOf(JSON.stringify(input)) }
   const isCreateVerb = CREATE_WORDS.test(`${name.split(' ')[0] ?? ''}`) || CREATE_WORDS.test(operation) || (path !== undefined && !path.isMerge && isWrite)
   if (hasPr && isCreateVerb && !REVIEW_WORDS.test(`${name} ${operation}`)) return { ...create(), repo: path?.repo ?? repo }
   return undefined

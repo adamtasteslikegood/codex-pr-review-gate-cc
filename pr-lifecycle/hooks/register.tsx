@@ -486,21 +486,32 @@ type Gated = { root: string; branch: string; base: string }
 /** A create whose head is a branch other than the one checked out here (R98). */
 type Elsewhere = { head: string; branch: string }
 
+/** A create whose head is `owner:branch` for an owner other than origin's, a fork's branch (#40). */
+type Foreign = { foreign: string }
+
 /**
  * The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61);
- * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); `head` when it names a head
- * that is not checked out here, so the gate cannot review it (R98); else undefined.
+ * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); 'unread' when it is a GraphQL
+ * create whose head the guard cannot read (#39); `foreign` when its head is a fork's branch (#40); `head` when it names a head that
+ * is not checked out here, so the gate cannot review it (R98); else undefined.
  */
-const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outside' | { noBase: string } | Elsewhere | undefined> => {
+const gatedCreate = async (
+  $: Engine,
+  action: PrAction,
+): Promise<Gated | 'outside' | 'unread' | { noBase: string } | Foreign | Elsewhere | undefined> => {
   if (action.base !== undefined && !config.bases.includes(action.base)) return undefined
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return isOutsideHeld(action) ? 'outside' : undefined
   const root = top.out
-  if (action.repo !== undefined) {
-    const origin = await git($, root, ['remote', 'get-url', 'origin'])
-    if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return undefined
-  }
+  const origin = await git($, root, ['remote', 'get-url', 'origin'])
+  const slug = origin.isOk ? slugOf(origin.out) : undefined
+  if (action.repo !== undefined && origin.isOk && slug !== slugOf(action.repo)) return undefined
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  // A head the guard cannot read is never taken for the checked-out branch: from dev it would pass as the promotion (#39).
+  if (action.isHeadUnread === true) return 'unread'
+  // `owner:branch` is this repository's branch only when the owner is origin's. A fork's dev is no promotion (#40).
+  const owner = action.head?.match(/^([^:]+):/)?.[1]
+  if (owner !== undefined && owner.toLowerCase() !== slug?.split('/')[0]) return { foreign: action.head ?? owner }
   const head = action.head?.replace(/^[^:]+:/, '')
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
   if (config.bases.includes(head ?? branch)) return undefined
@@ -530,6 +541,22 @@ const elsewhereText = (action: PrAction, found: Elsewhere): string =>
       'so the gate cannot review what that pull request would carry.',
     `Your next step: check out a local branch named ${found.head} that holds these commits (git branch -m ${found.head}, or ` +
       `git switch ${found.head}), then run the create again from it so its gate reviews it. Do not open the pull request another way.`,
+  ].join('\n') + unknownNote(action)
+
+const unreadText = (action: PrAction): string =>
+  [
+    `pr-gate: ${action.via} is held: the guard cannot read the head branch it opens a pull request from (no literal headRefName, ` +
+      'a variable whose value comes from a file or the shell, or a head in another repository), so the gate cannot review what it would carry.',
+    'Your next step: check out the head branch here and open the pull request with gh pr create from it, so its gate reviews it. ' +
+      'Do not open the pull request another way.',
+  ].join('\n') + unknownNote(action)
+
+const foreignText = (action: PrAction, found: Foreign): string =>
+  [
+    `pr-gate: ${action.via} is held: it opens a pull request from ${found.foreign}, a branch in another repository, ` +
+      "so the gate cannot review what it would carry, and it is not this repository's own promotion.",
+    'Your next step: the gate reviews only branches of this repository, checked out here. Open the pull request from such a branch, ' +
+      'or leave that pull request to the person. Do not open the pull request another way.',
   ].join('\n') + unknownNote(action)
 
 /** Why an unknown tool is held: said after the refusal, so the agent knows it was not misread as something else. */
@@ -1382,7 +1409,9 @@ export const register: Register = (on, options) => {
     }
     const found = await gatedCreate($, action)
     if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
+    if (found === 'unread') return config.enforce ? { deny: asHold(unreadText(action)) + tail } : next(e)
     if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
+    if (found !== undefined && 'foreign' in found) return config.enforce ? { deny: asHold(foreignText(action, found)) + tail } : next(e)
     if (found !== undefined && 'head' in found) return config.enforce ? { deny: asHold(elsewhereText(action, found)) + tail } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
