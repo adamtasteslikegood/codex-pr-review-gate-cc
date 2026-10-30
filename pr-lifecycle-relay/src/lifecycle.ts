@@ -1,8 +1,11 @@
 // One Durable Object per pull request (`owner/repo#pr`): the lifecycle record, its lease, its archives and its filing ledger
 // (#29 Part B). A Durable Object runs one request at a time and every request here touches only its own storage, so each operation is
-// atomic: the grant, the lease and the revision are checked in the same step that writes.
+// atomic: the grant, the lease and the revision are checked in the same step that writes. Each record change also queues an update for the
+// repo's index in that same step (its outbox), which the object's alarm delivers, retrying until the index acknowledges it (spec §9). The
+// same alarm deletes the object once its retention has run out (spec §8).
 
 import { isAdmin, type Preset, type Principal } from './auth.ts'
+import type { IndexEntry, IndexUpdate } from './repo-index.ts'
 import type { DurableObjectState, Env } from './types.ts'
 
 /**
@@ -33,6 +36,15 @@ type State = {
   writes: Write[]
   /** Set once the record has moved to that PR's object: `record` is then a Tombstone and the branch cannot be driven (R103). */
   movedTo?: number
+  /** When this incarnation began: the first write after the object was empty, kept until it is deleted (spec §9). */
+  born?: number
+  /** The object's repo (`owner/repo`) and key (`#<pr>` or `@<branch>`), kept for its alarm, which comes with no request. */
+  repo?: string
+  key?: string
+  /** When retention began: a PR key's archive commit, or a branch key's last write (spec §8). */
+  retainFrom?: number
+  /** Set once the retention alarm sent its removal: a later write starts a new incarnation, which the index can't mistake for this one. */
+  isRemoving?: true
 }
 
 /** One line of the run log (R106): `seq` is the object's counter, so a cursor on it loses no line even when many share an `at`. */
@@ -50,6 +62,8 @@ const FROZEN_OPS = new Set(['commit', 'claim', 'beat', 'take', 'release', 'moveT
 /** R106: the relay keeps the last 1000 log lines per object; older ones are counted in `logDropped`. */
 export const RELAY_LOG_CAP = 1000
 const LOG_TEXT_MAX = 300
+/** A log line's `kind` and `holder` are cut too, so no oversized value can make `log` fail for good. */
+const LOG_FIELD_MAX = 200
 const SNAPSHOT_REASONS = new Set(['fallback', 'migration', 'move'])
 
 /** How many archives a PR keeps (open decision 3: retention). */
@@ -59,6 +73,11 @@ const WRITE_CAP = 100
 const LEASE_MS = 120_000
 /** A filing claim older than the step timeout (30 minutes) may be adopted by the lease holder (PR #51 review, G1-2). */
 export const FILING_STALE_MS = 1_800_000
+/** Spec §8: an object is kept 90 days after its PR's archive commit (a PR key) or its last write (a branch key). */
+export const RETENTION_MS = 7_776_000_000
+/** The first retry of an index update; each failure doubles it, up to 5 minutes. */
+const INDEX_RETRY_MS = 1000
+const INDEX_RETRY_CAP_MS = 300_000
 
 const empty = (): State => ({ rev: 0, record: null, lease: null, fence: 0, archives: [], filings: {}, writes: [] })
 
@@ -76,6 +95,28 @@ const verifierOf = async (secret: unknown): Promise<string | undefined> => {
   if (typeof secret !== 'string' || secret.length < MIN_SECRET) return undefined
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret)))
   return Array.from(digest, b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** A record the index lists: neither a tombstone nor archived (spec §9). */
+const isListed = (s: State): boolean =>
+  s.movedTo === undefined && typeof s.record === 'object' && s.record !== null && (s.record as { phase?: unknown }).phase !== 'archived'
+
+/** The outbox entry for the state just written: the record's index entry, or its removal. */
+const outboxOf = (s: State, key: string, now: number): IndexUpdate => {
+  const at = { key, born: s.born!, rev: s.rev }
+  if (!isListed(s)) return { ...at, removed: true }
+  const r = s.record as { pr?: unknown; branch?: unknown; phase?: unknown; updatedAt?: unknown; lifecycleId?: unknown }
+  const pr = key.startsWith('#') ? Number(key.slice(1)) : typeof r.pr === 'number' ? r.pr : undefined
+  const entry: IndexEntry = {
+    key,
+    ...(pr === undefined ? {} : { pr }),
+    branch: typeof r.branch === 'string' ? r.branch : key.startsWith('@') ? key.slice(1) : '',
+    phase: typeof r.phase === 'string' ? r.phase : '',
+    rev: s.rev,
+    updatedAt: typeof r.updatedAt === 'number' ? r.updatedAt : now,
+    lifecycleId: typeof r.lifecycleId === 'string' ? r.lifecycleId : '',
+  }
+  return { ...at, entry }
 }
 
 const reply = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -114,7 +155,8 @@ export class LifecycleObject {
   async fetch(request: Request): Promise<Response> {
     const who = JSON.parse(request.headers.get('x-relay-principal') ?? 'null') as Principal | null
     const repo = request.headers.get('x-relay-repo') ?? ''
-    const isBranch = (request.headers.get('x-relay-key') ?? '').startsWith('@')
+    const key = request.headers.get('x-relay-key') ?? ''
+    const isBranch = key.startsWith('@')
     if (who === null) return reply(401, { error: 'no principal' })
     const body = (await request.json()) as { op?: string; [key: string]: unknown }
     const op = body.op ?? ''
@@ -134,9 +176,19 @@ export class LifecycleObject {
       (one.principal ?? one.actor) === who.id && proof !== undefined && one.verifier === proof
     // A plain object inherits `__proto__` and `constructor`: a filing is only ever an own property.
     const filingOf = (key: string): Filing | undefined => (Object.hasOwn(s.filings, key) ? s.filings[key] : undefined)
-    const save = async (next: State, what: string): Promise<void> => {
+    /** Writes the state; with `isIndexed` (a record change), its outbox entry too, in the same atomic step, and arms the alarm. */
+    const save = async (next: State, what: string, isIndexed = false): Promise<void> => {
       next.writes = [...next.writes, { actor: who.id, op: what, at: now, rev: next.rev }].slice(-WRITE_CAP)
-      await this.state.storage.put({ state: next })
+      // After a retention removal was sent, the index may already hold it at (born, rev + 1): this write is a new incarnation, and is listed again.
+      const isReborn = next.isRemoving === true
+      if (next.born === undefined || isReborn) next.born = now
+      delete next.isRemoving
+      next.repo = repo
+      next.key = key
+      if (isBranch) next.retainFrom = now
+      const queued = isIndexed || isReborn
+      await this.state.storage.put(queued ? { state: next, outbox: outboxOf(next, key, now), retry: 0 } : { state: next })
+      await this.arm(queued ? now : this.dueOf(next))
     }
 
     const logOf = async (): Promise<LogStore> => (await this.state.storage.get<LogStore>('log')) ?? { lines: [], dropped: 0, seq: 0 }
@@ -182,7 +234,10 @@ export class LifecycleObject {
         const archives = archive !== undefined ? [...s.archives, { at: archive.at as number, record: archive.record }].slice(-ARCHIVE_CAP) : s.archives
         const next: State = { ...s, rev: s.rev + 1, record: body.record ?? null, archives }
         delete next.movedTo
-        await save(next, archive !== undefined ? 'commit+archive' : 'commit')
+        // A PR key's retention runs from the commit that archives its record; a commit that revives it stops it.
+        delete next.retainFrom
+        if (!isBranch && (next.record as { phase?: unknown } | null)?.phase === 'archived') next.retainFrom = now
+        await save(next, archive !== undefined ? 'commit+archive' : 'commit', true)
         return reply(200, { rev: next.rev })
       }
       case 'claim': {
@@ -215,7 +270,8 @@ export class LifecycleObject {
         if (typeof body.at !== 'number' || typeof body.kind !== 'string' || typeof body.text !== 'string') return reply(400, { error: 'log needs { at, kind, text }' })
         const log = await logOf()
         const seq = log.seq + 1
-        const line: LogLine = { seq, at: body.at, kind: body.kind, text: body.text.slice(0, LOG_TEXT_MAX), principal: who.id, holder: String(body.holder ?? '') }
+        const holder = String(body.holder ?? '').slice(0, LOG_FIELD_MAX)
+        const line: LogLine = { seq, at: body.at, kind: body.kind.slice(0, LOG_FIELD_MAX), text: body.text.slice(0, LOG_TEXT_MAX), principal: who.id, holder }
         const lines = [...log.lines, line]
         const over = Math.max(0, lines.length - RELAY_LOG_CAP)
         const next: LogStore = { lines: lines.slice(over), dropped: log.dropped + over, seq }
@@ -251,7 +307,8 @@ export class LifecycleObject {
         if (typeof id !== 'string') return reply(409, { error: 'no record with a lifecycleId to move' })
         const tombstone: Tombstone = { movedTo: pr, lifecycleId: id, record: s.record }
         const next: State = { ...s, rev: s.rev + 1, record: tombstone, lease: null, movedTo: pr }
-        await save(next, `moveTo #${pr}`)
+        // The branch's index entry goes in the same step: the PR object's own commit lists the record under its PR key.
+        await save(next, `moveTo #${pr}`, true)
         return reply(200, { rev: next.rev })
       }
       case 'moveDone': {
@@ -318,5 +375,78 @@ export class LifecycleObject {
       }
     }
     return reply(400, { error: `unknown op ${op}` })
+  }
+
+  /** When retention runs out, if it has started. */
+  private dueOf(s: State): number | undefined {
+    return s.retainFrom === undefined ? undefined : s.retainFrom + Number(this.env.RETENTION_MS ?? RETENTION_MS)
+  }
+
+  /** Sets the one alarm to `at` unless it is already due sooner; one that fires early finds nothing due and sets itself again. */
+  private async arm(at: number | undefined): Promise<void> {
+    if (at === undefined) return
+    const current = await this.state.storage.getAlarm()
+    if (current === null || current > at) await this.state.storage.setAlarm(at)
+  }
+
+  /** Sends one update to the repo's index: true once the index acknowledged it. */
+  private async send(repo: string, update: IndexUpdate): Promise<boolean> {
+    try {
+      const index = this.env.REPO_INDEX.get(this.env.REPO_INDEX.idFromName(repo))
+      const res = await index.fetch(new Request('https://internal/', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'update', ...update }),
+      }))
+      await res.text()
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
+  /** A failed send tries again later, the delay doubling from INDEX_RETRY_MS up to 5 minutes. */
+  private async retry(): Promise<void> {
+    const storage = this.state.storage
+    const last = (await storage.get<number>('retry')) ?? 0
+    const delay = Math.min(last > 0 ? last * 2 : Number(this.env.INDEX_RETRY_MS ?? INDEX_RETRY_MS), INDEX_RETRY_CAP_MS)
+    await storage.put({ retry: delay })
+    await storage.setAlarm(Date.now() + delay)
+  }
+
+  /** Delivers the outbox, then deletes the object once its retention has run out. No client and no further commit is needed (#53). */
+  async alarm(): Promise<void> {
+    const storage = this.state.storage
+    const s = await storage.get<State>('state')
+    if (s === undefined || s.repo === undefined) return
+    const sent = await storage.get<IndexUpdate>('outbox')
+    if (sent !== undefined) {
+      if (!(await this.send(s.repo, sent))) return this.retry()
+      // A commit may have landed while the update was on its way (the send lets other requests in): only what was acknowledged is cleared.
+      const left = await storage.get<IndexUpdate>('outbox')
+      if (left !== undefined && (left.born !== sent.born || left.rev !== sent.rev)) {
+        await storage.put({ retry: 0 })
+        return storage.setAlarm(Date.now())
+      }
+      await storage.delete('outbox')
+      await storage.put({ retry: 0 })
+    }
+    // Nothing else runs on the object until it is deleted or kept: no write can land between the removal and the delete.
+    await this.state.blockConcurrencyWhile(() => this.retire())
+  }
+
+  private async retire(): Promise<void> {
+    const storage = this.state.storage
+    const s = await storage.get<State>('state')
+    if (s === undefined || s.repo === undefined || s.key === undefined || s.born === undefined) return
+    if ((await storage.get<IndexUpdate>('outbox')) !== undefined) return storage.setAlarm(Date.now())
+    const due = this.dueOf(s)
+    if (due === undefined) return
+    if (Date.now() < due) return storage.setAlarm(due)
+    // The removal sits one rev above the last update, so it wins over it at the index; the delete waits for the index's answer.
+    await storage.put({ state: { ...s, isRemoving: true } })
+    if (!(await this.send(s.repo, { key: s.key, born: s.born, rev: s.rev + 1, removed: true }))) return this.retry()
+    await storage.deleteAlarm()
+    await storage.deleteAll()
   }
 }

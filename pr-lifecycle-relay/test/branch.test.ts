@@ -10,7 +10,8 @@ const url = (branch: string, repo = 'owner/repo'): string => `/v1/${repo}/branch
 let adam: string
 
 before(async () => {
-  await start()
+  // Branch objects are deleted RETENTION_MS after their last write; these tests are not about retention (index.test.ts is).
+  await start({ RETENTION_MS: '600000' })
   await seed()
   adam = await sign(person(ADAM))
 })

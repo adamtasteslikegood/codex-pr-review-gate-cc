@@ -11,9 +11,17 @@ export type Env = {
   LEASE_MS?: string
   /** How old a filing claim must be before the lease holder may adopt it, in ms; 30 minutes when unset. */
   FILING_STALE_MS?: string
+  /** How long an object is kept after its PR's archive commit (a PR key) or its last write (a branch key), in ms; 90 days when unset. */
+  RETENTION_MS?: string
+  /** The first delay before an object retries its index update, in ms, doubled on each failure up to 5 minutes; 1000 when unset. */
+  INDEX_RETRY_MS?: string
+  /** `'1'` in tests only: opens `POST /v1/admin/index`, which faults a repo's index or sends it an update. Unset in wrangler. */
+  TEST_FAULTS?: string
   LIFECYCLE: DurableObjectNamespace
   /** The one GrantStore object (R104): who may read or operate on which repo. */
   GRANTS: DurableObjectNamespace
+  /** One RepoIndex object per `owner/repo` (spec §9): the repo's live records, for `list`. */
+  REPO_INDEX: DurableObjectNamespace
 }
 
 export interface DurableObjectId {
@@ -31,7 +39,15 @@ export interface DurableObjectNamespace {
 
 export interface DurableObjectStorage {
   get<T>(key: string): Promise<T | undefined>
+  get<T>(keys: string[]): Promise<Map<string, T>>
+  /** Several keys in one atomic step. */
   put(entries: Record<string, unknown>): Promise<void>
+  delete(key: string): Promise<boolean>
+  list<T>(options: { prefix: string }): Promise<Map<string, T>>
+  deleteAll(): Promise<void>
+  getAlarm(): Promise<number | null>
+  setAlarm(at: number): Promise<void>
+  deleteAlarm(): Promise<void>
 }
 
 export interface DurableObjectState {

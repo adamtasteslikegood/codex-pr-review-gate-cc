@@ -147,6 +147,14 @@ test('each line records the principal and the holder, and its text is cut to 300
   assert.equal(one!.text.length, 300)
 })
 
+test('a line cuts its kind and holder to 200 characters', async () => {
+  const path = fresh()
+  assert.equal((await call(adam, { op: 'log', at: 1, kind: 'k'.repeat(500), text: 't', holder: 'h'.repeat(500) }, path)).status, 200)
+  const [one] = (await read(path)).log as (Line & { kind: string })[]
+  assert.equal(one!.kind, 'k'.repeat(200))
+  assert.equal(one!.holder, 'h'.repeat(200))
+})
+
 // -------------------------------------------------------------- fileAdopt
 
 test('fileAdopt finishes a stale claim under the lease, without impersonating', async () => {

@@ -13,6 +13,9 @@ export const CODEX = 'codex-service.access'
 export const READER = 'reader@example.org'
 export const LEASE_MS = 600
 export const FILING_STALE_MS = 300
+export const INDEX_RETRY_MS = 50
+/** Short, so the retention tests run in real time; a file that waits past it on branch keys passes a longer one to `start`. */
+export const RETENTION_MS = 400
 
 const enc = (bytes: Uint8Array | string): string =>
   Buffer.from(typeof bytes === 'string' ? new TextEncoder().encode(bytes) : bytes)
@@ -73,15 +76,18 @@ export async function start(bindings: Record<string, string> = {}): Promise<void
   stranger = (await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])) as CryptoKeyPair
   const jwk = { ...(await crypto.subtle.exportKey('jwk', team.publicKey)), kid: 'k1', alg: 'RS256' }
   mf = new Miniflare({
-    modules: ['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'types.ts'].map(path => ({ type: 'ESModule', path, contents: source(path) })),
+    modules: ['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'repo-index.ts', 'types.ts'].map(path => ({ type: 'ESModule', path, contents: source(path) })),
     compatibilityDate: '2026-08-01',
-    durableObjects: { LIFECYCLE: 'LifecycleObject', GRANTS: 'GrantStore' },
+    durableObjects: { LIFECYCLE: 'LifecycleObject', GRANTS: 'GrantStore', REPO_INDEX: 'RepoIndex' },
     bindings: {
       ACCESS_TEAM_DOMAIN: TEAM,
       ACCESS_AUD: AUD,
       ADMINS: ` ${ADAM.toUpperCase()} , ${CODEX}`,
       LEASE_MS: String(LEASE_MS),
       FILING_STALE_MS: String(FILING_STALE_MS),
+      INDEX_RETRY_MS: String(INDEX_RETRY_MS),
+      RETENTION_MS: String(RETENTION_MS),
+      TEST_FAULTS: '1',
       ...bindings,
     },
     outboundService: req =>

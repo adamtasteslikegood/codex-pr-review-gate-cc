@@ -6,12 +6,13 @@
   "durable_objects": {
     "bindings": [
       { "name": "LIFECYCLE", "class_name": "LifecycleObject" },
-      { "name": "GRANTS", "class_name": "GrantStore" }
+      { "name": "GRANTS", "class_name": "GrantStore" },
+      { "name": "REPO_INDEX", "class_name": "RepoIndex" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] },
-    { "tag": "v2", "new_sqlite_classes": ["GrantStore"] }
+    { "tag": "v2", "new_sqlite_classes": ["GrantStore", "RepoIndex"] }
   ],
   "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>" }
 }
