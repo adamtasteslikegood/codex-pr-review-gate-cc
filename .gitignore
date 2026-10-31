@@ -3,3 +3,4 @@ node_modules/
 .gstack/tmp/
 **/.claude-plugin/types/
 .wrangler/
+pr-lifecycle-relay/.dev/

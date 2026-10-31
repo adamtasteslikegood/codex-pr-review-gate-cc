@@ -4,26 +4,18 @@
 // read). `POST /v1/admin/grants` edits the grants (admin only). The owner `admin` is reserved: `/v1/admin/...` never reaches a repo.
 
 import { isAdmin, verifyAccess, type Principal } from './auth.ts'
-import type { Env } from './types.ts'
+import { isBranchName, type Env } from './types.ts'
 
 export { GrantStore } from './grants.ts'
 export { LifecycleObject } from './lifecycle.ts'
 export { RepoIndex } from './repo-index.ts'
+export { isBranchName } from './types.ts'
+export { WorkBoard } from './work.ts'
 
 const NAME = /^[A-Za-z0-9_.-]{1,100}$/
 const ADMIN_GRANT_OPS = ['grants', 'grant', 'revoke']
 const ADMIN_INDEX_OPS = ['fault', 'update']
 const REPO = /^[a-z0-9_.-]{1,100}\/[a-z0-9_.-]{1,100}$/
-
-/** A branch name `git check-ref-format --branch` would accept, in 1 to 255 UTF-8 bytes (R103). */
-export const isBranchName = (name: string): boolean => {
-  const bytes = new TextEncoder().encode(name).length
-  if (bytes < 1 || bytes > 255) return false
-  if (/[\u0000-\u0020\u007f~^:?*[\\]/.test(name)) return false
-  if (name.includes('..') || name.includes('@{') || name.includes('//')) return false
-  if (name === '@') return false
-  return !/^[-/]|[/.]$|\.lock$/.test(name) && name.split('/').every(part => !part.startsWith('.') && !part.endsWith('.lock'))
-}
 
 const refuse = (status: number, text: string): Response => new Response(text, { status })
 
@@ -86,6 +78,8 @@ export default {
     if (request.method !== 'POST') return refuse(404, 'not found')
     if (version === 'v1' && owner?.toLowerCase() === 'admin') return admin(request, env, url.pathname)
     const isList = parts.length === 4
+    // `/v1/<owner>/<repo>/work`: the repo's work claims, one WorkBoard per repo. `work` was never a valid PR number, so no route changes.
+    const isWork = pr === 'work' && parts.length === 5
     // `/v1/<owner>/<repo>/branch/<branch>`: the branch is one percent-encoded segment, decoded once and checked as git would.
     let branch: string | undefined
     if (pr === 'branch') {
@@ -97,7 +91,7 @@ export default {
       }
       if (!isBranchName(branch)) return refuse(404, 'not found')
     }
-    const isShapeOk = isList || branch !== undefined || /^[1-9][0-9]{0,9}$/.test(pr ?? '')
+    const isShapeOk = isList || isWork || branch !== undefined || /^[1-9][0-9]{0,9}$/.test(pr ?? '')
     if (version !== 'v1' || !NAME.test(owner ?? '') || !NAME.test(repo ?? '') || !isShapeOk) return refuse(404, 'not found')
     const who = await verifyAccess(request, env, Date.now())
     if (who === undefined) return refuse(401, 'unauthenticated')
@@ -110,6 +104,10 @@ export default {
       if (parse(await request.text())?.op !== 'list') return refuse(400, 'the repo route takes { "op": "list" } only')
       if (preset !== 'read' && preset !== 'operate') return refuse(403, `${who.id} may not list ${name}`)
       return repoIndex(env, name).fetch(internal(who, JSON.stringify({ op: 'list' }), { 'x-relay-repo': name, 'x-relay-preset': preset }))
+    }
+    if (isWork) {
+      const board = env.WORK.get(env.WORK.idFromName(name))
+      return board.fetch(internal(who, await request.text(), { 'x-relay-repo': name, 'x-relay-preset': preset ?? '' }))
     }
     const key = branch !== undefined ? `@${branch}` : `#${pr}`
     const stub = env.LIFECYCLE.get(env.LIFECYCLE.idFromName(`${name}${key}`))

@@ -10,6 +10,16 @@ export async function bodyOf(request: Request): Promise<{ op?: unknown; [key: st
   }
 }
 
+/** A branch name `git check-ref-format --branch` would accept, in 1 to 255 UTF-8 bytes (R103). */
+export const isBranchName = (name: string): boolean => {
+  const bytes = new TextEncoder().encode(name).length
+  if (bytes < 1 || bytes > 255) return false
+  if (/[\u0000-\u0020\u007f~^:?*[\\]/.test(name)) return false
+  if (name.includes('..') || name.includes('@{') || name.includes('//')) return false
+  if (name === '@') return false
+  return !/^[-/]|[/.]$|\.lock$/.test(name) && name.split('/').every(part => !part.startsWith('.') && !part.endsWith('.lock'))
+}
+
 export type Env = {
   /** The Access team's domain, e.g. `example.cloudflareaccess.com`: the JWT's issuer and where its keys are published. */
   ACCESS_TEAM_DOMAIN: string
@@ -32,6 +42,8 @@ export type Env = {
   GRANTS: DurableObjectNamespace
   /** One RepoIndex object per `owner/repo` (spec §9): the repo's live records, for `list`. */
   REPO_INDEX: DurableObjectNamespace
+  /** One WorkBoard object per `owner/repo`: the repo's work claims (2026-10-31 work claims design). */
+  WORK: DurableObjectNamespace
 }
 
 export interface DurableObjectId {
