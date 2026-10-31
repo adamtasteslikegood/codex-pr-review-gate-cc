@@ -98,8 +98,10 @@ npm run relay:dev                                     # in one terminal
 `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`, so Node, Claude Code and Python trust it. pr-lifecycle takes only an https relay, so this is how
 the gate runs against it locally:
 
-1. `TLS=1 npm run relay:dev`, then `. pr-lifecycle-relay/.dev/gate.env && node pr-lifecycle-relay/dev/gate-smoke.mjs` checks the gate's
-   calls (lease, commit, log, filing claim, list) end to end.
+1. `TLS=1 npm run relay:dev`, then, with `. pr-lifecycle-relay/.dev/gate.env`:
+   - `node pr-lifecycle-relay/dev/gate-smoke.mjs` checks the gate's calls (lease, commit, log, filing claim, list) end to end;
+   - `node --no-warnings --import ./pr-lifecycle-relay/dev/ts-ext.mjs pr-lifecycle-relay/dev/gate-store-live.ts` runs pr-lifecycle's own
+     store code, unchanged, from a throwaway checkout whose base opts in: the opt-in, the credential, the pin and three commits.
 2. In a repo listed in `DEV_REPOS`, put `"sharedStore": { "url": "https://127.0.0.1:8443", "aud": "relay-dev" }` in the base branch's
    `.github/pr-gate.json` and push it.
 3. Start Claude Code from a shell that sourced `.dev/gate.env` (its `PR_GATE_RELAY_URL` is the pin, and `NODE_EXTRA_CA_CERTS` must be set
