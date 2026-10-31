@@ -109,13 +109,14 @@ const url = `${IS_TLS ? 'https' : 'http'}://${HOST === '0.0.0.0' ? '127.0.0.1' :
 /** With TLS, each env file also trusts the local CA: NODE_EXTRA_CA_CERTS for Node and Claude Code, SSL_CERT_FILE for Python. */
 const trust = IS_TLS ? `export NODE_EXTRA_CA_CERTS=${new URL('tls/ca.pem', DIR).pathname}\nexport SSL_CERT_FILE=${new URL('tls/ca.pem', DIR).pathname}\n` : ''
 for (const runtime of RUNTIMES) {
-  const env = `${trust}export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_CLIENT_ID=${runtime}\nexport PR_GATE_RELAY_CLIENT_SECRET=${tokens[runtime]}\nexport RELAY_RUNTIME=${runtime}\n`
+  const env = `${trust}unset PR_GATE_RELAY_TOKEN\nexport PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_CLIENT_ID=${runtime}\nexport PR_GATE_RELAY_CLIENT_SECRET=${tokens[runtime]}\nexport RELAY_RUNTIME=${runtime}\n`
   writeFileSync(new URL(`${runtime}.env`, DIR), env, { mode: 0o600 })
 }
 
-// The dev person's own token, for admin ops such as `breakClaim` (`cf-access-token`, as `PR_GATE_RELAY_TOKEN`), good for 30 days.
+// Each env file clears the other credential form, so sourcing one after another never leaves the first in charge (a service token wins
+// over a person's token). The dev person's own token, for admin ops such as `breakClaim` (`cf-access-token`, as `PR_GATE_RELAY_TOKEN`), good for 30 days.
 const person = await sign({ email: ADMIN }, 30 * 86_400)
-writeFileSync(new URL('admin.env', DIR), `${trust}export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_TOKEN=${person}\nexport RELAY_RUNTIME=admin\n`, { mode: 0o600 })
+writeFileSync(new URL('admin.env', DIR), `${trust}unset PR_GATE_RELAY_CLIENT_ID PR_GATE_RELAY_CLIENT_SECRET\nexport PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_TOKEN=${person}\nexport RELAY_RUNTIME=admin\n`, { mode: 0o600 })
 
 /** A local CA and a leaf certificate for 127.0.0.1 and localhost, made once with openssl and kept in `.dev/tls/`. */
 function tls(): { key: Buffer; cert: Buffer } {

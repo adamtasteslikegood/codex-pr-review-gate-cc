@@ -67,6 +67,14 @@ const verifierOf = async (secret: unknown): Promise<string | undefined> => {
 }
 
 const cut = (value: unknown, max: number): string | undefined => (typeof value === 'string' && value !== '' ? value.slice(0, max) : undefined)
+/**
+ * An identifier (a branch, a commit, a notes path) is kept exactly or refused: a cut one would name another ref or file. Undefined when
+ * absent, false when it isn't a string or is longer than `max`.
+ */
+const exact = (value: unknown, max: number): string | undefined | false =>
+  value === undefined || value === null || value === '' ? undefined : typeof value === 'string' && value.length <= max ? value : false
+/** git's own limit on a branch name is 255 bytes (`isBranchName`). */
+const BRANCH_MAX = 255
 
 /** What a response shows of a claim: never the verifier, and `lapsed` for an active claim whose lease ran out. */
 const shown = (c: Claim, now: number, withSteps = true) => {
@@ -149,10 +157,10 @@ export class WorkBoard {
       await storage.put({ [key]: summaryOf(c), [stepsKey]: c.steps })
       await this.arm(this.dueOf(c))
     }
-    /** A branch must be one git would accept, so no client ever passes an option-shaped name such as `--force` to git. */
+    /** A branch must be one git would accept, whole, so no client ever passes an option-shaped name such as `--force` to git. */
     const branchOf = (value: unknown): string | undefined | false => {
-      const branch = cut(value, FIELD_MAX)
-      return branch === undefined ? undefined : isBranchName(branch) ? branch : false
+      const branch = exact(value, BRANCH_MAX)
+      return branch === undefined || branch === false ? branch : isBranchName(branch) ? branch : false
     }
 
     switch (op) {
@@ -205,14 +213,14 @@ export class WorkBoard {
         } else if (op === 'checkpoint') {
           const text = cut(body.text, TEXT_MAX)
           if (text === undefined) return reply(400, { error: 'checkpoint needs a text' })
-          const commit = cut(body.commit, FIELD_MAX)
+          const commit = exact(body.commit, FIELD_MAX)
+          const notes = exact(body.notes, FIELD_MAX)
+          if (commit === false || notes === false) return reply(400, { error: `commit and notes are strings of at most ${FIELD_MAX} characters` })
           const branch = branchOf(body.branch)
           if (branch === false) return reply(400, { error: 'branch is not a name git accepts' })
           if (branch !== undefined) c = { ...c, branch }
-          for (const field of ['notes', 'commit'] as const) {
-            const value = cut(body[field], FIELD_MAX)
-            if (value !== undefined) c = { ...c, [field]: value }
-          }
+          if (commit !== undefined) c = { ...c, commit }
+          if (notes !== undefined) c = { ...c, notes }
           c = step({ ...c, lease: { ...c.lease!, until: now + leaseMs } }, 'checkpoint', text, c.lease, commit)
         } else {
           const outcome = typeof body.outcome === 'string' && OUTCOMES.has(body.outcome) ? (body.outcome as Outcome) : undefined

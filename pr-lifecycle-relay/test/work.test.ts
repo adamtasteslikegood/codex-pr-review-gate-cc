@@ -100,6 +100,13 @@ test('a branch git would refuse, such as an option-shaped one, is 400 on claim a
   }
   const { token } = (await work(adam, { op: 'claim', ref: 'gh#20', holder: 'tui', runtime: 'tui', secret: LAPTOP, branch: 'work/gh-20' })).json as unknown as Claimed
   assert.equal((await work(adam, { op: 'checkpoint', ref: 'gh#20', secret: LAPTOP, token, text: 't', branch: '--orphan=x' })).status, 400)
+  // An identifier is kept whole or refused, never cut: a cut branch or notes path would name another ref or file.
+  assert.equal((await work(adam, { op: 'checkpoint', ref: 'gh#20', secret: LAPTOP, token, text: 't', branch: 'b'.repeat(200) + '/x..y' })).status, 400)
+  assert.equal((await work(adam, { op: 'checkpoint', ref: 'gh#20', secret: LAPTOP, token, text: 't', notes: 'n'.repeat(201) })).status, 400)
+  const long = `work/${'b'.repeat(210)}`
+  const kept = await work(adam, { op: 'checkpoint', ref: 'gh#20', secret: LAPTOP, token, text: 't', branch: long })
+  assert.equal(kept.status, 200)
+  assert.equal((kept.json.claim as Record<string, unknown>).branch, long)
   assert.equal((await work(adam, { op: 'checkpoint', ref: 'gh#20', secret: LAPTOP, token, text: 't', branch: 'work/gh-20b' })).status, 200)
 })
 

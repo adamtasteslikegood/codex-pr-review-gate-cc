@@ -44,6 +44,13 @@ def new_secret() -> str:
     return secrets.token_hex(32)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would carry the Access credential to wherever it points, even over plain http. A 3xx is refused."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
 class RelayWork:
     def __init__(self, url: str, headers: dict[str, str], repo: str, runtime: str, holder: str, secret: str, timeout: float = 10.0):
         if len(secret) < 32:
@@ -56,7 +63,8 @@ class RelayWork:
         self.timeout = timeout
         self.tokens: dict[str, int] = {}
         cafile = os.environ.get("SSL_CERT_FILE")
-        self.context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+        context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+        self.opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=context))
 
     @classmethod
     def from_env(cls, repo: str, runtime: str, holder: str, secret: str | None = None) -> "RelayWork":
@@ -76,7 +84,7 @@ class RelayWork:
         data = json.dumps({k: v for k, v in body.items() if v is not None}).encode()
         request = urllib.request.Request(self.endpoint, data=data, headers=self.headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as res:
+            with self.opener.open(request, timeout=self.timeout) as res:
                 status, text = res.status, res.read().decode()
         except urllib.error.HTTPError as error:
             status, text = error.code, error.read().decode(errors="replace")
@@ -99,8 +107,8 @@ class RelayWork:
         self.tokens[ref] = answer["token"]
         return answer
 
-    def beat(self, ref: str) -> dict[str, Any]:
-        return self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": self.tokens[ref]})
+    def beat(self, ref: str, token: int | None = None) -> dict[str, Any]:
+        return self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": self.tokens[ref] if token is None else token})
 
     def checkpoint(self, ref: str, text: str, commit: str | None = None, branch: str | None = None, notes: str | None = None) -> dict[str, Any]:
         return self._send({"op": "checkpoint", "ref": ref, "secret": self.secret, "token": self.tokens[ref], "text": text,
@@ -123,11 +131,14 @@ class RelayWork:
         if every < 5:
             raise ValueError("every is at least 5 seconds")
         stop, lost = threading.Event(), threading.Event()
+        # Bound to the claim it started with: if that claim is lost and claimed again, this keepalive reports the loss rather than beat
+        # for the new claim.
+        token = self.tokens[ref]
 
         def run() -> None:
             while not stop.wait(every):
                 try:
-                    self.beat(ref)
+                    self.beat(ref, token)
                 except RelayRefused:
                     lost.set()
                     return

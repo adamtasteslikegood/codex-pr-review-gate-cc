@@ -143,11 +143,20 @@ switch (command) {
       // On a takeover, `--checkout` puts this checkout on the branch the last holder pushed, ready to read its notes and go on. The name
       // is checked as git would before it reaches git, and passed only inside full refs, so no name can act as an option.
       if (flags.checkout === true && typeof branch === 'string' && branch !== '') {
+        // The pushed checkpoint is the truth: a local branch of that name is switched to and fast-forwarded to it, and one that has
+        // diverged, or a failed fetch, is reported rather than resumed from stale code and notes.
         const isName = git('check-ref-format', '--branch', branch) === branch
-        const isLocal = isName && git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`) !== undefined
         const isFetched = isName && git('fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`) !== undefined
-        const isOn = isLocal ? git('switch', branch) !== undefined : isFetched && git('switch', '--track', `origin/${branch}`) !== undefined
-        if (!isOn) console.error(`could not check out ${JSON.stringify(branch)}`)
+        const isLocal = isFetched && git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`) !== undefined
+        const isOn = !isFetched
+          ? false
+          : isLocal
+            ? git('switch', branch) !== undefined && git('merge', '--ff-only', `refs/remotes/origin/${branch}`) !== undefined
+            : git('switch', '--track', `origin/${branch}`) !== undefined
+        if (!isOn) {
+          console.error(`could not check out ${JSON.stringify(branch)} at its pushed checkpoint`)
+          process.exitCode = 1
+        }
       }
     }
     done(answer)
