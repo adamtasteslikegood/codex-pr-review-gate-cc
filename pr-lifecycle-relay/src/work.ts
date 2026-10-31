@@ -1,10 +1,11 @@
 // One Durable Object per repo (`owner/repo`): the repo's work claims (docs/superpowers/specs/2026-10-31-relay-work-claims-design.md). An
 // agent claims a piece of work by its ref (`gh#12`), checkpoints where it pushed the work and its notes, and releases it. A claim whose
-// lease lapses is taken over by the next session, on any runtime, which resumes from the last checkpoint. Each claim has its own storage
-// key; a Durable Object runs one request at a time, so each op reads and writes its claim in one step.
+// lease lapses is taken over by the next session, on any runtime, which resumes from the last checkpoint. Each claim keeps its summary
+// under `claim:<ref>` and its steps under `steps:<ref>`, so `list`, the board's cap and the alarm read only the small summaries; a Durable
+// Object runs one request at a time, so each op reads and writes its claim in one step.
 
 import { isAdmin, type Preset, type Principal } from './auth.ts'
-import { bodyOf, type DurableObjectState, type Env } from './types.ts'
+import { bodyOf, isBranchName, type DurableObjectState, type Env } from './types.ts'
 
 export type WorkState = 'active' | 'paused' | 'done' | 'abandoned'
 type Outcome = 'paused' | 'done' | 'abandoned'
@@ -25,6 +26,8 @@ export type Claim = {
   commit?: string
   notes?: string
   steps: Step[]
+  /** The last step, kept in the summary so `list` needs no steps. */
+  lastStep?: Step
   stepsDropped: number
   seq: number
   created: number
@@ -48,6 +51,7 @@ const reply = (status: number, body: unknown): Response => new Response(JSON.str
 type Need = 'read' | 'operate' | 'admin'
 const NEEDS: Record<string, Need> = {
   get: 'read',
+  deleteClaim: 'admin',
   list: 'read',
   claim: 'operate',
   beat: 'operate',
@@ -68,13 +72,20 @@ const cut = (value: unknown, max: number): string | undefined => (typeof value =
 const shown = (c: Claim, now: number, withSteps = true) => {
   const { verifier: _, ...lease } = c.lease ?? { verifier: '' }
   const isLapsed = c.state === 'active' && (c.lease === null || c.lease.until <= now)
-  const { steps, ...rest } = c
+  const { steps, lastStep, ...rest } = c
   return {
     ...rest,
     state: isLapsed ? 'lapsed' : c.state,
     lease: c.lease === null ? null : lease,
-    ...(withSteps ? { steps } : { lastStep: steps.at(-1) ?? null }),
+    ...(withSteps ? { steps } : { lastStep: lastStep ?? steps.at(-1) ?? null }),
   }
+}
+
+type Summary = Omit<Claim, 'steps'>
+const summaryOf = (c: Claim): Summary => {
+  const { steps, ...rest } = c
+  const last = steps.at(-1)
+  return last === undefined ? rest : { ...rest, lastStep: last }
 }
 
 export class WorkBoard {
@@ -104,9 +115,9 @@ export class WorkBoard {
     const storage = this.state.storage
 
     if (op === 'list') {
-      const all = await storage.list<Claim>({ prefix: 'claim:' })
+      const all = await storage.list<Summary>({ prefix: 'claim:' })
       const wanted = typeof body.state === 'string' ? body.state : undefined
-      const claims = [...all.values()].map(c => shown(c, now, false)).filter(c => wanted === undefined || c.state === wanted)
+      const claims = [...all.values()].map(c => shown({ ...c, steps: [] }, now, false)).filter(c => wanted === undefined || c.state === wanted)
       return reply(200, { claims })
     }
 
@@ -115,24 +126,33 @@ export class WorkBoard {
     // The digest comes before the claim is read: no await other than storage falls between the read and the write.
     const proof = await verifierOf(body.secret)
     const key = `claim:${ref}`
-    const found = await storage.get<Claim>(key)
+    const stepsKey = `steps:${ref}`
+    const both = await storage.get<unknown>([key, stepsKey])
+    const summary = both.get(key) as Summary | undefined
+    const found: Claim | undefined = summary === undefined ? undefined : { ...summary, steps: (both.get(stepsKey) as Step[] | undefined) ?? [] }
     const leaseMs = Number(this.env.LEASE_MS ?? LEASE_MS)
     const isLive = (c: Claim): boolean => c.lease !== null && c.lease.until > now
     /** The caller holds this claim's live lease: same principal, same secret and, when given, the current token. */
     const isHeld = (c: Claim): boolean =>
       isLive(c) && c.lease!.principal === who.id && proof !== undefined && c.lease!.verifier === proof &&
       (body.token === undefined || body.token === c.lease!.token)
-    const step = (c: Claim, kind: string, text: string, lease: WorkLease | null, commit?: string): Claim => {
+    /** Appends a step. It names the lease it is about: its holder and runtime, and its principal unless `by` says who acted. */
+    const step = (c: Claim, kind: string, text: string, lease: WorkLease | null, commit?: string, by = who.id): Claim => {
       const seq = c.seq + 1
-      const one: Step = { seq, at: now, kind, text: text.slice(0, TEXT_MAX), principal: who.id, holder: lease?.holder ?? '', runtime: lease?.runtime ?? '' }
+      const one: Step = { seq, at: now, kind, text: text.slice(0, TEXT_MAX), principal: by, holder: lease?.holder ?? '', runtime: lease?.runtime ?? '' }
       if (commit !== undefined) one.commit = commit
       const steps = [...c.steps, one]
       const over = Math.max(0, steps.length - STEP_CAP)
       return { ...c, seq, steps: steps.slice(over), stepsDropped: c.stepsDropped + over, updated: now }
     }
     const save = async (c: Claim): Promise<void> => {
-      await storage.put({ [key]: c })
-      if (c.closedAt !== undefined) await this.arm(c.closedAt + this.retention())
+      await storage.put({ [key]: summaryOf(c), [stepsKey]: c.steps })
+      await this.arm(this.dueOf(c))
+    }
+    /** A branch must be one git would accept, so no client ever passes an option-shaped name such as `--force` to git. */
+    const branchOf = (value: unknown): string | undefined | false => {
+      const branch = cut(value, FIELD_MAX)
+      return branch === undefined ? undefined : isBranchName(branch) ? branch : false
     }
 
     switch (op) {
@@ -143,6 +163,8 @@ export class WorkBoard {
         const runtime = cut(body.runtime, FIELD_MAX)
         if (holder === undefined || runtime === undefined) return reply(400, { error: 'claim needs a holder and a runtime' })
         if (proof === undefined) return reply(400, { error: `claim needs a secret of at least ${MIN_SECRET} characters` })
+        const branch = branchOf(body.branch)
+        if (branch === false) return reply(400, { error: 'branch is not a name git accepts' })
         if (found === undefined && (await storage.list({ prefix: 'claim:' })).size >= BOARD_CAP) return reply(409, { error: `the board holds ${BOARD_CAP} claims` })
         let c: Claim = found ?? { ref, state: 'active', lease: null, fence: 0, steps: [], stepsDropped: 0, seq: 0, created: now, updated: now }
         if (isLive(c)) {
@@ -159,13 +181,12 @@ export class WorkBoard {
         const before = c.lease
         const tookOver = before !== null && c.state === 'active'
         // The old holder's last step is unknown: it is marked interrupted, and the next holder reads the notes rather than re-running it.
-        if (tookOver) c = step(c, 'interrupted', `the lease of ${before.holder} (${before.runtime}) lapsed`, before, c.commit)
+        if (tookOver) c = step(c, 'interrupted', `the lease of ${before.holder} (${before.runtime}) lapsed`, before, c.commit, before.principal)
         const lease: WorkLease = { holder, principal: who.id, runtime, token: c.fence + 1, until: now + leaseMs, verifier: proof }
         c = { ...c, state: 'active', lease, fence: lease.token }
         delete c.closedAt
         const title = cut(body.title, TEXT_MAX)
         if (title !== undefined) c.title = title
-        const branch = cut(body.branch, FIELD_MAX)
         if (branch !== undefined && c.branch === undefined) c.branch = branch
         const kind = found === undefined || tookOver ? 'claimed' : found.state === 'done' || found.state === 'abandoned' ? 'reopened' : 'resumed'
         c = step(c, kind, tookOver ? `took over from ${before.holder}` : kind, lease)
@@ -185,7 +206,10 @@ export class WorkBoard {
           const text = cut(body.text, TEXT_MAX)
           if (text === undefined) return reply(400, { error: 'checkpoint needs a text' })
           const commit = cut(body.commit, FIELD_MAX)
-          for (const field of ['branch', 'notes', 'commit'] as const) {
+          const branch = branchOf(body.branch)
+          if (branch === false) return reply(400, { error: 'branch is not a name git accepts' })
+          if (branch !== undefined) c = { ...c, branch }
+          for (const field of ['notes', 'commit'] as const) {
             const value = cut(body[field], FIELD_MAX)
             if (value !== undefined) c = { ...c, [field]: value }
           }
@@ -199,6 +223,12 @@ export class WorkBoard {
         }
         await save(c)
         return reply(200, { claim: shown(c, now, op !== 'beat') })
+      }
+      case 'deleteClaim': {
+        if (found === undefined) return reply(404, { error: `no claim ${ref}` })
+        await storage.delete(key)
+        await storage.delete(stepsKey)
+        return reply(200, {})
       }
       case 'breakClaim': {
         if (found === undefined) return reply(404, { error: `no claim ${ref}` })
@@ -219,22 +249,30 @@ export class WorkBoard {
     return Number(this.env.RETENTION_MS ?? RETENTION_MS)
   }
 
+  /** A claim is deleted `RETENTION_MS` after it last changed, whatever its state; a beat counts as a change, so a held claim stays. */
+  private dueOf(c: Summary): number {
+    return c.updated + this.retention()
+  }
+
   /** Sets the one alarm to `at` unless it is already due sooner. */
   private async arm(at: number): Promise<void> {
     const current = await this.state.storage.getAlarm()
     if (current === null || current > at) await this.state.storage.setAlarm(at)
   }
 
-  /** Deletes each closed claim whose retention ran out, then sets the alarm for the next one. */
+  /** Deletes each claim untouched for its retention, unless its lease is live, then sets the alarm for the next one. */
   async alarm(): Promise<void> {
     const now = Date.now()
-    const retention = this.retention()
     let next: number | undefined
-    for (const [key, c] of await this.state.storage.list<Claim>({ prefix: 'claim:' })) {
-      if (c.closedAt === undefined) continue
-      const due = c.closedAt + retention
-      if (due <= now) await this.state.storage.delete(key)
-      else next = next === undefined ? due : Math.min(next, due)
+    for (const [key, c] of await this.state.storage.list<Summary>({ prefix: 'claim:' })) {
+      const isLive = c.lease !== null && c.lease.until > now
+      const due = isLive ? Math.max(this.dueOf(c), c.lease!.until) : this.dueOf(c)
+      if (due <= now && !isLive) {
+        await this.state.storage.delete(key)
+        await this.state.storage.delete(`steps:${c.ref}`)
+      } else {
+        next = next === undefined ? due : Math.min(next, due)
+      }
     }
     if (next !== undefined) await this.state.storage.setAlarm(next)
   }

@@ -4,27 +4,18 @@
 // read). `POST /v1/admin/grants` edits the grants (admin only). The owner `admin` is reserved: `/v1/admin/...` never reaches a repo.
 
 import { isAdmin, verifyAccess, type Principal } from './auth.ts'
-import type { Env } from './types.ts'
+import { isBranchName, type Env } from './types.ts'
 
 export { GrantStore } from './grants.ts'
 export { LifecycleObject } from './lifecycle.ts'
 export { RepoIndex } from './repo-index.ts'
+export { isBranchName } from './types.ts'
 export { WorkBoard } from './work.ts'
 
 const NAME = /^[A-Za-z0-9_.-]{1,100}$/
 const ADMIN_GRANT_OPS = ['grants', 'grant', 'revoke']
 const ADMIN_INDEX_OPS = ['fault', 'update']
 const REPO = /^[a-z0-9_.-]{1,100}\/[a-z0-9_.-]{1,100}$/
-
-/** A branch name `git check-ref-format --branch` would accept, in 1 to 255 UTF-8 bytes (R103). */
-export const isBranchName = (name: string): boolean => {
-  const bytes = new TextEncoder().encode(name).length
-  if (bytes < 1 || bytes > 255) return false
-  if (/[\u0000-\u0020\u007f~^:?*[\\]/.test(name)) return false
-  if (name.includes('..') || name.includes('@{') || name.includes('//')) return false
-  if (name === '@') return false
-  return !/^[-/]|[/.]$|\.lock$/.test(name) && name.split('/').every(part => !part.startsWith('.') && !part.endsWith('.lock'))
-}
 
 const refuse = (status: number, text: string): Response => new Response(text, { status })
 

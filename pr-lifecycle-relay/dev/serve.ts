@@ -9,7 +9,7 @@
 // On first start it makes one service token per runtime (`DEV_RUNTIMES`) and writes `.dev/<runtime>.env` with the three variables
 // pr-lifecycle and `client/relay-work.ts` read. Every runtime and the dev person (`DEV_ADMIN`) get `operate` on each repo in `DEV_REPOS`.
 
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { stripTypeScriptTypes } from 'node:module'
@@ -20,6 +20,11 @@ const DIR = new URL('../.dev/', import.meta.url)
 const TEAM = 'dev.cloudflareaccess.local'
 const AUD = 'relay-dev'
 const HOST = process.env.HOST ?? '127.0.0.1'
+// Every dev runtime and the dev admin may operate on the seeded repos: this server is for one machine. Another address needs a choice.
+if (!['127.0.0.1', '::1', 'localhost'].includes(HOST) && process.env.DEV_EXPOSE !== '1') {
+  console.error(`refusing HOST=${HOST}: the dev relay grants operate to every dev credential. Set DEV_EXPOSE=1 to serve beyond this machine.`)
+  process.exit(2)
+}
 const PORT = Number(process.env.PORT ?? 8787)
 const ADMIN = (process.env.DEV_ADMIN ?? 'adam@dev.local').toLowerCase()
 const RUNTIMES = (process.env.DEV_RUNTIMES ?? 'tui,sandbox,vps,cloud,bridge,gate').split(',').map(one => one.trim()).filter(Boolean)
@@ -64,7 +69,8 @@ async function sign(claims: Record<string, unknown>, seconds = 3600): Promise<st
 async function assertionOf(headers: Record<string, string | string[] | undefined>): Promise<string | undefined> {
   const id = String(headers['cf-access-client-id'] ?? '')
   const secret = String(headers['cf-access-client-secret'] ?? '')
-  if (id !== '' && Object.hasOwn(tokens, id) && tokens[id] === secret) return sign({ common_name: id })
+  const isSecret = (want: string): boolean => want.length === secret.length && timingSafeEqual(Buffer.from(want), Buffer.from(secret))
+  if (id !== '' && Object.hasOwn(tokens, id) && isSecret(tokens[id])) return sign({ common_name: id })
   const token = headers['cf-access-token']
   return typeof token === 'string' && token !== '' ? token : undefined
 }

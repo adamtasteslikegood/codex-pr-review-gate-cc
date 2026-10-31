@@ -68,9 +68,11 @@ step is logged as `interrupted`. Every body carries `ref` (`^[A-Za-z0-9][A-Za-z0
 | `release { secret, token, outcome, text? }` | `operate` | `outcome` is `paused`, `done` or `abandoned`. |
 | `get`, `list { state? }` | `read` | One claim with its steps; every claim with its last step. An active claim with no live lease shows as `lapsed`. |
 | `breakClaim { text? }` | admin | Drops the lease and pauses the claim. |
+| `deleteClaim` | admin | Deletes the claim and its steps. |
 
-A wrong secret, principal or token, or a lapsed lease, is 409. A claim keeps its last 200 steps; a board holds at most 2000 claims; a
-`done` or `abandoned` claim is deleted `RETENTION_MS` after it closed.
+A wrong secret, principal or token, or a lapsed lease, is 409. A `branch` git would refuse is 400. A claim keeps its last 200 steps,
+stored apart from its summary; a board holds at most 2000 claims; a claim untouched for `RETENTION_MS`, whatever its state, is deleted
+unless its lease is live.
 
 **Client:** `npm run relay:work -- <command>` (`client/relay-work.ts`, Node 22, no dependencies) works the same from the TUI, a Workers
 sandbox, a VPS, Claude cloud or the game bridge (which can also call the HTTP API directly). It reads the pr-lifecycle variables

@@ -49,9 +49,12 @@ higher fence `token`; `beat`, `checkpoint` and `release` must prove the secret, 
 | `get { ref }` | read | One claim, with its steps. |
 | `list { state? }` | read | Every claim, without steps (the last one only). |
 | `breakClaim { ref, text? }` | admin | Drops a live lease and pauses the claim, logging who broke it. |
+| `deleteClaim { ref }` | admin | Deletes a claim and its steps. |
 
-Wrong secret, principal or token, or a lapsed lease: 409. A `done` or `abandoned` claim is deleted `RETENTION_MS` (90 days) after it closed.
-A board holds at most 2000 claims; a new claim beyond that is 409.
+Wrong secret, principal or token, or a lapsed lease: 409. A `branch` git would refuse (such as `--force`) is 400, so no client ever hands
+git an option-shaped name. A claim untouched for `RETENTION_MS` (90 days), whatever its state, is deleted unless its lease is live, so junk
+never fills the board. A board holds at most 2000 claims; a new claim beyond that is 409. Each claim's summary and its steps are stored
+under separate keys, so `list`, the cap and the alarm read only the summaries.
 
 ## Clients
 

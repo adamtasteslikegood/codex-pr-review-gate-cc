@@ -14,7 +14,7 @@
 // Prints the relay's JSON answer. Exit codes: 0 done, 1 refused (held, lost, not allowed, not found), 2 usage, 3 the relay did not answer.
 
 import { execFileSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { basename, join } from 'node:path'
@@ -34,7 +34,9 @@ const git = (...args: string[]): string | undefined => {
   }
 }
 
-/** Flags as `--name value` or a bare `--name` (true); the rest are positional. */
+/** The flags that take no value; every other flag takes the next argument (or `--name=value`), even one starting with `--`. */
+const SWITCHES = new Set(['reopen', 'checkout', 'push'])
+
 function parse(argv: string[]): { pos: string[]; flags: Record<string, string | true> } {
   const pos: string[] = []
   const flags: Record<string, string | true> = {}
@@ -44,9 +46,11 @@ function parse(argv: string[]): { pos: string[]; flags: Record<string, string | 
       pos.push(arg)
       continue
     }
-    const next = argv[i + 1]
-    if (next === undefined || next.startsWith('--')) flags[arg.slice(2)] = true
-    else flags[arg.slice(2)] = argv[++i]
+    const [name, inline] = arg.slice(2).split(/=(.*)/s)
+    if (SWITCHES.has(name)) flags[name] = true
+    else if (inline !== undefined) flags[name] = inline
+    else if (i + 1 < argv.length) flags[name] = argv[++i]
+    else fail(2, `--${name} needs a value`)
   }
   return { pos, flags }
 }
@@ -76,12 +80,20 @@ const holder = str('holder') ?? `${runtime}@${hostname()}:${top === undefined ? 
 
 // The checkout's secret, made once; and the token of each claim it holds.
 const gitDir = git('rev-parse', '--absolute-git-dir')
-const home = gitDir === undefined ? join(homedir(), '.relay-work') : join(gitDir, 'relay-work')
+const digest = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 24)
+// Outside a checkout, each working directory gets its own folder, so two directories never share a claim.
+const home = gitDir === undefined ? join(homedir(), '.relay-work', digest(process.cwd())) : join(gitDir, 'relay-work')
 mkdirSync(home, { recursive: true, mode: 0o700 })
 const secretFile = join(home, 'secret')
-if (!existsSync(secretFile)) writeFileSync(secretFile, randomBytes(32).toString('hex'), { mode: 0o600 })
+// Two first runs at once: only one write wins (`wx`), and both read the winner.
+try {
+  writeFileSync(secretFile, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' })
+} catch (error) {
+  if ((error as { code?: string }).code !== 'EEXIST') throw error
+}
 const secret = readFileSync(secretFile, 'utf8').trim()
-const tokenFile = (one: string) => join(home, `${repo!.replace('/', '__')}__${one.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
+// Named by a digest of the repo and ref, so refs that differ only in punctuation (`gh#12`, `gh:12`) never share a token file.
+const tokenFile = (one: string) => join(home, `${digest(`${repo}\n${one}`)}.json`)
 const tokenOf = (one: string): number => {
   try {
     return (JSON.parse(readFileSync(tokenFile(one), 'utf8')) as { token: number }).token
@@ -128,9 +140,14 @@ switch (command) {
     if (answer.status === 200) {
       writeFileSync(tokenFile(one), JSON.stringify({ token: answer.json.token, holder }), { mode: 0o600 })
       const branch = (answer.json.resume as { branch?: string | null } | undefined)?.branch
-      // On a takeover, `--checkout` puts this checkout on the branch the last holder pushed, ready to read its notes and go on.
+      // On a takeover, `--checkout` puts this checkout on the branch the last holder pushed, ready to read its notes and go on. The name
+      // is checked as git would before it reaches git, and passed only inside full refs, so no name can act as an option.
       if (flags.checkout === true && typeof branch === 'string' && branch !== '') {
-        if (git('fetch', 'origin', branch) === undefined || git('checkout', branch) === undefined) console.error(`could not check out ${branch}`)
+        const isName = git('check-ref-format', '--branch', branch) === branch
+        const isLocal = isName && git('rev-parse', '--verify', '--quiet', `refs/heads/${branch}`) !== undefined
+        const isFetched = isName && git('fetch', 'origin', `refs/heads/${branch}:refs/remotes/origin/${branch}`) !== undefined
+        const isOn = isLocal ? git('switch', branch) !== undefined : isFetched && git('switch', '--track', `origin/${branch}`) !== undefined
+        if (!isOn) console.error(`could not check out ${JSON.stringify(branch)}`)
       }
     }
     done(answer)
@@ -143,8 +160,11 @@ switch (command) {
     // Beats until the claim is lost or released, so an agent runs `relay-work keepalive gh#12 &` beside its work.
     const one = needRef()
     const every = Number(str('every') ?? 30) * 1000
+    if (!Number.isFinite(every) || every < 5000) fail(2, '--every is a number of seconds, at least 5')
+    // The token is read once: if the claim is lost and claimed again here, this keepalive stops rather than beat for the new claim.
+    const token = tokenOf(one)
     for (;;) {
-      const answer = await send({ op: 'beat', ref: one, secret, token: tokenOf(one) })
+      const answer = await send({ op: 'beat', ref: one, secret, token })
       if (answer.status !== 200) {
         console.error(`keepalive stopped: ${answer.status} ${JSON.stringify(answer.json.error ?? '')}`)
         process.exit(1)
