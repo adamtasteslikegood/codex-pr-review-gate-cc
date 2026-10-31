@@ -40,15 +40,14 @@ class RelayDown(Exception):
     pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Access redirects mean refusal. Never forward credentials off the pinned origin.
+        return None
+
+
 def new_secret() -> str:
     return secrets.token_hex(32)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect: it would carry the Access credential to wherever it points, even over plain http. A 3xx is refused."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        return None
 
 
 class RelayWork:
@@ -63,8 +62,8 @@ class RelayWork:
         self.timeout = timeout
         self.tokens: dict[str, int] = {}
         cafile = os.environ.get("SSL_CERT_FILE")
-        context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
-        self.opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=context))
+        self.context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.context), _NoRedirect())
 
     @classmethod
     def from_env(cls, repo: str, runtime: str, holder: str, secret: str | None = None) -> "RelayWork":
@@ -107,8 +106,8 @@ class RelayWork:
         self.tokens[ref] = answer["token"]
         return answer
 
-    def beat(self, ref: str, token: int | None = None) -> dict[str, Any]:
-        return self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": self.tokens[ref] if token is None else token})
+    def beat(self, ref: str) -> dict[str, Any]:
+        return self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": self.tokens[ref]})
 
     def checkpoint(self, ref: str, text: str, commit: str | None = None, branch: str | None = None, notes: str | None = None) -> dict[str, Any]:
         return self._send({"op": "checkpoint", "ref": ref, "secret": self.secret, "token": self.tokens[ref], "text": text,
@@ -130,15 +129,13 @@ class RelayWork:
         """Beats in a thread while the block runs. The yielded event is set if the claim is lost, so a loop can stop its work."""
         if every < 5:
             raise ValueError("every is at least 5 seconds")
-        stop, lost = threading.Event(), threading.Event()
-        # Bound to the claim it started with: if that claim is lost and claimed again, this keepalive reports the loss rather than beat
-        # for the new claim.
         token = self.tokens[ref]
+        stop, lost = threading.Event(), threading.Event()
 
         def run() -> None:
             while not stop.wait(every):
                 try:
-                    self.beat(ref, token)
+                    self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": token})
                 except RelayRefused:
                     lost.set()
                     return
