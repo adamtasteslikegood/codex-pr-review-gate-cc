@@ -32,6 +32,8 @@ export type Env = {
   GRANTS: DurableObjectNamespace
   /** One RepoIndex object per `owner/repo` (spec §9): the repo's live records, for `list`. */
   REPO_INDEX: DurableObjectNamespace
+  /** One WorkBoard object per `owner/repo`: the repo's work claims (2026-10-31 work claims design). */
+  WORK: DurableObjectNamespace
 }
 
 export interface DurableObjectId {
