@@ -480,6 +480,8 @@ export type PrAction = {
   cwd?: string
   /** A GitHub tool this mod does not know, held because it reads as opening or merging a PR. */
   isUnknown?: boolean
+  /** A GraphQL create whose head the guard cannot read, that names a head in another repository, or runs more than one create (#39). */
+  isHeadUnread?: boolean
 }
 
 // ------------------------------------------------------------------ Bash
@@ -676,9 +678,50 @@ function mutationIn(text: string): 'merge' | 'create' | undefined {
   return CREATE_MUTATIONS.some((name) => text.includes(name)) ? 'create' : undefined
 }
 
+/** Quotes and the backslashes that escape them, as a JSON body or a stringified input carries them. */
+const Q = `[\\\\"']*`
+/** A branch name's end: a closing quote, then a space, `,`, `}`, `)` or the end. */
+const END = `(?=${Q}(?:[\\s,})]|$))`
+
+/**
+ * Every value `name` is given anywhere in the text (`name: value`, or `name=value` where `sep` allows it), never after `$`: so not the
+ * declaration `$h: String!` nor the use `headRefName: $h`. undefined for one whose value can't be read.
+ */
+const valuesOf = (text: string, name: string, sep: string): (string | undefined)[] =>
+  [...text.matchAll(new RegExp(`(?<![$\\w])${name}${Q}\\s*${sep}\\s*${Q}(?:(\\$?[\\w./-]+)${END})?`, 'g'))].map(found => found[1])
+
+/**
+ * The one value every occurrence agrees on, else undefined. The guard reads text, not the GraphQL document, so a title or body that
+ * reads `headRefName: dev` is an occurrence too: when they differ, it can't tell which is the field, and the value is unread (PR #58).
+ */
+const agreed = (values: (string | undefined)[]): string | undefined =>
+  values.length > 0 && values.every(one => one !== undefined && one === values[0]) ? values[0] : undefined
+
+/**
+ * A createPullRequest field's value: a literal, or a `$variable` read from its `-f`/`-F` value or a JSON `variables` entry. undefined
+ * when it is missing, read two ways, or its value can't be read (a file, a shell variable).
+ */
+function refIn(text: string, field: string): string | undefined {
+  const raw = agreed(valuesOf(text, field, ':'))
+  if (raw === undefined || !raw.startsWith('$')) return raw
+  const value = agreed(valuesOf(text, raw.slice(1), '[:=]'))
+  return value?.startsWith('$') === true ? undefined : value
+}
+
+/**
+ * A GraphQL create's base and head. A head the guard can't read, one in another repository, or a mutation that runs more than one
+ * create (aliases), is marked, never guessed (#39, PR #58): the hold covers the whole call.
+ */
+function refsOf(text: string): Pick<PrAction, 'base' | 'head' | 'isHeadUnread'> {
+  const head = refIn(text, 'headRefName')
+  const isHeadUnread = head === undefined || /\bheadRepositoryId\b/.test(text) || (text.match(/\bcreatePullRequest\b/g) ?? []).length > 1
+  return { base: refIn(text, 'baseRefName'), head, ...(isHeadUnread ? { isHeadUnread } : {}) }
+}
+
 /** GraphQL names are matched over the whole command: its braces and parentheses split segments. An unreadable query is held as unknown. */
 function readGraphql(normal: string, isUnreadable: boolean, via: string, cwd: string | undefined): PrAction | undefined {
   const mutation = mutationIn(normal)
+  if (mutation === 'create') return { action: mutation, via, cwd, ...refsOf(normal) }
   if (mutation !== undefined) return { action: mutation, via, cwd }
   return isUnreadable ? { action: 'merge', via, cwd, isUnknown: true } : undefined
 }
@@ -844,7 +887,7 @@ function readUnknownTool(tool: string, input: Record<string, unknown>, repo: str
   if (hasPr && (MERGE_WORDS.test(name) || MERGE_WORDS.test(operation) || (path?.isMerge === true && isWrite))) {
     return { ...merge(), number: path?.number ?? number, repo: path?.repo ?? repo }
   }
-  if (mutation === 'create') return create()
+  if (mutation === 'create') return { ...create(), ...refsOf(JSON.stringify(input)) }
   const isCreateVerb = CREATE_WORDS.test(`${name.split(' ')[0] ?? ''}`) || CREATE_WORDS.test(operation) || (path !== undefined && !path.isMerge && isWrite)
   if (hasPr && isCreateVerb && !REVIEW_WORDS.test(`${name} ${operation}`)) return { ...create(), repo: path?.repo ?? repo }
   return undefined

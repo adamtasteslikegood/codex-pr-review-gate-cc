@@ -10,7 +10,7 @@ Claude Code mods for pre-PR and post-PR review, owned by Adam Schoen. See
 [README.md](README.md) for the component table and [VISION.md](VISION.md) for
 the project's goals and their order.
 
-## Current state (2026-10-30, after wave 2b and 1.6.0)
+## Current state (2026-10-30, after wave 2b and 1.6.1)
 
 - `codex-gate/` **0.3.1** is **not loaded** and **frozen**: don't change it
   unless Adam asks for a fix. Known, unfixed issues:
@@ -19,7 +19,7 @@ the project's goals and their order.
   - It refuses any Bash command whose *text* contains the PR-create command
     line, even inside a grep, a string or a heredoc. Write files that mention
     it with the Write tool, and build such strings from pieces in code.
-- `pr-lifecycle/` **1.6.0** is the plugin in daily use, loaded through
+- `pr-lifecycle/` **1.6.1** is the plugin in daily use, loaded through
   `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. Since 2026-10-28
   its `enforce` and `enforceMerge` settings are off and the Codex models and
   efforts are set per repo (ROADMAP decision M), so it holds no PR create or
@@ -42,7 +42,8 @@ the project's goals and their order.
     R97 in 1.5.2 (approvals settle on their verdict), R98 in 1.5.3
     (a create whose head is not checked out here is held), R99 in 1.5.4
     (a step timeout tells the agent and keeps a late fixer's answer) and
-    R100–R108 for the shared store (#29 Part B, 1.6.0):
+    R100–R108 for the shared store (#29 Part B, 1.6.0) and R109 in 1.6.1
+    (a GraphQL or fork head the create guard can't pin here is held, #39, #40):
     `docs/superpowers/specs/2026-10-16-pr-lifecycle-rulings.md`.
   - Read the spec and the rulings before changing it. The goals are in
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
@@ -115,7 +116,7 @@ From the repo root:
 
 ```bash
 npm run lint       # eslint, pr-lifecycle only
-npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 829)
+npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 837)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
 npm run test:relay       # the #29 Part B relay under Miniflare (89)
