@@ -40,6 +40,12 @@ class RelayDown(Exception):
     pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Access redirects mean refusal. Never forward credentials off the pinned origin.
+        return None
+
+
 def new_secret() -> str:
     return secrets.token_hex(32)
 
@@ -57,6 +63,7 @@ class RelayWork:
         self.tokens: dict[str, int] = {}
         cafile = os.environ.get("SSL_CERT_FILE")
         self.context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=self.context), _NoRedirect())
 
     @classmethod
     def from_env(cls, repo: str, runtime: str, holder: str, secret: str | None = None) -> "RelayWork":
@@ -76,7 +83,7 @@ class RelayWork:
         data = json.dumps({k: v for k, v in body.items() if v is not None}).encode()
         request = urllib.request.Request(self.endpoint, data=data, headers=self.headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as res:
+            with self.opener.open(request, timeout=self.timeout) as res:
                 status, text = res.status, res.read().decode()
         except urllib.error.HTTPError as error:
             status, text = error.code, error.read().decode(errors="replace")
@@ -122,12 +129,13 @@ class RelayWork:
         """Beats in a thread while the block runs. The yielded event is set if the claim is lost, so a loop can stop its work."""
         if every < 5:
             raise ValueError("every is at least 5 seconds")
+        token = self.tokens[ref]
         stop, lost = threading.Event(), threading.Event()
 
         def run() -> None:
             while not stop.wait(every):
                 try:
-                    self.beat(ref)
+                    self._send({"op": "beat", "ref": ref, "secret": self.secret, "token": token})
                 except RelayRefused:
                     lost.set()
                     return
