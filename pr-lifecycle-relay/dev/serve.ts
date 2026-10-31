@@ -158,8 +158,10 @@ const handler = (req: import('node:http').IncomingMessage, res: import('node:htt
       res.end(text)
       console.log(`${new Date().toISOString()} ${req.headers['cf-access-client-id'] ?? '-'} ${req.method} ${req.url} ${answer.status}`)
     } catch (error) {
-      res.writeHead(502)
-      res.end(String(error))
+      // The error stays in this server's log; the caller gets a fixed plain-text line, never the exception's text.
+      console.error(`${new Date().toISOString()} ${req.method} ${req.url} failed:`, error)
+      res.writeHead(502, { 'content-type': 'text/plain' })
+      res.end('relay dev server error')
     }
   })
 }
