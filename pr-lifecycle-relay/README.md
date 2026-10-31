@@ -23,6 +23,7 @@ same origin as the repo's `sharedStore.url`: a checkout never sends its Access c
 | `POST /v1/<owner>/<repo>/<pr>` | `LifecycleObject` for `owner/repo#<pr>` | the lifecycle ops below |
 | `POST /v1/<owner>/<repo>/branch/<branch>` | `LifecycleObject` for `owner/repo@<branch>` | the same, plus `moveTo` and `moveDone`. The branch is one percent-encoded segment, checked against git's ref rules; a name git would refuse answers 404. |
 | `POST /v1/<owner>/<repo>` | `RepoIndex` for `owner/repo` | `list` (needs `read`) |
+| `POST /v1/<owner>/<repo>/work` | `WorkBoard` for `owner/repo` | the work-claim ops below |
 | `POST /v1/admin/grants` | `GrantStore` | `grants`, `grant`, `revoke` (admin) |
 | `POST /v1/admin/index` | `RepoIndex` | `fault`, `update`: only when `TEST_FAULTS` is `'1'`, for tests; otherwise 404 |
 
@@ -52,6 +53,45 @@ A `commit` or `snapshot` body over 512 KiB answers 413 and changes nothing. The 
 
 Every write, a heartbeat included, records its principal.
 
+## Work claims
+
+One `WorkBoard` per repo holds its work claims (design: `docs/superpowers/specs/2026-10-31-relay-work-claims-design.md`). An agent on any
+runtime claims a piece of work by its ref (`gh#12`), checkpoints where it pushed the code and its notes file, and releases it. When its
+lease lapses, the next session takes the claim over and gets back the branch, commit, notes path and recent steps; the dead holder's last
+step is logged as `interrupted`. Every body carries `ref` (`^[A-Za-z0-9][A-Za-z0-9_.:#/@-]{0,127}$`) except `list`.
+
+| Op | Needs | What it does |
+| --- | --- | --- |
+| `claim { holder, runtime, secret, title?, branch?, reopen? }` | `operate` | Takes a free, paused or lapsed claim with a new fence `token`; answers `{ claim, token, tookOver, resume }`. Renews the holder's own live claim. A live claim held by anyone else is 423; a `done` or `abandoned` one is 409 unless `reopen`. |
+| `beat { secret, token }` | `operate` | Renews the lease. |
+| `checkpoint { secret, token, text, commit?, branch?, notes? }` | `operate` | Records where the work was pushed, logs a step, renews the lease. |
+| `release { secret, token, outcome, text? }` | `operate` | `outcome` is `paused`, `done` or `abandoned`. |
+| `get`, `list { state? }` | `read` | One claim with its steps; every claim with its last step. An active claim with no live lease shows as `lapsed`. |
+| `breakClaim { text? }` | admin | Drops the lease and pauses the claim. |
+
+A wrong secret, principal or token, or a lapsed lease, is 409. A claim keeps its last 200 steps; a board holds at most 2000 claims; a
+`done` or `abandoned` claim is deleted `RETENTION_MS` after it closed.
+
+**Client:** `npm run relay:work -- <command>` (`client/relay-work.ts`, Node 22, no dependencies) works the same from the TUI, a Workers
+sandbox, a VPS, Claude cloud or the game bridge (which can also call the HTTP API directly). It reads the pr-lifecycle variables
+(`PR_GATE_RELAY_URL`, then the service token pair or `PR_GATE_RELAY_TOKEN`), plus `RELAY_RUNTIME`; keeps the checkout's secret and tokens
+under `<git dir>/relay-work/`; and fills the branch and commit from git. `keepalive <ref> &` beats every 30 s until the claim is lost;
+`checkpoint --push` pushes before it records; `claim --checkout` checks out the branch a takeover resumes.
+
+## Running it locally
+
+`npm run relay:dev` serves the production Worker and objects under Miniflare at `http://127.0.0.1:8787`, with state kept in
+`pr-lifecycle-relay/.dev/` (gitignored) across restarts, behind a stand-in for Access that signs JWTs with keys it makes. It seeds
+`operate` grants for one service token per runtime (`DEV_RUNTIMES`, default `tui,sandbox,vps,cloud,bridge,gate`) and the dev admin
+(`DEV_ADMIN`) on each repo in `DEV_REPOS`, and writes `.dev/<runtime>.env` and `.dev/admin.env`. Source one and run the client:
+
+```bash
+npm run relay:dev                                     # in one terminal
+. pr-lifecycle-relay/.dev/sandbox.env && npm run relay:work -- claim gh#12 --repo adamtasteslikegood/td2do
+```
+
+`LEASE_MS=5000` shortens the lease for a takeover test. pr-lifecycle needs an `https` relay, so the gate itself is tested against a deploy.
+
 ## Grants and admins
 
 - `GrantStore` is one object. Presets are `read` (read ops, `list`) and `operate` (all but admin ops). A grant names one repo (`owner/name`,
@@ -66,7 +106,7 @@ Every write, a heartbeat included, records its principal.
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `LIFECYCLE`, `GRANTS`, `REPO_INDEX` | Durable Objects | `LifecycleObject`, `GrantStore`, `RepoIndex` (see `wrangler.jsonc`) |
+| `LIFECYCLE`, `GRANTS`, `REPO_INDEX`, `WORK` | Durable Objects | `LifecycleObject`, `GrantStore`, `RepoIndex`, `WorkBoard` (see `wrangler.jsonc`) |
 | `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` | vars | the Access team's domain and the application's AUD tag |
 | `ADMINS` | var | comma-separated admin people |
 | `LEASE_MS` | var, optional | lease length; 120 000 (R74, R100) when unset |
