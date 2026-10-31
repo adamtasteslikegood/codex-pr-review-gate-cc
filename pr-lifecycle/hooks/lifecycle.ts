@@ -2,7 +2,7 @@
 // the controller's choice of what comes next. No `$` here.
 
 import type {
-  Blocker, CheckState, Finding, FindingEvent, FindingStatus, Grant, Lane, LifecycleRecord, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver,
+  Blocker, CheckState, Finding, FindingEvent, FindingStatus, Grant, Lane, LifecycleRecord, LogEntry, RoundKind, RoundRecord, Severity, Standing, Tier, Waiver,
 } from '../types'
 
 // ----------------------------------------------------------------- budget
@@ -1465,13 +1465,21 @@ export function planIssues(rec: WithId, at: number, spec?: string, merged?: Merg
 
 // -------------------------------------------------------------------- log
 
-const clockOf = (at: number): string => `${new Date(at).toISOString().slice(11, 16)}Z`
+export const clockOf = (at: number): string => `${new Date(at).toISOString().slice(11, 16)}Z`
 const minutesOf = (ms: number): string => `${Math.round(ms / 60_000)}m`
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
 
 /** `/pr-gate log`: how a lifecycle went, in a few lines: its rounds and time, the person's steps, the stops, the last events. */
 export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15): string {
   const log = rec.log ?? []
+  const lines = logHead(rec, isArchived, log)
+  if (log.length === 0) lines.push('No events logged: the record is from before 1.3.0.')
+  else lines.push('Last events:', ...log.slice(-last).map(one => `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.text}`))
+  return lines.join('\n')
+}
+
+/** The summary's first lines, before its events: the rounds and time, the person's steps and the stops of `log`. */
+export function logHead(rec: LifecycleRecord, isArchived: boolean, log: readonly LogEntry[]): string[] {
   const done = rec.rounds.filter(one => one.isCompleted)
   const pre = done.filter(one => one.phase === 'pre').length
   const person = log.filter(one => one.kind === 'person')
@@ -1481,7 +1489,7 @@ export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15)
     verbs.set(verb, (verbs.get(verb) ?? 0) + 1)
   }
   const stops = log.filter(one => one.kind === 'stop')
-  const lines = [
+  return [
     `${rec.branch}${rec.pr === undefined ? '' : ` (PR #${rec.pr})`} → ${rec.base}: ${isArchived ? 'archived' : rec.phase}.`,
     `Rounds: ${done.length} completed (${pre} pre-PR, ${done.length - pre} post-PR), ${plural(rec.attempts, 'incomplete attempt')}. ` +
       `Active ${minutesOf(rec.activeMs)}, waiting ${minutesOf(rec.waitMs)}.`,
@@ -1490,8 +1498,5 @@ export function logSummary(rec: LifecycleRecord, isArchived: boolean, last = 15)
       : `The person stepped in ${plural(person.length, 'time')}: ${[...verbs].map(([verb, n]) => `${verb} ${n}`).join(', ')}.`,
     `Stops: ${stops.length}${stops.length === 0 ? '' : `; the last: ${stops.at(-1)?.text ?? ''}`}.`,
   ]
-  if (log.length === 0) lines.push('No events logged: the record is from before 1.3.0.')
-  else lines.push('Last events:', ...log.slice(-last).map(one => `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.text}`))
-  return lines.join('\n')
 }
 

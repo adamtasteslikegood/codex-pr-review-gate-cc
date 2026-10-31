@@ -8,8 +8,6 @@ export type Principal = { id: string; isService: boolean }
 /** What a principal may do on one repository: `read` (records, history, the filing ledger) or `operate` (also lease and mutate). */
 export type Preset = 'read' | 'operate'
 
-export type Grant = { principal: string; repo: string; preset: Preset }
-
 const b64url = (text: string): Uint8Array<ArrayBuffer> => {
   const base = text.replace(/-/g, '+').replace(/_/g, '/')
   const raw = atob(base + '='.repeat((4 - (base.length % 4)) % 4))
@@ -72,16 +70,6 @@ export async function verifyAccess(request: Request, env: Env, now: number): Pro
   return undefined
 }
 
-/** The v1 grants, from the Worker's configuration (decision 5 still open: where they live for good). */
-export const grantsOf = (env: Env): Grant[] => {
-  try {
-    const read = JSON.parse(env.GRANTS ?? '[]') as unknown
-    return Array.isArray(read) ? (read as Grant[]).filter(one => one.preset === 'read' || one.preset === 'operate') : []
-  } catch {
-    return []
-  }
-}
-
 /** Admin is a capability of its own, held only by people (never a service principal), and never implied by `operate`. */
 export const isAdmin = (env: Env, who: Principal): boolean =>
   !who.isService &&
@@ -89,8 +77,3 @@ export const isAdmin = (env: Env, who: Principal): boolean =>
     .split(',')
     .map(one => one.trim().toLowerCase())
     .includes(who.id)
-
-export const presetOf = (env: Env, who: Principal, repo: string): Preset | undefined => {
-  const mine = grantsOf(env).filter(one => String(one.principal).toLowerCase() === who.id && String(one.repo).toLowerCase() === repo)
-  return mine.some(one => one.preset === 'operate') ? 'operate' : mine.length > 0 ? 'read' : undefined
-}

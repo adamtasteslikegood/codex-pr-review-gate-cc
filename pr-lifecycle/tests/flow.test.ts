@@ -449,7 +449,7 @@ test('a graphql create whose PR comes from another branch does not move this one
   await $.tool.call(createPr)
   await done($, turn(review('r1-review', 'PASS')))
   w.gh.headRef = 'dev'
-  const create = "gh api graphql -f query='mutation { createPullRequest(input: {}) { pullRequest { number } } }'"
+  const create = "gh api graphql -f query='mutation { createPullRequest(input: {headRefName: \"feat/x\"}) { pullRequest { number } } }'"
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: create }))).toBe(false)
   expect((await recordOf(w)).phase).toBe('pre')
 })
@@ -3191,7 +3191,8 @@ test('R1-8: feedback from an author without write access is dropped; a rostered 
 test('F1: a GraphQL or REST create whose base cannot be read is held against the first gated base, whatever the default branch', async ($, on) => {
   const w = world(on)
   w.gh.defaultBranch = 'release'
-  const graphql = "gh api graphql -f query='mutation { createPullRequest(input: {baseRefName: \"dev\"}) { pullRequest { number } } }'"
+  // Its base is a variable with no readable value; its head is the checked-out branch (#39 holds a create with no readable head).
+  const graphql = "gh api graphql -f query='mutation($b: String!) { createPullRequest(input: {baseRefName: $b, headRefName: \"feat/x\"}) { pullRequest { number } } }' -F b=@base.txt"
   const held = (await $.tool.call({ tool: 'Bash', command: graphql })).deny ?? ''
   expect(held).toContain('waits for the pre-PR review')
   expect((await recordOf(w)).base).toBe('dev')
@@ -7319,6 +7320,24 @@ test('A9.7: with jiraProject set, a security deferral left for the person files 
   await w.clock.advance(1000)
   expect(creates(w)).toHaveLength(1)
   expect((await recordOf(w)).postStatus).toBe('awaiting-decision')
+})
+
+test('Task 8 review: a security-only filing pass crosses an action boundary before acli: a session that lost the record files no ticket', async ($, on) => {
+  const w = world(on)
+  await toTriage($, w, 'Consider rotating this token')
+  w.git.roster = JIRA
+  await done($, triaged('r2-triage', [{ id: 'G2-1', action: 'deferred', severity: 'P1', isSecurity: true, note: 'needs a key rotation', replyId: '992' }]))
+  // Another session takes the record once the pass has marked its ticket as sent, before acli runs: the next owner read sees it.
+  w.beforeRead = async key => {
+    const rec = w.store.get(KEY) as LifecycleRecord | undefined
+    if (key === `${KEY}:owner` && rec?.findings.some(one => one.jiraError?.startsWith('a ticket was sent to Jira') === true) === true) {
+      w.store.set(key, { sessionId: 'session-2', beatAt: (w.clock as unknown as { now: () => number }).now() })
+    }
+  }
+  await done($, accept('r2-verify', w))
+  w.beforeRead = undefined
+  expect(creates(w)).toEqual([])
+  expect(w.acli.calls).toEqual([])
 })
 
 test('A9.7: without jiraProject, no acli call is made and the security deferral waits for the person as before', async ($, on) => {

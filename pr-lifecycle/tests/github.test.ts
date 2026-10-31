@@ -183,6 +183,53 @@ test('gh api REST and GraphQL calls that open or merge a PR', async () => {
   expect(bash('gh api repos/me/repo/pulls/12/comments')).toBeUndefined()
 })
 
+test('#39: a GraphQL create carries its headRefName and baseRefName, and a head it cannot read is marked', async () => {
+  const literal = "gh api graphql -f query='mutation { createPullRequest(input: {repositoryId: \"R\", baseRefName: \"main\", headRefName: \"feature/x\", title: \"t\"}) { clientMutationId } }'"
+  expect(bash(literal)).toMatchObject({ action: 'create', base: 'main', head: 'feature/x' })
+  expect(bash(literal)?.isHeadUnread).toBeUndefined()
+  // A variable is read from its -f or -F value.
+  const variable = "gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: \"R\", baseRefName: \"dev\", headRefName: $h}) { clientMutationId } }' -f h=fix/y"
+  expect(bash(variable)).toMatchObject({ action: 'create', base: 'dev', head: 'fix/y' })
+  // A JSON body through curl, its quotes escaped, and its variables.
+  const curl =
+    'curl -X POST https://api.github.com/graphql -d \'{"query":"mutation($h: String!) { createPullRequest(input: {baseRefName: \\"main\\", headRefName: $h}) { clientMutationId } }","variables":{"h":"feature"}}\''
+  expect(bash(curl)).toMatchObject({ action: 'create', base: 'main', head: 'feature' })
+  // No headRefName, a variable with no readable value, or a head in another repository: never taken for the checked-out branch.
+  expect(bash("gh api graphql -f query='mutation { createPullRequest(input: {}) { clientMutationId } }'")).toMatchObject({ action: 'create', isHeadUnread: true })
+  expect(bash("gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {baseRefName: \"dev\", headRefName: $h}) { clientMutationId } }' -F h=@head.txt")).toMatchObject({
+    action: 'create',
+    isHeadUnread: true,
+  })
+  expect(
+    bash("gh api graphql -f query='mutation { createPullRequest(input: {baseRefName: \"dev\", headRefName: \"dev\", headRepositoryId: \"F\"}) { clientMutationId } }'"),
+  ).toMatchObject({ action: 'create', head: 'dev', isHeadUnread: true })
+  // An MCP tool that sends the mutation, with its variables as an object.
+  const query = 'mutation($h: String!) { createPullRequest(input: {baseRefName: "main", headRefName: $h}) { clientMutationId } }'
+  expect(readPrAction('mcp__github__graphql', { query, variables: { h: 'feature' } })).toMatchObject({ action: 'create', base: 'main', head: 'feature' })
+  expect(readPrAction('mcp__github__graphql', { query })).toMatchObject({ action: 'create', isHeadUnread: true })
+})
+
+test('PR #58: field-shaped text in a title, or a second aliased create, never decides the head', async () => {
+  const gql = (input: string, rest = '') => bash(`gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: "R", ${input}}) { clientMutationId } }'${rest}`)
+  // A title that reads like the field comes before the real head: the guard can't tell which is the field, so the head is unread.
+  expect(gql('title: "headRefName: dev", baseRefName: "main", headRefName: "feature"')).toMatchObject({ isHeadUnread: true })
+  expect(gql('title: "x", body: "headRefName: dev", baseRefName: "main", headRefName: "feature"')).toMatchObject({ isHeadUnread: true })
+  // The same for a variable: a title `h: dev` shadows -f h=feature.
+  expect(gql('title: "h: dev", baseRefName: "main", headRefName: $h', ' -f h=feature')).toMatchObject({ isHeadUnread: true })
+  // A base read two ways is no base: the create is held against the first gated base, never let through as another base's.
+  expect(gql('title: "baseRefName: release", baseRefName: "main", headRefName: "feature"')?.base).toBeUndefined()
+  // Text that agrees with the field, or names no field, changes nothing.
+  expect(gql('title: "fix the guard", baseRefName: "main", headRefName: "feature"')).toMatchObject({ base: 'main', head: 'feature' })
+  expect(gql('title: "fix the guard", baseRefName: "main", headRefName: "feature"')?.isHeadUnread).toBeUndefined()
+  // The MCP route reads the same.
+  const query = 'mutation { createPullRequest(input: {title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }'
+  expect(readPrAction('mcp__github__graphql', { query })).toMatchObject({ action: 'create', isHeadUnread: true })
+  // Two aliased creates in one mutation, in either order: the whole call is unread, whatever the first one's head.
+  const one = (name: string, head: string) => `${name}: createPullRequest(input: {repositoryId: "R", baseRefName: "main", headRefName: "${head}"}) { clientMutationId }`
+  expect(bash(`gh api graphql -f query='mutation { ${one('a', 'dev')} ${one('b', 'feature')} }'`)).toMatchObject({ isHeadUnread: true })
+  expect(bash(`gh api graphql -f query='mutation { ${one('a', 'feature')} ${one('b', 'dev')} }'`)).toMatchObject({ isHeadUnread: true })
+})
+
 test('both GitHub MCP connectors', async () => {
   expect(readPrAction('mcp__plugin_github_github__create_pull_request', { owner: 'me', repo: 'repo', base: 'dev', head: 'feat/x' })).toMatchObject({
     action: 'create',

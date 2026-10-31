@@ -61,7 +61,7 @@ test('a blocking finding goes to the main agent, then Codex reviews again', asyn
   expect(run.headSha).toBe('d'.repeat(40))
 })
 
-test('the shared allowance (4) without agreement ends the pre-PR gate as exhausted', async ($, on) => {
+test('the shared allowance (4) without agreement ends the pre-PR gate as exhausted', { timeoutMs: 15_000 }, async ($, on) => {
   const w = world(on)
   await $.tool.call(createPr)
   for (let round = 1; round <= 4; round++) {
@@ -393,6 +393,85 @@ test('R98 (#34): a create whose head is not the branch checked out here is held,
   w.git.branch = 'fix/x'
   expect(isHeld(await $.tool.call({ tool: 'Bash', command: commands[0]! }))).toBe(true)
   expect(w.spawned.length).toBeGreaterThan(0)
+})
+
+test('#40: a fork head named like a gated base is held, not taken for the promotion of this repository', async ($, on) => {
+  const w = world(on)
+  const results = [
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head outsider:dev --title t' }),
+    await $.tool.call({ tool: 'Bash', command: 'gh api repos/me/repo/pulls -f base=main -f head=outsider:dev -f title=t' }),
+    await $.tool.call({ tool: 'mcp__plugin_github_github__create_pull_request', owner: 'me', repo: 'repo', base: 'main', head: 'outsider:dev', title: 't' }),
+  ]
+  for (const ran of results) {
+    expect(isHeld(ran)).toBe(true)
+    expect(ran.deny).toContain('outsider:dev')
+    expect(ran.deny).toContain('another repository')
+    expect(ran.deny).toContain('Do not open the pull request another way')
+  }
+  // A fork's branch named like the checked-out one is not reviewed as this branch either.
+  w.git.branch = 'fix/x'
+  const same = await $.tool.call({ tool: 'Bash', command: 'gh pr create --base dev --head outsider:fix/x --title t' })
+  expect(isHeld(same)).toBe(true)
+  expect(same.deny).toContain('another repository')
+  expect(w.spawned).toHaveLength(0)
+  // The owner of origin is this repository: its dev is still the promotion.
+  expect(isHeld(await $.tool.call({ tool: 'Bash', command: 'gh pr create --base main --head ME:dev' }))).toBe(false)
+  expect(w.spawned).toHaveLength(0)
+})
+
+test('#39: a GraphQL create is gated by the head it names, and held when the guard cannot read one', async ($, on) => {
+  const w = world(on)
+  const create = (input: string, rest = '') => ({
+    tool: 'Bash' as const,
+    command: `gh api graphql -f query='mutation${rest === '' ? '' : '($h: String!)'} { createPullRequest(input: {repositoryId: "R", ${input}}) { clientMutationId } }'${rest}`,
+  })
+  // From a dev checkout, a feature head is not a promotion: held, as R98 holds a head not checked out here.
+  w.git.branch = 'dev'
+  const feature = await $.tool.call(create('baseRefName: "main", headRefName: "feature"'))
+  expect(isHeld(feature)).toBe(true)
+  expect(feature.deny).toContain('feature')
+  // Its own dev head is the promotion, as with gh pr create --head dev.
+  expect(isHeld(await $.tool.call(create('baseRefName: "main", headRefName: "dev"')))).toBe(false)
+  // A head it cannot read is held, from any checkout.
+  for (const call of [create('baseRefName: "main"'), create('baseRefName: "main", headRefName: $h', ' -F h=@head.txt'), create('baseRefName: "main", headRefName: "dev", headRepositoryId: "F"')]) {
+    const ran = await $.tool.call(call)
+    expect(isHeld(ran)).toBe(true)
+    expect(ran.deny).toContain('cannot read')
+    expect(ran.deny).toContain('Do not open the pull request another way')
+  }
+  expect(w.spawned).toHaveLength(0)
+  // From a feature checkout, a headRefName naming another branch is held (R98); naming this one goes to the gate.
+  w.git.branch = 'fix/x'
+  const other = await $.tool.call(create('baseRefName: "dev", headRefName: "fix/z"'))
+  expect(isHeld(other)).toBe(true)
+  expect(other.deny).toContain('fix/z')
+  expect(w.spawned).toHaveLength(0)
+  expect(isHeld(await $.tool.call(create('baseRefName: "dev", headRefName: $h', ' -f h=fix/x')))).toBe(true)
+  expect(w.spawned.length).toBeGreaterThan(0)
+})
+
+test('PR #58: from dev, a decoy title or a second aliased create does not pass a feature head as the promotion', async ($, on) => {
+  const w = world(on)
+  w.git.branch = 'dev'
+  const one = (name: string, head: string) => `${name}: createPullRequest(input: {repositoryId: "R", baseRefName: "main", headRefName: "${head}"}) { clientMutationId }`
+  const calls = [
+    `gh api graphql -f query='mutation { createPullRequest(input: {repositoryId: "R", title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }'`,
+    `gh api graphql -f query='mutation($h: String!) { createPullRequest(input: {repositoryId: "R", title: "h: dev", baseRefName: "main", headRefName: $h}) { clientMutationId } }' -f h=feature`,
+    `gh api graphql -f query='mutation { ${one('a', 'dev')} ${one('b', 'feature')} }'`,
+    `gh api graphql -f query='mutation { ${one('a', 'feature')} ${one('b', 'dev')} }'`,
+  ]
+  for (const command of calls) {
+    const ran = await $.tool.call({ tool: 'Bash', command })
+    expect(isHeld(ran)).toBe(true)
+    expect(ran.deny).toContain('cannot read')
+  }
+  // A tool this mod does not know, so not in the harness's typed list.
+  const mcp = await $.tool.call({
+    tool: 'mcp__github__graphql',
+    query: 'mutation { createPullRequest(input: {repositoryId: "R", title: "headRefName: dev", baseRefName: "main", headRefName: "feature"}) { clientMutationId } }',
+  } as never)
+  expect(isHeld(mcp)).toBe(true)
+  expect(w.spawned).toHaveLength(0)
 })
 
 test('a docs-only commit after the pass rides on it; a code commit does not', async ($, on) => {

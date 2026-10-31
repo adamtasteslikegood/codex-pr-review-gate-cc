@@ -7,8 +7,8 @@ version.
 | Component                    | Version | What it does                                                                                                  |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
 | [codex-gate](codex-gate/)    | 0.3.1   | Rounds of adversarial Codex review and agent fixes before a PR to `dev` or `main`. [README](codex-gate/README.md) |
-| [pr-lifecycle](pr-lifecycle/) | 1.5.4   | `/pr-gate` across the PR lifecycle: pre-PR Codex rounds, then the PR's own reviews, under one review budget and record. [README](pr-lifecycle/README.md) |
-| [pr-lifecycle-relay](pr-lifecycle-relay/) | prototype | The shared lifecycle store of #29 Part B, tested locally under Miniflare; not deployed, not yet called. [README](pr-lifecycle-relay/README.md) |
+| [pr-lifecycle](pr-lifecycle/) | 1.6.1   | `/pr-gate` across the PR lifecycle: pre-PR Codex rounds, then the PR's own reviews, under one review budget and record. [README](pr-lifecycle/README.md) |
+| [pr-lifecycle-relay](pr-lifecycle-relay/) | built, not deployed | The shared lifecycle store of #29 Part B, tested under Miniflare. pr-lifecycle 1.6.0 calls it only for a repo that opts in. [README](pr-lifecycle-relay/README.md) |
 
 ## Using a component
 
@@ -23,7 +23,7 @@ Each component's README covers its own setup, options and checks.
 
 ## Which one to load
 
-`pr-lifecycle` 1.5.4 is the plugin in daily use: Adam switched
+`pr-lifecycle` 1.6.1 is the plugin in daily use: Adam switched
 `CLAUDE_CODE_PLUGIN_DIRS` to its folder. `codex-gate` 0.3.1 is frozen. Never load
 both: both register `/pr-gate` and hold PR creation, so two would gate the
 same PR twice. [LIFECYCLE_SPEC.md](LIFECYCLE_SPEC.md) is the spec

@@ -30,6 +30,8 @@ import {
   remaining,
   rescope,
   securityHolds,
+  clockOf,
+  logHead,
   logSummary,
   ticketLine,
   unresolvedBlockers,
@@ -54,6 +56,7 @@ import {
   git,
   hasSecurityBlocker,
   headMoved,
+  heldNoteOf,
   heldReason,
   holdingPrompts,
   ignoredNote,
@@ -61,6 +64,8 @@ import {
   isMergeBlocked,
   isOwnedElsewhere,
   isStillCurrent,
+  isKeptBy,
+  isStoodDownBy,
   isTurnOf,
   markPr,
   noteArrival,
@@ -82,7 +87,8 @@ import {
 } from './round'
 import type { Config, RecordKey } from './round'
 import { renderPane } from './pane'
-import { latestArchive, liveRecords, loadRecord, logEvent, transact, updateRecord, upsertRecord } from './store'
+import { latestArchive, liveRecords, loadRecord, logEvent, relayLog, RelayRefused, stuckFilings, transact, updateRecord, upsertRecord } from './store'
+import type { RelayLine, RelayLog } from './store'
 
 const COMMAND = 'pr-gate'
 // The same state round.ts writes: the engine reads an atom only where this file makes it.
@@ -229,7 +235,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
   if (branch === '' || branch === 'HEAD') return 'Not started: HEAD is detached, so there is no branch to open a PR from.'
   // A start or a resume takes the record for this session (#13); a headless one never takes it from another.
-  if (!(await claimRecord($, root, branch))) return 'Not started: another session runs this lifecycle.'
+  if (!(await claimRecord($, root, branch))) return `Not started: ${heldNoteOf() ?? 'another session runs this lifecycle'}.`
   const known = await loadRecord($, root, branch)
   // A PR merged or closed since: nothing more to review on it, and its record is archived (R62).
   const isOpened = known !== undefined && (known.phase === 'post' || known.phase === 'ready') && known.pr !== undefined
@@ -279,7 +285,7 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
   const allowance = allowanceFor(scope.tier, lane, settings.allowances)
   // Read, rebuilt and written under the record's lock (R1-6): a waiver or grant given meanwhile is not overwritten. Only git and gh
   // run inside it; the controller runs after.
-  const { prior, rec, adopted, rebase } = await transact($, root, branch, async tx => {
+  const made = await transact($, root, branch, async tx => {
     const prior = await tx.load()
     // The branch's last run timed out at its lowest step: this one starts a level below where that one ended.
     // Otherwise it starts no higher than the effort a review last completed at on this branch.
@@ -341,7 +347,17 @@ const startGate = async ($: Engine, want: { base?: string; cwd?: string; isHeldC
     }
     await tx.save(rec)
     return { prior, rec, adopted: undefined, rebase: undefined }
+  }).catch(async (error: unknown) => {
+    // The shared store would not take the start (Task 8): a stale commit, another session's lease, a moved record or a refusal.
+    // This session stands down with a log line, and starts nothing.
+    if (await isStoodDownBy($, { root, branch }, error)) return undefined
+    // A plain stale commit (spec §14): another writer committed first. Nothing was saved, and a second /pr-gate starts from its record.
+    if (isKeptBy(error)) return null
+    throw error
   })
+  if (made === null) return 'Not started: another writer changed the shared lifecycle record meanwhile, and nothing was saved; run /pr-gate again.'
+  if (made === undefined) return `Not started: ${heldNoteOf() ?? 'another session runs this lifecycle'}.`
+  const { prior, rec, adopted, rebase } = made
   // One rescope only: a PR whose base moved again meanwhile is not chased; the next /pr-gate scopes against where it settled.
   if (rebase !== undefined && want.isRescoped === true) {
     return `The open PR from ${branch} moved to ${rebase} while the gate was scoping it: nothing was saved; run /pr-gate again.`
@@ -470,21 +486,32 @@ type Gated = { root: string; branch: string; base: string }
 /** A create whose head is a branch other than the one checked out here (R98). */
 type Elsewhere = { head: string; branch: string }
 
+/** A create whose head is `owner:branch` for an owner other than origin's, a fork's branch (#40). */
+type Foreign = { foreign: string }
+
 /**
  * The checked-out branch a create is for, when it is this gate's to review; 'outside' when it must be held unchecked (R61);
- * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); `head` when it names a head
- * that is not checked out here, so the gate cannot review it (R98); else undefined.
+ * `noBase` when it names no base and gh cannot read the default branch it would open against (R1-5); 'unread' when it is a GraphQL
+ * create whose head the guard cannot read (#39); `foreign` when its head is a fork's branch (#40); `head` when it names a head that
+ * is not checked out here, so the gate cannot review it (R98); else undefined.
  */
-const gatedCreate = async ($: Engine, action: PrAction): Promise<Gated | 'outside' | { noBase: string } | Elsewhere | undefined> => {
+const gatedCreate = async (
+  $: Engine,
+  action: PrAction,
+): Promise<Gated | 'outside' | 'unread' | { noBase: string } | Foreign | Elsewhere | undefined> => {
   if (action.base !== undefined && !config.bases.includes(action.base)) return undefined
   const top = await git($, action.cwd, ['rev-parse', '--show-toplevel'])
   if (!top.isOk) return isOutsideHeld(action) ? 'outside' : undefined
   const root = top.out
-  if (action.repo !== undefined) {
-    const origin = await git($, root, ['remote', 'get-url', 'origin'])
-    if (origin.isOk && slugOf(origin.out) !== slugOf(action.repo)) return undefined
-  }
+  const origin = await git($, root, ['remote', 'get-url', 'origin'])
+  const slug = origin.isOk ? slugOf(origin.out) : undefined
+  if (action.repo !== undefined && origin.isOk && slug !== slugOf(action.repo)) return undefined
   const branch = (await git($, root, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+  // A head the guard cannot read is never taken for the checked-out branch: from dev it would pass as the promotion (#39).
+  if (action.isHeadUnread === true) return 'unread'
+  // `owner:branch` is this repository's branch only when the owner is origin's. A fork's dev is no promotion (#40).
+  const owner = action.head?.match(/^([^:]+):/)?.[1]
+  if (owner !== undefined && owner.toLowerCase() !== slug?.split('/')[0]) return { foreign: action.head ?? owner }
   const head = action.head?.replace(/^[^:]+:/, '')
   // A promotion between gated bases (dev into main) carries only what was gated on its way in.
   if (config.bases.includes(head ?? branch)) return undefined
@@ -514,6 +541,23 @@ const elsewhereText = (action: PrAction, found: Elsewhere): string =>
       'so the gate cannot review what that pull request would carry.',
     `Your next step: check out a local branch named ${found.head} that holds these commits (git branch -m ${found.head}, or ` +
       `git switch ${found.head}), then run the create again from it so its gate reviews it. Do not open the pull request another way.`,
+  ].join('\n') + unknownNote(action)
+
+const unreadText = (action: PrAction): string =>
+  [
+    `pr-gate: ${action.via} is held: the guard cannot read the head branch it opens a pull request from (no literal headRefName, ` +
+      'one it reads two ways, a variable whose value comes from a file or the shell, a head in another repository, or more than one create ' +
+      'in the call), so the gate cannot review what it would carry.',
+    'Your next step: check out the head branch here and open the pull request with gh pr create from it, so its gate reviews it. ' +
+      'Do not open the pull request another way.',
+  ].join('\n') + unknownNote(action)
+
+const foreignText = (action: PrAction, found: Foreign): string =>
+  [
+    `pr-gate: ${action.via} is held: it opens a pull request from ${found.foreign}, a branch in another repository, ` +
+      "so the gate cannot review what it would carry, and it is not this repository's own promotion.",
+    'Your next step: the gate reviews only branches of this repository, checked out here. Open the pull request from such a branch, ' +
+      'or leave that pull request to the person. Do not open the pull request another way.',
   ].join('\n') + unknownNote(action)
 
 /** Why an unknown tool is held: said after the refusal, so the agent knows it was not misread as something else. */
@@ -556,7 +600,7 @@ const judgeCreate = async ($: Engine, action: PrAction, gated: { root: string; b
     const since = await git($, root, ['diff', '--numstat', rec.preHead, 'HEAD'])
     const files = since.out === '' ? [] : since.out.split('\n').map(line => line.split('\t')[2] ?? '')
     if (since.isOk && files.length > 0 && classify(files, 0, now.highRisk).tier === 'trivial') {
-      await updateRecord($, root, branch, one => ({ ...one, preHead: head }))
+      await updateRecord($, root, branch, one => ({ ...one, preHead: head }), { isPure: true })
       return undefined
     }
   }
@@ -817,7 +861,7 @@ const onOpened = async ($: Engine, root: string, branch: string): Promise<void> 
   const pr = await openPrOf($, root, branch)
   if (pr === undefined) return
   const who = await identityOf($, root)
-  const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }))
+  const saved = await updateRecord($, root, branch, rec => ({ ...rec, ...who, phase: 'post', pr: pr.number, head: pr.headRefOid }), { isPure: true })
   // When the head reached the PR (#24): GitHub's push time, else now.
   if (saved !== undefined) await noteArrival($, root, branch, pr.headRefOid, await $.clock.now())
   await markOpened($)
@@ -935,7 +979,8 @@ async function waiveTarget($: Engine, root: string, checkedOut: string, arg: str
   if (!FINDING_ID.test(arg)) return { branch: checkedOut }
   const own = await loadRecord($, root, checkedOut)
   const isOwn = own !== undefined && own.phase !== 'archived' && own.findings.some(each => each.id === arg)
-  const blocked = (await liveRecords($, root)).filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
+  const live = await liveRecords($, root, config.bases)
+  const blocked = live.filter(one => one.branch !== checkedOut && securityBlockedIds(one).includes(arg)).map(one => one.branch)
   const all = [...(isOwn ? [checkedOut] : []), ...blocked]
   if (all.length > 1) {
     return {
@@ -974,7 +1019,51 @@ async function logText($: Engine): Promise<string> {
   const live = await loadRecord($, here.root, here.branch)
   const rec = live !== undefined && live.phase !== 'archived' ? live : await latestArchive($, here.root, here.branch)
   if (rec === undefined) return `/${COMMAND} log: there is no lifecycle for ${here.branch}.`
+  // A record on the relay (#29 Part B): its run log is the relay's, across a move, with who wrote each line and the stuck filings.
+  if (rec === live && live.relayRev !== undefined) return `/${COMMAND} log: ${await relayLogText($, here, live)}`
   return `/${COMMAND} log: ${logSummary(rec, rec !== live)}`
+}
+
+/** One relay line: its time, kind, the principal and the short id of the session that wrote it, and its text. */
+const relayLine = (one: RelayLine): string =>
+  `  ${clockOf(one.at)} ${one.kind.padEnd(7)} ${one.principal === undefined ? '' : `[${one.principal} ${(one.holder ?? '').slice(0, 8)}] `}${one.text}`
+
+/** The relay's log of a lifecycle, as `/pr-gate log` shows it (spec §5): the summary, the events by section, and any stuck filing. */
+async function relayLogText($: Engine, here: { root: string; branch: string }, live: LifecycleRecord): Promise<string> {
+  let log: Awaited<ReturnType<typeof relayLog>>
+  try {
+    log = await relayLog($, here.root, here.branch)
+  } catch (error) {
+    if (!(error instanceof RelayRefused)) throw error
+    return `${logSummary(live, false)}\nThe relay refused this checkout (${error.message}): this is the local log.`
+  }
+  const all = [...(log.movedFrom?.lines ?? []), ...log.lines]
+  const lines = logHead(live, false, all)
+  const section = (one: RelayLog): string[] => [
+    ...(one.dropped > 0 ? [`${one.dropped} earlier lines dropped`] : []),
+    ...one.lines.slice(-15).map(relayLine),
+  ]
+  if (all.length === 0 && log.unreachable === undefined) lines.push('No events logged: the record is from before 1.3.0.')
+  else if (log.movedFrom === undefined) lines.push('Last events:', ...section(log))
+  else lines.push('Last events:', `branch ${here.branch}`, ...section(log.movedFrom), `PR #${log.pr ?? live.pr ?? '?'}`, ...section(log))
+  if (log.unreachable !== undefined) lines.push(`The relay was unreachable (${log.unreachable}): this is the local log.`)
+  else {
+    try {
+      const { config: settings } = await configFor($, here.root, live.base)
+      const probe = await stuckFilings($, here.root, here.branch, settings.stepTimeoutMs)
+      if (probe.stuck.length > 0) {
+        lines.push(
+          'stuck filings (known findings only)',
+          ...probe.stuck.map(one => `  ${one.key} claimed by ${one.actor}, ${Math.round(one.ageMs / 60_000)} minutes ago`),
+          "the driver adopts it once its issue is found; otherwise an admin's fileDelete frees it",
+        )
+      }
+      if (probe.unreachable !== undefined) lines.push(`The relay was unreachable (${probe.unreachable}): the stuck filings could not all be checked.`)
+    } catch {
+      // The settings or the probe could not be read: the log goes without its stuck section.
+    }
+  }
+  return lines.join('\n')
 }
 
 /** The person's commands that change a lifecycle, for its run log. */
@@ -1065,7 +1154,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
     if (!Number.isInteger(n) || n < 1 || n > 5 || reason === '') return `Say how many and why: /${COMMAND} allow <1-5> <reason>`
     if (rec === undefined) return none
     await take()
-    await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }))
+    await updateRecord($, root, branch, one => ({ ...one, grants: [...one.grants, { n, reason, head, at: now }] }), { isPure: true })
     await tellAgent($, { root, branch }, `allowed ${n} more round${n === 1 ? '' : 's'}: ${reason}`,
       'the gate continues the review. Leave the branch alone until it sends you what needs an answer.')
     // A run in flight reads the grant when its round ends; otherwise the controller decides again now (a ready record stays ready).
@@ -1105,7 +1194,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
       if (refusal !== undefined) return one
       // A fresh waiver at this head: one that lapsed on a file change stays in the history as lapsed (R55).
       return { ...one, waivers: [...one.waivers, { scope: 'finding' as const, findingId: scope, head: one.head, reason, by: origin, at: now }] }
-    })
+    }, { isPure: true })
     if (refusal !== undefined) return refusal
     await take()
     // A PR merged before the gate finished, blocked on this finding or on an issue it could not confirm (spec §5.12, §5.13.2): the
@@ -1207,7 +1296,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
           : one
       const waiver = { scope: 'pre' as const, head, base: base.base, reason, by: origin, at: now }
       return { ...base, preStatus: 'waived' as const, preHead: head, waivers: [...base.waivers, waiver] }
-    })
+    }, { isPure: true })
     if (refusal !== undefined || waived === undefined) return refusal ?? `/${COMMAND}: no pre waiver was recorded.`
     await take()
     if (isOurs && run.lifecycle === 'pre') await finish($, run.id, 'waived', `Waived: ${reason}`)
@@ -1254,7 +1343,7 @@ const runCommand = async ($: Engine, args: string, origin: string): Promise<stri
         }
         : one
     return { ...base, waivers: [...base.waivers, { scope: 'post' as const, head: at, reason, by: origin, at: now }] }
-  })
+  }, { isPure: true })
   // The review the waiver settles stops collecting, as a pre waiver ends a pre run (R62).
   if (isOurs && run.lifecycle === 'post') await finish($, run.id, 'waived', `Waived: ${reason}`)
   const after = await loadRecord($, root, branch)
@@ -1321,7 +1410,9 @@ export const register: Register = (on, options) => {
     }
     const found = await gatedCreate($, action)
     if (found === 'outside') return config.enforce ? { deny: asHold(outsideText(action)) + tail } : next(e)
+    if (found === 'unread') return config.enforce ? { deny: asHold(unreadText(action)) + tail } : next(e)
     if (found !== undefined && 'noBase' in found) return config.enforce ? { deny: asHold(noBaseText(action, found.noBase)) + tail } : next(e)
+    if (found !== undefined && 'foreign' in found) return config.enforce ? { deny: asHold(foreignText(action, found)) + tail } : next(e)
     if (found !== undefined && 'head' in found) return config.enforce ? { deny: asHold(elsewhereText(action, found)) + tail } : next(e)
     const gated = found
     const refusal = gated !== undefined && config.enforce ? await judgeCreate($, action, gated) : undefined
@@ -1355,6 +1446,9 @@ export const register: Register = (on, options) => {
         await onAnswer($, e.agentId, e.answer, e.reason, e.turnId)
       } catch (error) {
         const run = await getRun($)
+        // The shared store would not take a change (Task 8): this session stands down with a log line, and its run is not failed.
+        // A plain stale commit keeps the run: the next tick works from the relay's record (spec §14).
+        if (run !== null && (isKeptBy(error) || (await isStoodDownBy($, run, error)))) return done
         if (run !== null && run.status === 'running') {
           await finish($, run.id, 'error', `The gate itself failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300))
         }
@@ -1391,7 +1485,7 @@ export const register: Register = (on, options) => {
         // (spec §5.12) and the filing of what still holds (§5.13.1), whatever the record waits on (final review m1); it is not
         // collected again (R62). Only a session a person is at does this, and never on a record a live session elsewhere owns (#13).
         if (top.isOk && e.isInteractive) {
-          for (const one of await liveRecords($, top.out)) {
+          for (const one of await liveRecords($, top.out, config.bases)) {
             if (one.pr === undefined || (one.phase !== 'ready' && one.phase !== 'post')) continue
             const pr = one.pr
             try {
@@ -1414,7 +1508,7 @@ export const register: Register = (on, options) => {
         const isMine = rec !== undefined && e.isInteractive && !(await isOwnedElsewhere($, top.out, branch))
         // One still open is left as it is, unless its review was under way or stopped on an error.
         if (rec !== undefined && isMine && rec.phase === 'post' && (rec.postStatus === undefined || rec.postStatus === 'error')) {
-          if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }))
+          if (rec.postStatus === 'error') await updateRecord($, top.out, branch, one => ({ ...one, postStatus: undefined }), { isPure: true })
           await holdingPrompts($, () => advance($, top.out, branch))
         }
       } catch {

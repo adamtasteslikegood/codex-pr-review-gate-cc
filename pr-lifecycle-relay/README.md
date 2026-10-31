@@ -1,31 +1,85 @@
 # pr-lifecycle-relay
 
-A prototype of the shared lifecycle store for pr-lifecycle (#29 Part B). It runs only under Miniflare, in tests. **Nothing is deployed**, and
-no Cloudflare resource or Access application exists for it. pr-lifecycle does not call it yet.
+The shared lifecycle store for pr-lifecycle (#29 Part B): a Cloudflare Worker and Durable Objects that hold a PR's record, its lease, its run
+log and its filing ledger, so that checkouts of one PR share one record. It is built and tested under Miniflare. **Nothing is deployed**: no
+Cloudflare resource or Access application exists for it, and the first deploy waits for Adam's confirmation (R108). pr-lifecycle 1.6.0 calls
+it only for a repo that opts in (see the pr-lifecycle README, "The shared store"), and only from a machine whose `PR_GATE_RELAY_URL` has the
+same origin as the repo's `sharedStore.url`: a checkout never sends its Access credential to a relay its own machine did not pin.
 
 ## Shape
 
-- `POST /v1/<owner>/<repo>/<pr>` with a JSON body `{ "op": ... }`.
 - The Worker (`src/index.ts`) verifies the Cloudflare Access JWT in `Cf-Access-Jwt-Assertion` (`src/auth.ts`): RS256 against the team's
   published keys, then issuer, audience, `exp` and `nbf`. A person is their `email`; a service token is its `common_name`. A header value
-  alone is never an identity.
-- It hands the call to one Durable Object per `owner/repo#pr` (`src/lifecycle.ts`), which checks the grant, the lease and the revision in
-  the same step that writes.
+  alone is never an identity. Principals, grants and admins are compared in lower case.
+- It asks `GrantStore` for the caller's preset on the repo, then hands the call to one object. The object checks the preset, the lease and
+  the revision in the same step that writes. The Worker replaces `x-relay-principal`, `x-relay-repo`, `x-relay-preset` and `x-relay-key` on
+  every call, whatever the caller sent.
+- Only `POST` is served. Anything else, and any path not listed here, answers 404. A body that is not JSON answers 400.
+
+## Routes
+
+| Route | Object | Ops |
+| --- | --- | --- |
+| `POST /v1/<owner>/<repo>/<pr>` | `LifecycleObject` for `owner/repo#<pr>` | the lifecycle ops below |
+| `POST /v1/<owner>/<repo>/branch/<branch>` | `LifecycleObject` for `owner/repo@<branch>` | the same, plus `moveTo` and `moveDone`. The branch is one percent-encoded segment, checked against git's ref rules; a name git would refuse answers 404. |
+| `POST /v1/<owner>/<repo>` | `RepoIndex` for `owner/repo` | `list` (needs `read`) |
+| `POST /v1/admin/grants` | `GrantStore` | `grants`, `grant`, `revoke` (admin) |
+| `POST /v1/admin/index` | `RepoIndex` | `fault`, `update`: only when `TEST_FAULTS` is `'1'`, for tests; otherwise 404 |
+
+The owner `admin` is reserved: `/v1/admin/...` is matched before owner and repo are parsed.
+
+## Lifecycle ops
+
+Body `{ "op": ..., "secret"?: ..., ... }`. A checkout makes its own secret (32 characters or more) and sends it with each lease call; the
+object keeps only its SHA-256 and never returns it.
 
 | Op | Needs | What it does |
 | --- | --- | --- |
-| `read`, `archives`, `filing` | `read` | The record, its revision and lease, the last write; the archives; one filing. |
-| `commit` | `operate` | Writes the record if `rev` is current (else 409 with the current record) and no lease is live that the caller doesn't hold (else 423). `archive: { at, record }` keeps the record the caller archived (as the local store's `tx.archive` does), not the one stored. |
-| `claim`, `beat`, `release` | `operate` | The lease. A new holder gets a higher public fence `token`. Its checkout makes its own `secret` (32 characters or more) and sends it with each call; the object keeps only its SHA-256 and never returns it. A live lease is renewed, beaten, released or written under only by the same principal with the same secret; a lapsed one is lost even to its holder. |
-| `fileClaim`, `fileDone` | `operate` | The filing ledger. A second claim of a key finds the first. The claim takes the checkout's secret the same way: a retry with it answers `isMine: true`, so a lost answer is no dead end. Only the claimant finishes it; a done filing never changes. |
+| `read` | `read` | `{ rev, record, lease, lastWrite, log, logDropped, logSeq }`. `logSince` (a `seq`) returns only newer log lines. |
+| `archives`, `filing` | `read` | The kept archives; one filing. |
+| `commit` | `operate` | Writes the record if `rev` is current (else 409 with the current record) and no lease is live that the caller doesn't hold (else 423). `archive: { at, record }` keeps the record the caller archived. `isFresh` starts a new lifecycle over a tombstone. A branch key whose record now carries `pr` moves to the PR key inside the commit (R103). A tombstone answers 410. |
+| `claim` | `operate` | Takes the lease if none is live. A new holder gets a higher public fence `token`. A live lease held by another is 423. |
+| `take` | `operate` | Takes a live lease from another session of the same principal at once, with a new `token` (R105); a lapsed or empty lease is simply taken. Another principal's live lease answers 423. |
+| `beat`, `release` | `operate` | Renew or drop your own lease. A lease you no longer hold answers 409. A lapsed lease is lost even to its holder. |
+| `moveTo`, `moveDone` | `operate` | Branch keys only (404 on a PR key). `moveTo` answers 200 and freezes the branch key with a tombstone that keeps the record; every record and lease op after it answers 410 (apart from a fresh start). `moveDone` drops the copy once the PR key has it. |
+| `log` | `operate` | Appends `{ seq, at, kind, text, principal, holder }`, with no lease needed. `text` is cut to 300 characters. The log holds 1000 lines (`RELAY_LOG_CAP`), and `logDropped` counts the lines pushed out (R106). |
+| `snapshot` | `operate` | Appends a record to the archives, with a `reason` of `fallback`, `migration` or `move`. It does not change `rev`. The archives keep at most 1 MiB, dropping the oldest. |
+| `fileClaim`, `fileDone` | `operate` | The filing ledger, keyed `lifecycleId:findingId:attempt` (R101). A second claim of a key finds the first. Only the claimant finishes it (anyone else gets 409), and a retry with the same secret answers `isMine: true`. A done filing never changes. |
+| `fileAdopt` | `operate` + the live lease | Finishes a claim older than `FILING_STALE_MS` with the issue the exact-mark search found, recorded as `adoptedBy`. 423 without the lease, 409 on a younger claim or one with no claim. |
 | `breakLease`, `fileDelete` | admin | Held by people listed in `ADMINS`, never by a service principal. |
 
-Every write, a heartbeat included, records its principal. Principals, grants and admins are compared in lower case.
+A `commit` or `snapshot` body over 512 KiB answers 413 and changes nothing. The plugin then keeps that lifecycle in its local store.
 
-## Provisional
+Every write, a heartbeat included, records its principal.
 
-Adam's open decisions are filled in for the prototype only: a 2-minute lease (R74), the filing key `lifecycleId:findingId:attempt`,
-20 archives per PR, and grants as JSON in the `GRANTS` variable.
+## Grants and admins
+
+- `GrantStore` is one object. Presets are `read` (read ops, `list`) and `operate` (all but admin ops). A grant names one repo (`owner/name`,
+  lowercased) and a principal; there is no wildcard.
+- `grants` lists them. `grant { principal, repo, preset }` adds one or changes its preset. `revoke { principal, repo }` removes it. Each
+  records its actor in a history capped at 500 entries (R104).
+- A principal with no grant gets 403. A revoke holds for every request that starts after it commits; there is no cache.
+- Admins come only from the `ADMINS` Worker variable (comma-separated people). No op makes an admin.
+- **Seeding.** `GrantStore` starts empty. After the first deploy, an admin sends `{ "op": "grant", "principal": "<email or service token common_name>", "repo": "owner/name", "preset": "operate" }` to `/v1/admin/grants`, once per principal and repo.
+
+## Bindings and variables
+
+| Name | Kind | Meaning |
+| --- | --- | --- |
+| `LIFECYCLE`, `GRANTS`, `REPO_INDEX` | Durable Objects | `LifecycleObject`, `GrantStore`, `RepoIndex` (see `wrangler.jsonc`) |
+| `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` | vars | the Access team's domain and the application's AUD tag |
+| `ADMINS` | var | comma-separated admin people |
+| `LEASE_MS` | var, optional | lease length; 120 000 (R74, R100) when unset |
+| `FILING_STALE_MS` | var, optional | age before the lease holder may adopt a claim; 30 minutes when unset |
+| `RETENTION_MS` | var, optional | how long an object is kept: 90 days after its PR's archive commit, or after a branch key's last write (R102) |
+| `INDEX_RETRY_MS` | var, optional | first delay before an object retries its index update (doubled to 5 minutes); 1000 when unset |
+| `TEST_FAULTS` | var, tests only | `'1'` opens `/v1/admin/index`. Leave it unset in wrangler. |
+
+## Also kept
+
+- 20 archives per object (`ARCHIVE_CAP`), and 100 write-history entries (`WRITE_CAP`).
+- Each object tells `RepoIndex` about its changes through an outbox, delivered by an alarm that retries; `list` reads the index. The index
+  orders by `(born, rev)` per key, so a late update never brings back a removed entry.
 
 ## Checks
 
@@ -34,4 +88,5 @@ npm run test:relay       # node --test, the Worker under Miniflare
 npm run typecheck:relay  # tsc -p pr-lifecycle-relay
 ```
 
-`wrangler.jsonc` is for reference only.
+`wrangler.jsonc` is for reference only. The request count per lifecycle-hour is in the design's section 12
+(`docs/superpowers/specs/2026-10-29-pr-lifecycle-shared-store-design.md`).
