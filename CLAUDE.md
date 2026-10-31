@@ -49,7 +49,9 @@ the project's goals and their order.
     [VISION.md](VISION.md); the waves of work are in [ROADMAP.md](ROADMAP.md).
   - `/pr-gate log` sums up how a lifecycle went (R78).
 - `pr-lifecycle-relay/` is #29 Part B's shared store: a Worker and Durable Objects (a lifecycle object per PR or branch, `GrantStore`,
-  `RepoIndex`), tested under Miniflare. **Nothing is deployed**: the one development deploy (R108) ran on 2026-10-30 to measure latency
+  `RepoIndex`, and since 2026-10-31 a `WorkBoard` per repo for work claims that agents on any runtime claim, checkpoint and take over;
+  design `docs/superpowers/specs/2026-10-31-relay-work-claims-design.md`), tested under Miniflare. `npm run relay:dev` runs it locally
+  behind an Access stand-in, and `npm run relay:work` is the claims client. **Nothing is deployed**: the one development deploy (R108) ran on 2026-10-30 to measure latency
   (spec §12) and was torn down the same day. Any new deploy waits for Adam's confirmation first. pr-lifecycle 1.6.0 calls it only for a repo that opts in with
   `sharedStore` (`{ url, aud }`) in `.github/pr-gate.json` on the base branch, with a credential in `PR_GATE_RELAY_CLIENT_ID` and
   `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token), and only when the origin of
@@ -119,7 +121,7 @@ npm run lint       # eslint, pr-lifecycle only
 npm run test       # claude plugin test, both components (codex-gate 22, pr-lifecycle 837)
 npm run validate   # claude plugin validate, both components
 npm run typecheck  # tsc -p pr-lifecycle --noEmit, with the pinned TypeScript
-npm run test:relay       # the #29 Part B relay under Miniflare (89)
+npm run test:relay       # the #29 Part B relay under Miniflare (97)
 npm run typecheck:relay  # tsc -p pr-lifecycle-relay
 npm run check      # all of the above
 ```
