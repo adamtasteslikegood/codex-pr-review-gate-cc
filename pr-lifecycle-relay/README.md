@@ -92,7 +92,22 @@ npm run relay:dev                                     # in one terminal
 . pr-lifecycle-relay/.dev/sandbox.env && npm run relay:work -- claim gh#12 --repo adamtasteslikegood/td2do
 ```
 
-`LEASE_MS=5000` shortens the lease for a takeover test. pr-lifecycle needs an `https` relay, so the gate itself is tested against a deploy.
+`LEASE_MS=5000` shortens the lease for a takeover test.
+
+**https (`TLS=1`, port 8443)** makes a local CA and a certificate for `127.0.0.1` once (`.dev/tls/`), and the env files then also set
+`NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE`, so Node, Claude Code and Python trust it. pr-lifecycle takes only an https relay, so this is how
+the gate runs against it locally:
+
+1. `TLS=1 npm run relay:dev`, then `. pr-lifecycle-relay/.dev/gate.env && node pr-lifecycle-relay/dev/gate-smoke.mjs` checks the gate's
+   calls (lease, commit, log, filing claim, list) end to end.
+2. In a repo listed in `DEV_REPOS`, put `"sharedStore": { "url": "https://127.0.0.1:8443", "aud": "relay-dev" }` in the base branch's
+   `.github/pr-gate.json` and push it.
+3. Start Claude Code from a shell that sourced `.dev/gate.env` (its `PR_GATE_RELAY_URL` is the pin, and `NODE_EXTRA_CA_CERTS` must be set
+   before Claude Code starts), and run `/pr-gate`; `/pr-gate log` and the relay's own log show the calls.
+
+**The game bridge (Python):** `client/relay_work.py` is the same claims API for Python, stdlib only: `RelayWork.from_env(repo, runtime,
+holder)`, then `claim`, `checkpoint`, `release`, and `with work.keepalive(ref) as lost:` around a loop of work, where `lost` is set if the
+claim is lost. Source `.dev/bridge.env` before starting the bridge.
 
 ## Grants and admins
 

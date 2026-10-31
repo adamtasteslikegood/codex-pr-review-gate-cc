@@ -4,14 +4,20 @@
 // `Cf-Access-Jwt-Assertion`. Production code is unchanged; the Worker verifies the JWT against keys this script makes and serves.
 //
 //   node pr-lifecycle-relay/dev/serve.ts            # http://127.0.0.1:8787
+//   TLS=1 node pr-lifecycle-relay/dev/serve.ts      # https://127.0.0.1:8443, for pr-lifecycle, which takes only an https relay
 //   PORT=9000 DEV_REPOS=owner/a,owner/b node pr-lifecycle-relay/dev/serve.ts
+//
+// With TLS=1 it makes a local CA (`.dev/tls/ca.pem`) and a certificate for 127.0.0.1 and localhost, once, with openssl. A client trusts it
+// with NODE_EXTRA_CA_CERTS (Node, Claude Code), SSL_CERT_FILE or a cafile (Python), or curl --cacert.
 //
 // On first start it makes one service token per runtime (`DEV_RUNTIMES`) and writes `.dev/<runtime>.env` with the three variables
 // pr-lifecycle and `client/relay-work.ts` read. Every runtime and the dev person (`DEV_ADMIN`) get `operate` on each repo in `DEV_REPOS`.
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createTlsServer } from 'node:https'
 import { stripTypeScriptTypes } from 'node:module'
 
 import { Miniflare } from 'miniflare'
@@ -25,7 +31,8 @@ if (!['127.0.0.1', '::1', 'localhost'].includes(HOST) && process.env.DEV_EXPOSE 
   console.error(`refusing HOST=${HOST}: the dev relay grants operate to every dev credential. Set DEV_EXPOSE=1 to serve beyond this machine.`)
   process.exit(2)
 }
-const PORT = Number(process.env.PORT ?? 8787)
+const IS_TLS = process.env.TLS === '1'
+const PORT = Number(process.env.PORT ?? (IS_TLS ? 8443 : 8787))
 const ADMIN = (process.env.DEV_ADMIN ?? 'adam@dev.local').toLowerCase()
 const RUNTIMES = (process.env.DEV_RUNTIMES ?? 'tui,sandbox,vps,cloud,bridge,gate').split(',').map(one => one.trim()).filter(Boolean)
 const REPOS = (process.env.DEV_REPOS ?? 'adamtasteslikegood/td2do,adamtasteslikegood/codex-pr-review-gate-cc,adamtasteslikegood/10110tasteslikegoodplaza')
@@ -98,17 +105,44 @@ for (const repo of REPOS) {
   }
 }
 
-const url = `http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}`
+const url = `${IS_TLS ? 'https' : 'http'}://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}`
+/** With TLS, each env file also trusts the local CA: NODE_EXTRA_CA_CERTS for Node and Claude Code, SSL_CERT_FILE for Python. */
+const trust = IS_TLS ? `export NODE_EXTRA_CA_CERTS=${new URL('tls/ca.pem', DIR).pathname}\nexport SSL_CERT_FILE=${new URL('tls/ca.pem', DIR).pathname}\n` : ''
 for (const runtime of RUNTIMES) {
-  const env = `export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_CLIENT_ID=${runtime}\nexport PR_GATE_RELAY_CLIENT_SECRET=${tokens[runtime]}\nexport RELAY_RUNTIME=${runtime}\n`
+  const env = `${trust}export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_CLIENT_ID=${runtime}\nexport PR_GATE_RELAY_CLIENT_SECRET=${tokens[runtime]}\nexport RELAY_RUNTIME=${runtime}\n`
   writeFileSync(new URL(`${runtime}.env`, DIR), env, { mode: 0o600 })
 }
 
 // The dev person's own token, for admin ops such as `breakClaim` (`cf-access-token`, as `PR_GATE_RELAY_TOKEN`), good for 30 days.
 const person = await sign({ email: ADMIN }, 30 * 86_400)
-writeFileSync(new URL('admin.env', DIR), `export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_TOKEN=${person}\nexport RELAY_RUNTIME=admin\n`, { mode: 0o600 })
+writeFileSync(new URL('admin.env', DIR), `${trust}export PR_GATE_RELAY_URL=${url}\nexport PR_GATE_RELAY_TOKEN=${person}\nexport RELAY_RUNTIME=admin\n`, { mode: 0o600 })
 
-createServer((req, res) => {
+/** A local CA and a leaf certificate for 127.0.0.1 and localhost, made once with openssl and kept in `.dev/tls/`. */
+function tls(): { key: Buffer; cert: Buffer } {
+  const dir = new URL('tls/', DIR).pathname
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const at = (name: string) => `${dir}${name}`
+  if (!existsSync(at('cert.pem'))) {
+    const run = (...args: string[]) => execFileSync('openssl', args, { stdio: 'ignore' })
+    // The extensions Python 3.13's strict verification asks for: key usage on the CA, key identifiers on both.
+    const ca = ['-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-addext', 'subjectKeyIdentifier=hash']
+    run('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '825', '-subj', '/CN=pr-gate relay dev CA', ...ca, '-keyout', at('ca.key'), '-out', at('ca.pem'))
+    run('req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=127.0.0.1', '-keyout', at('key.pem'), '-out', at('req.csr'))
+    const leaf = [
+      'subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost',
+      'basicConstraints=CA:FALSE',
+      'keyUsage=critical,digitalSignature,keyEncipherment',
+      'extendedKeyUsage=serverAuth',
+      'subjectKeyIdentifier=hash',
+      'authorityKeyIdentifier=keyid,issuer',
+    ]
+    writeFileSync(at('ext.cnf'), leaf.join('\n') + '\n')
+    run('x509', '-req', '-in', at('req.csr'), '-CA', at('ca.pem'), '-CAkey', at('ca.key'), '-CAcreateserial', '-days', '825', '-extfile', at('ext.cnf'), '-out', at('cert.pem'))
+  }
+  return { key: readFileSync(at('key.pem')), cert: readFileSync(at('cert.pem')) }
+}
+
+const handler = (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): void => {
   const chunks: Buffer[] = []
   req.on('data', chunk => chunks.push(chunk as Buffer))
   req.on('end', async () => {
@@ -128,8 +162,11 @@ createServer((req, res) => {
       res.end(String(error))
     }
   })
-}).listen(PORT, HOST, () => {
+}
+const server = IS_TLS ? createTlsServer(tls(), handler) : createServer(handler)
+server.listen(PORT, HOST, () => {
   console.log(`relay (dev) on ${url}; state in ${new URL('state', DIR).pathname}`)
   console.log(`admin person: ${ADMIN}; repos: ${REPOS.join(', ')}`)
+  if (IS_TLS) console.log(`trust: NODE_EXTRA_CA_CERTS=${new URL('tls/ca.pem', DIR).pathname} (Python: SSL_CERT_FILE, curl: --cacert)`)
   console.log(`credentials: source ${new URL('.', DIR).pathname}<runtime>.env for one of ${RUNTIMES.join(', ')}, or admin.env`)
 })

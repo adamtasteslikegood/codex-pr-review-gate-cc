@@ -62,9 +62,10 @@ under separate keys, so `list`, the cap and the alarm read only the summaries.
   `get`, `list`. It reads the same variables as pr-lifecycle (`PR_GATE_RELAY_URL`, then `PR_GATE_RELAY_CLIENT_ID` and
   `PR_GATE_RELAY_CLIENT_SECRET`, or `PR_GATE_RELAY_TOKEN`), keeps the checkout's secret and tokens under `.git/relay-work/`, and fills
   the branch and commit from git.
-- The game bridge (Python) can call the HTTP API directly or run the CLI.
+- **`client/relay_work.py`**, the same API for the game bridge (Python, stdlib only), with a keepalive thread around a loop of work.
 - **`dev/serve.ts`** runs the relay locally under Miniflare, with state kept on disk, behind a stand-in for Access: it signs JWTs for the
-  dev identities it seeds, so every runtime on the machine (and pr-lifecycle) can test against it with no Cloudflare account.
+  dev identities it seeds, so every runtime on the machine can test against it with no Cloudflare account. With `TLS=1` it serves https
+  from a local CA, which pr-lifecycle needs; `dev/gate-smoke.mjs` checks the gate's calls against it.
 
 ## Not in this step
 
