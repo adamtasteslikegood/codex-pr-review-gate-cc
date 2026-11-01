@@ -3,6 +3,8 @@
 // module's scope, which the Worker and its objects share under Miniflare (one isolate); `/__count` reads them and `/__reset` clears them.
 
 import relay, { GrantStore as Grants, LifecycleObject as Lifecycle, RepoIndex as Index } from '../src/index.ts'
+
+export { WorkBoard } from '../src/index.ts'
 import type { Env } from '../src/types.ts'
 
 type Counts = { worker: number; objects: Record<string, number> }

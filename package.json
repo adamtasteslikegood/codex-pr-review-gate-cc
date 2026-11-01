@@ -10,7 +10,9 @@
     "validate": "claude plugin validate codex-gate && claude plugin validate pr-lifecycle",
     "check": "npm run lint && npm run test && npm run test:relay && npm run validate && npm run typecheck:relay && npm run typecheck",
     "test:relay": "node --test pr-lifecycle-relay/test/*.test.ts",
-    "typecheck:relay": "tsc -p pr-lifecycle-relay"
+    "typecheck:relay": "tsc -p pr-lifecycle-relay",
+    "relay:dev": "node pr-lifecycle-relay/dev/serve.ts",
+    "relay:work": "node --no-warnings pr-lifecycle-relay/client/relay-work.ts"
   },
   "devDependencies": {
     "@stylistic/eslint-plugin": "5.10.0",

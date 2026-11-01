@@ -7,12 +7,14 @@
     "bindings": [
       { "name": "LIFECYCLE", "class_name": "LifecycleObject" },
       { "name": "GRANTS", "class_name": "GrantStore" },
-      { "name": "REPO_INDEX", "class_name": "RepoIndex" }
+      { "name": "REPO_INDEX", "class_name": "RepoIndex" },
+      { "name": "WORK", "class_name": "WorkBoard" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["LifecycleObject"] },
-    { "tag": "v2", "new_sqlite_classes": ["GrantStore", "RepoIndex"] }
+    { "tag": "v2", "new_sqlite_classes": ["GrantStore", "RepoIndex"] },
+    { "tag": "v3", "new_sqlite_classes": ["WorkBoard"] }
   ],
   "vars": { "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com", "ACCESS_AUD": "<aud tag>", "ADMINS": "<comma-separated admin people>" }
 }

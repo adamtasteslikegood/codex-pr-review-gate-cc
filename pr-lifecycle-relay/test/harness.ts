@@ -85,10 +85,10 @@ export async function start(bindings: Record<string, string> = {}, entry?: strin
   mf = new Miniflare({
     modules: [
       ...(entry === undefined ? [] : [{ type: 'ESModule' as const, path: entry, contents: tested(entry) }]),
-      ...['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'repo-index.ts', 'types.ts'].map(path => ({ type: 'ESModule' as const, path, contents: source(path) })),
+      ...['index.ts', 'auth.ts', 'grants.ts', 'lifecycle.ts', 'repo-index.ts', 'types.ts', 'work.ts'].map(path => ({ type: 'ESModule' as const, path, contents: source(path) })),
     ],
     compatibilityDate: '2026-08-01',
-    durableObjects: { LIFECYCLE: 'LifecycleObject', GRANTS: 'GrantStore', REPO_INDEX: 'RepoIndex' },
+    durableObjects: { LIFECYCLE: 'LifecycleObject', GRANTS: 'GrantStore', REPO_INDEX: 'RepoIndex', WORK: 'WorkBoard' },
     bindings: {
       ACCESS_TEAM_DOMAIN: TEAM,
       ACCESS_AUD: AUD,
