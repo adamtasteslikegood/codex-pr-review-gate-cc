@@ -437,7 +437,9 @@ ledger. It is opt-in per repo and **off unless the base's `.github/pr-gate.json`
   checkout that found it keeps the text, and another checkout shows a placeholder.
 - **`/pr-gate log`** shows the relay's run log, with who wrote each line, and a `stuck filings (known findings only)` section for claims
   older than the step timeout. It lists only findings the record knows, because no relay op lists every filing.
-- **Nothing is deployed yet.** There is no relay to point `url` at until Adam confirms the first deploy (R108).
+- **One development deploy is up** (since 2026-11-13), for testing: the relay README's "The development deploy" gives its URL and what
+  exists. It is not a production store. No repo's base opts in yet, and a repo should point `url` at it only for testing. Any other
+  deploy waits for Adam's confirmation (R108).
 
 ## What is held
 

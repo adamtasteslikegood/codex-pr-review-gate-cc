@@ -48,6 +48,13 @@ class RelayWorkTest(unittest.TestCase):
         self.assertFalse(sent["user-agent"].lower().startswith("python-urllib"))
         self.assertEqual(sent["cf-access-token"], "t")
 
+        sent.clear()
+        own = self.client({"User-Agent": "plaza-bridge/9"})
+        self.assertEqual([key for key in own.headers if key.lower() == "user-agent"], ["User-Agent"])
+        with patch.object(urllib.request.HTTPSHandler, "https_open", transport):
+            self.assertEqual(own.list(), {"claims": []})
+        self.assertEqual(sent["user-agent"], "plaza-bridge/9")
+
     def test_redirects_do_not_forward_credentials(self):
         for destination in ("https://other.example/login", "http://other.example/login"):
             for credentials in ({"CF-Access-Client-Id": "fake-id", "CF-Access-Client-Secret": "fake-secret"},
