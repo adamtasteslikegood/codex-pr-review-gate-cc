@@ -1,8 +1,8 @@
 # pr-lifecycle-relay
 
 The shared lifecycle store for pr-lifecycle (#29 Part B): a Cloudflare Worker and Durable Objects that hold a PR's record, its lease, its run
-log and its filing ledger, so that checkouts of one PR share one record. It is built and tested under Miniflare. **Nothing is deployed**: no
-Cloudflare resource or Access application exists for it, and the first deploy waits for Adam's confirmation (R108). pr-lifecycle 1.6.0 calls
+log and its filing ledger, so that checkouts of one PR share one record. It is built and tested under Miniflare, and since 2026-11-13 one
+development deploy is up (see "The development deploy"). Any other deploy waits for Adam's confirmation (R108). pr-lifecycle 1.6.0 calls
 it only for a repo that opts in (see the pr-lifecycle README, "The shared store"), and only from a machine whose `PR_GATE_RELAY_URL` has the
 same origin as the repo's `sharedStore.url`: a checkout never sends its Access credential to a relay its own machine did not pin.
 
@@ -110,6 +110,28 @@ the gate runs against it locally:
 **The game bridge (Python):** `client/relay_work.py` is the same claims API for Python, stdlib only: `RelayWork.from_env(repo, runtime,
 holder)`, then `claim`, `checkpoint`, `release`, and `with work.keepalive(ref) as lost:` around a loop of work, where `lost` is set if the
 claim is lost. Source `.dev/bridge.env` before starting the bridge.
+
+## The development deploy
+
+Up since 2026-11-13, by Adam's go-ahead, and kept up for testing the gate and the game bridge against a hosted relay.
+
+- **Worker** `pr-lifecycle-relay-dev` at `https://pr-lifecycle-relay-dev.adamschoen3.workers.dev`, deployed from `main` with Adam as the
+  only admin (`ADMINS`).
+- **Access application** `pr-lifecycle-relay-dev` in front of it, with two policies: the service tokens `relay-dev-gate` and
+  `relay-dev-bridge` (they expire 2027-11-13), and Adam by email with the Cloudflare login.
+- **Grants**, added by Adam from the browser console, since only a person is an admin: the bridge token operates on the game repo; the gate
+  token on this repo, td2do and the game repo; Adam on all three.
+- **Credentials** are only in Adam's main checkout, git-ignored: `pr-lifecycle-relay/.dev/cf-relay-dev/` holds `gate.env`, `bridge.env`,
+  `plaza-bridge.env` (the bridge's, with `RELAY_WORK_REPO`), `app.json` (the AUD and the client ids) and `grant-snippet.js`. Source one of
+  the `.env` files and the clients work as against the local relay.
+- **Redeploy:** from a checkout of `main`, copy `wrangler.jsonc` to a config with the name `pr-lifecycle-relay-dev`, `"workers_dev": true`
+  and the three vars (`ACCESS_TEAM_DOMAIN`, the AUD from `app.json`, `ADMINS`), then `npx wrangler deploy -c <that config>` with wrangler's
+  own login. An account API token is needed only to change the Access application or its service tokens, and never goes to a client.
+- **Checked on it (2026-11-13):** a caller with no credential, or a wrong one, is turned away by Access; a service token with no grant gets
+  403 from the Worker; `dev/gate-smoke.mjs` and `dev/gate-store-live.ts` pass with the gate token; the game bridge's Godot-client
+  integration tests pass with claims on, and the relay then holds their claims.
+- **One thing only a deployed relay shows:** Cloudflare answers urllib's default `User-Agent` with 403 `error code: 1010`, so
+  `client/relay_work.py` names itself (`relay-work-py/1`).
 
 ## Grants and admins
 

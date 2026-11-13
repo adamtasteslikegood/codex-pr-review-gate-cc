@@ -51,8 +51,11 @@ the project's goals and their order.
 - `pr-lifecycle-relay/` is #29 Part B's shared store: a Worker and Durable Objects (a lifecycle object per PR or branch, `GrantStore`,
   `RepoIndex`, and since 2026-10-31 a `WorkBoard` per repo for work claims that agents on any runtime claim, checkpoint and take over;
   design `docs/superpowers/specs/2026-10-31-relay-work-claims-design.md`), tested under Miniflare. `npm run relay:dev` runs it locally
-  behind an Access stand-in, and `npm run relay:work` is the claims client. **Nothing is deployed**: the one development deploy (R108) ran on 2026-10-30 to measure latency
-  (spec §12) and was torn down the same day. Any new deploy waits for Adam's confirmation first. pr-lifecycle 1.6.0 calls it only for a repo that opts in with
+  behind an Access stand-in, and `npm run relay:work` is the claims client. **A development deploy is up** since 2026-11-13, by Adam's go-ahead: Worker `pr-lifecycle-relay-dev` at
+  `https://pr-lifecycle-relay-dev.adamschoen3.workers.dev`, behind one Access application, with service tokens for the gate and the game
+  bridge (relay README, "The development deploy"). Its credentials are only in git-ignored files in Adam's main checkout. The earlier
+  deploy (R108, 2026-10-30) measured latency (spec §12) and was torn down. Any other deploy, or a change to this one's Access setup, waits
+  for Adam's confirmation first. pr-lifecycle 1.6.0 calls it only for a repo that opts in with
   `sharedStore` (`{ url, aud }`) in `.github/pr-gate.json` on the base branch, with a credential in `PR_GATE_RELAY_CLIENT_ID` and
   `PR_GATE_RELAY_CLIENT_SECRET` (an Access service token) or `PR_GATE_RELAY_TOKEN` (a person's token), and only when the origin of
   `sharedStore.url` equals the origin of the machine's pin, `PR_GATE_RELAY_URL`; the credential goes nowhere else. With no credential, no

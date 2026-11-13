@@ -32,6 +32,29 @@ class RelayWorkTest(unittest.TestCase):
         with patch.object(urllib.request.HTTPSHandler, "https_open", transport):
             self.assertEqual(client.get("gh#12"), {"ok": True})
 
+    def test_requests_name_the_client_so_cloudflare_does_not_block_them(self):
+        client = self.client({"cf-access-token": "t"})
+        sent = {}
+
+        def transport(handler, request):
+            sent.update({key.lower(): value for key, value in request.header_items()})
+            response = urllib.response.addinfourl(io.BytesIO(b'{"claims": []}'), Message(), request.full_url, 200)
+            response.msg = "OK"
+            return response
+
+        with patch.object(urllib.request.HTTPSHandler, "https_open", transport):
+            self.assertEqual(client.list(), {"claims": []})
+        self.assertEqual(sent["user-agent"], relay_work.USER_AGENT)
+        self.assertFalse(sent["user-agent"].lower().startswith("python-urllib"))
+        self.assertEqual(sent["cf-access-token"], "t")
+
+        sent.clear()
+        own = self.client({"User-Agent": "plaza-bridge/9"})
+        self.assertEqual([key for key in own.headers if key.lower() == "user-agent"], ["User-Agent"])
+        with patch.object(urllib.request.HTTPSHandler, "https_open", transport):
+            self.assertEqual(own.list(), {"claims": []})
+        self.assertEqual(sent["user-agent"], "plaza-bridge/9")
+
     def test_redirects_do_not_forward_credentials(self):
         for destination in ("https://other.example/login", "http://other.example/login"):
             for credentials in ({"CF-Access-Client-Id": "fake-id", "CF-Access-Client-Secret": "fake-secret"},
