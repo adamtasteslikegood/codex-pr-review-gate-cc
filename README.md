@@ -8,7 +8,7 @@ version.
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
 | [codex-gate](codex-gate/)    | 0.3.1   | Rounds of adversarial Codex review and agent fixes before a PR to `dev` or `main`. [README](codex-gate/README.md) |
 | [pr-lifecycle](pr-lifecycle/) | 1.6.1   | `/pr-gate` across the PR lifecycle: pre-PR Codex rounds, then the PR's own reviews, under one review budget and record. [README](pr-lifecycle/README.md) |
-| [pr-lifecycle-relay](pr-lifecycle-relay/) | built, not deployed | The shared lifecycle store of #29 Part B, tested under Miniflare. pr-lifecycle 1.6.0 calls it only for a repo that opts in. [README](pr-lifecycle-relay/README.md) |
+| [pr-lifecycle-relay](pr-lifecycle-relay/) | built; one development deploy up | The shared lifecycle store of #29 Part B, tested under Miniflare. pr-lifecycle 1.6.0 calls it only for a repo that opts in. [README](pr-lifecycle-relay/README.md) |
 
 ## Using a component
 

@@ -1,4 +1,5 @@
-// Reference only: the relay is not deployed (#29 Part B). Values in angle brackets are placeholders.
+// Reference only (#29 Part B): values in angle brackets are placeholders. The development deploy uses a copy of this with its own name
+// and vars (README, "The development deploy").
 {
   "name": "pr-lifecycle-relay",
   "main": "src/index.ts",

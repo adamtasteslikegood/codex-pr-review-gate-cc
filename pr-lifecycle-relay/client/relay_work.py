@@ -46,6 +46,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# Cloudflare's Browser Integrity Check answers urllib's default User-Agent ("Python-urllib/3.x") with 403 "error code: 1010", before
+# Access or the Worker ever see the request. Miniflare has no such check, so only a deployed relay shows it.
+USER_AGENT = "relay-work-py/1"
+
+
 def new_secret() -> str:
     return secrets.token_hex(32)
 
@@ -55,7 +60,7 @@ class RelayWork:
         if len(secret) < 32:
             raise ValueError("the secret must be at least 32 characters")
         self.endpoint = f"{url.rstrip('/')}/v1/{repo.lower()}/work"
-        self.headers = {**headers, "content-type": "application/json"}
+        self.headers = {"user-agent": USER_AGENT, **headers, "content-type": "application/json"}
         self.runtime = runtime
         self.holder = holder
         self.secret = secret
