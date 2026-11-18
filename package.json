@@ -15,10 +15,10 @@
     "relay:work": "node --no-warnings pr-lifecycle-relay/client/relay-work.ts"
   },
   "devDependencies": {
-    "@stylistic/eslint-plugin": "5.10.0",
-    "eslint": "10.14.0",
+    "@stylistic/eslint-plugin": "6.0.0",
+    "eslint": "10.15.0",
     "miniflare": "4.20260730.0",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.72.1"
+    "typescript-eslint": "8.72.2"
   }
 }
